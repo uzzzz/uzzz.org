@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>区块链安全 - DAO攻击事件解析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="区块链安全 - DAO攻击事件解析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="0x00 前言 最近关注了一下区块链方面的安全，因此翻出来之前的DAO攻击事件研究了一番，形成此文。 之后可能还会发一些其他的安全分析文章。 0x00 基础知识 1.跨合约调用 智能合约之间的调用本质上是外部调用，可以使用message call或者创建智能合约对象的形式进行调用。 （1）使用message call 比如合约1调用合约2的某个方法： bytes4 methodId = bytes4(keccak256(&quot;increaseAge(string,uint256)&quot;)); return addr.call(methodId,&quot;jack&quot;, 1); （2）还原智能合约对象 如果已知合约的地址，可以通过如下方式获取到合约对象： Contract1 c = Contract1(AddressOfContract1) ; c.foo() ; //跨合约调用 2.智能合约发送ETH 我们可以在智能合约中用代码向某个地址（这个地址可以是人，也可以是智能合约）发送以太币，比较常见的两个方式是： （1）调用send函数 比如：msg.sender.send(100) （2）使用message call msg.sender.call.value(100)() 这两个方式不同的是发送的gas数量，gas就是执行opcode需要花费的一种币，称作为gas也特别形象。当调用send方法时，只会发送一部分gas，准确地来讲，是2300gas，一旦gas耗尽就可能抛出异常。 而使用message call的时候，则是发送全部的gas，执行完之后剩余的gas会退还给发起调用的合约。 3.fallback函数 智能合约中可以有唯一的一个未命名函数，称为fallback函数。该函数不能有实参，不能返回任何值。如果其他函数都不能匹配给定的函数标识符，则执行fallback函数。 当合约接收到以太币但是不调用任何函数的时候，就会执行fallback函数。如果一个合约接收了以太币但是内部没有fallback函数，那么就会抛出异常，然后将以太币退还给发送方。 下面就是一个fallback函数的代码示例： contract Sample{ &nbsp;&nbsp;&nbsp;&nbsp;function () payable{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// your code here &nbsp;&nbsp;&nbsp;&nbsp;} } 一般单纯使用message call或者send函数发送以太币给合约的时候，没有指明调用合约的某个方法，这种情况下就会调用合约的fallback函数。 0x01 攻击事件还原 我们先用简单的模拟代码来了解下整个攻击过程。 首先是存在漏洞的智能合约代码，Bank： 用户可以通过addToBalance方法存入一定量的以太币到这个智能合约，通过withdrawBalance方法可以提现以太坊，通过getUserBalance可以获取到账户余额。 注意到这里是通过message call的方式来发送以太币，所以在调用sender的fallback函数的时候我们就会有充足的gas来进行循环调用。如果是send的方式，gas只有2300，稍微一操作就会耗尽gas抛出异常，是不够用来进行嵌套调用的。以下是不同操作所需要的gas数量： 出问题的是withdrawBalance方法，特别是在修改保存在区块链的balances的代码是放在了发送以太币之后。 攻击代码如下： 这里的deposit函数是往Bank合约中发送10wei。withdraw是通过调用Bank合约的withdrawBalance函数把以太币提取出来。注意看这里的fallback函数，这里循环调用了两次Bank合约的withdrawBalance方法。 攻击的过程如下： （1）假设Bank合约中有100wei，攻击者Attack合约中有10wei （2）Attack合约先调用deposit方法向Bank合约发送10wei （3）之后Attack合约调用withdraw方法，从而调用了Bank的withdrawBalance方法。 （4）Bank的withdrawBalance方法发送给了Attack合约10wei （5）Attack收到10wei之后，又会触发调用fallback函数 （6）这时，fallback函数又调用了两次Bank合约的withdrawBalance，从而转走了20wei （7）之后Bank合约才修改Attack合约的balance，将其置为0 通过上面的步骤，攻击者实际上从Bank合约转走了30wei，Bank则损失了20wei，如果攻击者多嵌套调用几次withdrawBalance，完全可以将Bank合约中的以太币全部转走。 0x02 复现过程 给Bank合约100wei，给Attack合约10wei。 （1）部署Bank，分配100wei （2）部署Attack 分配给Attack 10wei。 （3）调用Attack合约的deposit方法 （4）调用Attack合约的withdraw方法 （5）查看Attack合约的余额，变成了30wei，即窃取了20wei 0x03 DAO攻击事件代码分析 在DAO源码中，有withdrawRewardFor函数： function withdrawRewardFor(address _account) noEther internal returns (bool _success) { if ((balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply &lt; paidOut[_account]) throw; uint reward = (balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply - paidOut[_account]; if (!rewardAccount.payOut(_account, reward)) //vulnerable throw; paidOut[_account] += reward; return true; } 这里调用了payOut函数进行付款。 function payOut(address _recipient, uint _amount) returns (bool) { if (msg.sender != owner || msg.value &gt; 0 || (payOwnerOnly &amp;&amp; _recipient != owner)) throw; if (_recipient.call.value(_amount)()) { //vulnerable PayOut(_recipient, _amount); return true; } else { return false; } 而payOut中直接使用的是message call的方式发送以太币，从而导致了嵌套漏洞。 0x04 总结 在编写智能合约进行以太币发送的时候，要使用send或者transfer，不要使用message call的方式，而send其实还是有些小问题，以后有时间再分析。 DAO事件直接导致了以太坊硬分叉，分为ETH和ETC。可见，区块链领域的安全不容忽视，因为其修复难度和所造成的影响都很高，毕竟是和钱打交道。 阅读更多" />
+<meta property="og:description" content="0x00 前言 最近关注了一下区块链方面的安全，因此翻出来之前的DAO攻击事件研究了一番，形成此文。 之后可能还会发一些其他的安全分析文章。 0x00 基础知识 1.跨合约调用 智能合约之间的调用本质上是外部调用，可以使用message call或者创建智能合约对象的形式进行调用。 （1）使用message call 比如合约1调用合约2的某个方法： bytes4 methodId = bytes4(keccak256(&quot;increaseAge(string,uint256)&quot;)); return addr.call(methodId,&quot;jack&quot;, 1); （2）还原智能合约对象 如果已知合约的地址，可以通过如下方式获取到合约对象： Contract1 c = Contract1(AddressOfContract1) ; c.foo() ; //跨合约调用 2.智能合约发送ETH 我们可以在智能合约中用代码向某个地址（这个地址可以是人，也可以是智能合约）发送以太币，比较常见的两个方式是： （1）调用send函数 比如：msg.sender.send(100) （2）使用message call msg.sender.call.value(100)() 这两个方式不同的是发送的gas数量，gas就是执行opcode需要花费的一种币，称作为gas也特别形象。当调用send方法时，只会发送一部分gas，准确地来讲，是2300gas，一旦gas耗尽就可能抛出异常。 而使用message call的时候，则是发送全部的gas，执行完之后剩余的gas会退还给发起调用的合约。 3.fallback函数 智能合约中可以有唯一的一个未命名函数，称为fallback函数。该函数不能有实参，不能返回任何值。如果其他函数都不能匹配给定的函数标识符，则执行fallback函数。 当合约接收到以太币但是不调用任何函数的时候，就会执行fallback函数。如果一个合约接收了以太币但是内部没有fallback函数，那么就会抛出异常，然后将以太币退还给发送方。 下面就是一个fallback函数的代码示例： contract Sample{ &nbsp;&nbsp;&nbsp;&nbsp;function () payable{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// your code here &nbsp;&nbsp;&nbsp;&nbsp;} } 一般单纯使用message call或者send函数发送以太币给合约的时候，没有指明调用合约的某个方法，这种情况下就会调用合约的fallback函数。 0x01 攻击事件还原 我们先用简单的模拟代码来了解下整个攻击过程。 首先是存在漏洞的智能合约代码，Bank： 用户可以通过addToBalance方法存入一定量的以太币到这个智能合约，通过withdrawBalance方法可以提现以太坊，通过getUserBalance可以获取到账户余额。 注意到这里是通过message call的方式来发送以太币，所以在调用sender的fallback函数的时候我们就会有充足的gas来进行循环调用。如果是send的方式，gas只有2300，稍微一操作就会耗尽gas抛出异常，是不够用来进行嵌套调用的。以下是不同操作所需要的gas数量： 出问题的是withdrawBalance方法，特别是在修改保存在区块链的balances的代码是放在了发送以太币之后。 攻击代码如下： 这里的deposit函数是往Bank合约中发送10wei。withdraw是通过调用Bank合约的withdrawBalance函数把以太币提取出来。注意看这里的fallback函数，这里循环调用了两次Bank合约的withdrawBalance方法。 攻击的过程如下： （1）假设Bank合约中有100wei，攻击者Attack合约中有10wei （2）Attack合约先调用deposit方法向Bank合约发送10wei （3）之后Attack合约调用withdraw方法，从而调用了Bank的withdrawBalance方法。 （4）Bank的withdrawBalance方法发送给了Attack合约10wei （5）Attack收到10wei之后，又会触发调用fallback函数 （6）这时，fallback函数又调用了两次Bank合约的withdrawBalance，从而转走了20wei （7）之后Bank合约才修改Attack合约的balance，将其置为0 通过上面的步骤，攻击者实际上从Bank合约转走了30wei，Bank则损失了20wei，如果攻击者多嵌套调用几次withdrawBalance，完全可以将Bank合约中的以太币全部转走。 0x02 复现过程 给Bank合约100wei，给Attack合约10wei。 （1）部署Bank，分配100wei （2）部署Attack 分配给Attack 10wei。 （3）调用Attack合约的deposit方法 （4）调用Attack合约的withdraw方法 （5）查看Attack合约的余额，变成了30wei，即窃取了20wei 0x03 DAO攻击事件代码分析 在DAO源码中，有withdrawRewardFor函数： function withdrawRewardFor(address _account) noEther internal returns (bool _success) { if ((balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply &lt; paidOut[_account]) throw; uint reward = (balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply - paidOut[_account]; if (!rewardAccount.payOut(_account, reward)) //vulnerable throw; paidOut[_account] += reward; return true; } 这里调用了payOut函数进行付款。 function payOut(address _recipient, uint _amount) returns (bool) { if (msg.sender != owner || msg.value &gt; 0 || (payOwnerOnly &amp;&amp; _recipient != owner)) throw; if (_recipient.call.value(_amount)()) { //vulnerable PayOut(_recipient, _amount); return true; } else { return false; } 而payOut中直接使用的是message call的方式发送以太币，从而导致了嵌套漏洞。 0x04 总结 在编写智能合约进行以太币发送的时候，要使用send或者transfer，不要使用message call的方式，而send其实还是有些小问题，以后有时间再分析。 DAO事件直接导致了以太坊硬分叉，分为ETH和ETC。可见，区块链领域的安全不容忽视，因为其修复难度和所造成的影响都很高，毕竟是和钱打交道。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/03/05/0a73178a4832881d7f7b893d75b7a12a.html" />
+<meta property="og:url" content="https://uzzz.org/2018/03/05/0a73178a4832881d7f7b893d75b7a12a.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-03-05T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"0x00 前言 最近关注了一下区块链方面的安全，因此翻出来之前的DAO攻击事件研究了一番，形成此文。 之后可能还会发一些其他的安全分析文章。 0x00 基础知识 1.跨合约调用 智能合约之间的调用本质上是外部调用，可以使用message call或者创建智能合约对象的形式进行调用。 （1）使用message call 比如合约1调用合约2的某个方法： bytes4 methodId = bytes4(keccak256(&quot;increaseAge(string,uint256)&quot;)); return addr.call(methodId,&quot;jack&quot;, 1); （2）还原智能合约对象 如果已知合约的地址，可以通过如下方式获取到合约对象： Contract1 c = Contract1(AddressOfContract1) ; c.foo() ; //跨合约调用 2.智能合约发送ETH 我们可以在智能合约中用代码向某个地址（这个地址可以是人，也可以是智能合约）发送以太币，比较常见的两个方式是： （1）调用send函数 比如：msg.sender.send(100) （2）使用message call msg.sender.call.value(100)() 这两个方式不同的是发送的gas数量，gas就是执行opcode需要花费的一种币，称作为gas也特别形象。当调用send方法时，只会发送一部分gas，准确地来讲，是2300gas，一旦gas耗尽就可能抛出异常。 而使用message call的时候，则是发送全部的gas，执行完之后剩余的gas会退还给发起调用的合约。 3.fallback函数 智能合约中可以有唯一的一个未命名函数，称为fallback函数。该函数不能有实参，不能返回任何值。如果其他函数都不能匹配给定的函数标识符，则执行fallback函数。 当合约接收到以太币但是不调用任何函数的时候，就会执行fallback函数。如果一个合约接收了以太币但是内部没有fallback函数，那么就会抛出异常，然后将以太币退还给发送方。 下面就是一个fallback函数的代码示例： contract Sample{ &nbsp;&nbsp;&nbsp;&nbsp;function () payable{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// your code here &nbsp;&nbsp;&nbsp;&nbsp;} } 一般单纯使用message call或者send函数发送以太币给合约的时候，没有指明调用合约的某个方法，这种情况下就会调用合约的fallback函数。 0x01 攻击事件还原 我们先用简单的模拟代码来了解下整个攻击过程。 首先是存在漏洞的智能合约代码，Bank： 用户可以通过addToBalance方法存入一定量的以太币到这个智能合约，通过withdrawBalance方法可以提现以太坊，通过getUserBalance可以获取到账户余额。 注意到这里是通过message call的方式来发送以太币，所以在调用sender的fallback函数的时候我们就会有充足的gas来进行循环调用。如果是send的方式，gas只有2300，稍微一操作就会耗尽gas抛出异常，是不够用来进行嵌套调用的。以下是不同操作所需要的gas数量： 出问题的是withdrawBalance方法，特别是在修改保存在区块链的balances的代码是放在了发送以太币之后。 攻击代码如下： 这里的deposit函数是往Bank合约中发送10wei。withdraw是通过调用Bank合约的withdrawBalance函数把以太币提取出来。注意看这里的fallback函数，这里循环调用了两次Bank合约的withdrawBalance方法。 攻击的过程如下： （1）假设Bank合约中有100wei，攻击者Attack合约中有10wei （2）Attack合约先调用deposit方法向Bank合约发送10wei （3）之后Attack合约调用withdraw方法，从而调用了Bank的withdrawBalance方法。 （4）Bank的withdrawBalance方法发送给了Attack合约10wei （5）Attack收到10wei之后，又会触发调用fallback函数 （6）这时，fallback函数又调用了两次Bank合约的withdrawBalance，从而转走了20wei （7）之后Bank合约才修改Attack合约的balance，将其置为0 通过上面的步骤，攻击者实际上从Bank合约转走了30wei，Bank则损失了20wei，如果攻击者多嵌套调用几次withdrawBalance，完全可以将Bank合约中的以太币全部转走。 0x02 复现过程 给Bank合约100wei，给Attack合约10wei。 （1）部署Bank，分配100wei （2）部署Attack 分配给Attack 10wei。 （3）调用Attack合约的deposit方法 （4）调用Attack合约的withdraw方法 （5）查看Attack合约的余额，变成了30wei，即窃取了20wei 0x03 DAO攻击事件代码分析 在DAO源码中，有withdrawRewardFor函数： function withdrawRewardFor(address _account) noEther internal returns (bool _success) { if ((balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply &lt; paidOut[_account]) throw; uint reward = (balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply - paidOut[_account]; if (!rewardAccount.payOut(_account, reward)) //vulnerable throw; paidOut[_account] += reward; return true; } 这里调用了payOut函数进行付款。 function payOut(address _recipient, uint _amount) returns (bool) { if (msg.sender != owner || msg.value &gt; 0 || (payOwnerOnly &amp;&amp; _recipient != owner)) throw; if (_recipient.call.value(_amount)()) { //vulnerable PayOut(_recipient, _amount); return true; } else { return false; } 而payOut中直接使用的是message call的方式发送以太币，从而导致了嵌套漏洞。 0x04 总结 在编写智能合约进行以太币发送的时候，要使用send或者transfer，不要使用message call的方式，而send其实还是有些小问题，以后有时间再分析。 DAO事件直接导致了以太坊硬分叉，分为ETH和ETC。可见，区块链领域的安全不容忽视，因为其修复难度和所造成的影响都很高，毕竟是和钱打交道。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/03/05/0a73178a4832881d7f7b893d75b7a12a.html","headline":"区块链安全 - DAO攻击事件解析","dateModified":"2018-03-05T00:00:00+08:00","datePublished":"2018-03-05T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/03/05/0a73178a4832881d7f7b893d75b7a12a.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>区块链安全 - DAO攻击事件解析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x00 前言</strong></span>
+  </div>
+  <div style="line-height:1.75;font-size:14px;">
+   最近关注了一下区块链方面的安全，因此翻出来之前的DAO攻击事件研究了一番，形成此文。
+  </div>
+  <div style="line-height:1.75;font-size:14px;">
+   之后可能还会发一些其他的安全分析文章。
+  </div>
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x00 基础知识</strong></span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-weight:bold;">1.跨合约调用</span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   智能合约之间的调用本质上是外部调用，可以使用message call或者创建智能合约对象的形式进行调用。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （1）使用message call
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   比如合约1调用合约2的某个方法：
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <pre><code class="language-html">bytes4 methodId = bytes4(keccak256("increaseAge(string,uint256)"));
+return addr.call(methodId,"jack", 1);</code></pre>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （2）还原智能合约对象
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   如果已知合约的地址，可以通过如下方式获取到合约对象：
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <pre><code class="language-html">Contract1 c = Contract1(AddressOfContract1) ;
+c.foo() ; //跨合约调用</code></pre>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-weight:bold;">2.智能合约发送ETH</span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   我们可以在智能合约中用代码向某个地址（这个地址可以是人，也可以是智能合约）发送以太币，比较常见的两个方式是：
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （1）调用send函数
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   比如：msg.sender.send(100)
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （2）使用message call
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   msg.sender.call.value(100)()
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   这两个方式不同的是发送的gas数量，gas就是执行opcode需要花费的一种币，称作为gas也特别形象。当调用send方法时，只会发送一部分gas，准确地来讲，是2300gas，一旦gas耗尽就可能抛出异常。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   而使用message call的时候，则是发送全部的gas，执行完之后剩余的gas会退还给发起调用的合约。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-weight:bold;">3.fallback函数</span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   智能合约中可以有唯一的一个未命名函数，称为fallback函数。该函数不能有实参，不能返回任何值。如果其他函数都不能匹配给定的函数标识符，则执行fallback函数。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   当合约接收到以太币但是不调用任何函数的时候，就会执行fallback函数。如果一个合约接收了以太币但是内部没有fallback函数，那么就会抛出异常，然后将以太币退还给发送方。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   下面就是一个fallback函数的代码示例：
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <pre><code class="language-html">contract Sample{
+&nbsp;&nbsp;&nbsp;&nbsp;function () payable{
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// your code here
+&nbsp;&nbsp;&nbsp;&nbsp;}
+}</code></pre>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   一般单纯使用message call或者send函数发送以太币给合约的时候，没有指明调用合约的某个方法，这种情况下就会调用合约的fallback函数。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x01 攻击事件还原</strong></span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   我们先用简单的模拟代码来了解下整个攻击过程。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   首先是存在漏洞的智能合约代码，Bank：
+  </div>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180305195044893?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTcyMTUwMQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+  <p></p>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   用户可以通过addToBalance方法存入一定量的以太币到这个智能合约，通过withdrawBalance方法可以提现以太坊，通过getUserBalance可以获取到账户余额。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   注意到这里是通过message call的方式来发送以太币，所以在调用sender的fallback函数的时候我们就会有充足的gas来进行循环调用。如果是send的方式，gas只有2300，稍微一操作就会耗尽gas抛出异常，是不够用来进行嵌套调用的。以下是不同操作所需要的gas数量：
+  </div>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180305195102440?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTcyMTUwMQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   出问题的是withdrawBalance方法，特别是在修改保存在区块链的balances的代码是放在了发送以太币之后。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   攻击代码如下：
+  </div>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180305195120972?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTcyMTUwMQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   这里的deposit函数是往Bank合约中发送10wei。withdraw是通过调用Bank合约的withdrawBalance函数把以太币提取出来。注意看这里的fallback函数，这里循环调用了两次Bank合约的withdrawBalance方法。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   攻击的过程如下：
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （1）假设Bank合约中有100wei，攻击者Attack合约中有10wei
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （2）Attack合约先调用deposit方法向Bank合约发送10wei
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （3）之后Attack合约调用withdraw方法，从而调用了Bank的withdrawBalance方法。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （4）Bank的withdrawBalance方法发送给了Attack合约10wei
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （5）Attack收到10wei之后，又会触发调用fallback函数
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （6）这时，fallback函数又调用了两次Bank合约的withdrawBalance，从而转走了20wei
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （7）之后Bank合约才修改Attack合约的balance，将其置为0
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   通过上面的步骤，攻击者实际上从Bank合约转走了30wei，Bank则损失了20wei，如果攻击者多嵌套调用几次withdrawBalance，完全可以将Bank合约中的以太币全部转走。
+  </div>
+  <p><br></p>
+  <p></p>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x02 复现过程</strong></span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   给Bank合约100wei，给Attack合约10wei。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （1）部署Bank，分配100wei
+  </div>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180306104658494?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTcyMTUwMQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   （2）部署Attack
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018030610473690?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvdTAxMTcyMTUwMQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="">
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <div style="text-align:left;line-height:1.75;font-size:14px;">
+    分配给Attack 10wei。
+   </div>
+   <div style="text-align:left;line-height:1.75;font-size:14px;">
+    （3）调用Attack合约的deposit方法
+   </div>
+   <div style="text-align:left;line-height:1.75;font-size:14px;">
+    （4）调用Attack合约的withdraw方法
+   </div>
+   <div style="text-align:left;line-height:1.75;font-size:14px;">
+    （5）查看Attack合约的余额，变成了30wei，即窃取了20wei
+   </div>
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x03 DAO攻击事件代码分析</strong></span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   在DAO源码中，有withdrawRewardFor函数：
+  </div>
+  <pre><code class="language-html">function withdrawRewardFor(address _account) noEther internal returns (bool _success) {
+  if ((balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply &lt; paidOut[_account])
+    throw;
+  uint reward =
+    (balanceOf(_account) * rewardAccount.accumulatedInput()) / totalSupply - paidOut[_account];
+  if (!rewardAccount.payOut(_account, reward)) //vulnerable
+    throw;
+  paidOut[_account] += reward;
+  return true;
+}</code></pre>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   这里调用了payOut函数进行付款。
+  </div>
+  <pre><code class="language-html">function payOut(address _recipient, uint _amount) returns (bool) {
+  if (msg.sender != owner || msg.value &gt; 0 || (payOwnerOnly &amp;&amp; _recipient != owner))
+      throw;
+  if (_recipient.call.value(_amount)()) { //vulnerable
+      PayOut(_recipient, _amount);
+      return true;
+  } else {
+      return false;
+}</code></pre>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   而payOut中直接使用的是message call的方式发送以太币，从而导致了嵌套漏洞。
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <br>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   <span style="font-size:20px;"><strong>0x04 总结</strong></span>
+  </div>
+  <div style="text-align:left;line-height:1.75;font-size:14px;">
+   在编写智能合约进行以太币发送的时候，要使用send或者transfer，不要使用message call的方式，而send其实还是有些小问题，以后有时间再分析。
+   <span style="line-height:1.75;">DAO事件直接导致了以太坊硬分叉，分为ETH和ETC。可见，区块链领域的安全不容忽视，因为其修复难度和所造成的影响都很高，毕竟是和钱打交道。</span>
+  </div>
+  <br>
+  <p></p>
+  <p><br></p>
+  <p></p>
+  <p></p>
+  <p></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011721501/article/details/79450122,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011721501/article/details/79450122,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

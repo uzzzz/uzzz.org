@@ -1,0 +1,1572 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>open-ethereum-pool以太坊矿池源码分析(5)proxy模块 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="open-ethereum-pool以太坊矿池源码分析(5)proxy模块" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="# open-ethereum-pool以太坊矿池-proxy模块 ## ProxyServer定义 ```go type ProxyServer struct { config *Config blockTemplate atomic.Value upstream int32 upstreams []*rpc.RPCClient backend *storage.RedisClient diff string policy *policy.PolicyServer hashrateExpiration time.Duration failsCount int64 // Stratum sessionsMu sync.RWMutex sessions map[*Session] struct{} timeout time.Duration } ``` ## BlockTemplate定义 ```go type BlockTemplate struct { sync.RWMutex Header string Seed string Target string Difficulty *big.Int Height uint64 GetPendingBlockCache *rpc.GetBlockReplyPart nonces map[ string] bool headers map[ string]heightDiffPair } type heightDiffPair struct { diff *big.Int height uint64 } ``` ## 以太坊Pow算法原理 ``` //以太坊Pow算法可以表示为如下公式： //RAND(h, n) &lt;= M / d //其中RAND()表示一个概念函数，代表一系列的复杂运算。 其中h和n为输入，即区块Header的哈希、以及Header中的Nonce。 //M表示一个极大的数，此处使用2^256-1。 d，为区块难度，即Header中的Difficulty。 //因此在h和n确定的情况下，d越大，挖矿难度越大，即为Difficulty本义。 即不断变更Nonce，使RAND(h, n)满足RAND(h, n) &lt;= M / d，即完成Pow。 ``` ## NewProxy流程图 ## ProxyServer Start流程图 ## eth_submitWork处理流程图 即：processShare() ## WriteNodeState原理 ```go //cfg.Proxy.StateUpdateInterval为WriteNodeState定时器，时间为3s //调取：err := backend.WriteNodeState(cfg.Name, t.Height, t.Difficulty) func (r *RedisClient) WriteNodeState(id string, height uint64, diff *big.Int) error { &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:name main &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;name&quot;), id) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:height height &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;height&quot;), strconv.FormatUint(height, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:difficulty difficulty &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;difficulty&quot;), diff.String()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:lastBeat now &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;lastBeat&quot;), strconv.FormatInt(now, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return err } ``` ## WriteBlock原理 ```go //调取：exist, err := s.backend.WriteBlock(login, id, params, shareDiff, h.diff.Int64(), h.height, s.hashrateExpiration) //s.hashrateExpiration即cfg.Proxy.HashrateExpiration，为3h，即TTL（生命周期） for workers stats，通常等于hashrateLargeWindow func (r *RedisClient) WriteBlock(login, id string, params [] string, diff, roundDiff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 //转换成秒 &nbsp;&nbsp;&nbsp;&nbsp;cmds, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //调取writeShare &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:stats lastBlockFound ts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;stats&quot;), &quot;lastBlockFound&quot;, strconv.FormatInt(ts, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HDEL eth:stats roundShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hdel 命令用于删除哈希表 key 中的一个或多个指定字段，不存在的字段将被忽略 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HDel(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZINCRBY eth:finders 1 login &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zincrby 命令对有序集合中指定成员的分数加上增量 increment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.ZIncrBy(r.formatKey( &quot;finders&quot;), 1, login) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:miners:login blocksFound 1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;miners&quot;, login), &quot;blocksFound&quot;, 1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //RENAME eth:shares:roundCurrent eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Rename 命令用于修改 key 的名称 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.Rename(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HGetAllMap(r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sharesMap, _ := cmds[ 10].(*redis.StringStringMapCmd).Result() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares := int64( 0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, v := range sharesMap { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;n, _ := strconv.ParseInt(v, 10, 64) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares += n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //nonce、powHash、mixDigest &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hashHex := strings.Join(params, &quot;:&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //MakeTimestamp、h.diff、totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s := join(hashHex, ts, roundDiff, totalShares) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:blocks:candidates height nonce:powHash:mixDigest:MakeTimestamp:h.diff:totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //candidates为候选者 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.ZAdd(r.formatKey( &quot;blocks&quot;, &quot;candidates&quot;), redis.Z{Score: float64(height), Member: s}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} } func (r *RedisClient) checkPoWExist(height uint64, params [] string) ( bool, error) { // Sweep PoW backlog for previous blocks, we have 3 templates back in RAM &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //扫描积压的前块 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZREMRANGEBYSCORE eth:pow -inf (height-8 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zremrangebyscore 命令用于移除有序集中，指定分数（score）区间内的所有成员 r.client.ZRemRangeByScore(r.formatKey( &quot;pow&quot;), &quot;-inf&quot;, fmt.Sprint( &quot;(&quot;, height- 8)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 val, err := r.client.ZAdd(r.formatKey( &quot;pow&quot;), redis.Z{Score: float64(height), Member: strings.Join(params, &quot;:&quot;)}).Result() return val == 0, err } ``` ## WriteShare原理 ```go func (r *RedisClient) WriteShare(login, id string, params [] string, diff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err = tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:stats roundShares diff &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;, diff) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return false, err } func (r *RedisClient) writeShare(tx *redis.Multi, ms, ts int64, login, id string, diff int64, expire time.Duration) { &nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:shares:roundCurrent login diff &nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), login, diff) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;), redis.Z{Score: float64(ts), Member: join(diff, login, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate:login ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;, login), redis.Z{Score: float64(ts), Member: join(diff, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //EXPIRE eth:hashrate:login expire &nbsp;&nbsp;&nbsp;&nbsp; //expire即cfg.Proxy.HashrateExpiration，即3小时 &nbsp;&nbsp;&nbsp;&nbsp;tx.Expire(r.formatKey( &quot;hashrate&quot;, login), expire) // Will delete hashrates for miners that gone &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:miners:login lastShare ts &nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;miners&quot;, login), &quot;lastShare&quot;, strconv.FormatInt(ts, 10)) } ``` ## Stratum Mining Protocol ### eth_submitLogin ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;] } //或 { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;, &quot;admin@example.net&quot;] } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } //{ &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Invalid login&quot; } } ``` ### eth_getWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_getWork&quot; } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } //Exceptions { &quot;id&quot;: 10, &quot;result&quot;: null, &quot;error&quot;: { code: 0, message: &quot;Work not ready&quot; } } ``` ### New Job Notification ```json //New Job Notification { &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } ``` ### eth_submitWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitWork&quot;, &quot;params&quot;: [ &quot;0xe05d1fd4002d962f&quot;, &quot;0x6c872e2304cd1e64b553a65387d7383470f22331aff288cbce5748dc430f016a&quot;, &quot;0x2b20a6c641ed155b893ee750ef90ec3be5d24736d16838b84759385b6724220d&quot; ] } //Response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: false } //Exceptions { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 23, message: &quot;Invalid share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 22, message: &quot;Duplicate share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;High rate of invalid shares&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 25, message: &quot;Not subscribed&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Malformed PoW result&quot; } } ``` ### Submit Hashrate ```json { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } ``` ## Geth JavaScript console ```shell //getBlock &gt; eth.getBlock( &#39;pending&#39;) { author: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, difficulty: 550853386, extraData: &quot;0xd5830109048650617269747986312e32342e30826c69&quot;, gasLimit: 4700036, gasUsed: 3933311, hash: &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, logsBloom: &quot;0x02000000000000010000000000000000400000000000800000000000000000000000000000000400000000800000000000000000000000400000000000000000000000001000000000020008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000080000040000004000000004000080000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000001000040000000000000000000000000000000000000010000000000000000000000000000000000000000000000000100000&quot;, miner: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, number: 2753366, parentHash: &quot;0x31256e245ce314c0b5cf4007d21b7baebb46e2beb3e6b445809d8bceb1bd3039&quot;, receiptsRoot: &quot;0x9d89da07e7300f4edc5ef580a6ccbaaffae76a978f9ee4d77fb83a7907a8c508&quot;, sealFields: [], sha3Uncles: &quot;0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347&quot;, size: 2455, stateRoot: &quot;0x557340ac77aef679dae4ddef6a426436659a4e1e9588c85fb5da74491d28fe8b&quot;, timestamp: 1519976198, totalDifficulty: 7852523064449795, transactions: [ &quot;0x715eb518875555fd6abf3cb8e90588222d3be89554a64e2dac72ba58ed729d78&quot;, &quot;0xcfbf33be2bd2141cc9d5a5896d2fb99c978a8d75bce59462b645733ff57bcfd0&quot;, &quot;0x82eb59d32abb36d2754a48e2e581ec8c9809f9180f7200ea334bcb746365797a&quot;, &quot;0xe0d0f519452d4aad44c706aee65e99dce6e3c15876a71daa32e1496e803cf8e5&quot;, &quot;0x3731d60c5dd0c1013555312bef2471de0c30978d9ab611f28325addd44492664&quot;, &quot;0x0fb9b1fee161632c069068bec45b910dc2cd013480dea5987e1da84e8f779cd7&quot;, &quot;0xc5dade656fa25bb044398675851765a8f8182112d7a400e8a0c4e6f4045bd42b&quot;, &quot;0xfe41aa0ee9090d623609435b0b8b8e5ab3b6019d79560396956a5f4a5f3c1357&quot;, &quot;0xe40c8e78ec16ea4bc1c445749dfaddb6777d6652e9882a5ab8ae48b316cc926e&quot;, &quot;0xc08fac21754c516ba3e61c9a6b0a51982c7b680e48c80c04e9572c6e1b2adbb4&quot;, &quot;0x2a5d22570373f21f6989b2228d7031d42bdbac13992152e55a95af441e20138a&quot;, &quot;0x204b56dd370fe9f73282df925168f6375b5cccb38a681e9cb97855aed2e34aee&quot;, &quot;0x5be5b6ea903e66ced2de9674e48639032aad4eca3f970605a3fbb0162e481da3&quot;, &quot;0xc35a3b3fab6ae3503287a765497c82f4687f536676c79c87771d1332d0d0d313&quot;], transactionsRoot: &quot;0x07bf02d4b8239576682c33d9393998401112dd011b57ac77042fe1981830c3e1&quot;, uncles: [] } //getWork &gt; eth.getWork() [ &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, &quot;0xcadf16f9c673bb7540bc190a9eed2b04fd59a98a7d4f631d85c240ad6155bfa9&quot;, &quot;0x00000007cc03d7d0cb49aa514f6aed05705a9baef46aea9a02514c253e288daa&quot;] ``` ## 参考文档 * [ eth_getblockbynumber]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getblockbynumber) * [ 以太币的挖矿机制]( http://ethfans.org/topics/18) * [ 以太坊ETH挖矿详细教程]( https://www.cybtc.com/thread-15905-1-1.html) * [ JavaScript Runtime Environment]( https://ethereum.gitbooks.io/frontier-guide/content/jsre.html) * [ Management APIs]( https://github.com/ethereum/go-ethereum/wiki/Management-APIs) * [ Pacy-以太坊矿池流程图]( https://processon.com/u/58748c7ee4b09f680a4af83e) * [ Stratum Mining Protocol]( https://github.com/sammy007/open-ethereum-pool/blob/master/docs/STRATUM.md) * [ JSON-RPC methods]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getwork) * [ cpp-ethereum/libethash]( https://github.com/ethereum/cpp-ethereum/tree/develop/libethash) * [ Web3.js API 中文文档]( http://web3.tryblockchain.org/Web3.js-api-refrence.html) * [ Redis Command 命令]( http://www.runoob.com/redis/server-command.html) 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="# open-ethereum-pool以太坊矿池-proxy模块 ## ProxyServer定义 ```go type ProxyServer struct { config *Config blockTemplate atomic.Value upstream int32 upstreams []*rpc.RPCClient backend *storage.RedisClient diff string policy *policy.PolicyServer hashrateExpiration time.Duration failsCount int64 // Stratum sessionsMu sync.RWMutex sessions map[*Session] struct{} timeout time.Duration } ``` ## BlockTemplate定义 ```go type BlockTemplate struct { sync.RWMutex Header string Seed string Target string Difficulty *big.Int Height uint64 GetPendingBlockCache *rpc.GetBlockReplyPart nonces map[ string] bool headers map[ string]heightDiffPair } type heightDiffPair struct { diff *big.Int height uint64 } ``` ## 以太坊Pow算法原理 ``` //以太坊Pow算法可以表示为如下公式： //RAND(h, n) &lt;= M / d //其中RAND()表示一个概念函数，代表一系列的复杂运算。 其中h和n为输入，即区块Header的哈希、以及Header中的Nonce。 //M表示一个极大的数，此处使用2^256-1。 d，为区块难度，即Header中的Difficulty。 //因此在h和n确定的情况下，d越大，挖矿难度越大，即为Difficulty本义。 即不断变更Nonce，使RAND(h, n)满足RAND(h, n) &lt;= M / d，即完成Pow。 ``` ## NewProxy流程图 ## ProxyServer Start流程图 ## eth_submitWork处理流程图 即：processShare() ## WriteNodeState原理 ```go //cfg.Proxy.StateUpdateInterval为WriteNodeState定时器，时间为3s //调取：err := backend.WriteNodeState(cfg.Name, t.Height, t.Difficulty) func (r *RedisClient) WriteNodeState(id string, height uint64, diff *big.Int) error { &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:name main &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;name&quot;), id) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:height height &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;height&quot;), strconv.FormatUint(height, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:difficulty difficulty &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;difficulty&quot;), diff.String()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:lastBeat now &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;lastBeat&quot;), strconv.FormatInt(now, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return err } ``` ## WriteBlock原理 ```go //调取：exist, err := s.backend.WriteBlock(login, id, params, shareDiff, h.diff.Int64(), h.height, s.hashrateExpiration) //s.hashrateExpiration即cfg.Proxy.HashrateExpiration，为3h，即TTL（生命周期） for workers stats，通常等于hashrateLargeWindow func (r *RedisClient) WriteBlock(login, id string, params [] string, diff, roundDiff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 //转换成秒 &nbsp;&nbsp;&nbsp;&nbsp;cmds, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //调取writeShare &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:stats lastBlockFound ts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;stats&quot;), &quot;lastBlockFound&quot;, strconv.FormatInt(ts, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HDEL eth:stats roundShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hdel 命令用于删除哈希表 key 中的一个或多个指定字段，不存在的字段将被忽略 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HDel(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZINCRBY eth:finders 1 login &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zincrby 命令对有序集合中指定成员的分数加上增量 increment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.ZIncrBy(r.formatKey( &quot;finders&quot;), 1, login) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:miners:login blocksFound 1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;miners&quot;, login), &quot;blocksFound&quot;, 1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //RENAME eth:shares:roundCurrent eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Rename 命令用于修改 key 的名称 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.Rename(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HGetAllMap(r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sharesMap, _ := cmds[ 10].(*redis.StringStringMapCmd).Result() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares := int64( 0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, v := range sharesMap { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;n, _ := strconv.ParseInt(v, 10, 64) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares += n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //nonce、powHash、mixDigest &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hashHex := strings.Join(params, &quot;:&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //MakeTimestamp、h.diff、totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s := join(hashHex, ts, roundDiff, totalShares) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:blocks:candidates height nonce:powHash:mixDigest:MakeTimestamp:h.diff:totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //candidates为候选者 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.ZAdd(r.formatKey( &quot;blocks&quot;, &quot;candidates&quot;), redis.Z{Score: float64(height), Member: s}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} } func (r *RedisClient) checkPoWExist(height uint64, params [] string) ( bool, error) { // Sweep PoW backlog for previous blocks, we have 3 templates back in RAM &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //扫描积压的前块 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZREMRANGEBYSCORE eth:pow -inf (height-8 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zremrangebyscore 命令用于移除有序集中，指定分数（score）区间内的所有成员 r.client.ZRemRangeByScore(r.formatKey( &quot;pow&quot;), &quot;-inf&quot;, fmt.Sprint( &quot;(&quot;, height- 8)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 val, err := r.client.ZAdd(r.formatKey( &quot;pow&quot;), redis.Z{Score: float64(height), Member: strings.Join(params, &quot;:&quot;)}).Result() return val == 0, err } ``` ## WriteShare原理 ```go func (r *RedisClient) WriteShare(login, id string, params [] string, diff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err = tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:stats roundShares diff &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;, diff) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return false, err } func (r *RedisClient) writeShare(tx *redis.Multi, ms, ts int64, login, id string, diff int64, expire time.Duration) { &nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:shares:roundCurrent login diff &nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), login, diff) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;), redis.Z{Score: float64(ts), Member: join(diff, login, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate:login ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;, login), redis.Z{Score: float64(ts), Member: join(diff, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //EXPIRE eth:hashrate:login expire &nbsp;&nbsp;&nbsp;&nbsp; //expire即cfg.Proxy.HashrateExpiration，即3小时 &nbsp;&nbsp;&nbsp;&nbsp;tx.Expire(r.formatKey( &quot;hashrate&quot;, login), expire) // Will delete hashrates for miners that gone &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:miners:login lastShare ts &nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;miners&quot;, login), &quot;lastShare&quot;, strconv.FormatInt(ts, 10)) } ``` ## Stratum Mining Protocol ### eth_submitLogin ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;] } //或 { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;, &quot;admin@example.net&quot;] } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } //{ &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Invalid login&quot; } } ``` ### eth_getWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_getWork&quot; } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } //Exceptions { &quot;id&quot;: 10, &quot;result&quot;: null, &quot;error&quot;: { code: 0, message: &quot;Work not ready&quot; } } ``` ### New Job Notification ```json //New Job Notification { &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } ``` ### eth_submitWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitWork&quot;, &quot;params&quot;: [ &quot;0xe05d1fd4002d962f&quot;, &quot;0x6c872e2304cd1e64b553a65387d7383470f22331aff288cbce5748dc430f016a&quot;, &quot;0x2b20a6c641ed155b893ee750ef90ec3be5d24736d16838b84759385b6724220d&quot; ] } //Response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: false } //Exceptions { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 23, message: &quot;Invalid share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 22, message: &quot;Duplicate share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;High rate of invalid shares&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 25, message: &quot;Not subscribed&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Malformed PoW result&quot; } } ``` ### Submit Hashrate ```json { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } ``` ## Geth JavaScript console ```shell //getBlock &gt; eth.getBlock( &#39;pending&#39;) { author: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, difficulty: 550853386, extraData: &quot;0xd5830109048650617269747986312e32342e30826c69&quot;, gasLimit: 4700036, gasUsed: 3933311, hash: &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, logsBloom: &quot;0x02000000000000010000000000000000400000000000800000000000000000000000000000000400000000800000000000000000000000400000000000000000000000001000000000020008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000080000040000004000000004000080000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000001000040000000000000000000000000000000000000010000000000000000000000000000000000000000000000000100000&quot;, miner: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, number: 2753366, parentHash: &quot;0x31256e245ce314c0b5cf4007d21b7baebb46e2beb3e6b445809d8bceb1bd3039&quot;, receiptsRoot: &quot;0x9d89da07e7300f4edc5ef580a6ccbaaffae76a978f9ee4d77fb83a7907a8c508&quot;, sealFields: [], sha3Uncles: &quot;0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347&quot;, size: 2455, stateRoot: &quot;0x557340ac77aef679dae4ddef6a426436659a4e1e9588c85fb5da74491d28fe8b&quot;, timestamp: 1519976198, totalDifficulty: 7852523064449795, transactions: [ &quot;0x715eb518875555fd6abf3cb8e90588222d3be89554a64e2dac72ba58ed729d78&quot;, &quot;0xcfbf33be2bd2141cc9d5a5896d2fb99c978a8d75bce59462b645733ff57bcfd0&quot;, &quot;0x82eb59d32abb36d2754a48e2e581ec8c9809f9180f7200ea334bcb746365797a&quot;, &quot;0xe0d0f519452d4aad44c706aee65e99dce6e3c15876a71daa32e1496e803cf8e5&quot;, &quot;0x3731d60c5dd0c1013555312bef2471de0c30978d9ab611f28325addd44492664&quot;, &quot;0x0fb9b1fee161632c069068bec45b910dc2cd013480dea5987e1da84e8f779cd7&quot;, &quot;0xc5dade656fa25bb044398675851765a8f8182112d7a400e8a0c4e6f4045bd42b&quot;, &quot;0xfe41aa0ee9090d623609435b0b8b8e5ab3b6019d79560396956a5f4a5f3c1357&quot;, &quot;0xe40c8e78ec16ea4bc1c445749dfaddb6777d6652e9882a5ab8ae48b316cc926e&quot;, &quot;0xc08fac21754c516ba3e61c9a6b0a51982c7b680e48c80c04e9572c6e1b2adbb4&quot;, &quot;0x2a5d22570373f21f6989b2228d7031d42bdbac13992152e55a95af441e20138a&quot;, &quot;0x204b56dd370fe9f73282df925168f6375b5cccb38a681e9cb97855aed2e34aee&quot;, &quot;0x5be5b6ea903e66ced2de9674e48639032aad4eca3f970605a3fbb0162e481da3&quot;, &quot;0xc35a3b3fab6ae3503287a765497c82f4687f536676c79c87771d1332d0d0d313&quot;], transactionsRoot: &quot;0x07bf02d4b8239576682c33d9393998401112dd011b57ac77042fe1981830c3e1&quot;, uncles: [] } //getWork &gt; eth.getWork() [ &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, &quot;0xcadf16f9c673bb7540bc190a9eed2b04fd59a98a7d4f631d85c240ad6155bfa9&quot;, &quot;0x00000007cc03d7d0cb49aa514f6aed05705a9baef46aea9a02514c253e288daa&quot;] ``` ## 参考文档 * [ eth_getblockbynumber]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getblockbynumber) * [ 以太币的挖矿机制]( http://ethfans.org/topics/18) * [ 以太坊ETH挖矿详细教程]( https://www.cybtc.com/thread-15905-1-1.html) * [ JavaScript Runtime Environment]( https://ethereum.gitbooks.io/frontier-guide/content/jsre.html) * [ Management APIs]( https://github.com/ethereum/go-ethereum/wiki/Management-APIs) * [ Pacy-以太坊矿池流程图]( https://processon.com/u/58748c7ee4b09f680a4af83e) * [ Stratum Mining Protocol]( https://github.com/sammy007/open-ethereum-pool/blob/master/docs/STRATUM.md) * [ JSON-RPC methods]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getwork) * [ cpp-ethereum/libethash]( https://github.com/ethereum/cpp-ethereum/tree/develop/libethash) * [ Web3.js API 中文文档]( http://web3.tryblockchain.org/Web3.js-api-refrence.html) * [ Redis Command 命令]( http://www.runoob.com/redis/server-command.html) 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/21/1fb4c8dfa3688af37c0cc58b47d24bdb.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/21/1fb4c8dfa3688af37c0cc58b47d24bdb.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"# open-ethereum-pool以太坊矿池-proxy模块 ## ProxyServer定义 ```go type ProxyServer struct { config *Config blockTemplate atomic.Value upstream int32 upstreams []*rpc.RPCClient backend *storage.RedisClient diff string policy *policy.PolicyServer hashrateExpiration time.Duration failsCount int64 // Stratum sessionsMu sync.RWMutex sessions map[*Session] struct{} timeout time.Duration } ``` ## BlockTemplate定义 ```go type BlockTemplate struct { sync.RWMutex Header string Seed string Target string Difficulty *big.Int Height uint64 GetPendingBlockCache *rpc.GetBlockReplyPart nonces map[ string] bool headers map[ string]heightDiffPair } type heightDiffPair struct { diff *big.Int height uint64 } ``` ## 以太坊Pow算法原理 ``` //以太坊Pow算法可以表示为如下公式： //RAND(h, n) &lt;= M / d //其中RAND()表示一个概念函数，代表一系列的复杂运算。 其中h和n为输入，即区块Header的哈希、以及Header中的Nonce。 //M表示一个极大的数，此处使用2^256-1。 d，为区块难度，即Header中的Difficulty。 //因此在h和n确定的情况下，d越大，挖矿难度越大，即为Difficulty本义。 即不断变更Nonce，使RAND(h, n)满足RAND(h, n) &lt;= M / d，即完成Pow。 ``` ## NewProxy流程图 ## ProxyServer Start流程图 ## eth_submitWork处理流程图 即：processShare() ## WriteNodeState原理 ```go //cfg.Proxy.StateUpdateInterval为WriteNodeState定时器，时间为3s //调取：err := backend.WriteNodeState(cfg.Name, t.Height, t.Difficulty) func (r *RedisClient) WriteNodeState(id string, height uint64, diff *big.Int) error { &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:name main &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;name&quot;), id) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:height height &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;height&quot;), strconv.FormatUint(height, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:difficulty difficulty &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;difficulty&quot;), diff.String()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:nodes:main:lastBeat now &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;nodes&quot;), join(id, &quot;lastBeat&quot;), strconv.FormatInt(now, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return err } ``` ## WriteBlock原理 ```go //调取：exist, err := s.backend.WriteBlock(login, id, params, shareDiff, h.diff.Int64(), h.height, s.hashrateExpiration) //s.hashrateExpiration即cfg.Proxy.HashrateExpiration，为3h，即TTL（生命周期） for workers stats，通常等于hashrateLargeWindow func (r *RedisClient) WriteBlock(login, id string, params [] string, diff, roundDiff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 //转换成秒 &nbsp;&nbsp;&nbsp;&nbsp;cmds, err := tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //调取writeShare &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:stats lastBlockFound ts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;stats&quot;), &quot;lastBlockFound&quot;, strconv.FormatInt(ts, 10)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HDEL eth:stats roundShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hdel 命令用于删除哈希表 key 中的一个或多个指定字段，不存在的字段将被忽略 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HDel(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZINCRBY eth:finders 1 login &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zincrby 命令对有序集合中指定成员的分数加上增量 increment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.ZIncrBy(r.formatKey( &quot;finders&quot;), 1, login) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:miners:login blocksFound 1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;miners&quot;, login), &quot;blocksFound&quot;, 1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //RENAME eth:shares:roundCurrent eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Rename 命令用于修改 key 的名称 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.Rename(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HGetAllMap(r.formatRound(int64(height), params[ 0])) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HGETALL eth:shares:round&amp;height:nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hgetall 命令用于返回哈希表中，所有的字段和值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sharesMap, _ := cmds[ 10].(*redis.StringStringMapCmd).Result() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares := int64( 0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, v := range sharesMap { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;n, _ := strconv.ParseInt(v, 10, 64) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares += n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //nonce、powHash、mixDigest &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hashHex := strings.Join(params, &quot;:&quot;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //MakeTimestamp、h.diff、totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s := join(hashHex, ts, roundDiff, totalShares) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:blocks:candidates height nonce:powHash:mixDigest:MakeTimestamp:h.diff:totalShares &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //candidates为候选者 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.ZAdd(r.formatKey( &quot;blocks&quot;, &quot;candidates&quot;), redis.Z{Score: float64(height), Member: s}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} } func (r *RedisClient) checkPoWExist(height uint64, params [] string) ( bool, error) { // Sweep PoW backlog for previous blocks, we have 3 templates back in RAM &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //扫描积压的前块 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZREMRANGEBYSCORE eth:pow -inf (height-8 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zremrangebyscore 命令用于移除有序集中，指定分数（score）区间内的所有成员 r.client.ZRemRangeByScore(r.formatKey( &quot;pow&quot;), &quot;-inf&quot;, fmt.Sprint( &quot;(&quot;, height- 8)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 val, err := r.client.ZAdd(r.formatKey( &quot;pow&quot;), redis.Z{Score: float64(height), Member: strings.Join(params, &quot;:&quot;)}).Result() return val == 0, err } ``` ## WriteShare原理 ```go func (r *RedisClient) WriteShare(login, id string, params [] string, diff int64, height uint64, window time.Duration) ( bool, error) { &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:pow height params &nbsp;&nbsp;&nbsp;&nbsp; //写入eth:pow中，并检查是否已存在 &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params) &nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; // Duplicate share, (nonce, powHash, mixDigest) pair exist &nbsp;&nbsp;&nbsp;&nbsp; //已存在 &nbsp;&nbsp;&nbsp;&nbsp; if exist { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true, nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi() &nbsp;&nbsp;&nbsp;&nbsp; defer tx.Close() &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 1000 &nbsp;&nbsp;&nbsp;&nbsp;_, err = tx.Exec( func() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:stats roundShares diff &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;stats&quot;), &quot;roundShares&quot;, diff) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;}) &nbsp;&nbsp;&nbsp;&nbsp; return false, err } func (r *RedisClient) writeShare(tx *redis.Multi, ms, ts int64, login, id string, diff int64, expire time.Duration) { &nbsp;&nbsp;&nbsp;&nbsp; //HINCRBY eth:shares:roundCurrent login diff &nbsp;&nbsp;&nbsp;&nbsp; //Hincrby 命令用于为哈希表中的字段值加上指定增量值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey( &quot;shares&quot;, &quot;roundCurrent&quot;), login, diff) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp; //Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中 &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;), redis.Z{Score: float64(ts), Member: join(diff, login, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; //ZADD eth:hashrate:login ts diff:login:id:ms &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey( &quot;hashrate&quot;, login), redis.Z{Score: float64(ts), Member: join(diff, id, ms)}) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //EXPIRE eth:hashrate:login expire &nbsp;&nbsp;&nbsp;&nbsp; //expire即cfg.Proxy.HashrateExpiration，即3小时 &nbsp;&nbsp;&nbsp;&nbsp;tx.Expire(r.formatKey( &quot;hashrate&quot;, login), expire) // Will delete hashrates for miners that gone &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; //HSET eth:miners:login lastShare ts &nbsp;&nbsp;&nbsp;&nbsp; //Hset 命令用于为哈希表中的字段赋值 &nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey( &quot;miners&quot;, login), &quot;lastShare&quot;, strconv.FormatInt(ts, 10)) } ``` ## Stratum Mining Protocol ### eth_submitLogin ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;] } //或 { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitLogin&quot;, &quot;params&quot;: [ &quot;0xb85150eb365e7df0941f0cf08235f987ba91506a&quot;, &quot;admin@example.net&quot;] } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } //{ &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Invalid login&quot; } } ``` ### eth_getWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_getWork&quot; } //Successful response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } //Exceptions { &quot;id&quot;: 10, &quot;result&quot;: null, &quot;error&quot;: { code: 0, message: &quot;Work not ready&quot; } } ``` ### New Job Notification ```json //New Job Notification { &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: [ &quot;0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef&quot;, &quot;0x5eed00000000000000000000000000005eed0000000000000000000000000000&quot;, &quot;0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000&quot; ] } ``` ### eth_submitWork ```json //Request { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;eth_submitWork&quot;, &quot;params&quot;: [ &quot;0xe05d1fd4002d962f&quot;, &quot;0x6c872e2304cd1e64b553a65387d7383470f22331aff288cbce5748dc430f016a&quot;, &quot;0x2b20a6c641ed155b893ee750ef90ec3be5d24736d16838b84759385b6724220d&quot; ] } //Response { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: false } //Exceptions { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 23, message: &quot;Invalid share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 22, message: &quot;Duplicate share&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;High rate of invalid shares&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: 25, message: &quot;Not subscribed&quot; } } { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: null, &quot;error&quot;: { code: -1, message: &quot;Malformed PoW result&quot; } } ``` ### Submit Hashrate ```json { &quot;id&quot;: 1, &quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;result&quot;: true } ``` ## Geth JavaScript console ```shell //getBlock &gt; eth.getBlock( &#39;pending&#39;) { author: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, difficulty: 550853386, extraData: &quot;0xd5830109048650617269747986312e32342e30826c69&quot;, gasLimit: 4700036, gasUsed: 3933311, hash: &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, logsBloom: &quot;0x02000000000000010000000000000000400000000000800000000000000000000000000000000400000000800000000000000000000000400000000000000000000000001000000000020008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000080000040000004000000004000080000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000001000040000000000000000000000000000000000000010000000000000000000000000000000000000000000000000100000&quot;, miner: &quot;0xdda50d9783dfda1c7ac51c4920f3561e17438be7&quot;, number: 2753366, parentHash: &quot;0x31256e245ce314c0b5cf4007d21b7baebb46e2beb3e6b445809d8bceb1bd3039&quot;, receiptsRoot: &quot;0x9d89da07e7300f4edc5ef580a6ccbaaffae76a978f9ee4d77fb83a7907a8c508&quot;, sealFields: [], sha3Uncles: &quot;0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347&quot;, size: 2455, stateRoot: &quot;0x557340ac77aef679dae4ddef6a426436659a4e1e9588c85fb5da74491d28fe8b&quot;, timestamp: 1519976198, totalDifficulty: 7852523064449795, transactions: [ &quot;0x715eb518875555fd6abf3cb8e90588222d3be89554a64e2dac72ba58ed729d78&quot;, &quot;0xcfbf33be2bd2141cc9d5a5896d2fb99c978a8d75bce59462b645733ff57bcfd0&quot;, &quot;0x82eb59d32abb36d2754a48e2e581ec8c9809f9180f7200ea334bcb746365797a&quot;, &quot;0xe0d0f519452d4aad44c706aee65e99dce6e3c15876a71daa32e1496e803cf8e5&quot;, &quot;0x3731d60c5dd0c1013555312bef2471de0c30978d9ab611f28325addd44492664&quot;, &quot;0x0fb9b1fee161632c069068bec45b910dc2cd013480dea5987e1da84e8f779cd7&quot;, &quot;0xc5dade656fa25bb044398675851765a8f8182112d7a400e8a0c4e6f4045bd42b&quot;, &quot;0xfe41aa0ee9090d623609435b0b8b8e5ab3b6019d79560396956a5f4a5f3c1357&quot;, &quot;0xe40c8e78ec16ea4bc1c445749dfaddb6777d6652e9882a5ab8ae48b316cc926e&quot;, &quot;0xc08fac21754c516ba3e61c9a6b0a51982c7b680e48c80c04e9572c6e1b2adbb4&quot;, &quot;0x2a5d22570373f21f6989b2228d7031d42bdbac13992152e55a95af441e20138a&quot;, &quot;0x204b56dd370fe9f73282df925168f6375b5cccb38a681e9cb97855aed2e34aee&quot;, &quot;0x5be5b6ea903e66ced2de9674e48639032aad4eca3f970605a3fbb0162e481da3&quot;, &quot;0xc35a3b3fab6ae3503287a765497c82f4687f536676c79c87771d1332d0d0d313&quot;], transactionsRoot: &quot;0x07bf02d4b8239576682c33d9393998401112dd011b57ac77042fe1981830c3e1&quot;, uncles: [] } //getWork &gt; eth.getWork() [ &quot;0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8&quot;, &quot;0xcadf16f9c673bb7540bc190a9eed2b04fd59a98a7d4f631d85c240ad6155bfa9&quot;, &quot;0x00000007cc03d7d0cb49aa514f6aed05705a9baef46aea9a02514c253e288daa&quot;] ``` ## 参考文档 * [ eth_getblockbynumber]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getblockbynumber) * [ 以太币的挖矿机制]( http://ethfans.org/topics/18) * [ 以太坊ETH挖矿详细教程]( https://www.cybtc.com/thread-15905-1-1.html) * [ JavaScript Runtime Environment]( https://ethereum.gitbooks.io/frontier-guide/content/jsre.html) * [ Management APIs]( https://github.com/ethereum/go-ethereum/wiki/Management-APIs) * [ Pacy-以太坊矿池流程图]( https://processon.com/u/58748c7ee4b09f680a4af83e) * [ Stratum Mining Protocol]( https://github.com/sammy007/open-ethereum-pool/blob/master/docs/STRATUM.md) * [ JSON-RPC methods]( https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getwork) * [ cpp-ethereum/libethash]( https://github.com/ethereum/cpp-ethereum/tree/develop/libethash) * [ Web3.js API 中文文档]( http://web3.tryblockchain.org/Web3.js-api-refrence.html) * [ Redis Command 命令]( http://www.runoob.com/redis/server-command.html) 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/21/1fb4c8dfa3688af37c0cc58b47d24bdb.html","headline":"open-ethereum-pool以太坊矿池源码分析(5)proxy模块","dateModified":"2018-05-21T00:00:00+08:00","datePublished":"2018-05-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/21/1fb4c8dfa3688af37c0cc58b47d24bdb.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>open-ethereum-pool以太坊矿池源码分析(5)proxy模块</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="font-size:14px;color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;line-height:19px;">
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;"># open-ethereum-pool以太坊矿池-proxy模块</span></span>
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## ProxyServer定义</span></span>
+   </div>
+   <br>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:rgb(86,156,214);">type</span> 
+    <span style="color:rgb(78,201,176);">ProxyServer</span> 
+    <span style="color:rgb(86,156,214);">struct</span> {
+   </div>
+   <div>
+     config *Config
+   </div>
+   <div>
+     blockTemplate atomic.Value
+   </div>
+   <div>
+     upstream 
+    <span style="color:rgb(78,201,176);">int32</span>
+   </div>
+   <div>
+     upstreams []*rpc.RPCClient
+   </div>
+   <div>
+     backend *storage.RedisClient
+   </div>
+   <div>
+     diff 
+    <span style="color:rgb(78,201,176);">string</span>
+   </div>
+   <div>
+     policy *policy.PolicyServer
+   </div>
+   <div>
+     hashrateExpiration time.Duration
+   </div>
+   <div>
+     failsCount 
+    <span style="color:rgb(78,201,176);">int64</span>
+   </div>
+   <br>
+   <div> 
+    <span style="color:rgb(96,139,78);">// Stratum</span>
+   </div>
+   <div>
+     sessionsMu sync.RWMutex
+   </div>
+   <div>
+     sessions 
+    <span style="color:rgb(86,156,214);">map</span>[*Session]
+    <span style="color:rgb(86,156,214);">struct</span>{}
+   </div>
+   <div>
+     timeout time.Duration
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## BlockTemplate定义</span></span>
+   </div>
+   <br>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:rgb(86,156,214);">type</span> 
+    <span style="color:rgb(78,201,176);">BlockTemplate</span> 
+    <span style="color:rgb(86,156,214);">struct</span> {
+   </div>
+   <div>
+     sync.RWMutex
+   </div>
+   <div>
+     Header 
+    <span style="color:rgb(78,201,176);">string</span>
+   </div>
+   <div>
+     Seed 
+    <span style="color:rgb(78,201,176);">string</span>
+   </div>
+   <div>
+     Target 
+    <span style="color:rgb(78,201,176);">string</span>
+   </div>
+   <div>
+     Difficulty *big.Int
+   </div>
+   <div>
+     Height 
+    <span style="color:rgb(78,201,176);">uint64</span>
+   </div>
+   <div>
+     GetPendingBlockCache *rpc.GetBlockReplyPart
+   </div>
+   <div>
+     nonces 
+    <span style="color:rgb(86,156,214);">map</span>[
+    <span style="color:rgb(78,201,176);">string</span>]
+    <span style="color:rgb(78,201,176);">bool</span>
+   </div>
+   <div>
+     headers 
+    <span style="color:rgb(86,156,214);">map</span>[
+    <span style="color:rgb(78,201,176);">string</span>]heightDiffPair
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);">type</span> 
+    <span style="color:rgb(78,201,176);">heightDiffPair</span> 
+    <span style="color:rgb(86,156,214);">struct</span> {
+   </div>
+   <div>
+     diff *big.Int
+   </div>
+   <div>
+     height 
+    <span style="color:rgb(78,201,176);">uint64</span>
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 以太坊Pow算法原理</span></span>
+   </div>
+   <br>
+   <div>
+    ```
+   </div>
+   <div>
+    //以太坊Pow算法可以表示为如下公式：
+   </div>
+   <div>
+    //RAND(h, n) &lt;= M / d
+   </div>
+   <div>
+    //其中RAND()表示一个概念函数，代表一系列的复杂运算。 其中h和n为输入，即区块Header的哈希、以及Header中的Nonce。 
+   </div>
+   <div>
+    //M表示一个极大的数，此处使用2^256-1。 d，为区块难度，即Header中的Difficulty。
+   </div>
+   <br>
+   <div>
+    //因此在h和n确定的情况下，d越大，挖矿难度越大，即为Difficulty本义。 即不断变更Nonce，使RAND(h, n)满足RAND(h, n) &lt;= M / d，即完成Pow。
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## NewProxy流程图</span></span>
+   </div>
+   <br>
+   <div>
+    <img src="https://img-blog.csdn.net/20180520100657880" alt="">
+    <br>
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## ProxyServer Start流程图</span></span>
+   </div>
+   <br>
+   <div>
+    <img src="https://img-blog.csdn.net/20180520100711963" alt="">
+    <br>
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## eth_submitWork处理流程图</span></span>
+   </div>
+   <br>
+   <div>
+    即：processShare()
+   </div>
+   <img src="https://img-blog.csdn.net/20180520100721967" alt="">
+   <br>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## WriteNodeState原理</span></span>
+   </div>
+   <br>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//cfg.Proxy.StateUpdateInterval为WriteNodeState定时器，时间为3s</span>
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//调取：err := backend.WriteNodeState(cfg.Name, t.Height, t.Difficulty)</span>
+   </div>
+   <div>
+    <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) WriteNodeState(id 
+    <span style="color:rgb(78,201,176);">string</span>, height 
+    <span style="color:rgb(78,201,176);">uint64</span>, diff *big.Int) 
+    <span style="color:rgb(86,156,214);">error</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">defer</span> tx.Close()
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() / 
+    <span style="color:rgb(181,206,168);">1000</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;_, err := tx.Exec(
+    <span style="color:rgb(86,156,214);">func</span>() 
+    <span style="color:rgb(86,156,214);">error</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:nodes:main:name main</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"nodes"</span>), join(id, 
+    <span style="color:rgb(206,145,120);">"name"</span>), id)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:nodes:main:height height</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"nodes"</span>), join(id, 
+    <span style="color:rgb(206,145,120);">"height"</span>), strconv.FormatUint(height, 
+    <span style="color:rgb(181,206,168);">10</span>))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:nodes:main:difficulty difficulty</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"nodes"</span>), join(id, 
+    <span style="color:rgb(206,145,120);">"difficulty"</span>), diff.String())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:nodes:main:lastBeat now</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"nodes"</span>), join(id, 
+    <span style="color:rgb(206,145,120);">"lastBeat"</span>), strconv.FormatInt(now, 
+    <span style="color:rgb(181,206,168);">10</span>))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">nil</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> err
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## WriteBlock原理</span></span>
+   </div>
+   <br>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//调取：exist, err := s.backend.WriteBlock(login, id, params, shareDiff, h.diff.Int64(), h.height, s.hashrateExpiration)</span>
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//s.hashrateExpiration即cfg.Proxy.HashrateExpiration，为3h，即TTL（生命周期） for workers stats，通常等于hashrateLargeWindow</span>
+   </div>
+   <div>
+    <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) WriteBlock(login, id 
+    <span style="color:rgb(78,201,176);">string</span>, params []
+    <span style="color:rgb(78,201,176);">string</span>, diff, roundDiff 
+    <span style="color:rgb(78,201,176);">int64</span>, height 
+    <span style="color:rgb(78,201,176);">uint64</span>, window time.Duration) (
+    <span style="color:rgb(78,201,176);">bool</span>, 
+    <span style="color:rgb(86,156,214);">error</span>) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//写入eth:pow中，并检查是否已存在</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">if</span> err != 
+    <span style="color:rgb(86,156,214);">nil</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">false</span>, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">// Duplicate share, (nonce, powHash, mixDigest) pair exist</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//已存在</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">if</span> exist {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">true</span>, 
+    <span style="color:rgb(86,156,214);">nil</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">defer</span> tx.Close()
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 
+    <span style="color:rgb(181,206,168);">1000</span> 
+    <span style="color:rgb(96,139,78);">//转换成秒</span>
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;cmds, err := tx.Exec(
+    <span style="color:rgb(86,156,214);">func</span>() 
+    <span style="color:rgb(86,156,214);">error</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//调取writeShare</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:stats lastBlockFound ts</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hset 命令用于为哈希表中的字段赋值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"stats"</span>), 
+    <span style="color:rgb(206,145,120);">"lastBlockFound"</span>, strconv.FormatInt(ts, 
+    <span style="color:rgb(181,206,168);">10</span>))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HDEL eth:stats roundShares</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hdel 命令用于删除哈希表 key 中的一个或多个指定字段，不存在的字段将被忽略</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HDel(r.formatKey(
+    <span style="color:rgb(206,145,120);">"stats"</span>), 
+    <span style="color:rgb(206,145,120);">"roundShares"</span>)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZINCRBY eth:finders 1 login</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Zincrby 命令对有序集合中指定成员的分数加上增量 increment</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.ZIncrBy(r.formatKey(
+    <span style="color:rgb(206,145,120);">"finders"</span>), 
+    <span style="color:rgb(181,206,168);">1</span>, login)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HINCRBY eth:miners:login blocksFound 1</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hincrby 命令用于为哈希表中的字段值加上指定增量值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey(
+    <span style="color:rgb(206,145,120);">"miners"</span>, login), 
+    <span style="color:rgb(206,145,120);">"blocksFound"</span>, 
+    <span style="color:rgb(181,206,168);">1</span>)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//RENAME eth:shares:roundCurrent eth:shares:round&amp;height:nonce</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Rename 命令用于修改 key 的名称</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.Rename(r.formatKey(
+    <span style="color:rgb(206,145,120);">"shares"</span>, 
+    <span style="color:rgb(206,145,120);">"roundCurrent"</span>), r.formatRound(int64(height), params[
+    <span style="color:rgb(181,206,168);">0</span>]))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HGETALL eth:shares:round&amp;height:nonce</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hgetall 命令用于返回哈希表中，所有的字段和值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HGetAllMap(r.formatRound(int64(height), params[
+    <span style="color:rgb(181,206,168);">0</span>]))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">nil</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">if</span> err != 
+    <span style="color:rgb(86,156,214);">nil</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">false</span>, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;} 
+    <span style="color:rgb(197,134,192);">else</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HGETALL eth:shares:round&amp;height:nonce</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hgetall 命令用于返回哈希表中，所有的字段和值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sharesMap, _ := cmds[
+    <span style="color:rgb(181,206,168);">10</span>].(*redis.StringStringMapCmd).Result()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares := int64(
+    <span style="color:rgb(181,206,168);">0</span>)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">for</span> _, v := 
+    <span style="color:rgb(197,134,192);">range</span> sharesMap {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;n, _ := strconv.ParseInt(v, 
+    <span style="color:rgb(181,206,168);">10</span>, 
+    <span style="color:rgb(181,206,168);">64</span>)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalShares += n
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//nonce、powHash、mixDigest</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;hashHex := strings.Join(params, 
+    <span style="color:rgb(206,145,120);">":"</span>)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//MakeTimestamp、h.diff、totalShares</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s := join(hashHex, ts, roundDiff, totalShares)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZADD eth:blocks:candidates height nonce:powHash:mixDigest:MakeTimestamp:h.diff:totalShares</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//candidates为候选者</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.ZAdd(r.formatKey(
+    <span style="color:rgb(206,145,120);">"blocks"</span>, 
+    <span style="color:rgb(206,145,120);">"candidates"</span>), redis.Z{Score: float64(height), Member: s})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">false</span>, cmd.Err()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) checkPoWExist(height 
+    <span style="color:rgb(78,201,176);">uint64</span>, params []
+    <span style="color:rgb(78,201,176);">string</span>) (
+    <span style="color:rgb(78,201,176);">bool</span>, 
+    <span style="color:rgb(86,156,214);">error</span>) {
+   </div>
+   <div> 
+    <span style="color:rgb(96,139,78);">// Sweep PoW backlog for previous blocks, we have 3 templates back in RAM</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//扫描积压的前块</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZREMRANGEBYSCORE eth:pow -inf (height-8</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Zremrangebyscore 命令用于移除有序集中，指定分数（score）区间内的所有成员</span>
+   </div>
+   <div>
+     r.client.ZRemRangeByScore(r.formatKey(
+    <span style="color:rgb(206,145,120);">"pow"</span>), 
+    <span style="color:rgb(206,145,120);">"-inf"</span>, fmt.Sprint(
+    <span style="color:rgb(206,145,120);">"("</span>, height-
+    <span style="color:rgb(181,206,168);">8</span>))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZADD eth:pow height params</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中</span>
+   </div>
+   <div>
+     val, err := r.client.ZAdd(r.formatKey(
+    <span style="color:rgb(206,145,120);">"pow"</span>), redis.Z{Score: float64(height), Member: strings.Join(params, 
+    <span style="color:rgb(206,145,120);">":"</span>)}).Result()
+   </div>
+   <div> 
+    <span style="color:rgb(197,134,192);">return</span> val == 
+    <span style="color:rgb(181,206,168);">0</span>, err
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## WriteShare原理</span></span>
+   </div>
+   <br>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) WriteShare(login, id 
+    <span style="color:rgb(78,201,176);">string</span>, params []
+    <span style="color:rgb(78,201,176);">string</span>, diff 
+    <span style="color:rgb(78,201,176);">int64</span>, height 
+    <span style="color:rgb(78,201,176);">uint64</span>, window time.Duration) (
+    <span style="color:rgb(78,201,176);">bool</span>, 
+    <span style="color:rgb(86,156,214);">error</span>) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZADD eth:pow height params</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//写入eth:pow中，并检查是否已存在</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;exist, err := r.checkPoWExist(height, params)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">if</span> err != 
+    <span style="color:rgb(86,156,214);">nil</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">false</span>, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">// Duplicate share, (nonce, powHash, mixDigest) pair exist</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//已存在</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">if</span> exist {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">true</span>, 
+    <span style="color:rgb(86,156,214);">nil</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx := r.client.Multi()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">defer</span> tx.Close()
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;ms := util.MakeTimestamp()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;ts := ms / 
+    <span style="color:rgb(181,206,168);">1000</span>
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;_, err = tx.Exec(
+    <span style="color:rgb(86,156,214);">func</span>() 
+    <span style="color:rgb(86,156,214);">error</span> {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;r.writeShare(tx, ms, ts, login, id, diff, window)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HINCRBY eth:stats roundShares diff</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hincrby 命令用于为哈希表中的字段值加上指定增量值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey(
+    <span style="color:rgb(206,145,120);">"stats"</span>), 
+    <span style="color:rgb(206,145,120);">"roundShares"</span>, diff)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">nil</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(197,134,192);">return</span> 
+    <span style="color:rgb(86,156,214);">false</span>, err
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) writeShare(tx *redis.Multi, ms, ts 
+    <span style="color:rgb(78,201,176);">int64</span>, login, id 
+    <span style="color:rgb(78,201,176);">string</span>, diff 
+    <span style="color:rgb(78,201,176);">int64</span>, expire time.Duration) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HINCRBY eth:shares:roundCurrent login diff</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hincrby 命令用于为哈希表中的字段值加上指定增量值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx.HIncrBy(r.formatKey(
+    <span style="color:rgb(206,145,120);">"shares"</span>, 
+    <span style="color:rgb(206,145,120);">"roundCurrent"</span>), login, diff)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZADD eth:hashrate ts diff:login:id:ms</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Zadd 命令用于将一个或多个成员元素及其分数值加入到有序集当中</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey(
+    <span style="color:rgb(206,145,120);">"hashrate"</span>), redis.Z{Score: float64(ts), Member: join(diff, login, id, ms)})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//ZADD eth:hashrate:login ts diff:login:id:ms</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx.ZAdd(r.formatKey(
+    <span style="color:rgb(206,145,120);">"hashrate"</span>, login), redis.Z{Score: float64(ts), Member: join(diff, id, ms)})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//EXPIRE eth:hashrate:login expire</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//expire即cfg.Proxy.HashrateExpiration，即3小时</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx.Expire(r.formatKey(
+    <span style="color:rgb(206,145,120);">"hashrate"</span>, login), expire) 
+    <span style="color:rgb(96,139,78);">// Will delete hashrates for miners that gone</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//HSET eth:miners:login lastShare ts</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:rgb(96,139,78);">//Hset 命令用于为哈希表中的字段赋值</span>
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;tx.HSet(r.formatKey(
+    <span style="color:rgb(206,145,120);">"miners"</span>, login), 
+    <span style="color:rgb(206,145,120);">"lastShare"</span>, strconv.FormatInt(ts, 
+    <span style="color:rgb(181,206,168);">10</span>))
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## Stratum Mining Protocol</span></span>
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">### eth_submitLogin</span></span>
+   </div>
+   <br>
+   <div>
+    ```json
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//Request</span>
+   </div>
+   <div>
+    {
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"method"</span>: 
+    <span style="color:rgb(206,145,120);">"eth_submitLogin"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"params"</span>: [
+    <span style="color:rgb(206,145,120);">"0xb85150eb365e7df0941f0cf08235f987ba91506a"</span>]
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//或</span>
+   </div>
+   <div>
+    {
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"method"</span>: 
+    <span style="color:rgb(206,145,120);">"eth_submitLogin"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"params"</span>: [
+    <span style="color:rgb(206,145,120);">"0xb85150eb365e7df0941f0cf08235f987ba91506a"</span>, 
+    <span style="color:rgb(206,145,120);">"admin@example.net"</span>]
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//Successful response</span>
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">true</span> }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//{ "id": 1, "jsonrpc": "2.0", "result": null, "error": { code: -1, message: "Invalid login" } }</span>
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">### eth_getWork</span></span>
+   </div>
+   <br>
+   <div>
+    ```json
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//Request </span>
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"method"</span>: 
+    <span style="color:rgb(206,145,120);">"eth_getWork"</span> }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//Successful response</span>
+   </div>
+   <div>
+    {
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"result"</span>: [
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x5eed00000000000000000000000000005eed0000000000000000000000000000"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000"</span>
+   </div>
+   <div>
+     ]
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//Exceptions</span>
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">10</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">0</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"Work not ready"</span> } }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">### New Job Notification</span></span>
+   </div>
+   <br>
+   <div>
+    ```json
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//New Job Notification</span>
+   </div>
+   <div>
+    {
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"result"</span>: [
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x5eed00000000000000000000000000005eed0000000000000000000000000000"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0xd1ff1c01710000000000000000000000d1ff1c01710000000000000000000000"</span>
+   </div>
+   <div>
+     ]
+   </div>
+   <div>
+    }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">### eth_submitWork</span></span>
+   </div>
+   <br>
+   <div>
+    ```json
+   </div>
+   <div>
+    <span style="color:rgb(96,139,78);">//Request </span>
+   </div>
+   <div>
+    {
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"method"</span>: 
+    <span style="color:rgb(206,145,120);">"eth_submitWork"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(156,220,254);">"params"</span>: [
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0xe05d1fd4002d962f"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x6c872e2304cd1e64b553a65387d7383470f22331aff288cbce5748dc430f016a"</span>,
+   </div>
+   <div> 
+    <span style="color:rgb(206,145,120);">"0x2b20a6c641ed155b893ee750ef90ec3be5d24736d16838b84759385b6724220d"</span>
+   </div>
+   <div>
+     ]
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//Response</span>
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">true</span> }
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">false</span> }
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(96,139,78);">//Exceptions</span>
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">23</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"Invalid share"</span> } }
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">22</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"Duplicate share"</span> } }
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">-1</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"High rate of invalid shares"</span> } }
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">25</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"Not subscribed"</span> } }
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">null</span>, 
+    <span style="color:rgb(156,220,254);">"error"</span>: { 
+    <span style="color:rgb(244,71,71);">code</span>: 
+    <span style="color:rgb(181,206,168);">-1</span>, 
+    <span style="color:rgb(244,71,71);">message</span>: 
+    <span style="color:rgb(206,145,120);">"Malformed PoW result"</span> } }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">### Submit Hashrate</span></span>
+   </div>
+   <br>
+   <div>
+    ```json
+   </div>
+   <div>
+    { 
+    <span style="color:rgb(156,220,254);">"id"</span>: 
+    <span style="color:rgb(181,206,168);">1</span>, 
+    <span style="color:rgb(156,220,254);">"jsonrpc"</span>: 
+    <span style="color:rgb(206,145,120);">"2.0"</span>, 
+    <span style="color:rgb(156,220,254);">"result"</span>: 
+    <span style="color:rgb(86,156,214);">true</span> }
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## Geth JavaScript console</span></span>
+   </div>
+   <br>
+   <div>
+    ```shell
+   </div>
+   <div>
+    //getBlock
+   </div>
+   <div>
+    &gt; eth.getBlock(
+    <span style="color:rgb(206,145,120);">'pending'</span>)
+   </div>
+   <div>
+    {
+   </div>
+   <div>
+     author: 
+    <span style="color:rgb(206,145,120);">"0xdda50d9783dfda1c7ac51c4920f3561e17438be7"</span>,
+   </div>
+   <div>
+     difficulty: 550853386,
+   </div>
+   <div>
+     extraData: 
+    <span style="color:rgb(206,145,120);">"0xd5830109048650617269747986312e32342e30826c69"</span>,
+   </div>
+   <div>
+     gasLimit: 4700036,
+   </div>
+   <div>
+     gasUsed: 3933311,
+   </div>
+   <div>
+     hash: 
+    <span style="color:rgb(206,145,120);">"0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8"</span>,
+   </div>
+   <div>
+     logsBloom: 
+    <span style="color:rgb(206,145,120);">"0x02000000000000010000000000000000400000000000800000000000000000000000000000000400000000800000000000000000000000400000000000000000000000001000000000020008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000080000040000004000000004000080000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000001000040000000000000000000000000000000000000010000000000000000000000000000000000000000000000000100000"</span>,
+   </div>
+   <div>
+     miner: 
+    <span style="color:rgb(206,145,120);">"0xdda50d9783dfda1c7ac51c4920f3561e17438be7"</span>,
+   </div>
+   <div>
+     number: 2753366,
+   </div>
+   <div>
+     parentHash: 
+    <span style="color:rgb(206,145,120);">"0x31256e245ce314c0b5cf4007d21b7baebb46e2beb3e6b445809d8bceb1bd3039"</span>,
+   </div>
+   <div>
+     receiptsRoot: 
+    <span style="color:rgb(206,145,120);">"0x9d89da07e7300f4edc5ef580a6ccbaaffae76a978f9ee4d77fb83a7907a8c508"</span>,
+   </div>
+   <div>
+     sealFields: [],
+   </div>
+   <div>
+     sha3Uncles: 
+    <span style="color:rgb(206,145,120);">"0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"</span>,
+   </div>
+   <div>
+     size: 2455,
+   </div>
+   <div>
+     stateRoot: 
+    <span style="color:rgb(206,145,120);">"0x557340ac77aef679dae4ddef6a426436659a4e1e9588c85fb5da74491d28fe8b"</span>,
+   </div>
+   <div>
+     timestamp: 1519976198,
+   </div>
+   <div>
+     totalDifficulty: 7852523064449795,
+   </div>
+   <div>
+     transactions: [
+    <span style="color:rgb(206,145,120);">"0x715eb518875555fd6abf3cb8e90588222d3be89554a64e2dac72ba58ed729d78"</span>, 
+    <span style="color:rgb(206,145,120);">"0xcfbf33be2bd2141cc9d5a5896d2fb99c978a8d75bce59462b645733ff57bcfd0"</span>, 
+    <span style="color:rgb(206,145,120);">"0x82eb59d32abb36d2754a48e2e581ec8c9809f9180f7200ea334bcb746365797a"</span>, 
+    <span style="color:rgb(206,145,120);">"0xe0d0f519452d4aad44c706aee65e99dce6e3c15876a71daa32e1496e803cf8e5"</span>, 
+    <span style="color:rgb(206,145,120);">"0x3731d60c5dd0c1013555312bef2471de0c30978d9ab611f28325addd44492664"</span>, 
+    <span style="color:rgb(206,145,120);">"0x0fb9b1fee161632c069068bec45b910dc2cd013480dea5987e1da84e8f779cd7"</span>, 
+    <span style="color:rgb(206,145,120);">"0xc5dade656fa25bb044398675851765a8f8182112d7a400e8a0c4e6f4045bd42b"</span>, 
+    <span style="color:rgb(206,145,120);">"0xfe41aa0ee9090d623609435b0b8b8e5ab3b6019d79560396956a5f4a5f3c1357"</span>, 
+    <span style="color:rgb(206,145,120);">"0xe40c8e78ec16ea4bc1c445749dfaddb6777d6652e9882a5ab8ae48b316cc926e"</span>, 
+    <span style="color:rgb(206,145,120);">"0xc08fac21754c516ba3e61c9a6b0a51982c7b680e48c80c04e9572c6e1b2adbb4"</span>, 
+    <span style="color:rgb(206,145,120);">"0x2a5d22570373f21f6989b2228d7031d42bdbac13992152e55a95af441e20138a"</span>, 
+    <span style="color:rgb(206,145,120);">"0x204b56dd370fe9f73282df925168f6375b5cccb38a681e9cb97855aed2e34aee"</span>, 
+    <span style="color:rgb(206,145,120);">"0x5be5b6ea903e66ced2de9674e48639032aad4eca3f970605a3fbb0162e481da3"</span>, 
+    <span style="color:rgb(206,145,120);">"0xc35a3b3fab6ae3503287a765497c82f4687f536676c79c87771d1332d0d0d313"</span>],
+   </div>
+   <div>
+     transactionsRoot: 
+    <span style="color:rgb(206,145,120);">"0x07bf02d4b8239576682c33d9393998401112dd011b57ac77042fe1981830c3e1"</span>,
+   </div>
+   <div>
+     uncles: []
+   </div>
+   <div>
+    }
+   </div>
+   <br>
+   <div>
+    //getWork
+   </div>
+   <div>
+    &gt; 
+    <span style="color:rgb(220,220,170);">eth.getWork</span>()
+   </div>
+   <div>
+    [
+    <span style="color:rgb(206,145,120);">"0x6615dc650abc224822e3328155f843a5b441d2de11e7bb6dfc8bdecfc22ad3f8"</span>, 
+    <span style="color:rgb(206,145,120);">"0xcadf16f9c673bb7540bc190a9eed2b04fd59a98a7d4f631d85c240ad6155bfa9"</span>, 
+    <span style="color:rgb(206,145,120);">"0x00000007cc03d7d0cb49aa514f6aed05705a9baef46aea9a02514c253e288daa"</span>]
+   </div>
+   <div>
+    ```
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 参考文档</span></span>
+   </div>
+   <br>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">eth_getblockbynumber</span>](
+    <span>https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getblockbynumber</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">以太币的挖矿机制</span>](
+    <span>http://ethfans.org/topics/18</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">以太坊ETH挖矿详细教程</span>](
+    <span>https://www.cybtc.com/thread-15905-1-1.html</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">JavaScript Runtime Environment</span>](
+    <span>https://ethereum.gitbooks.io/frontier-guide/content/jsre.html</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">Management APIs</span>](
+    <span>https://github.com/ethereum/go-ethereum/wiki/Management-APIs</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">Pacy-以太坊矿池流程图</span>](
+    <span>https://processon.com/u/58748c7ee4b09f680a4af83e</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">Stratum Mining Protocol</span>](
+    <span>https://github.com/sammy007/open-ethereum-pool/blob/master/docs/STRATUM.md</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">JSON-RPC methods</span>](
+    <span>https://github.com/ethereum/wiki/wiki/JSON-RPC#eth_getwork</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">cpp-ethereum/libethash</span>](
+    <span>https://github.com/ethereum/cpp-ethereum/tree/develop/libethash</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">Web3.js API 中文文档</span>](
+    <span>http://web3.tryblockchain.org/Web3.js-api-refrence.html</span>)
+   </div>
+   <div>
+    <span style="color:rgb(103,150,230);">*</span> [
+    <span style="color:rgb(206,145,120);">Redis Command 命令</span>](
+    <span>http://www.runoob.com/redis/server-command.html</span>)
+   </div>
+   <div>
+    <br>
+   </div>
+  </div>
+  <p style="background-color:rgb(255,255,255);"></p>
+  <p style="background-color:rgb(255,255,255);"><br><br></p>
+  <p style="font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><br style="color:rgb(51,51,51);font-size:14px;"><br style="color:rgb(51,51,51);font-size:14px;"></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><img src="https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span>网址：http://www.qukuailianxueyuan.io/<br></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><img src="https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><img src="https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span>欲领取造币技术与全套虚拟机资料</span></p>
+  <p style="font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></span></p>
+  <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span>尹成学院微信：备注：CSDN</span></p>
+  <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;background-color:rgb(255,255,255);"><span><img src="https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></span></p>
+  <br style="color:rgb(51,51,51);font-size:14px;background-color:rgb(255,255,255);">
+  <div style="color:rgb(51,51,51);font-size:14px;background-color:rgb(255,255,255);">
+   <p style="font-family:Consolas, 'Courier New', monospace;"><span><br style="color:rgb(51,51,51);font-size:14px;"><br style="color:rgb(51,51,51);font-size:14px;"></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>网址：http://www.qukuailianxueyuan.io/<br></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>欲领取造币技术与全套虚拟机资料</span></p>
+   <p style="font-family:Consolas, 'Courier New', monospace;"><span><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>尹成学院微信：备注：CSDN</span></p>
+   <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;"><span><img src="https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></span></p>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80391555,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80391555,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

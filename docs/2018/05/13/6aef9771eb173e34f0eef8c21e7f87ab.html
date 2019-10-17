@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析(13)RPC分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析(13)RPC分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="这是一个交互式的 JavaScript 执行环境，在这里面可以执行 JavaScript 代码，其中 &gt; 是命令提示符。在这个环境里也内置了一些用来操作以太坊的 JavaScript 对象，可以直接使用这些对象。这些对象主要包括：eth：包含一些跟操作区块链相关的方法；net：包含一些查看p2p网络状态的方法；admin：包含一些与管理节点相关的方法；miner：包含启动&amp;停止挖矿的一些方法；personal：主要包含一些管理账户的方法；txpool：包含一些查看交易内存池的方法；web3：包含了以上对象，还包含一些单位换算的方法。personal.newAccount(&#39;liyuechun&#39;)personal.listAccounts&nbsp;account1 = web3.eth.coinbaseweb3.eth.getBalance(account1)发送交易：eth.sendTransaction({from:&quot;0x1c0f18be339b56073e5d18b479bbc43b0ad5349c&quot;, to:&quot;0x13d0dc1c592570f48360d7b779202d8df404563e&quot;, value: web3.toWei(0.05, &quot;ether&quot;)})#增加节点admin.addPeers(&quot;..&quot;)#查看当前链连接信息admin.nodeInfo.enode#查看连接了几个节点web3.net.peerCountnet.listening#查看连接了几个节点net.peerCount#连接对应workid链的控制台--networkid=1114 console初始化创世块init /home/yujian/eth-go/genesis.json --datadir /home/yujian/eth-go根据创世块启动，并且开启控制台--datadir /home/yujian/eth-go --networkid 1114 --port 30304 console 2&gt;&gt;/home/yujian/eth-go/myEth2.log ## RPC包概述 RPC包主要的服务逻辑在server.go和subscription.go包中。接口的定义在types.go中。 RPC包主要实现在启动节点的时候，将自己写的api包通过反射的形式将方法名和调用的api绑定。在启动命令行之后，通过输入命令的形式，通过RPC方法找到对应的方法调用，获取返回值。 ## RPC方法追踪 首先，在geth启动时，geth中有startNode方法，通过层层跟踪我们进入到了Node.Start()方法中。 在start方法中，有一个startRPC方法，启动节点的RPC。 ```go // startRPC is a helper method to start all the various RPC endpoint during node // startup. It&#39;s not meant to be called at any time afterwards as it makes certain // assumptions about the state of the node. func (n *Node) startRPC(services map[reflect.Type]Service) error { // Gather all the possible APIs to surface apis := n.apis() for _, service := range services { apis = append(apis, service.APIs()...) } // Start the various API endpoints, terminating all in case of errors if err := n.startInProc(apis); err != nil { return err } if err := n.startIPC(apis); err != nil { n.stopInProc() return err } if err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors); err != nil { n.stopIPC() n.stopInProc() return err } if err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != nil { n.stopHTTP() n.stopIPC() n.stopInProc() return err } // All API endpoints started successfully n.rpcAPIs = apis return nil } ``` 这里，startRPC方法在执行时就会去读取api，然后暴露各个api。 apis()的定义如下： ```go // apis returns the collection of RPC descriptors this node offers. func (n *Node) apis() []rpc.API { return []rpc.API{ { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPrivateAdminAPI(n), }, { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPublicAdminAPI(n), Public: true, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: debug.Handler, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: NewPublicDebugAPI(n), Public: true, }, { Namespace: &quot;web3&quot;, Version: &quot;1.0&quot;, Service: NewPublicWeb3API(n), Public: true, }, } } ``` 其中，Namespace是我们定义的包名，即在命令行中可以调用的方法。 Version是这个包的版本号。 Service是所映射的API管理的结构体，这里API的方法需要满足RPC的标准才能通过校验。 成为RPC调用方法标准如下： ```markdown ·对象必须导出 ·方法必须导出 ·方法返回0，1（响应或错误）或2（响应和错误）值 ·方法参数必须导出或是内置类型 ·方法返回值必须导出或是内置类型 ``` 在将各个API都写入到列表中之后，然后启动多个API endpoints。 这里我们以启动IPC为例，主要看startIPC方法。 ```go func (n *Node) startIPC(apis []rpc.API) error { // Short circuit if the IPC endpoint isn&#39;t being exposed if n.ipcEndpoint == &quot;&quot; { return nil } // Register all the APIs exposed by the services handler := rpc.NewServer() for _, api := range apis { if err := handler.RegisterName(api.Namespace, api.Service); err != nil { return err } n.log.Debug(fmt.Sprintf( &quot;IPC registered %T under &#39;%s&#39;&quot;, api.Service, api.Namespace)) } ... ``` 这里会首先启创建一个rpc server。在启动的过程中，rpc server会将自己注册到handler中，即rpc包。 在创建rpc server之后，handler会通过RegisterName方法将暴露的方法注册到rpc server中。 ```go // RegisterName will create a service for the given rcvr type under the given name. When no methods on the given rcvr // match the criteria to be either a RPC method or a subscription an error is returned. Otherwise a new service is // created and added to the service collection this server instance serves. func (s *Server) RegisterName(name string, rcvr interface{}) error { if s.services == nil { s.services = make(serviceRegistry) } svc := new(service) svc.typ = reflect.TypeOf(rcvr) rcvrVal := reflect.ValueOf(rcvr) if name == &quot;&quot; { return fmt.Errorf( &quot;no service name for type %s&quot;, svc.typ.String()) } if !isExported(reflect.Indirect(rcvrVal).Type().Name()) { return fmt.Errorf( &quot;%s is not exported&quot;, reflect.Indirect(rcvrVal).Type().Name()) } methods, subscriptions := suitableCallbacks(rcvrVal, svc.typ) // already a previous service register under given sname, merge methods/subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if regsvc, present := s.services[name]; present { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(methods) == 0 &amp;&amp; len(subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, m := range methods { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.callbacks[formatName(m.method.Name)] = m &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, s := range subscriptions { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.subscriptions[formatName(s.method.Name)] = s &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;svc.name = name &nbsp;&nbsp;&nbsp;&nbsp;svc.callbacks, svc.subscriptions = methods, subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if len(svc.callbacks) == 0 &amp;&amp; len(svc.subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;s.services[svc.name] = svc &nbsp;&nbsp;&nbsp;&nbsp; return nil } ``` 在RegisterName方法中，这个方法会将所提供包下所有符合RPC调用标准的方法注册到Server的callback调用集合中等待调用。 这里，筛选符合条件的RPC调用方法又suitableCallbacks方法实现。 这样就将对应包中的方法注册到Server中，在之后的命令行中即可调用。 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="这是一个交互式的 JavaScript 执行环境，在这里面可以执行 JavaScript 代码，其中 &gt; 是命令提示符。在这个环境里也内置了一些用来操作以太坊的 JavaScript 对象，可以直接使用这些对象。这些对象主要包括：eth：包含一些跟操作区块链相关的方法；net：包含一些查看p2p网络状态的方法；admin：包含一些与管理节点相关的方法；miner：包含启动&amp;停止挖矿的一些方法；personal：主要包含一些管理账户的方法；txpool：包含一些查看交易内存池的方法；web3：包含了以上对象，还包含一些单位换算的方法。personal.newAccount(&#39;liyuechun&#39;)personal.listAccounts&nbsp;account1 = web3.eth.coinbaseweb3.eth.getBalance(account1)发送交易：eth.sendTransaction({from:&quot;0x1c0f18be339b56073e5d18b479bbc43b0ad5349c&quot;, to:&quot;0x13d0dc1c592570f48360d7b779202d8df404563e&quot;, value: web3.toWei(0.05, &quot;ether&quot;)})#增加节点admin.addPeers(&quot;..&quot;)#查看当前链连接信息admin.nodeInfo.enode#查看连接了几个节点web3.net.peerCountnet.listening#查看连接了几个节点net.peerCount#连接对应workid链的控制台--networkid=1114 console初始化创世块init /home/yujian/eth-go/genesis.json --datadir /home/yujian/eth-go根据创世块启动，并且开启控制台--datadir /home/yujian/eth-go --networkid 1114 --port 30304 console 2&gt;&gt;/home/yujian/eth-go/myEth2.log ## RPC包概述 RPC包主要的服务逻辑在server.go和subscription.go包中。接口的定义在types.go中。 RPC包主要实现在启动节点的时候，将自己写的api包通过反射的形式将方法名和调用的api绑定。在启动命令行之后，通过输入命令的形式，通过RPC方法找到对应的方法调用，获取返回值。 ## RPC方法追踪 首先，在geth启动时，geth中有startNode方法，通过层层跟踪我们进入到了Node.Start()方法中。 在start方法中，有一个startRPC方法，启动节点的RPC。 ```go // startRPC is a helper method to start all the various RPC endpoint during node // startup. It&#39;s not meant to be called at any time afterwards as it makes certain // assumptions about the state of the node. func (n *Node) startRPC(services map[reflect.Type]Service) error { // Gather all the possible APIs to surface apis := n.apis() for _, service := range services { apis = append(apis, service.APIs()...) } // Start the various API endpoints, terminating all in case of errors if err := n.startInProc(apis); err != nil { return err } if err := n.startIPC(apis); err != nil { n.stopInProc() return err } if err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors); err != nil { n.stopIPC() n.stopInProc() return err } if err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != nil { n.stopHTTP() n.stopIPC() n.stopInProc() return err } // All API endpoints started successfully n.rpcAPIs = apis return nil } ``` 这里，startRPC方法在执行时就会去读取api，然后暴露各个api。 apis()的定义如下： ```go // apis returns the collection of RPC descriptors this node offers. func (n *Node) apis() []rpc.API { return []rpc.API{ { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPrivateAdminAPI(n), }, { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPublicAdminAPI(n), Public: true, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: debug.Handler, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: NewPublicDebugAPI(n), Public: true, }, { Namespace: &quot;web3&quot;, Version: &quot;1.0&quot;, Service: NewPublicWeb3API(n), Public: true, }, } } ``` 其中，Namespace是我们定义的包名，即在命令行中可以调用的方法。 Version是这个包的版本号。 Service是所映射的API管理的结构体，这里API的方法需要满足RPC的标准才能通过校验。 成为RPC调用方法标准如下： ```markdown ·对象必须导出 ·方法必须导出 ·方法返回0，1（响应或错误）或2（响应和错误）值 ·方法参数必须导出或是内置类型 ·方法返回值必须导出或是内置类型 ``` 在将各个API都写入到列表中之后，然后启动多个API endpoints。 这里我们以启动IPC为例，主要看startIPC方法。 ```go func (n *Node) startIPC(apis []rpc.API) error { // Short circuit if the IPC endpoint isn&#39;t being exposed if n.ipcEndpoint == &quot;&quot; { return nil } // Register all the APIs exposed by the services handler := rpc.NewServer() for _, api := range apis { if err := handler.RegisterName(api.Namespace, api.Service); err != nil { return err } n.log.Debug(fmt.Sprintf( &quot;IPC registered %T under &#39;%s&#39;&quot;, api.Service, api.Namespace)) } ... ``` 这里会首先启创建一个rpc server。在启动的过程中，rpc server会将自己注册到handler中，即rpc包。 在创建rpc server之后，handler会通过RegisterName方法将暴露的方法注册到rpc server中。 ```go // RegisterName will create a service for the given rcvr type under the given name. When no methods on the given rcvr // match the criteria to be either a RPC method or a subscription an error is returned. Otherwise a new service is // created and added to the service collection this server instance serves. func (s *Server) RegisterName(name string, rcvr interface{}) error { if s.services == nil { s.services = make(serviceRegistry) } svc := new(service) svc.typ = reflect.TypeOf(rcvr) rcvrVal := reflect.ValueOf(rcvr) if name == &quot;&quot; { return fmt.Errorf( &quot;no service name for type %s&quot;, svc.typ.String()) } if !isExported(reflect.Indirect(rcvrVal).Type().Name()) { return fmt.Errorf( &quot;%s is not exported&quot;, reflect.Indirect(rcvrVal).Type().Name()) } methods, subscriptions := suitableCallbacks(rcvrVal, svc.typ) // already a previous service register under given sname, merge methods/subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if regsvc, present := s.services[name]; present { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(methods) == 0 &amp;&amp; len(subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, m := range methods { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.callbacks[formatName(m.method.Name)] = m &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, s := range subscriptions { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.subscriptions[formatName(s.method.Name)] = s &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;svc.name = name &nbsp;&nbsp;&nbsp;&nbsp;svc.callbacks, svc.subscriptions = methods, subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if len(svc.callbacks) == 0 &amp;&amp; len(svc.subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;s.services[svc.name] = svc &nbsp;&nbsp;&nbsp;&nbsp; return nil } ``` 在RegisterName方法中，这个方法会将所提供包下所有符合RPC调用标准的方法注册到Server的callback调用集合中等待调用。 这里，筛选符合条件的RPC调用方法又suitableCallbacks方法实现。 这样就将对应包中的方法注册到Server中，在之后的命令行中即可调用。 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/13/6aef9771eb173e34f0eef8c21e7f87ab.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/13/6aef9771eb173e34f0eef8c21e7f87ab.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-13T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"这是一个交互式的 JavaScript 执行环境，在这里面可以执行 JavaScript 代码，其中 &gt; 是命令提示符。在这个环境里也内置了一些用来操作以太坊的 JavaScript 对象，可以直接使用这些对象。这些对象主要包括：eth：包含一些跟操作区块链相关的方法；net：包含一些查看p2p网络状态的方法；admin：包含一些与管理节点相关的方法；miner：包含启动&amp;停止挖矿的一些方法；personal：主要包含一些管理账户的方法；txpool：包含一些查看交易内存池的方法；web3：包含了以上对象，还包含一些单位换算的方法。personal.newAccount(&#39;liyuechun&#39;)personal.listAccounts&nbsp;account1 = web3.eth.coinbaseweb3.eth.getBalance(account1)发送交易：eth.sendTransaction({from:&quot;0x1c0f18be339b56073e5d18b479bbc43b0ad5349c&quot;, to:&quot;0x13d0dc1c592570f48360d7b779202d8df404563e&quot;, value: web3.toWei(0.05, &quot;ether&quot;)})#增加节点admin.addPeers(&quot;..&quot;)#查看当前链连接信息admin.nodeInfo.enode#查看连接了几个节点web3.net.peerCountnet.listening#查看连接了几个节点net.peerCount#连接对应workid链的控制台--networkid=1114 console初始化创世块init /home/yujian/eth-go/genesis.json --datadir /home/yujian/eth-go根据创世块启动，并且开启控制台--datadir /home/yujian/eth-go --networkid 1114 --port 30304 console 2&gt;&gt;/home/yujian/eth-go/myEth2.log ## RPC包概述 RPC包主要的服务逻辑在server.go和subscription.go包中。接口的定义在types.go中。 RPC包主要实现在启动节点的时候，将自己写的api包通过反射的形式将方法名和调用的api绑定。在启动命令行之后，通过输入命令的形式，通过RPC方法找到对应的方法调用，获取返回值。 ## RPC方法追踪 首先，在geth启动时，geth中有startNode方法，通过层层跟踪我们进入到了Node.Start()方法中。 在start方法中，有一个startRPC方法，启动节点的RPC。 ```go // startRPC is a helper method to start all the various RPC endpoint during node // startup. It&#39;s not meant to be called at any time afterwards as it makes certain // assumptions about the state of the node. func (n *Node) startRPC(services map[reflect.Type]Service) error { // Gather all the possible APIs to surface apis := n.apis() for _, service := range services { apis = append(apis, service.APIs()...) } // Start the various API endpoints, terminating all in case of errors if err := n.startInProc(apis); err != nil { return err } if err := n.startIPC(apis); err != nil { n.stopInProc() return err } if err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors); err != nil { n.stopIPC() n.stopInProc() return err } if err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != nil { n.stopHTTP() n.stopIPC() n.stopInProc() return err } // All API endpoints started successfully n.rpcAPIs = apis return nil } ``` 这里，startRPC方法在执行时就会去读取api，然后暴露各个api。 apis()的定义如下： ```go // apis returns the collection of RPC descriptors this node offers. func (n *Node) apis() []rpc.API { return []rpc.API{ { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPrivateAdminAPI(n), }, { Namespace: &quot;admin&quot;, Version: &quot;1.0&quot;, Service: NewPublicAdminAPI(n), Public: true, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: debug.Handler, }, { Namespace: &quot;debug&quot;, Version: &quot;1.0&quot;, Service: NewPublicDebugAPI(n), Public: true, }, { Namespace: &quot;web3&quot;, Version: &quot;1.0&quot;, Service: NewPublicWeb3API(n), Public: true, }, } } ``` 其中，Namespace是我们定义的包名，即在命令行中可以调用的方法。 Version是这个包的版本号。 Service是所映射的API管理的结构体，这里API的方法需要满足RPC的标准才能通过校验。 成为RPC调用方法标准如下： ```markdown ·对象必须导出 ·方法必须导出 ·方法返回0，1（响应或错误）或2（响应和错误）值 ·方法参数必须导出或是内置类型 ·方法返回值必须导出或是内置类型 ``` 在将各个API都写入到列表中之后，然后启动多个API endpoints。 这里我们以启动IPC为例，主要看startIPC方法。 ```go func (n *Node) startIPC(apis []rpc.API) error { // Short circuit if the IPC endpoint isn&#39;t being exposed if n.ipcEndpoint == &quot;&quot; { return nil } // Register all the APIs exposed by the services handler := rpc.NewServer() for _, api := range apis { if err := handler.RegisterName(api.Namespace, api.Service); err != nil { return err } n.log.Debug(fmt.Sprintf( &quot;IPC registered %T under &#39;%s&#39;&quot;, api.Service, api.Namespace)) } ... ``` 这里会首先启创建一个rpc server。在启动的过程中，rpc server会将自己注册到handler中，即rpc包。 在创建rpc server之后，handler会通过RegisterName方法将暴露的方法注册到rpc server中。 ```go // RegisterName will create a service for the given rcvr type under the given name. When no methods on the given rcvr // match the criteria to be either a RPC method or a subscription an error is returned. Otherwise a new service is // created and added to the service collection this server instance serves. func (s *Server) RegisterName(name string, rcvr interface{}) error { if s.services == nil { s.services = make(serviceRegistry) } svc := new(service) svc.typ = reflect.TypeOf(rcvr) rcvrVal := reflect.ValueOf(rcvr) if name == &quot;&quot; { return fmt.Errorf( &quot;no service name for type %s&quot;, svc.typ.String()) } if !isExported(reflect.Indirect(rcvrVal).Type().Name()) { return fmt.Errorf( &quot;%s is not exported&quot;, reflect.Indirect(rcvrVal).Type().Name()) } methods, subscriptions := suitableCallbacks(rcvrVal, svc.typ) // already a previous service register under given sname, merge methods/subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if regsvc, present := s.services[name]; present { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(methods) == 0 &amp;&amp; len(subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, m := range methods { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.callbacks[formatName(m.method.Name)] = m &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; for _, s := range subscriptions { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.subscriptions[formatName(s.method.Name)] = s &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;svc.name = name &nbsp;&nbsp;&nbsp;&nbsp;svc.callbacks, svc.subscriptions = methods, subscriptions &nbsp;&nbsp;&nbsp;&nbsp; if len(svc.callbacks) == 0 &amp;&amp; len(svc.subscriptions) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return fmt.Errorf( &quot;Service %T doesn&#39;t have any suitable methods/subscriptions to expose&quot;, rcvr) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;s.services[svc.name] = svc &nbsp;&nbsp;&nbsp;&nbsp; return nil } ``` 在RegisterName方法中，这个方法会将所提供包下所有符合RPC调用标准的方法注册到Server的callback调用集合中等待调用。 这里，筛选符合条件的RPC调用方法又suitableCallbacks方法实现。 这样就将对应包中的方法注册到Server中，在之后的命令行中即可调用。 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/13/6aef9771eb173e34f0eef8c21e7f87ab.html","headline":"以太坊源码分析(13)RPC分析","dateModified":"2018-05-13T00:00:00+08:00","datePublished":"2018-05-13T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/13/6aef9771eb173e34f0eef8c21e7f87ab.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析(13)RPC分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+   <div>
+    <span style="color:#569cd6;"><strong><br></strong></span>
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong>这是一个交互式的 JavaScript 执行环境，在这里面可以执行 JavaScript 代码，其中 &gt; 是命令提示符。在这个环境里也内置了一些用来操作以太坊的 JavaScript 对象，可以直接使用这些对象。这些对象主要包括：<br><br><br>eth：包含一些跟操作区块链相关的方法；<br>net：包含一些查看p2p网络状态的方法；<br>admin：包含一些与管理节点相关的方法；<br>miner：包含启动&amp;停止挖矿的一些方法；<br>personal：主要包含一些管理账户的方法；<br>txpool：包含一些查看交易内存池的方法；<br>web3：包含了以上对象，还包含一些单位换算的方法。<br><br><br><br><br><br><br>personal.newAccount('liyuechun')<br>personal.listAccounts&nbsp;<br>account1 = web3.eth.coinbase<br>web3.eth.getBalance(account1)<br><br><br>发送交易：<br>eth.sendTransaction({from:"0x1c0f18be339b56073e5d18b479bbc43b0ad5349c", to:"0x13d0dc1c592570f48360d7b779202d8df404563e", value: web3.toWei(0.05, "ether")})<br><br><br>#增加节点<br>admin.addPeers("..")<br>#查看当前链连接信息<br>admin.nodeInfo.enode<br>#查看连接了几个节点<br>web3.net.peerCount<br><br><br>net.listening<br><br><br>#查看连接了几个节点<br>net.peerCount<br><br><br>#连接对应workid链的控制台<br>--networkid=1114 console<br><br><br>初始化创世块<br>init /home/yujian/eth-go/genesis.json --datadir /home/yujian/eth-go<br>根据创世块启动，并且开启控制台<br>--datadir /home/yujian/eth-go --networkid 1114 --port 30304 console 2&gt;&gt;/home/yujian/eth-go/myEth2.log<br></strong></span>
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong><br></strong></span>
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong><br></strong></span>
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong><br></strong></span>
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong>## RPC包概述</strong></span>
+   </div>
+   <div>
+    RPC包主要的服务逻辑在server.go和subscription.go包中。接口的定义在types.go中。
+   </div>
+   <div>
+    RPC包主要实现在启动节点的时候，将自己写的api包通过反射的形式将方法名和调用的api绑定。在启动命令行之后，通过输入命令的形式，通过RPC方法找到对应的方法调用，获取返回值。
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong>## RPC方法追踪</strong></span>
+   </div>
+   <div>
+    首先，在geth启动时，geth中有startNode方法，通过层层跟踪我们进入到了Node.Start()方法中。
+   </div>
+   <div>
+    在start方法中，有一个startRPC方法，启动节点的RPC。
+   </div>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:#608b4e;">// startRPC is a helper method to start all the various RPC endpoint during node</span>
+   </div>
+   <div>
+    <span style="color:#608b4e;">// startup. It's not meant to be called at any time afterwards as it makes certain</span>
+   </div>
+   <div>
+    <span style="color:#608b4e;">// assumptions about the state of the node.</span>
+   </div>
+   <div> 
+    <span style="color:#569cd6;">func</span> (n *Node) startRPC(services 
+    <span style="color:#569cd6;">map</span>[reflect.Type]Service) 
+    <span style="color:#569cd6;">error</span> {
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// Gather all the possible APIs to surface</span>
+   </div>
+   <div>
+     apis := n.apis()
+   </div>
+   <div> 
+    <span style="color:#c586c0;">for</span> _, service := 
+    <span style="color:#c586c0;">range</span> services {
+   </div>
+   <div>
+     apis = 
+    <span style="color:#dcdcaa;">append</span>(apis, service.APIs()...)
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// Start the various API endpoints, terminating all in case of errors</span>
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> err := n.startInProc(apis); err != 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> err
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> err := n.startIPC(apis); err != 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div>
+     n.stopInProc()
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> err
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> err := n.startHTTP(n.httpEndpoint, apis, n.config.HTTPModules, n.config.HTTPCors); err != 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div>
+     n.stopIPC()
+   </div>
+   <div>
+     n.stopInProc()
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> err
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> err := n.startWS(n.wsEndpoint, apis, n.config.WSModules, n.config.WSOrigins, n.config.WSExposeAll); err != 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div>
+     n.stopHTTP()
+   </div>
+   <div>
+     n.stopIPC()
+   </div>
+   <div>
+     n.stopInProc()
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> err
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// All API endpoints started successfully</span>
+   </div>
+   <div>
+     n.rpcAPIs = apis
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> 
+    <span style="color:#569cd6;">nil</span>
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+    ```
+   </div>
+   <div>
+    这里，startRPC方法在执行时就会去读取api，然后暴露各个api。
+   </div>
+   <div>
+    apis()的定义如下：
+   </div>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:#608b4e;">// apis returns the collection of RPC descriptors this node offers.</span>
+   </div>
+   <div> 
+    <span style="color:#569cd6;">func</span> (n *Node) apis() []rpc.API {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> []rpc.API{
+   </div>
+   <div>
+     {
+   </div>
+   <div>
+     Namespace: 
+    <span style="color:#ce9178;">"admin"</span>,
+   </div>
+   <div>
+     Version: 
+    <span style="color:#ce9178;">"1.0"</span>,
+   </div>
+   <div>
+     Service: NewPrivateAdminAPI(n),
+   </div>
+   <div>
+     }, {
+   </div>
+   <div>
+     Namespace: 
+    <span style="color:#ce9178;">"admin"</span>,
+   </div>
+   <div>
+     Version: 
+    <span style="color:#ce9178;">"1.0"</span>,
+   </div>
+   <div>
+     Service: NewPublicAdminAPI(n),
+   </div>
+   <div>
+     Public: 
+    <span style="color:#569cd6;">true</span>,
+   </div>
+   <div>
+     }, {
+   </div>
+   <div>
+     Namespace: 
+    <span style="color:#ce9178;">"debug"</span>,
+   </div>
+   <div>
+     Version: 
+    <span style="color:#ce9178;">"1.0"</span>,
+   </div>
+   <div>
+     Service: debug.Handler,
+   </div>
+   <div>
+     }, {
+   </div>
+   <div>
+     Namespace: 
+    <span style="color:#ce9178;">"debug"</span>,
+   </div>
+   <div>
+     Version: 
+    <span style="color:#ce9178;">"1.0"</span>,
+   </div>
+   <div>
+     Service: NewPublicDebugAPI(n),
+   </div>
+   <div>
+     Public: 
+    <span style="color:#569cd6;">true</span>,
+   </div>
+   <div>
+     }, {
+   </div>
+   <div>
+     Namespace: 
+    <span style="color:#ce9178;">"web3"</span>,
+   </div>
+   <div>
+     Version: 
+    <span style="color:#ce9178;">"1.0"</span>,
+   </div>
+   <div>
+     Service: NewPublicWeb3API(n),
+   </div>
+   <div>
+     Public: 
+    <span style="color:#569cd6;">true</span>,
+   </div>
+   <div>
+     },
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+    ```
+   </div>
+   <div>
+    其中，Namespace是我们定义的包名，即在命令行中可以调用的方法。
+   </div>
+   <div>
+    Version是这个包的版本号。
+   </div>
+   <div>
+    Service是所映射的API管理的结构体，这里API的方法需要满足RPC的标准才能通过校验。
+   </div>
+   <div>
+    成为RPC调用方法标准如下：
+   </div>
+   <div>
+    ```markdown
+   </div>
+   <div>
+     ·对象必须导出
+   </div>
+   <div>
+     ·方法必须导出
+   </div>
+   <div>
+     ·方法返回0，1（响应或错误）或2（响应和错误）值
+   </div>
+   <div>
+     ·方法参数必须导出或是内置类型
+   </div>
+   <div>
+     ·方法返回值必须导出或是内置类型
+   </div>
+   <div>
+    ```
+   </div>
+   <div>
+    在将各个API都写入到列表中之后，然后启动多个API endpoints。
+   </div>
+   <div>
+    这里我们以启动IPC为例，主要看startIPC方法。
+   </div>
+   <div>
+    ```go
+   </div>
+   <div> 
+    <span style="color:#569cd6;">func</span> (n *Node) startIPC(apis []rpc.API) 
+    <span style="color:#569cd6;">error</span> {
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// Short circuit if the IPC endpoint isn't being exposed</span>
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> n.ipcEndpoint == 
+    <span style="color:#ce9178;">""</span> {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> 
+    <span style="color:#569cd6;">nil</span>
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// Register all the APIs exposed by the services</span>
+   </div>
+   <div>
+     handler := rpc.NewServer()
+   </div>
+   <div> 
+    <span style="color:#c586c0;">for</span> _, api := 
+    <span style="color:#c586c0;">range</span> apis {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> err := handler.RegisterName(api.Namespace, api.Service); err != 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> err
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+     n.log.Debug(fmt.Sprintf(
+    <span style="color:#ce9178;">"IPC registered %T under '%s'"</span>, api.Service, api.Namespace))
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+     ...
+   </div>
+   <div>
+    ```
+   </div>
+   <div>
+    这里会首先启创建一个rpc server。在启动的过程中，rpc server会将自己注册到handler中，即rpc包。
+   </div>
+   <div>
+    在创建rpc server之后，handler会通过RegisterName方法将暴露的方法注册到rpc server中。
+   </div>
+   <div>
+    ```go
+   </div>
+   <div>
+    <span style="color:#608b4e;">// RegisterName will create a service for the given rcvr type under the given name. When no methods on the given rcvr</span>
+   </div>
+   <div>
+    <span style="color:#608b4e;">// match the criteria to be either a RPC method or a subscription an error is returned. Otherwise a new service is</span>
+   </div>
+   <div>
+    <span style="color:#608b4e;">// created and added to the service collection this server instance serves.</span>
+   </div>
+   <div> 
+    <span style="color:#569cd6;">func</span> (s *Server) RegisterName(name 
+    <span style="color:#4ec9b0;">string</span>, rcvr 
+    <span style="color:#569cd6;">interface</span>{}) 
+    <span style="color:#569cd6;">error</span> {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> s.services == 
+    <span style="color:#569cd6;">nil</span> {
+   </div>
+   <div>
+     s.services = 
+    <span style="color:#dcdcaa;">make</span>(serviceRegistry)
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+   </div>
+   <div>
+     svc := 
+    <span style="color:#dcdcaa;">new</span>(service)
+   </div>
+   <div>
+     svc.typ = reflect.TypeOf(rcvr)
+   </div>
+   <div>
+     rcvrVal := reflect.ValueOf(rcvr)
+   </div>
+   <div> 
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> name == 
+    <span style="color:#ce9178;">""</span> {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> fmt.Errorf(
+    <span style="color:#ce9178;">"no service name for type %s"</span>, svc.typ.String())
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+    <span style="color:#c586c0;">if</span> !isExported(reflect.Indirect(rcvrVal).Type().Name()) {
+   </div>
+   <div> 
+    <span style="color:#c586c0;">return</span> fmt.Errorf(
+    <span style="color:#ce9178;">"%s is not exported"</span>, reflect.Indirect(rcvrVal).Type().Name())
+   </div>
+   <div>
+     }
+   </div>
+   <div> 
+   </div>
+   <div>
+     methods, subscriptions := suitableCallbacks(rcvrVal, svc.typ)
+   </div>
+   <div> 
+    <span style="color:#608b4e;">// already a previous service register under given sname, merge methods/subscriptions</span>
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">if</span> regsvc, present := s.services[name]; present {
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">if</span> 
+    <span style="color:#dcdcaa;">len</span>(methods) == 
+    <span style="color:#b5cea8;">0</span> &amp;&amp; 
+    <span style="color:#dcdcaa;">len</span>(subscriptions) == 
+    <span style="color:#b5cea8;">0</span> {
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">return</span> fmt.Errorf(
+    <span style="color:#ce9178;">"Service %T doesn't have any suitable methods/subscriptions to expose"</span>, rcvr)
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">for</span> _, m := 
+    <span style="color:#c586c0;">range</span> methods {
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.callbacks[formatName(m.method.Name)] = m
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">for</span> _, s := 
+    <span style="color:#c586c0;">range</span> subscriptions {
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;regsvc.subscriptions[formatName(s.method.Name)] = s
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">return</span> 
+    <span style="color:#569cd6;">nil</span>
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div> 
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;svc.name = name
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;svc.callbacks, svc.subscriptions = methods, subscriptions
+   </div>
+   <div> 
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">if</span> 
+    <span style="color:#dcdcaa;">len</span>(svc.callbacks) == 
+    <span style="color:#b5cea8;">0</span> &amp;&amp; 
+    <span style="color:#dcdcaa;">len</span>(svc.subscriptions) == 
+    <span style="color:#b5cea8;">0</span> {
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">return</span> fmt.Errorf(
+    <span style="color:#ce9178;">"Service %T doesn't have any suitable methods/subscriptions to expose"</span>, rcvr)
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div> 
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;s.services[svc.name] = svc
+   </div>
+   <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;
+    <span style="color:#c586c0;">return</span> 
+    <span style="color:#569cd6;">nil</span>
+   </div>
+   <div>
+     }
+   </div>
+   <div>
+    ```
+   </div>
+   <div>
+    在RegisterName方法中，这个方法会将所提供包下所有符合RPC调用标准的方法注册到Server的callback调用集合中等待调用。
+   </div>
+   <div>
+    这里，筛选符合条件的RPC调用方法又suitableCallbacks方法实现。
+   </div>
+   <p>这样就将对应包中的方法注册到Server中，在之后的命令行中即可调用。</p>
+   <p></p>
+   <h2><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180430224554793?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br><br></h2>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);">网址：http://www.qukuailianxueyuan.io/<br></p>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);">欲领取造币技术与全套虚拟机资料</p>
+   <p><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);background-color:rgb(255,255,255);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></p>
+   <p style="color:rgb(25,25,25);">尹成学院微信：备注：CSDN</p>
+   <p style="color:rgb(25,25,25);text-align:center;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+   <br>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80304381,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80304381,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

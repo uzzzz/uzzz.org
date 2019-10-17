@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>智能合约升级模式介绍 — 入门篇 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="智能合约升级模式介绍 — 入门篇" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊最大的优势就是，每一笔用来转账、部署合约或者和合约交互的交易（事务）都被存在一个叫做区块链的公共账本上。一旦交易发生，就再也无法隐藏或者改变。这带来一个巨大的好处，就是在以太坊中的每一个节点都可以去验证任意一笔交易的合法性和当前状态。这使得以太坊成为一个非常健壮的去中心化系统。 但是随之而来的是，它还有一个最大的缺点，就是智能合约一旦部署之后，就再也无法改变源码。开发中心化应用（比如facebook或者Airbnb）的开发者，都已经习惯了，为了修复bug或者引入新的特性而频繁更新产品。但这种方式却不适用以太坊。 还记得当面Parity多签名钱包被黑导致150000以太币被偷的恶劣事件吗？在整个攻击中，就因为钱包中的一个bug导致很多巨额钱包的资金被清空。而唯一的解决方案就是尝试以比黑客更快的速度，利用相同的漏洞攻击剩余的钱包，来把以太币重新分配给它们合法的所有者。 要是有一种方法可以在智能合约部署之后，还能对它们进行升级，那该多好… 引入代理模式 尽管想升级已经部署的智能合约中的代码是不可能的，但是可以通过设计一个代理合约结构，这个结构可以让你可以通过新部署一个合约的方式，来实现升级主要的处理逻辑的目的。 代理结构模式就像下面这张图一样：所有消息通过一个代理合约来间接调用最新部署的逻辑合约。如果想要升级的话，只需要部署一个新的合约，然后在代理合约中更新引用新的合约地址就可以了。 作为实现zeppelin_os的一部分，zeppelin正致力于实现集中代理模式。目前已经探索出来的有下面三个： 继承存储模式 Inherited Storage 永久存储模式 Eternal Storage 非结构化存储模式 Unstructured Storage 所有三种模式都依赖低阶的delegatecall。尽管solidity提供了一个delegatecall方法，但它只能返回true或者false来显示调用是否成功，而不是允许你操作返回的数据。 在我们深入了解之前，理解两个关键的概念很重要： 当调用一个合约中并不支持的的方法时，就会调用合约中的fallback方法。你可以自己写一个fallback函数来处理这种场景。代理合约就是用自定义的fallback方法将调用重定向到其他合约实现。 每当合约A授权对另一个合约B的调用时，它就会在合约A的上下文中执行合约B的代码。这就意味着msg.value和msg.sender的值会被保留。并且对存储的修改将会作用在合约A的存储上。 zeppelin的代理合约，为了可以返回调用逻辑合约后的结果，实现了自己的delegatecall方法，所有模式都是这样。如果你想要使用zeppelin的代理合约代码，你就要理解代码的每一个细节。让我们先来看看它是如何发挥作用的，以及理解为了达到目的它所使用的assembly操作码。 assembly { let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) let size := returndatasize returndatacopy(ptr, 0, size) switch result case 0 { revert(ptr, size) } default { return(ptr, size) } } 为了授权对另一个合约中方法的调用，我们需要把它赋值给proxy合约接收的msg.data。因为msg.data是bytes类型的，是一个动态的数据结构，所以它在msg.data的第一个字（word，也就是32个字节）中的存储长度会不一样。如果我们想要只取出真正的数据，我们需要跳过第一个字（word），从msg.data的0x20（32个字节）开始。然而，我们会用到两个操作码来实现此目的。我们会使用calldatasize来获取msg.data的大小，以及calldatacopy来把它复制到ptr所指向的位置。 注意到我们是如何初始化ptr变量的。在solidity中，内存槽中的0x40位置是和特殊的，因为它存储了指向下一个可用自由内存的指针。每次当你想往内存里存储一个变量时，你都要检查存储在0x40的值。这就是你变量即将存放的位置。现在我们知道了我们要在哪儿存变量，我们就可以使用calldatacopy，把大小为calldatasize的calldata从0开始啊复制到ptr指向的那个位置了。 let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) 我们再看看下面的assembly代码（使用delegatecall操作码） let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) 解释一下上面的参数： gas：函数执行所需的gas _impl：我们调用的逻辑合约的地址 ptr：内存指针（指向数据开始存储的地方） calldatasize：传入的数据大小 0：调用逻辑合约后的返回值。我们没有使用这个参数因为我们还不知道返回值的大小，所以不能把它赋值给一个变量。我们可以后面可以进一步使用returndata操作码来获取这些信息。 0：返回值的大小。这个参数也没有被使用因为我们没有机会创造一个临时变量用来存储返回值。鉴于我们在调用其他合约之前无法知道它的大小（所以就无法创造临时变量呀）。我们稍后可以用returndatasize操作码来得到这个值。 下面一行代码就是用returndatasize操作码得到了返回数据的大小： let size := returndatasize 我们使用这个返回值的大小，来把返回值复制到ptr指向的内存，使用returndatacopy来达到这个目的： returndatacopy(ptr, 0, size) 最后，switch语句要么返回 【返回值】，要么抛出错误，如果发生错误的话。 很好，我们现在有了一个从逻辑合约中获取正确结果的方法。 现在，我们理解了代理合约是如何工作的。下面就让我们正式学习三种模式：继承存储模式、永久存储模式和非结构化存储模式。 这三种方法用不同的方法来解决同一个难点：怎样确保逻辑合约不会重写/覆盖代理中的状态变量。 任何代理结构模式的主要问题就是如何分配存储。记住，既然我们使用一个合约来存储，另一个合约来实现逻辑，它们中的任何一个都有可能重写一个已经使用的存储槽。这意味着如果代理合约有一个状态变量在某个存储槽中存储着最新的逻辑合约地址，但是逻辑合约却不知道的话，那么逻辑合约可能就会在那个槽中存一些其他数据，这样就把代理合约中的重要信息覆盖了。zeppelin的这三种方法代表了架构合约系统的三种途径，实现通过代理模式升级合约的目的。 使用继承存储模式升级 继承存储方法要求逻辑合约内部也实现代理合约内的存储结构。代理合约和逻辑合约都要继承完全一样的存储结构，来确保二者都支持存储必要的代理合约的状态变量。 当探索这种模式时，我们有这样一个想法，我们想要有一个Registry合约来追踪不同版本的逻辑合约。 为了升级成新的逻辑合约，你需要为它在Registry里注册一个新的版本，并且要求代理合约中也升级成这个最新版本的逻辑合约。注意到有一个Registry合约并不影响存储机制，实际上，它可以应用到这篇文章中提到的任意一种存储模式中。 如何初始化 部署Registry合约 部署一个逻辑合约的最初版本(V1)，确保它继承了Upgradeable合约 向Registry合约中注册这个最初版本(V1)的地址 要求Registry合约创建一个UpgradeabilityProxy实例 调用你的UpgrageabilityProxy实例来升级到你最初版本(V1) 如何升级 部署一个继承了你最初版本合约的新版本(V2)，==确保它保留了代理合约和最初版本逻辑合约中的存储结构== 向Registry中注册合约的新版本 调用你的UpgradeabilityProxy实例来升级到最新注册的版本 tips 我们可以在未来部署的逻辑合约中升级现有方法、创造新的方法以及新的状态变量，但仍然调用同一个UpgradeabilityProxy合约。 使用永久存储模式升级 在永久存储模式中，存储模式用一个独立的合约（代理和逻辑合约都要继承这个合约）来定义。这个存储合约保留了所有逻辑合约需要的状态变量，因为代理合约也会知道这些变量的存在（因为继承），它就可以为升级定义自己的状态变量，不用考虑覆盖变量这些问题。注意到所有的版本的逻辑合约都不可以再定义任何额外的状态变量。所有版本的逻辑合约都必须一直使用一开始就定义好的永久存储架构。 这种应用在zeppelin labs项目中提供了实现，并且同时引入了代理所有权的概念。一个代理的所有者是唯一一个可以升级代理并指定一个新的逻辑合约的地址，也是唯一一个可以转移所有权的地址。 如何初始化 部署一个EternalStorageProxy实例 部署一个逻辑合约的最初版本(V1) 调用EternalStorageProxy实例来升级到这个最初版本合约的地址 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。EternalStorageProxy有一个叫upgradeToAndCall的函数专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个逻辑合约的最新版本(v2)，确保它也包含永久存储结构。 调用EternalStorageProxy实例来升级到最新版本。 tips 这是没有增加太多开销同时很直观的逻辑合约。 以后的逻辑合约可以升级现有的方法或者创造新的方法，但是不能引入新的状态变量。 使用非结构化存储升级 非结构化存储模式和继承存储类似，但是不要求逻辑合约继承任何和升级相关的状态变量。这个模式使用代理合约中定义的非结构化的存储槽来保存升级所需的数据。 在代理合约中，我们定义了一个常量，每当哈希的时候，就给出一个足够随机的存储位置来存储代理合约需要调用的逻辑合约的地址。 bytes32 private constant implementationPosition = keccak256(&quot;org.zeppelinos.proxy.implementation&quot;); 因为常量(恒定)状态变量并不占用存储槽，所以并不用担心implementationPosition会不小心被逻辑合约占用。鉴于solidity在存储中放置状态变量的方法，依然有非常非常非常小的概率可能发生要存储新变量的存储槽已经被占用了。 通过使用这种模式，任何版本的逻辑合约都不需要知道代理合约的存储结构，但是所有后一个版本的逻辑合约都必须继承上一个版本的存储变量。就像在继承存储模式中一样，未来的逻辑合约可以更新现有的方法，也可以创建新的方法和新的状态变量。 这个模式也使用了代理合约所有权的概念。只有代理合约的所有者可以更新逻辑合约的地址，也是唯一可以转移所有权的地址。 如何初始化 部署OwnedUpgradeabilityProxy实例 部署逻辑合约的初始版本(V1) 调用OwnedUpgradeabilityProxy实例来更新到初始版本的逻辑合约 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。OwnedUpgradeabilityProxy有一个upgradeToAndCall方法专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个新版本的逻辑合约(V2)，确保它继承了上一个版本里的状态变量结构。 调用ownedUpgradeabilityProxy实例来升级到新版本合约的地址。 tips 这个方法很棒，因为它不需要逻辑合约知道它是整个代理系统的一部分。 关于升级 重要：如果你的逻辑合约依赖自己的构造器来设置一些初始状态的话，这个过程在新版本的逻辑合约注册到代理中时需要重新做一遍。举个例子，逻辑合约继承Zeppelin中的Ownable合约，这很常见。当你的逻辑合约继承Ownable，它也就继承了Ownable的构造器，构造器会在合约创建的时候就设置合约的所有者是谁。当你让代理合约来使用你的逻辑合约的时候，代理合约是不知道逻辑合约的所有者是谁的。 升级代理合约的一种常见的模式就代理立即对逻辑合约调用一个初始化方法。这个初始化方法应该去模仿在构造器中做的一些事情。同时你也想要一个标识，用来确保你不可以再次对同一个逻辑合约调用初始化方法。（只能调用一次） 你的逻辑合约看上去可能像下面这样： contract Token is Ownable { ... bool internal _initialized; function initialize(address owner) public { require(!_initialized); setOwner(owner); _initialized = true; } ... } 当然这取决于你的部署策略，你可以写一个帮助部署的合约，或者你可以可以单独部署代理合约和逻辑合约。如果你单独部署的话，你需要使用upgradeToAndCall把代理合约链接到逻辑合约上，这看上去就会像下面这样： const initializeData = encodeCall(&#39;initialize&#39;, [&#39;address&#39;], [tokenOwner]) await proxy.upgradeToAndCall(logicContract.address, initializeData, { from: proxyOwner }) 结论 代理模式的概念已经出来有一段时间了，但是由于太复杂了、害怕引入安全漏洞以及绕过了区块链不可变的特性，它还没有被广泛接受。过去的解决方法在关于未来版本的逻辑合约可以添加和修改的东西上有严格的限制，这很不灵活。但是很显然，开发者对于可升级合约的需求很迫切。zeppelin提供并且测试了三种模式，他们致力于帮助开发者架构自己的项目，引入可升级特性。 尽管代理模式的概念出来也有段时间了，但是它的应用依然处在非常早期。很开心看到越来越多的高级DApp架构通过这种方式得以实现。 阅读更多" />
+<meta property="og:description" content="以太坊最大的优势就是，每一笔用来转账、部署合约或者和合约交互的交易（事务）都被存在一个叫做区块链的公共账本上。一旦交易发生，就再也无法隐藏或者改变。这带来一个巨大的好处，就是在以太坊中的每一个节点都可以去验证任意一笔交易的合法性和当前状态。这使得以太坊成为一个非常健壮的去中心化系统。 但是随之而来的是，它还有一个最大的缺点，就是智能合约一旦部署之后，就再也无法改变源码。开发中心化应用（比如facebook或者Airbnb）的开发者，都已经习惯了，为了修复bug或者引入新的特性而频繁更新产品。但这种方式却不适用以太坊。 还记得当面Parity多签名钱包被黑导致150000以太币被偷的恶劣事件吗？在整个攻击中，就因为钱包中的一个bug导致很多巨额钱包的资金被清空。而唯一的解决方案就是尝试以比黑客更快的速度，利用相同的漏洞攻击剩余的钱包，来把以太币重新分配给它们合法的所有者。 要是有一种方法可以在智能合约部署之后，还能对它们进行升级，那该多好… 引入代理模式 尽管想升级已经部署的智能合约中的代码是不可能的，但是可以通过设计一个代理合约结构，这个结构可以让你可以通过新部署一个合约的方式，来实现升级主要的处理逻辑的目的。 代理结构模式就像下面这张图一样：所有消息通过一个代理合约来间接调用最新部署的逻辑合约。如果想要升级的话，只需要部署一个新的合约，然后在代理合约中更新引用新的合约地址就可以了。 作为实现zeppelin_os的一部分，zeppelin正致力于实现集中代理模式。目前已经探索出来的有下面三个： 继承存储模式 Inherited Storage 永久存储模式 Eternal Storage 非结构化存储模式 Unstructured Storage 所有三种模式都依赖低阶的delegatecall。尽管solidity提供了一个delegatecall方法，但它只能返回true或者false来显示调用是否成功，而不是允许你操作返回的数据。 在我们深入了解之前，理解两个关键的概念很重要： 当调用一个合约中并不支持的的方法时，就会调用合约中的fallback方法。你可以自己写一个fallback函数来处理这种场景。代理合约就是用自定义的fallback方法将调用重定向到其他合约实现。 每当合约A授权对另一个合约B的调用时，它就会在合约A的上下文中执行合约B的代码。这就意味着msg.value和msg.sender的值会被保留。并且对存储的修改将会作用在合约A的存储上。 zeppelin的代理合约，为了可以返回调用逻辑合约后的结果，实现了自己的delegatecall方法，所有模式都是这样。如果你想要使用zeppelin的代理合约代码，你就要理解代码的每一个细节。让我们先来看看它是如何发挥作用的，以及理解为了达到目的它所使用的assembly操作码。 assembly { let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) let size := returndatasize returndatacopy(ptr, 0, size) switch result case 0 { revert(ptr, size) } default { return(ptr, size) } } 为了授权对另一个合约中方法的调用，我们需要把它赋值给proxy合约接收的msg.data。因为msg.data是bytes类型的，是一个动态的数据结构，所以它在msg.data的第一个字（word，也就是32个字节）中的存储长度会不一样。如果我们想要只取出真正的数据，我们需要跳过第一个字（word），从msg.data的0x20（32个字节）开始。然而，我们会用到两个操作码来实现此目的。我们会使用calldatasize来获取msg.data的大小，以及calldatacopy来把它复制到ptr所指向的位置。 注意到我们是如何初始化ptr变量的。在solidity中，内存槽中的0x40位置是和特殊的，因为它存储了指向下一个可用自由内存的指针。每次当你想往内存里存储一个变量时，你都要检查存储在0x40的值。这就是你变量即将存放的位置。现在我们知道了我们要在哪儿存变量，我们就可以使用calldatacopy，把大小为calldatasize的calldata从0开始啊复制到ptr指向的那个位置了。 let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) 我们再看看下面的assembly代码（使用delegatecall操作码） let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) 解释一下上面的参数： gas：函数执行所需的gas _impl：我们调用的逻辑合约的地址 ptr：内存指针（指向数据开始存储的地方） calldatasize：传入的数据大小 0：调用逻辑合约后的返回值。我们没有使用这个参数因为我们还不知道返回值的大小，所以不能把它赋值给一个变量。我们可以后面可以进一步使用returndata操作码来获取这些信息。 0：返回值的大小。这个参数也没有被使用因为我们没有机会创造一个临时变量用来存储返回值。鉴于我们在调用其他合约之前无法知道它的大小（所以就无法创造临时变量呀）。我们稍后可以用returndatasize操作码来得到这个值。 下面一行代码就是用returndatasize操作码得到了返回数据的大小： let size := returndatasize 我们使用这个返回值的大小，来把返回值复制到ptr指向的内存，使用returndatacopy来达到这个目的： returndatacopy(ptr, 0, size) 最后，switch语句要么返回 【返回值】，要么抛出错误，如果发生错误的话。 很好，我们现在有了一个从逻辑合约中获取正确结果的方法。 现在，我们理解了代理合约是如何工作的。下面就让我们正式学习三种模式：继承存储模式、永久存储模式和非结构化存储模式。 这三种方法用不同的方法来解决同一个难点：怎样确保逻辑合约不会重写/覆盖代理中的状态变量。 任何代理结构模式的主要问题就是如何分配存储。记住，既然我们使用一个合约来存储，另一个合约来实现逻辑，它们中的任何一个都有可能重写一个已经使用的存储槽。这意味着如果代理合约有一个状态变量在某个存储槽中存储着最新的逻辑合约地址，但是逻辑合约却不知道的话，那么逻辑合约可能就会在那个槽中存一些其他数据，这样就把代理合约中的重要信息覆盖了。zeppelin的这三种方法代表了架构合约系统的三种途径，实现通过代理模式升级合约的目的。 使用继承存储模式升级 继承存储方法要求逻辑合约内部也实现代理合约内的存储结构。代理合约和逻辑合约都要继承完全一样的存储结构，来确保二者都支持存储必要的代理合约的状态变量。 当探索这种模式时，我们有这样一个想法，我们想要有一个Registry合约来追踪不同版本的逻辑合约。 为了升级成新的逻辑合约，你需要为它在Registry里注册一个新的版本，并且要求代理合约中也升级成这个最新版本的逻辑合约。注意到有一个Registry合约并不影响存储机制，实际上，它可以应用到这篇文章中提到的任意一种存储模式中。 如何初始化 部署Registry合约 部署一个逻辑合约的最初版本(V1)，确保它继承了Upgradeable合约 向Registry合约中注册这个最初版本(V1)的地址 要求Registry合约创建一个UpgradeabilityProxy实例 调用你的UpgrageabilityProxy实例来升级到你最初版本(V1) 如何升级 部署一个继承了你最初版本合约的新版本(V2)，==确保它保留了代理合约和最初版本逻辑合约中的存储结构== 向Registry中注册合约的新版本 调用你的UpgradeabilityProxy实例来升级到最新注册的版本 tips 我们可以在未来部署的逻辑合约中升级现有方法、创造新的方法以及新的状态变量，但仍然调用同一个UpgradeabilityProxy合约。 使用永久存储模式升级 在永久存储模式中，存储模式用一个独立的合约（代理和逻辑合约都要继承这个合约）来定义。这个存储合约保留了所有逻辑合约需要的状态变量，因为代理合约也会知道这些变量的存在（因为继承），它就可以为升级定义自己的状态变量，不用考虑覆盖变量这些问题。注意到所有的版本的逻辑合约都不可以再定义任何额外的状态变量。所有版本的逻辑合约都必须一直使用一开始就定义好的永久存储架构。 这种应用在zeppelin labs项目中提供了实现，并且同时引入了代理所有权的概念。一个代理的所有者是唯一一个可以升级代理并指定一个新的逻辑合约的地址，也是唯一一个可以转移所有权的地址。 如何初始化 部署一个EternalStorageProxy实例 部署一个逻辑合约的最初版本(V1) 调用EternalStorageProxy实例来升级到这个最初版本合约的地址 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。EternalStorageProxy有一个叫upgradeToAndCall的函数专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个逻辑合约的最新版本(v2)，确保它也包含永久存储结构。 调用EternalStorageProxy实例来升级到最新版本。 tips 这是没有增加太多开销同时很直观的逻辑合约。 以后的逻辑合约可以升级现有的方法或者创造新的方法，但是不能引入新的状态变量。 使用非结构化存储升级 非结构化存储模式和继承存储类似，但是不要求逻辑合约继承任何和升级相关的状态变量。这个模式使用代理合约中定义的非结构化的存储槽来保存升级所需的数据。 在代理合约中，我们定义了一个常量，每当哈希的时候，就给出一个足够随机的存储位置来存储代理合约需要调用的逻辑合约的地址。 bytes32 private constant implementationPosition = keccak256(&quot;org.zeppelinos.proxy.implementation&quot;); 因为常量(恒定)状态变量并不占用存储槽，所以并不用担心implementationPosition会不小心被逻辑合约占用。鉴于solidity在存储中放置状态变量的方法，依然有非常非常非常小的概率可能发生要存储新变量的存储槽已经被占用了。 通过使用这种模式，任何版本的逻辑合约都不需要知道代理合约的存储结构，但是所有后一个版本的逻辑合约都必须继承上一个版本的存储变量。就像在继承存储模式中一样，未来的逻辑合约可以更新现有的方法，也可以创建新的方法和新的状态变量。 这个模式也使用了代理合约所有权的概念。只有代理合约的所有者可以更新逻辑合约的地址，也是唯一可以转移所有权的地址。 如何初始化 部署OwnedUpgradeabilityProxy实例 部署逻辑合约的初始版本(V1) 调用OwnedUpgradeabilityProxy实例来更新到初始版本的逻辑合约 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。OwnedUpgradeabilityProxy有一个upgradeToAndCall方法专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个新版本的逻辑合约(V2)，确保它继承了上一个版本里的状态变量结构。 调用ownedUpgradeabilityProxy实例来升级到新版本合约的地址。 tips 这个方法很棒，因为它不需要逻辑合约知道它是整个代理系统的一部分。 关于升级 重要：如果你的逻辑合约依赖自己的构造器来设置一些初始状态的话，这个过程在新版本的逻辑合约注册到代理中时需要重新做一遍。举个例子，逻辑合约继承Zeppelin中的Ownable合约，这很常见。当你的逻辑合约继承Ownable，它也就继承了Ownable的构造器，构造器会在合约创建的时候就设置合约的所有者是谁。当你让代理合约来使用你的逻辑合约的时候，代理合约是不知道逻辑合约的所有者是谁的。 升级代理合约的一种常见的模式就代理立即对逻辑合约调用一个初始化方法。这个初始化方法应该去模仿在构造器中做的一些事情。同时你也想要一个标识，用来确保你不可以再次对同一个逻辑合约调用初始化方法。（只能调用一次） 你的逻辑合约看上去可能像下面这样： contract Token is Ownable { ... bool internal _initialized; function initialize(address owner) public { require(!_initialized); setOwner(owner); _initialized = true; } ... } 当然这取决于你的部署策略，你可以写一个帮助部署的合约，或者你可以可以单独部署代理合约和逻辑合约。如果你单独部署的话，你需要使用upgradeToAndCall把代理合约链接到逻辑合约上，这看上去就会像下面这样： const initializeData = encodeCall(&#39;initialize&#39;, [&#39;address&#39;], [tokenOwner]) await proxy.upgradeToAndCall(logicContract.address, initializeData, { from: proxyOwner }) 结论 代理模式的概念已经出来有一段时间了，但是由于太复杂了、害怕引入安全漏洞以及绕过了区块链不可变的特性，它还没有被广泛接受。过去的解决方法在关于未来版本的逻辑合约可以添加和修改的东西上有严格的限制，这很不灵活。但是很显然，开发者对于可升级合约的需求很迫切。zeppelin提供并且测试了三种模式，他们致力于帮助开发者架构自己的项目，引入可升级特性。 尽管代理模式的概念出来也有段时间了，但是它的应用依然处在非常早期。很开心看到越来越多的高级DApp架构通过这种方式得以实现。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/23/18535b09a0b37526bd1cd948894af0ce.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/23/18535b09a0b37526bd1cd948894af0ce.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-23T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊最大的优势就是，每一笔用来转账、部署合约或者和合约交互的交易（事务）都被存在一个叫做区块链的公共账本上。一旦交易发生，就再也无法隐藏或者改变。这带来一个巨大的好处，就是在以太坊中的每一个节点都可以去验证任意一笔交易的合法性和当前状态。这使得以太坊成为一个非常健壮的去中心化系统。 但是随之而来的是，它还有一个最大的缺点，就是智能合约一旦部署之后，就再也无法改变源码。开发中心化应用（比如facebook或者Airbnb）的开发者，都已经习惯了，为了修复bug或者引入新的特性而频繁更新产品。但这种方式却不适用以太坊。 还记得当面Parity多签名钱包被黑导致150000以太币被偷的恶劣事件吗？在整个攻击中，就因为钱包中的一个bug导致很多巨额钱包的资金被清空。而唯一的解决方案就是尝试以比黑客更快的速度，利用相同的漏洞攻击剩余的钱包，来把以太币重新分配给它们合法的所有者。 要是有一种方法可以在智能合约部署之后，还能对它们进行升级，那该多好… 引入代理模式 尽管想升级已经部署的智能合约中的代码是不可能的，但是可以通过设计一个代理合约结构，这个结构可以让你可以通过新部署一个合约的方式，来实现升级主要的处理逻辑的目的。 代理结构模式就像下面这张图一样：所有消息通过一个代理合约来间接调用最新部署的逻辑合约。如果想要升级的话，只需要部署一个新的合约，然后在代理合约中更新引用新的合约地址就可以了。 作为实现zeppelin_os的一部分，zeppelin正致力于实现集中代理模式。目前已经探索出来的有下面三个： 继承存储模式 Inherited Storage 永久存储模式 Eternal Storage 非结构化存储模式 Unstructured Storage 所有三种模式都依赖低阶的delegatecall。尽管solidity提供了一个delegatecall方法，但它只能返回true或者false来显示调用是否成功，而不是允许你操作返回的数据。 在我们深入了解之前，理解两个关键的概念很重要： 当调用一个合约中并不支持的的方法时，就会调用合约中的fallback方法。你可以自己写一个fallback函数来处理这种场景。代理合约就是用自定义的fallback方法将调用重定向到其他合约实现。 每当合约A授权对另一个合约B的调用时，它就会在合约A的上下文中执行合约B的代码。这就意味着msg.value和msg.sender的值会被保留。并且对存储的修改将会作用在合约A的存储上。 zeppelin的代理合约，为了可以返回调用逻辑合约后的结果，实现了自己的delegatecall方法，所有模式都是这样。如果你想要使用zeppelin的代理合约代码，你就要理解代码的每一个细节。让我们先来看看它是如何发挥作用的，以及理解为了达到目的它所使用的assembly操作码。 assembly { let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) let size := returndatasize returndatacopy(ptr, 0, size) switch result case 0 { revert(ptr, size) } default { return(ptr, size) } } 为了授权对另一个合约中方法的调用，我们需要把它赋值给proxy合约接收的msg.data。因为msg.data是bytes类型的，是一个动态的数据结构，所以它在msg.data的第一个字（word，也就是32个字节）中的存储长度会不一样。如果我们想要只取出真正的数据，我们需要跳过第一个字（word），从msg.data的0x20（32个字节）开始。然而，我们会用到两个操作码来实现此目的。我们会使用calldatasize来获取msg.data的大小，以及calldatacopy来把它复制到ptr所指向的位置。 注意到我们是如何初始化ptr变量的。在solidity中，内存槽中的0x40位置是和特殊的，因为它存储了指向下一个可用自由内存的指针。每次当你想往内存里存储一个变量时，你都要检查存储在0x40的值。这就是你变量即将存放的位置。现在我们知道了我们要在哪儿存变量，我们就可以使用calldatacopy，把大小为calldatasize的calldata从0开始啊复制到ptr指向的那个位置了。 let ptr := mload(0x40) calldatacopy(ptr, 0, calldatasize) 我们再看看下面的assembly代码（使用delegatecall操作码） let result := delegatecall(gas, _impl, ptr, calldatasize, 0, 0) 解释一下上面的参数： gas：函数执行所需的gas _impl：我们调用的逻辑合约的地址 ptr：内存指针（指向数据开始存储的地方） calldatasize：传入的数据大小 0：调用逻辑合约后的返回值。我们没有使用这个参数因为我们还不知道返回值的大小，所以不能把它赋值给一个变量。我们可以后面可以进一步使用returndata操作码来获取这些信息。 0：返回值的大小。这个参数也没有被使用因为我们没有机会创造一个临时变量用来存储返回值。鉴于我们在调用其他合约之前无法知道它的大小（所以就无法创造临时变量呀）。我们稍后可以用returndatasize操作码来得到这个值。 下面一行代码就是用returndatasize操作码得到了返回数据的大小： let size := returndatasize 我们使用这个返回值的大小，来把返回值复制到ptr指向的内存，使用returndatacopy来达到这个目的： returndatacopy(ptr, 0, size) 最后，switch语句要么返回 【返回值】，要么抛出错误，如果发生错误的话。 很好，我们现在有了一个从逻辑合约中获取正确结果的方法。 现在，我们理解了代理合约是如何工作的。下面就让我们正式学习三种模式：继承存储模式、永久存储模式和非结构化存储模式。 这三种方法用不同的方法来解决同一个难点：怎样确保逻辑合约不会重写/覆盖代理中的状态变量。 任何代理结构模式的主要问题就是如何分配存储。记住，既然我们使用一个合约来存储，另一个合约来实现逻辑，它们中的任何一个都有可能重写一个已经使用的存储槽。这意味着如果代理合约有一个状态变量在某个存储槽中存储着最新的逻辑合约地址，但是逻辑合约却不知道的话，那么逻辑合约可能就会在那个槽中存一些其他数据，这样就把代理合约中的重要信息覆盖了。zeppelin的这三种方法代表了架构合约系统的三种途径，实现通过代理模式升级合约的目的。 使用继承存储模式升级 继承存储方法要求逻辑合约内部也实现代理合约内的存储结构。代理合约和逻辑合约都要继承完全一样的存储结构，来确保二者都支持存储必要的代理合约的状态变量。 当探索这种模式时，我们有这样一个想法，我们想要有一个Registry合约来追踪不同版本的逻辑合约。 为了升级成新的逻辑合约，你需要为它在Registry里注册一个新的版本，并且要求代理合约中也升级成这个最新版本的逻辑合约。注意到有一个Registry合约并不影响存储机制，实际上，它可以应用到这篇文章中提到的任意一种存储模式中。 如何初始化 部署Registry合约 部署一个逻辑合约的最初版本(V1)，确保它继承了Upgradeable合约 向Registry合约中注册这个最初版本(V1)的地址 要求Registry合约创建一个UpgradeabilityProxy实例 调用你的UpgrageabilityProxy实例来升级到你最初版本(V1) 如何升级 部署一个继承了你最初版本合约的新版本(V2)，==确保它保留了代理合约和最初版本逻辑合约中的存储结构== 向Registry中注册合约的新版本 调用你的UpgradeabilityProxy实例来升级到最新注册的版本 tips 我们可以在未来部署的逻辑合约中升级现有方法、创造新的方法以及新的状态变量，但仍然调用同一个UpgradeabilityProxy合约。 使用永久存储模式升级 在永久存储模式中，存储模式用一个独立的合约（代理和逻辑合约都要继承这个合约）来定义。这个存储合约保留了所有逻辑合约需要的状态变量，因为代理合约也会知道这些变量的存在（因为继承），它就可以为升级定义自己的状态变量，不用考虑覆盖变量这些问题。注意到所有的版本的逻辑合约都不可以再定义任何额外的状态变量。所有版本的逻辑合约都必须一直使用一开始就定义好的永久存储架构。 这种应用在zeppelin labs项目中提供了实现，并且同时引入了代理所有权的概念。一个代理的所有者是唯一一个可以升级代理并指定一个新的逻辑合约的地址，也是唯一一个可以转移所有权的地址。 如何初始化 部署一个EternalStorageProxy实例 部署一个逻辑合约的最初版本(V1) 调用EternalStorageProxy实例来升级到这个最初版本合约的地址 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。EternalStorageProxy有一个叫upgradeToAndCall的函数专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个逻辑合约的最新版本(v2)，确保它也包含永久存储结构。 调用EternalStorageProxy实例来升级到最新版本。 tips 这是没有增加太多开销同时很直观的逻辑合约。 以后的逻辑合约可以升级现有的方法或者创造新的方法，但是不能引入新的状态变量。 使用非结构化存储升级 非结构化存储模式和继承存储类似，但是不要求逻辑合约继承任何和升级相关的状态变量。这个模式使用代理合约中定义的非结构化的存储槽来保存升级所需的数据。 在代理合约中，我们定义了一个常量，每当哈希的时候，就给出一个足够随机的存储位置来存储代理合约需要调用的逻辑合约的地址。 bytes32 private constant implementationPosition = keccak256(&quot;org.zeppelinos.proxy.implementation&quot;); 因为常量(恒定)状态变量并不占用存储槽，所以并不用担心implementationPosition会不小心被逻辑合约占用。鉴于solidity在存储中放置状态变量的方法，依然有非常非常非常小的概率可能发生要存储新变量的存储槽已经被占用了。 通过使用这种模式，任何版本的逻辑合约都不需要知道代理合约的存储结构，但是所有后一个版本的逻辑合约都必须继承上一个版本的存储变量。就像在继承存储模式中一样，未来的逻辑合约可以更新现有的方法，也可以创建新的方法和新的状态变量。 这个模式也使用了代理合约所有权的概念。只有代理合约的所有者可以更新逻辑合约的地址，也是唯一可以转移所有权的地址。 如何初始化 部署OwnedUpgradeabilityProxy实例 部署逻辑合约的初始版本(V1) 调用OwnedUpgradeabilityProxy实例来更新到初始版本的逻辑合约 如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。OwnedUpgradeabilityProxy有一个upgradeToAndCall方法专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。 如何升级 部署一个新版本的逻辑合约(V2)，确保它继承了上一个版本里的状态变量结构。 调用ownedUpgradeabilityProxy实例来升级到新版本合约的地址。 tips 这个方法很棒，因为它不需要逻辑合约知道它是整个代理系统的一部分。 关于升级 重要：如果你的逻辑合约依赖自己的构造器来设置一些初始状态的话，这个过程在新版本的逻辑合约注册到代理中时需要重新做一遍。举个例子，逻辑合约继承Zeppelin中的Ownable合约，这很常见。当你的逻辑合约继承Ownable，它也就继承了Ownable的构造器，构造器会在合约创建的时候就设置合约的所有者是谁。当你让代理合约来使用你的逻辑合约的时候，代理合约是不知道逻辑合约的所有者是谁的。 升级代理合约的一种常见的模式就代理立即对逻辑合约调用一个初始化方法。这个初始化方法应该去模仿在构造器中做的一些事情。同时你也想要一个标识，用来确保你不可以再次对同一个逻辑合约调用初始化方法。（只能调用一次） 你的逻辑合约看上去可能像下面这样： contract Token is Ownable { ... bool internal _initialized; function initialize(address owner) public { require(!_initialized); setOwner(owner); _initialized = true; } ... } 当然这取决于你的部署策略，你可以写一个帮助部署的合约，或者你可以可以单独部署代理合约和逻辑合约。如果你单独部署的话，你需要使用upgradeToAndCall把代理合约链接到逻辑合约上，这看上去就会像下面这样： const initializeData = encodeCall(&#39;initialize&#39;, [&#39;address&#39;], [tokenOwner]) await proxy.upgradeToAndCall(logicContract.address, initializeData, { from: proxyOwner }) 结论 代理模式的概念已经出来有一段时间了，但是由于太复杂了、害怕引入安全漏洞以及绕过了区块链不可变的特性，它还没有被广泛接受。过去的解决方法在关于未来版本的逻辑合约可以添加和修改的东西上有严格的限制，这很不灵活。但是很显然，开发者对于可升级合约的需求很迫切。zeppelin提供并且测试了三种模式，他们致力于帮助开发者架构自己的项目，引入可升级特性。 尽管代理模式的概念出来也有段时间了，但是它的应用依然处在非常早期。很开心看到越来越多的高级DApp架构通过这种方式得以实现。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/23/18535b09a0b37526bd1cd948894af0ce.html","headline":"智能合约升级模式介绍 — 入门篇","dateModified":"2018-07-23T00:00:00+08:00","datePublished":"2018-07-23T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/23/18535b09a0b37526bd1cd948894af0ce.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>智能合约升级模式介绍 — 入门篇</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>以太坊最大的优势就是，每一笔用来转账、部署合约或者和合约交互的交易（事务）都被存在一个叫做区块链的公共账本上。一旦交易发生，就再也无法隐藏或者改变。这带来一个巨大的好处，就是在以太坊中的每一个节点都可以去验证任意一笔交易的合法性和当前状态。这使得以太坊成为一个非常健壮的去中心化系统。</p> 
+  <p>但是随之而来的是，它还有一个最大的缺点，就是智能合约一旦部署之后，就再也无法改变源码。开发中心化应用（比如facebook或者Airbnb）的开发者，都已经习惯了，为了修复bug或者引入新的特性而频繁更新产品。但这种方式却不适用以太坊。</p> 
+  <p>还记得当面Parity多签名钱包被黑导致150000以太币被偷的恶劣事件吗？在整个攻击中，就因为钱包中的一个bug导致很多巨额钱包的资金被清空。而唯一的解决方案就是尝试以比黑客更快的速度，利用相同的漏洞攻击剩余的钱包，来把以太币重新分配给它们合法的所有者。</p> 
+  <p>要是有一种方法可以在智能合约部署之后，还能对它们进行升级，那该多好…</p> 
+  <h3 id="引入代理模式">引入代理模式</h3> 
+  <p>尽管想升级已经部署的智能合约中的代码是不可能的，但是可以通过设计一个代理合约结构，这个结构可以让你可以通过新部署一个合约的方式，来实现升级主要的处理逻辑的目的。</p> 
+  <p>代理结构模式就像下面这张图一样：所有消息通过一个代理合约来间接调用最新部署的逻辑合约。如果想要升级的话，只需要部署一个新的合约，然后在代理合约中更新引用新的合约地址就可以了。</p> 
+  <p><img src="http://oojjnh6rf.bkt.clouddn.com/blog/2018-07-13-165659.jpg" alt="1Proxy0" title=""></p> 
+  <p>作为实现zeppelin_os的一部分，zeppelin正致力于实现集中代理模式。目前已经探索出来的有下面三个：</p> 
+  <ol> 
+   <li>继承存储模式 <code>Inherited Storage</code></li> 
+   <li>永久存储模式 <code>Eternal Storage</code></li> 
+   <li>非结构化存储模式 <code>Unstructured Storage</code></li> 
+  </ol> 
+  <p>所有三种模式都依赖低阶的delegatecall。尽管solidity提供了一个delegatecall方法，但它只能返回true或者false来显示调用是否成功，而不是允许你操作返回的数据。</p> 
+  <p>在我们深入了解之前，理解两个关键的概念很重要：</p> 
+  <ul> 
+   <li>当调用一个合约中并不支持的的方法时，就会调用合约中的fallback方法。你可以自己写一个fallback函数来处理这种场景。代理合约就是用自定义的fallback方法将调用重定向到其他合约实现。</li> 
+   <li>每当合约A授权对另一个合约B的调用时，它就会在合约A的上下文中执行合约B的代码。这就意味着<code>msg.value</code>和<code>msg.sender</code>的值会被保留。并且对存储的修改将会作用在合约A的存储上。</li> 
+  </ul> 
+  <p>zeppelin的代理合约，为了可以返回调用逻辑合约后的结果，实现了自己的delegatecall方法，所有模式都是这样。如果你想要使用zeppelin的代理合约代码，你就要理解代码的每一个细节。让我们先来看看它是如何发挥作用的，以及理解为了达到目的它所使用的assembly操作码。</p> 
+  <pre class="prettyprint"><code class="language-assembly hljs mel"> assembly {
+    let ptr := mload(<span class="hljs-number">0x40</span>)
+    calldatacopy(ptr, <span class="hljs-number">0</span>, calldatasize)
+    let result := delegatecall(gas, _impl, ptr, calldatasize, <span class="hljs-number">0</span>, <span class="hljs-number">0</span>)
+    let <span class="hljs-keyword">size</span> := returndatasize
+    returndatacopy(ptr, <span class="hljs-number">0</span>, <span class="hljs-keyword">size</span>)
+
+    <span class="hljs-keyword">switch</span> result
+    <span class="hljs-keyword">case</span> <span class="hljs-number">0</span> { revert(ptr, <span class="hljs-keyword">size</span>) }
+    <span class="hljs-keyword">default</span> { <span class="hljs-keyword">return</span>(ptr, <span class="hljs-keyword">size</span>) }
+ }</code></pre> 
+  <p>为了授权对另一个合约中方法的调用，我们需要把它赋值给proxy合约接收的<code>msg.data</code>。因为<code>msg.data</code>是<code>bytes</code>类型的，是一个动态的数据结构，所以它在<code>msg.data</code>的第一个字（<code>word</code>，也就是32个字节）中的存储长度会不一样。如果我们想要只取出真正的数据，我们需要跳过第一个字（<code>word</code>），从<code>msg.data</code>的<code>0x20</code>（32个字节）开始。然而，我们会用到两个操作码来实现此目的。我们会使用<code>calldatasize</code>来获取<code>msg.data</code>的大小，以及<code>calldatacopy</code>来把它复制到<code>ptr</code>所指向的位置。</p> 
+  <p>注意到我们是如何初始化<code>ptr</code>变量的。在solidity中，内存槽中的<code>0x40</code>位置是和特殊的，因为它存储了指向下一个可用自由内存的指针。每次当你想往内存里存储一个变量时，你都要检查存储在<code>0x40</code>的值。这就是你变量即将存放的位置。现在我们知道了我们要在哪儿存变量，我们就可以使用<code>calldatacopy</code>，把大小为<code>calldatasize</code>的calldata从0开始啊复制到<code>ptr</code>指向的那个位置了。</p> 
+  <pre class="prettyprint"><code class="language-assembly hljs erlang"><span class="hljs-keyword">let</span> ptr := mload(<span class="hljs-number">0</span>x40)
+<span class="hljs-function"><span class="hljs-title">calldatacopy</span><span class="hljs-params">(ptr, <span class="hljs-number">0</span>, calldatasize)</span></span></code></pre> 
+  <p>我们再看看下面的assembly代码（使用<code>delegatecall</code>操作码）</p> 
+  <pre class="prettyprint"><code class="language-assembly hljs bash"><span class="hljs-built_in">let</span> result := delegatecall(gas, _impl,  ptr, calldatasize, <span class="hljs-number">0</span>, <span class="hljs-number">0</span>)</code></pre> 
+  <p>解释一下上面的参数：</p> 
+  <ul> 
+   <li><code>gas</code>：函数执行所需的gas</li> 
+   <li><code>_impl</code>：我们调用的逻辑合约的地址</li> 
+   <li><code>ptr</code>：内存指针（指向数据开始存储的地方）</li> 
+   <li><code>calldatasize</code>：传入的数据大小</li> 
+   <li><code>0</code>：调用逻辑合约后的返回值。我们没有使用这个参数因为我们还不知道返回值的大小，所以不能把它赋值给一个变量。我们可以后面可以进一步使用<code>returndata</code>操作码来获取这些信息。</li> 
+   <li><code>0</code>：返回值的大小。这个参数也没有被使用因为我们没有机会创造一个临时变量用来存储返回值。鉴于我们在调用其他合约之前无法知道它的大小（所以就无法创造临时变量呀）。我们稍后可以用<code>returndatasize</code>操作码来得到这个值。</li> 
+  </ul> 
+  <p>下面一行代码就是用<code>returndatasize</code>操作码得到了返回数据的大小：</p> 
+  <pre class="prettyprint"><code class="language-assembly hljs bash"><span class="hljs-built_in">let</span> size := returndatasize</code></pre> 
+  <p>我们使用这个返回值的大小，来把返回值复制到<code>ptr</code>指向的内存，使用<code>returndatacopy</code>来达到这个目的：</p> 
+  <pre class="prettyprint"><code class="language-assembly hljs erlang"><span class="hljs-function"><span class="hljs-title">returndatacopy</span><span class="hljs-params">(ptr, <span class="hljs-number">0</span>, size)</span></span></code></pre> 
+  <p>最后，<code>switch</code>语句要么返回 【返回值】，要么抛出错误，如果发生错误的话。</p> 
+  <p><img src="http://oojjnh6rf.bkt.clouddn.com/blog/2018-07-13-165657.jpg" alt="storage_proxy" title=""></p> 
+  <p>很好，我们现在有了一个从逻辑合约中获取正确结果的方法。</p> 
+  <p>现在，我们理解了代理合约是如何工作的。下面就让我们正式学习三种模式：继承存储模式、永久存储模式和非结构化存储模式。</p> 
+  <p>这三种方法用不同的方法来解决同一个难点：怎样确保逻辑合约不会重写/覆盖代理中的状态变量。</p> 
+  <p>任何代理结构模式的主要问题就是如何分配存储。记住，既然我们使用一个合约来存储，另一个合约来实现逻辑，它们中的任何一个都有可能重写一个已经使用的存储槽。这意味着如果代理合约有一个状态变量在某个存储槽中存储着最新的逻辑合约地址，但是逻辑合约却不知道的话，那么逻辑合约可能就会在那个槽中存一些其他数据，这样就把代理合约中的重要信息覆盖了。zeppelin的这三种方法代表了架构合约系统的三种途径，实现通过代理模式升级合约的目的。</p> 
+  <h3 id="使用继承存储模式升级">使用继承存储模式升级</h3> 
+  <p><strong>继承存储方法要求逻辑合约内部也实现代理合约内的存储结构。代理合约和逻辑合约都要继承完全一样的存储结构，来确保二者都支持存储必要的代理合约的状态变量</strong>。</p> 
+  <p>当探索这种模式时，我们有这样一个想法，我们想要有一个<code>Registry</code>合约来追踪不同版本的逻辑合约。 为了升级成新的逻辑合约，你需要为它在<code>Registry</code>里注册一个新的版本，并且要求代理合约中也升级成这个最新版本的逻辑合约。注意到有一个<code>Registry</code>合约并不影响存储机制，实际上，它可以应用到这篇文章中提到的任意一种存储模式中。</p> 
+  <p><img src="http://oojjnh6rf.bkt.clouddn.com/blog/2018-07-13-165653.jpg" alt="inherit_storage" title=""></p> 
+  <h4 id="如何初始化"><strong><em>如何初始化</em></strong></h4> 
+  <ol> 
+   <li>部署<code>Registry</code>合约</li> 
+   <li>部署一个逻辑合约的最初版本(V1)，确保它继承了<code>Upgradeable</code>合约</li> 
+   <li>向<code>Registry</code>合约中注册这个最初版本(V1)的地址</li> 
+   <li>要求<code>Registry</code>合约创建一个<code>UpgradeabilityProxy</code>实例</li> 
+   <li>调用你的<code>UpgrageabilityProxy</code>实例来升级到你最初版本(V1)</li> 
+  </ol> 
+  <h4 id="如何升级"><strong><em>如何升级</em></strong></h4> 
+  <ol> 
+   <li>部署一个继承了你最初版本合约的新版本(V2)，==确保它保留了代理合约和最初版本逻辑合约中的存储结构==</li> 
+   <li>向<code>Registry</code>中注册合约的新版本</li> 
+   <li>调用你的<code>UpgradeabilityProxy</code>实例来升级到最新注册的版本</li> 
+  </ol> 
+  <h4 id="tips"><strong><em>tips</em></strong></h4> 
+  <p>我们可以在未来部署的逻辑合约中升级现有方法、创造新的方法以及新的状态变量，但仍然调用同一个<code>UpgradeabilityProxy</code>合约。</p> 
+  <h3 id="使用永久存储模式升级">使用永久存储模式升级</h3> 
+  <p>在永久存储模式中，存储模式用一个独立的合约（代理和逻辑合约都要继承这个合约）来定义。这个存储合约保留了所有逻辑合约需要的状态变量，因为代理合约也会知道这些变量的存在（因为继承），它就可以为升级定义自己的状态变量，不用考虑覆盖变量这些问题。<strong><em>注意到所有的版本的逻辑合约都不可以再定义任何额外的状态变量。</em></strong>所有版本的逻辑合约都必须一直使用一开始就定义好的永久存储架构。</p> 
+  <p>这种应用在zeppelin labs项目中提供了实现，并且同时引入了代理所有权的概念。一个代理的所有者是唯一一个可以升级代理并指定一个新的逻辑合约的地址，也是唯一一个可以转移所有权的地址。</p> 
+  <p><img src="http://oojjnh6rf.bkt.clouddn.com/blog/2018-07-13-165701.jpg" alt="eternal_storage" title=""></p> 
+  <h4 id="如何初始化-1"><strong><em>如何初始化</em></strong></h4> 
+  <ol> 
+   <li>部署一个<code>EternalStorageProxy</code>实例</li> 
+   <li>部署一个逻辑合约的最初版本(V1)</li> 
+   <li>调用<code>EternalStorageProxy</code>实例来升级到这个最初版本合约的地址</li> 
+   <li>如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。<code>EternalStorageProxy</code>有一个叫<code>upgradeToAndCall</code>的函数专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。</li> 
+  </ol> 
+  <h4 id="如何升级-1"><strong><em>如何升级</em></strong></h4> 
+  <ol> 
+   <li>部署一个逻辑合约的最新版本(v2)，确保它也包含永久存储结构。</li> 
+   <li>调用<code>EternalStorageProxy</code>实例来升级到最新版本。</li> 
+  </ol> 
+  <h4 id="tips-1"><strong><em>tips</em></strong></h4> 
+  <p>这是没有增加太多开销同时很直观的逻辑合约。 以后的逻辑合约可以升级现有的方法或者创造新的方法，但是不能引入新的状态变量。</p> 
+  <h3 id="使用非结构化存储升级">使用非结构化存储升级</h3> 
+  <p><strong>非结构化存储模式和继承存储类似，但是不要求逻辑合约继承任何和升级相关的状态变量。这个模式使用代理合约中定义的非结构化的存储槽来保存升级所需的数据。</strong></p> 
+  <p>在代理合约中，我们定义了一个常量，每当哈希的时候，就给出一个足够随机的存储位置来存储代理合约需要调用的逻辑合约的地址。</p> 
+  <pre class="prettyprint"><code class="language-js hljs ">bytes32 private constant implementationPosition = 
+                     keccak256(<span class="hljs-string">"org.zeppelinos.proxy.implementation"</span>);</code></pre> 
+  <p>因为常量(恒定)状态变量并不占用存储槽，所以并不用担心<code>implementationPosition</code>会不小心被逻辑合约占用。鉴于solidity在存储中放置状态变量的方法，依然有非常非常非常小的概率可能发生要存储新变量的存储槽已经被占用了。</p> 
+  <p>通过使用这种模式，任何版本的逻辑合约都不需要知道代理合约的存储结构，但是所有后一个版本的逻辑合约都必须继承上一个版本的存储变量。就像在继承存储模式中一样，未来的逻辑合约可以更新现有的方法，也可以创建新的方法和新的状态变量。</p> 
+  <p>这个模式也使用了代理合约所有权的概念。只有代理合约的所有者可以更新逻辑合约的地址，也是唯一可以转移所有权的地址。</p> 
+  <p><img src="http://oojjnh6rf.bkt.clouddn.com/blog/2018-07-23-060040.jpg" alt="unstructured_storage" title=""></p> 
+  <h4 id="如何初始化-2"><strong><em>如何初始化</em></strong></h4> 
+  <ol> 
+   <li>部署<code>OwnedUpgradeabilityProxy</code>实例</li> 
+   <li>部署逻辑合约的初始版本(V1)</li> 
+   <li>调用<code>OwnedUpgradeabilityProxy</code>实例来更新到初始版本的逻辑合约</li> 
+   <li>如果你的逻辑合约依赖自己的构造函数(constructor)来设置某个初始状态，那么在它和代理合约产生联系之后，之前的这些状态就要重新修改，因为代理合约的存储并不知道(逻辑合约里的)这些值。<code>OwnedUpgradeabilityProxy</code>有一个<code>upgradeToAndCall</code>方法专门来调用一些逻辑合约中的方法，一旦代理合约升级到最新版本时，就把连接到的那个逻辑合约里的初始设置重新设置一遍。</li> 
+  </ol> 
+  <h4 id="如何升级-2"><strong><em>如何升级</em></strong></h4> 
+  <ol> 
+   <li>部署一个新版本的逻辑合约(V2)，确保它继承了上一个版本里的状态变量结构。</li> 
+   <li>调用<code>ownedUpgradeabilityProxy</code>实例来升级到新版本合约的地址。</li> 
+  </ol> 
+  <h4 id="tips-2"><strong><em>tips</em></strong></h4> 
+  <p>这个方法很棒，因为它不需要逻辑合约知道它是整个代理系统的一部分。</p> 
+  <h3 id="关于升级">关于升级</h3> 
+  <p>重要：如果你的逻辑合约依赖自己的构造器来设置一些初始状态的话，这个过程在新版本的逻辑合约注册到代理中时需要重新做一遍。举个例子，逻辑合约继承Zeppelin中的<code>Ownable</code>合约，这很常见。当你的逻辑合约继承<code>Ownable</code>，它也就继承了<code>Ownable</code>的构造器，构造器会在合约创建的时候就设置合约的所有者是谁。当你让代理合约来使用你的逻辑合约的时候，代理合约是不知道逻辑合约的所有者是谁的。</p> 
+  <p>升级代理合约的一种常见的模式就代理立即对逻辑合约调用一个初始化方法。这个初始化方法应该去模仿在构造器中做的一些事情。同时你也想要一个标识，用来确保你不可以再次对同一个逻辑合约调用初始化方法。（只能调用一次）</p> 
+  <p>你的逻辑合约看上去可能像下面这样：</p> 
+  <pre class="prettyprint"><code class="language-js hljs ">contract Token is Ownable {
+   ...
+   bool internal _initialized;
+
+   <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initialize</span><span class="hljs-params">(address owner)</span> <span class="hljs-title">public</span> {</span>
+      <span class="hljs-built_in">require</span>(!_initialized);
+      setOwner(owner);
+      _initialized = <span class="hljs-literal">true</span>;
+   }
+   ...
+}</code></pre> 
+  <p>当然这取决于你的部署策略，你可以写一个帮助部署的合约，或者你可以可以单独部署代理合约和逻辑合约。如果你单独部署的话，你需要使用<code>upgradeToAndCall</code>把代理合约链接到逻辑合约上，这看上去就会像下面这样：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-keyword">const</span> initializeData = encodeCall(<span class="hljs-string">'initialize'</span>, [<span class="hljs-string">'address'</span>], [tokenOwner])
+await proxy.upgradeToAndCall(logicContract.address, initializeData, { from: proxyOwner })</code></pre> 
+  <h3 id="结论">结论</h3> 
+  <p>代理模式的概念已经出来有一段时间了，但是由于太复杂了、害怕引入安全漏洞以及绕过了区块链不可变的特性，它还没有被广泛接受。过去的解决方法在关于未来版本的逻辑合约可以添加和修改的东西上有严格的限制，这很不灵活。但是很显然，开发者对于可升级合约的需求很迫切。zeppelin提供并且测试了三种模式，他们致力于帮助开发者架构自己的项目，引入可升级特性。</p> 
+  <p>尽管代理模式的概念出来也有段时间了，但是它的应用依然处在非常早期。很开心看到越来越多的高级DApp架构通过这种方式得以实现。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_38746124/article/details/81166737,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_38746124/article/details/81166737,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

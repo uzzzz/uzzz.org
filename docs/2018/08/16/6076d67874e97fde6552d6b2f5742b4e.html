@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>探索比特币源码6-公钥 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="探索比特币源码6-公钥" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="继续源码的阅读，本文将对比特币源码中的公钥相关部分进行梳理。 在阅读代码前，先明确一个概念：公钥是如何定义和产生的？ 公钥如何产生 我们已经知道，比特币的私钥就是一个256位二进制数字。 通过椭圆曲线乘法可以很容易的从私钥计算得到公钥，这是不可逆转的过程： K = k * G 其中k是私钥，G是被称为生成点的常数点(xG,yG)，而K是所得公钥。 比特币系统所使用的椭圆曲线叫做secp256k1，具体参数如下： p = 0xffffffff ffffffff ffffffff ffffffff ffffffff ffffffff fffffffe fffffc2f a = 0 b = 7 xG = 0x79be667e f9dcbbac 55a06295 ce870b07 029bfcdb 2dce28d9 59f2815b 16f81798 yG = 0x483ada77 26a3c465 5da4fbfc 0e1108a8 fd17b448 a6855419 9c47d08f fb10d4b8 n = 0xffffffff ffffffff ffffffff fffffffe baaedce6 af48a03b bfd25e8c d0364141 h = 1 通过椭圆曲线乘法得到的公钥K是二维离散域内的一个点（x，y） 因此公钥K包含两个256bit的二进制数，分别对应其x和y坐标。 需要注意的是，由同一个私钥生成的公钥是唯一的，但是同一个公钥可以有两种不同的格式： 压缩格式和非压缩格式（这是由于y可以由x推导出，于是公钥同时存储x和y就浪费了一半的空间，因此有了压缩格式的公钥） 而两种格式后续将会得到两个不同的比特币地址，但任何一个都是合法的。 为了标识公钥使用的哪种格式，需要前缀进行标识。 04用于标识非压缩格式 02或03用于标识压缩格式，y为奇数用03,y为偶数用02 以这样一个公钥为例，其坐标x和y如下： x = F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A y = 07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE52DDFE2E505BDB 如果用非压缩格式表达，是一个520比特的数字（8+256+256）。这个520比特的数字以前缀04开头，紧接着是x及y坐标，组成格式为04 x y： K = 04F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE 52DDFE2E505BDB 如果用压缩格式表达，是一个264比特数字（8+256），其中前缀03表示y坐标是一个奇数： K = 03F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A 代码阅读 公钥的相关源码位于pubkey.h和pubkey.cpp中 pubkey.h的源码如下： // Copyright (c) 2009-2010 Satoshi Nakamoto // Copyright (c) 2009-2018 The Bitcoin Core developers // Copyright (c) 2017 The Zcash developers // Distributed under the MIT software license, see the accompanying // file COPYING or http://www.opensource.org/licenses/mit-license.php. #ifndef BITCOIN_PUBKEY_H #define BITCOIN_PUBKEY_H #include &lt;hash.h&gt; #include &lt;serialize.h&gt; #include &lt;uint256.h&gt; #include &lt;stdexcept&gt; #include &lt;vector&gt; const unsigned int BIP32_EXTKEY_SIZE = 74; // 按照上一篇的分析，这应该是HD wallet使用的公钥的大小 /** * A reference to a CKey: the Hash160 of its serialized public key * CKeyID用来作为一个CPubKey公钥实例的ID，用公钥的Hash160(SHA-256 + RIPEMD-160)作为唯一引用ID * 因此CKeyID继承自定义类型uint160，本质就是一个160bit的hash二进制数组 * 通过实现来看，CKeyID = RIPEMD-160(SHA-256(publicKey)) * 因此CKeyID其实就是未经 Base58 Check 编码的比特币地址 */ class CKeyID : public uint160 { public: CKeyID() : uint160() {} explicit CKeyID(const uint160&amp; in) : uint160(in) {} }; typedef uint256 ChainCode; // CExtPubKey中的成员变量 /** 封装的公钥. */ class CPubKey { public: /** * secp256k1: */ static constexpr unsigned int PUBLIC_KEY_SIZE = 65; // 非压缩格式公钥的大小（65byte = 520bit） static constexpr unsigned int COMPRESSED_PUBLIC_KEY_SIZE = 33; // 压缩格式公钥的大小（33byte = 264bit） static constexpr unsigned int SIGNATURE_SIZE = 72; static constexpr unsigned int COMPACT_SIGNATURE_SIZE = 65; /** * see www.keylength.com * script supports up to 75 for single byte push */ static_assert( PUBLIC_KEY_SIZE &gt;= COMPRESSED_PUBLIC_KEY_SIZE, &quot;COMPRESSED_PUBLIC_KEY_SIZE is larger than PUBLIC_KEY_SIZE&quot;); private: /** * Just store the serialized data. 公钥数据 * Its length can very cheaply be computed from the first byte. * 由于第一个字节代表前缀，公钥的长度可以通过前缀轻松的得到 */ unsigned char vch[PUBLIC_KEY_SIZE]; //! Compute the length of a pubkey with a given first byte. // 通过一个字节（前缀）得到公钥的长度 // 函数私有，程序应时刻维护前缀与实际数据相对应。 unsigned int static GetLen(unsigned char chHeader) { if (chHeader == 2 || chHeader == 3) // 2或3代表压缩格式公钥，2代表y为偶数，3代表y为奇数 return COMPRESSED_PUBLIC_KEY_SIZE; if (chHeader == 4 || chHeader == 6 || chHeader == 7) // 4代表非压缩公钥，6和7？？？ return PUBLIC_KEY_SIZE; return 0; } //! Set this key data to be invalid 使用0xFF前缀标识公钥无效 void Invalidate() { vch[0] = 0xFF; } public: // 验证一个vector&lt;unsigned char&gt;数组的大小是否满足公钥的要求 bool static ValidSize(const std::vector&lt;unsigned char&gt; &amp;vch) { return vch.size() &gt; 0 &amp;&amp; GetLen(vch[0]) == vch.size(); } //! Construct an invalid public key. // 初始化一个空的公钥，状态为无效，需要使用Set函数赋值vch CPubKey() { Invalidate(); } //! Initialize a public key using begin/end iterators to byte data. // 初始化公钥数据vsh的函数，通过迭代器 begin/end 的方式 template &lt;typename T&gt; void Set(const T pbegin, const T pend) { int len = pend == pbegin ? 0 : GetLen(pbegin[0]); if (len &amp;&amp; len == (pend - pbegin)) memcpy(vch, (unsigned char*)&amp;pbegin[0], len); else Invalidate(); // 公钥无效（提供数据长度为0 或 数据长度与前缀不一致） } //! Construct a public key using begin/end iterators to byte data. template &lt;typename T&gt; CPubKey(const T pbegin, const T pend) { Set(pbegin, pend); } //! Construct a public key from a byte vector. // 直接用vector&lt;unsigned char&gt;构造 explicit CPubKey(const std::vector&lt;unsigned char&gt;&amp; _vch) { Set(_vch.begin(), _vch.end()); } //! Simple read-only vector-like interface to the pubkey data. // 获取公钥数据的一些只读的接口 unsigned int size() const { return GetLen(vch[0]); } const unsigned char* data() const { return vch; } const unsigned char* begin() const { return vch; } const unsigned char* end() const { return vch + size(); } const unsigned char&amp; operator[](unsigned int pos) const { return vch[pos]; } //! Comparator implementation. 比较两个CPubKey // vch是私有成员，因此定义为友元 friend bool operator==(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) == 0; } friend bool operator!=(const CPubKey&amp; a, const CPubKey&amp; b) { return !(a == b); } // 比较两个公钥可以理解，为什么要比较大小？？？ friend bool operator&lt;(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] &lt; b.vch[0] || (a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) &lt; 0); } //! Implement serialization, as if this was a byte vector. template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = size(); ::WriteCompactSize(s, len); // 函数定义于serialize.h s.write((char*)vch, len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); // 函数定义于serialize.h if (len &lt;= PUBLIC_KEY_SIZE) { s.read((char*)vch, len); // 读取Stream中的数据 } else { // invalid pubkey, skip available data（将Stream中的数据丢弃） char dummy; while (len--) s.read(&amp;dummy, 1); Invalidate(); } } //! Get the KeyID of this public key (hash of its serialization) // 获得公钥数据的Hash160(SHA-256 + RIPEMD-160)作为ID // 由此看来，CKeyID其实就是公钥对应的未经Base58校验编码的比特币地址 CKeyID GetID() const { return CKeyID(Hash160(vch, vch + size())); // Hash160函数定义于hash.h中 } //! Get the 256-bit hash of this public key. uint256 GetHash() const { return Hash(vch, vch + size()); } /* * Check syntactic correctness. 检查公钥是否有效 * IsValid()仅仅按照协议查看前缀，只要不是0xFF，说明有效 * Note that this is consensus critical as CheckSig() calls it! */ bool IsValid() const { return size() &gt; 0; } //! fully validate whether this is a valid public key (more expensive than IsValid()) // 完全验证这是否是有效的公钥 // IsFullyValid()比IsValid()的验证更彻底，进行数学上的验证。 bool IsFullyValid() const; //! Check whether this is a compressed public key. // 本质是检查第一个字节的标识符 bool IsCompressed() const { return size() == COMPRESSED_PUBLIC_KEY_SIZE; } /** * Verify a DER signature (~72 bytes). * If this public key is not fully valid, the return value will be false. */ bool Verify(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig) const; /** * Check whether a signature is normalized (lower-S). */ static bool CheckLowS(const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Recover a public key from a compact signature. bool RecoverCompact(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Turn this public key into an uncompressed public key. bool Decompress(); //! Derive BIP32 child pubkey. bool Derive(CPubKey&amp; pubkeyChild, ChainCode &amp;ccChild, unsigned int nChild, const ChainCode&amp; cc) const; }; struct CExtPubKey { unsigned char nDepth; unsigned char vchFingerprint[4]; unsigned int nChild; ChainCode chaincode; CPubKey pubkey; friend bool operator==(const CExtPubKey &amp;a, const CExtPubKey &amp;b) { return a.nDepth == b.nDepth &amp;&amp; memcmp(&amp;a.vchFingerprint[0], &amp;b.vchFingerprint[0], sizeof(vchFingerprint)) == 0 &amp;&amp; a.nChild == b.nChild &amp;&amp; a.chaincode == b.chaincode &amp;&amp; a.pubkey == b.pubkey; } void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const; void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]); bool Derive(CExtPubKey&amp; out, unsigned int nChild) const; void Serialize(CSizeComputer&amp; s) const { // Optimized implementation for ::GetSerializeSize that avoids copying. s.seek(BIP32_EXTKEY_SIZE + 1); // add one byte for the size (compact int) } template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = BIP32_EXTKEY_SIZE; ::WriteCompactSize(s, len); unsigned char code[BIP32_EXTKEY_SIZE]; Encode(code); s.write((const char *)&amp;code[0], len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); unsigned char code[BIP32_EXTKEY_SIZE]; if (len != BIP32_EXTKEY_SIZE) throw std::runtime_error(&quot;Invalid extended key size\n&quot;); s.read((char *)&amp;code[0], len); Decode(code); } }; /** Users of this module must hold an ECCVerifyHandle. The constructor and * destructor of these are not allowed to run in parallel, though. */ class ECCVerifyHandle { static int refcount; public: ECCVerifyHandle(); ~ECCVerifyHandle(); }; #endif // BITCOIN_PUBKEY_H 阅读更多" />
+<meta property="og:description" content="继续源码的阅读，本文将对比特币源码中的公钥相关部分进行梳理。 在阅读代码前，先明确一个概念：公钥是如何定义和产生的？ 公钥如何产生 我们已经知道，比特币的私钥就是一个256位二进制数字。 通过椭圆曲线乘法可以很容易的从私钥计算得到公钥，这是不可逆转的过程： K = k * G 其中k是私钥，G是被称为生成点的常数点(xG,yG)，而K是所得公钥。 比特币系统所使用的椭圆曲线叫做secp256k1，具体参数如下： p = 0xffffffff ffffffff ffffffff ffffffff ffffffff ffffffff fffffffe fffffc2f a = 0 b = 7 xG = 0x79be667e f9dcbbac 55a06295 ce870b07 029bfcdb 2dce28d9 59f2815b 16f81798 yG = 0x483ada77 26a3c465 5da4fbfc 0e1108a8 fd17b448 a6855419 9c47d08f fb10d4b8 n = 0xffffffff ffffffff ffffffff fffffffe baaedce6 af48a03b bfd25e8c d0364141 h = 1 通过椭圆曲线乘法得到的公钥K是二维离散域内的一个点（x，y） 因此公钥K包含两个256bit的二进制数，分别对应其x和y坐标。 需要注意的是，由同一个私钥生成的公钥是唯一的，但是同一个公钥可以有两种不同的格式： 压缩格式和非压缩格式（这是由于y可以由x推导出，于是公钥同时存储x和y就浪费了一半的空间，因此有了压缩格式的公钥） 而两种格式后续将会得到两个不同的比特币地址，但任何一个都是合法的。 为了标识公钥使用的哪种格式，需要前缀进行标识。 04用于标识非压缩格式 02或03用于标识压缩格式，y为奇数用03,y为偶数用02 以这样一个公钥为例，其坐标x和y如下： x = F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A y = 07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE52DDFE2E505BDB 如果用非压缩格式表达，是一个520比特的数字（8+256+256）。这个520比特的数字以前缀04开头，紧接着是x及y坐标，组成格式为04 x y： K = 04F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE 52DDFE2E505BDB 如果用压缩格式表达，是一个264比特数字（8+256），其中前缀03表示y坐标是一个奇数： K = 03F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A 代码阅读 公钥的相关源码位于pubkey.h和pubkey.cpp中 pubkey.h的源码如下： // Copyright (c) 2009-2010 Satoshi Nakamoto // Copyright (c) 2009-2018 The Bitcoin Core developers // Copyright (c) 2017 The Zcash developers // Distributed under the MIT software license, see the accompanying // file COPYING or http://www.opensource.org/licenses/mit-license.php. #ifndef BITCOIN_PUBKEY_H #define BITCOIN_PUBKEY_H #include &lt;hash.h&gt; #include &lt;serialize.h&gt; #include &lt;uint256.h&gt; #include &lt;stdexcept&gt; #include &lt;vector&gt; const unsigned int BIP32_EXTKEY_SIZE = 74; // 按照上一篇的分析，这应该是HD wallet使用的公钥的大小 /** * A reference to a CKey: the Hash160 of its serialized public key * CKeyID用来作为一个CPubKey公钥实例的ID，用公钥的Hash160(SHA-256 + RIPEMD-160)作为唯一引用ID * 因此CKeyID继承自定义类型uint160，本质就是一个160bit的hash二进制数组 * 通过实现来看，CKeyID = RIPEMD-160(SHA-256(publicKey)) * 因此CKeyID其实就是未经 Base58 Check 编码的比特币地址 */ class CKeyID : public uint160 { public: CKeyID() : uint160() {} explicit CKeyID(const uint160&amp; in) : uint160(in) {} }; typedef uint256 ChainCode; // CExtPubKey中的成员变量 /** 封装的公钥. */ class CPubKey { public: /** * secp256k1: */ static constexpr unsigned int PUBLIC_KEY_SIZE = 65; // 非压缩格式公钥的大小（65byte = 520bit） static constexpr unsigned int COMPRESSED_PUBLIC_KEY_SIZE = 33; // 压缩格式公钥的大小（33byte = 264bit） static constexpr unsigned int SIGNATURE_SIZE = 72; static constexpr unsigned int COMPACT_SIGNATURE_SIZE = 65; /** * see www.keylength.com * script supports up to 75 for single byte push */ static_assert( PUBLIC_KEY_SIZE &gt;= COMPRESSED_PUBLIC_KEY_SIZE, &quot;COMPRESSED_PUBLIC_KEY_SIZE is larger than PUBLIC_KEY_SIZE&quot;); private: /** * Just store the serialized data. 公钥数据 * Its length can very cheaply be computed from the first byte. * 由于第一个字节代表前缀，公钥的长度可以通过前缀轻松的得到 */ unsigned char vch[PUBLIC_KEY_SIZE]; //! Compute the length of a pubkey with a given first byte. // 通过一个字节（前缀）得到公钥的长度 // 函数私有，程序应时刻维护前缀与实际数据相对应。 unsigned int static GetLen(unsigned char chHeader) { if (chHeader == 2 || chHeader == 3) // 2或3代表压缩格式公钥，2代表y为偶数，3代表y为奇数 return COMPRESSED_PUBLIC_KEY_SIZE; if (chHeader == 4 || chHeader == 6 || chHeader == 7) // 4代表非压缩公钥，6和7？？？ return PUBLIC_KEY_SIZE; return 0; } //! Set this key data to be invalid 使用0xFF前缀标识公钥无效 void Invalidate() { vch[0] = 0xFF; } public: // 验证一个vector&lt;unsigned char&gt;数组的大小是否满足公钥的要求 bool static ValidSize(const std::vector&lt;unsigned char&gt; &amp;vch) { return vch.size() &gt; 0 &amp;&amp; GetLen(vch[0]) == vch.size(); } //! Construct an invalid public key. // 初始化一个空的公钥，状态为无效，需要使用Set函数赋值vch CPubKey() { Invalidate(); } //! Initialize a public key using begin/end iterators to byte data. // 初始化公钥数据vsh的函数，通过迭代器 begin/end 的方式 template &lt;typename T&gt; void Set(const T pbegin, const T pend) { int len = pend == pbegin ? 0 : GetLen(pbegin[0]); if (len &amp;&amp; len == (pend - pbegin)) memcpy(vch, (unsigned char*)&amp;pbegin[0], len); else Invalidate(); // 公钥无效（提供数据长度为0 或 数据长度与前缀不一致） } //! Construct a public key using begin/end iterators to byte data. template &lt;typename T&gt; CPubKey(const T pbegin, const T pend) { Set(pbegin, pend); } //! Construct a public key from a byte vector. // 直接用vector&lt;unsigned char&gt;构造 explicit CPubKey(const std::vector&lt;unsigned char&gt;&amp; _vch) { Set(_vch.begin(), _vch.end()); } //! Simple read-only vector-like interface to the pubkey data. // 获取公钥数据的一些只读的接口 unsigned int size() const { return GetLen(vch[0]); } const unsigned char* data() const { return vch; } const unsigned char* begin() const { return vch; } const unsigned char* end() const { return vch + size(); } const unsigned char&amp; operator[](unsigned int pos) const { return vch[pos]; } //! Comparator implementation. 比较两个CPubKey // vch是私有成员，因此定义为友元 friend bool operator==(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) == 0; } friend bool operator!=(const CPubKey&amp; a, const CPubKey&amp; b) { return !(a == b); } // 比较两个公钥可以理解，为什么要比较大小？？？ friend bool operator&lt;(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] &lt; b.vch[0] || (a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) &lt; 0); } //! Implement serialization, as if this was a byte vector. template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = size(); ::WriteCompactSize(s, len); // 函数定义于serialize.h s.write((char*)vch, len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); // 函数定义于serialize.h if (len &lt;= PUBLIC_KEY_SIZE) { s.read((char*)vch, len); // 读取Stream中的数据 } else { // invalid pubkey, skip available data（将Stream中的数据丢弃） char dummy; while (len--) s.read(&amp;dummy, 1); Invalidate(); } } //! Get the KeyID of this public key (hash of its serialization) // 获得公钥数据的Hash160(SHA-256 + RIPEMD-160)作为ID // 由此看来，CKeyID其实就是公钥对应的未经Base58校验编码的比特币地址 CKeyID GetID() const { return CKeyID(Hash160(vch, vch + size())); // Hash160函数定义于hash.h中 } //! Get the 256-bit hash of this public key. uint256 GetHash() const { return Hash(vch, vch + size()); } /* * Check syntactic correctness. 检查公钥是否有效 * IsValid()仅仅按照协议查看前缀，只要不是0xFF，说明有效 * Note that this is consensus critical as CheckSig() calls it! */ bool IsValid() const { return size() &gt; 0; } //! fully validate whether this is a valid public key (more expensive than IsValid()) // 完全验证这是否是有效的公钥 // IsFullyValid()比IsValid()的验证更彻底，进行数学上的验证。 bool IsFullyValid() const; //! Check whether this is a compressed public key. // 本质是检查第一个字节的标识符 bool IsCompressed() const { return size() == COMPRESSED_PUBLIC_KEY_SIZE; } /** * Verify a DER signature (~72 bytes). * If this public key is not fully valid, the return value will be false. */ bool Verify(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig) const; /** * Check whether a signature is normalized (lower-S). */ static bool CheckLowS(const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Recover a public key from a compact signature. bool RecoverCompact(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Turn this public key into an uncompressed public key. bool Decompress(); //! Derive BIP32 child pubkey. bool Derive(CPubKey&amp; pubkeyChild, ChainCode &amp;ccChild, unsigned int nChild, const ChainCode&amp; cc) const; }; struct CExtPubKey { unsigned char nDepth; unsigned char vchFingerprint[4]; unsigned int nChild; ChainCode chaincode; CPubKey pubkey; friend bool operator==(const CExtPubKey &amp;a, const CExtPubKey &amp;b) { return a.nDepth == b.nDepth &amp;&amp; memcmp(&amp;a.vchFingerprint[0], &amp;b.vchFingerprint[0], sizeof(vchFingerprint)) == 0 &amp;&amp; a.nChild == b.nChild &amp;&amp; a.chaincode == b.chaincode &amp;&amp; a.pubkey == b.pubkey; } void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const; void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]); bool Derive(CExtPubKey&amp; out, unsigned int nChild) const; void Serialize(CSizeComputer&amp; s) const { // Optimized implementation for ::GetSerializeSize that avoids copying. s.seek(BIP32_EXTKEY_SIZE + 1); // add one byte for the size (compact int) } template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = BIP32_EXTKEY_SIZE; ::WriteCompactSize(s, len); unsigned char code[BIP32_EXTKEY_SIZE]; Encode(code); s.write((const char *)&amp;code[0], len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); unsigned char code[BIP32_EXTKEY_SIZE]; if (len != BIP32_EXTKEY_SIZE) throw std::runtime_error(&quot;Invalid extended key size\n&quot;); s.read((char *)&amp;code[0], len); Decode(code); } }; /** Users of this module must hold an ECCVerifyHandle. The constructor and * destructor of these are not allowed to run in parallel, though. */ class ECCVerifyHandle { static int refcount; public: ECCVerifyHandle(); ~ECCVerifyHandle(); }; #endif // BITCOIN_PUBKEY_H 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/16/6076d67874e97fde6552d6b2f5742b4e.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/16/6076d67874e97fde6552d6b2f5742b4e.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"继续源码的阅读，本文将对比特币源码中的公钥相关部分进行梳理。 在阅读代码前，先明确一个概念：公钥是如何定义和产生的？ 公钥如何产生 我们已经知道，比特币的私钥就是一个256位二进制数字。 通过椭圆曲线乘法可以很容易的从私钥计算得到公钥，这是不可逆转的过程： K = k * G 其中k是私钥，G是被称为生成点的常数点(xG,yG)，而K是所得公钥。 比特币系统所使用的椭圆曲线叫做secp256k1，具体参数如下： p = 0xffffffff ffffffff ffffffff ffffffff ffffffff ffffffff fffffffe fffffc2f a = 0 b = 7 xG = 0x79be667e f9dcbbac 55a06295 ce870b07 029bfcdb 2dce28d9 59f2815b 16f81798 yG = 0x483ada77 26a3c465 5da4fbfc 0e1108a8 fd17b448 a6855419 9c47d08f fb10d4b8 n = 0xffffffff ffffffff ffffffff fffffffe baaedce6 af48a03b bfd25e8c d0364141 h = 1 通过椭圆曲线乘法得到的公钥K是二维离散域内的一个点（x，y） 因此公钥K包含两个256bit的二进制数，分别对应其x和y坐标。 需要注意的是，由同一个私钥生成的公钥是唯一的，但是同一个公钥可以有两种不同的格式： 压缩格式和非压缩格式（这是由于y可以由x推导出，于是公钥同时存储x和y就浪费了一半的空间，因此有了压缩格式的公钥） 而两种格式后续将会得到两个不同的比特币地址，但任何一个都是合法的。 为了标识公钥使用的哪种格式，需要前缀进行标识。 04用于标识非压缩格式 02或03用于标识压缩格式，y为奇数用03,y为偶数用02 以这样一个公钥为例，其坐标x和y如下： x = F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A y = 07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE52DDFE2E505BDB 如果用非压缩格式表达，是一个520比特的数字（8+256+256）。这个520比特的数字以前缀04开头，紧接着是x及y坐标，组成格式为04 x y： K = 04F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE 52DDFE2E505BDB 如果用压缩格式表达，是一个264比特数字（8+256），其中前缀03表示y坐标是一个奇数： K = 03F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A 代码阅读 公钥的相关源码位于pubkey.h和pubkey.cpp中 pubkey.h的源码如下： // Copyright (c) 2009-2010 Satoshi Nakamoto // Copyright (c) 2009-2018 The Bitcoin Core developers // Copyright (c) 2017 The Zcash developers // Distributed under the MIT software license, see the accompanying // file COPYING or http://www.opensource.org/licenses/mit-license.php. #ifndef BITCOIN_PUBKEY_H #define BITCOIN_PUBKEY_H #include &lt;hash.h&gt; #include &lt;serialize.h&gt; #include &lt;uint256.h&gt; #include &lt;stdexcept&gt; #include &lt;vector&gt; const unsigned int BIP32_EXTKEY_SIZE = 74; // 按照上一篇的分析，这应该是HD wallet使用的公钥的大小 /** * A reference to a CKey: the Hash160 of its serialized public key * CKeyID用来作为一个CPubKey公钥实例的ID，用公钥的Hash160(SHA-256 + RIPEMD-160)作为唯一引用ID * 因此CKeyID继承自定义类型uint160，本质就是一个160bit的hash二进制数组 * 通过实现来看，CKeyID = RIPEMD-160(SHA-256(publicKey)) * 因此CKeyID其实就是未经 Base58 Check 编码的比特币地址 */ class CKeyID : public uint160 { public: CKeyID() : uint160() {} explicit CKeyID(const uint160&amp; in) : uint160(in) {} }; typedef uint256 ChainCode; // CExtPubKey中的成员变量 /** 封装的公钥. */ class CPubKey { public: /** * secp256k1: */ static constexpr unsigned int PUBLIC_KEY_SIZE = 65; // 非压缩格式公钥的大小（65byte = 520bit） static constexpr unsigned int COMPRESSED_PUBLIC_KEY_SIZE = 33; // 压缩格式公钥的大小（33byte = 264bit） static constexpr unsigned int SIGNATURE_SIZE = 72; static constexpr unsigned int COMPACT_SIGNATURE_SIZE = 65; /** * see www.keylength.com * script supports up to 75 for single byte push */ static_assert( PUBLIC_KEY_SIZE &gt;= COMPRESSED_PUBLIC_KEY_SIZE, &quot;COMPRESSED_PUBLIC_KEY_SIZE is larger than PUBLIC_KEY_SIZE&quot;); private: /** * Just store the serialized data. 公钥数据 * Its length can very cheaply be computed from the first byte. * 由于第一个字节代表前缀，公钥的长度可以通过前缀轻松的得到 */ unsigned char vch[PUBLIC_KEY_SIZE]; //! Compute the length of a pubkey with a given first byte. // 通过一个字节（前缀）得到公钥的长度 // 函数私有，程序应时刻维护前缀与实际数据相对应。 unsigned int static GetLen(unsigned char chHeader) { if (chHeader == 2 || chHeader == 3) // 2或3代表压缩格式公钥，2代表y为偶数，3代表y为奇数 return COMPRESSED_PUBLIC_KEY_SIZE; if (chHeader == 4 || chHeader == 6 || chHeader == 7) // 4代表非压缩公钥，6和7？？？ return PUBLIC_KEY_SIZE; return 0; } //! Set this key data to be invalid 使用0xFF前缀标识公钥无效 void Invalidate() { vch[0] = 0xFF; } public: // 验证一个vector&lt;unsigned char&gt;数组的大小是否满足公钥的要求 bool static ValidSize(const std::vector&lt;unsigned char&gt; &amp;vch) { return vch.size() &gt; 0 &amp;&amp; GetLen(vch[0]) == vch.size(); } //! Construct an invalid public key. // 初始化一个空的公钥，状态为无效，需要使用Set函数赋值vch CPubKey() { Invalidate(); } //! Initialize a public key using begin/end iterators to byte data. // 初始化公钥数据vsh的函数，通过迭代器 begin/end 的方式 template &lt;typename T&gt; void Set(const T pbegin, const T pend) { int len = pend == pbegin ? 0 : GetLen(pbegin[0]); if (len &amp;&amp; len == (pend - pbegin)) memcpy(vch, (unsigned char*)&amp;pbegin[0], len); else Invalidate(); // 公钥无效（提供数据长度为0 或 数据长度与前缀不一致） } //! Construct a public key using begin/end iterators to byte data. template &lt;typename T&gt; CPubKey(const T pbegin, const T pend) { Set(pbegin, pend); } //! Construct a public key from a byte vector. // 直接用vector&lt;unsigned char&gt;构造 explicit CPubKey(const std::vector&lt;unsigned char&gt;&amp; _vch) { Set(_vch.begin(), _vch.end()); } //! Simple read-only vector-like interface to the pubkey data. // 获取公钥数据的一些只读的接口 unsigned int size() const { return GetLen(vch[0]); } const unsigned char* data() const { return vch; } const unsigned char* begin() const { return vch; } const unsigned char* end() const { return vch + size(); } const unsigned char&amp; operator[](unsigned int pos) const { return vch[pos]; } //! Comparator implementation. 比较两个CPubKey // vch是私有成员，因此定义为友元 friend bool operator==(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) == 0; } friend bool operator!=(const CPubKey&amp; a, const CPubKey&amp; b) { return !(a == b); } // 比较两个公钥可以理解，为什么要比较大小？？？ friend bool operator&lt;(const CPubKey&amp; a, const CPubKey&amp; b) { return a.vch[0] &lt; b.vch[0] || (a.vch[0] == b.vch[0] &amp;&amp; memcmp(a.vch, b.vch, a.size()) &lt; 0); } //! Implement serialization, as if this was a byte vector. template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = size(); ::WriteCompactSize(s, len); // 函数定义于serialize.h s.write((char*)vch, len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); // 函数定义于serialize.h if (len &lt;= PUBLIC_KEY_SIZE) { s.read((char*)vch, len); // 读取Stream中的数据 } else { // invalid pubkey, skip available data（将Stream中的数据丢弃） char dummy; while (len--) s.read(&amp;dummy, 1); Invalidate(); } } //! Get the KeyID of this public key (hash of its serialization) // 获得公钥数据的Hash160(SHA-256 + RIPEMD-160)作为ID // 由此看来，CKeyID其实就是公钥对应的未经Base58校验编码的比特币地址 CKeyID GetID() const { return CKeyID(Hash160(vch, vch + size())); // Hash160函数定义于hash.h中 } //! Get the 256-bit hash of this public key. uint256 GetHash() const { return Hash(vch, vch + size()); } /* * Check syntactic correctness. 检查公钥是否有效 * IsValid()仅仅按照协议查看前缀，只要不是0xFF，说明有效 * Note that this is consensus critical as CheckSig() calls it! */ bool IsValid() const { return size() &gt; 0; } //! fully validate whether this is a valid public key (more expensive than IsValid()) // 完全验证这是否是有效的公钥 // IsFullyValid()比IsValid()的验证更彻底，进行数学上的验证。 bool IsFullyValid() const; //! Check whether this is a compressed public key. // 本质是检查第一个字节的标识符 bool IsCompressed() const { return size() == COMPRESSED_PUBLIC_KEY_SIZE; } /** * Verify a DER signature (~72 bytes). * If this public key is not fully valid, the return value will be false. */ bool Verify(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig) const; /** * Check whether a signature is normalized (lower-S). */ static bool CheckLowS(const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Recover a public key from a compact signature. bool RecoverCompact(const uint256&amp; hash, const std::vector&lt;unsigned char&gt;&amp; vchSig); //! Turn this public key into an uncompressed public key. bool Decompress(); //! Derive BIP32 child pubkey. bool Derive(CPubKey&amp; pubkeyChild, ChainCode &amp;ccChild, unsigned int nChild, const ChainCode&amp; cc) const; }; struct CExtPubKey { unsigned char nDepth; unsigned char vchFingerprint[4]; unsigned int nChild; ChainCode chaincode; CPubKey pubkey; friend bool operator==(const CExtPubKey &amp;a, const CExtPubKey &amp;b) { return a.nDepth == b.nDepth &amp;&amp; memcmp(&amp;a.vchFingerprint[0], &amp;b.vchFingerprint[0], sizeof(vchFingerprint)) == 0 &amp;&amp; a.nChild == b.nChild &amp;&amp; a.chaincode == b.chaincode &amp;&amp; a.pubkey == b.pubkey; } void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const; void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]); bool Derive(CExtPubKey&amp; out, unsigned int nChild) const; void Serialize(CSizeComputer&amp; s) const { // Optimized implementation for ::GetSerializeSize that avoids copying. s.seek(BIP32_EXTKEY_SIZE + 1); // add one byte for the size (compact int) } template &lt;typename Stream&gt; void Serialize(Stream&amp; s) const { unsigned int len = BIP32_EXTKEY_SIZE; ::WriteCompactSize(s, len); unsigned char code[BIP32_EXTKEY_SIZE]; Encode(code); s.write((const char *)&amp;code[0], len); } template &lt;typename Stream&gt; void Unserialize(Stream&amp; s) { unsigned int len = ::ReadCompactSize(s); unsigned char code[BIP32_EXTKEY_SIZE]; if (len != BIP32_EXTKEY_SIZE) throw std::runtime_error(&quot;Invalid extended key size\\n&quot;); s.read((char *)&amp;code[0], len); Decode(code); } }; /** Users of this module must hold an ECCVerifyHandle. The constructor and * destructor of these are not allowed to run in parallel, though. */ class ECCVerifyHandle { static int refcount; public: ECCVerifyHandle(); ~ECCVerifyHandle(); }; #endif // BITCOIN_PUBKEY_H 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/16/6076d67874e97fde6552d6b2f5742b4e.html","headline":"探索比特币源码6-公钥","dateModified":"2018-08-16T00:00:00+08:00","datePublished":"2018-08-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/16/6076d67874e97fde6552d6b2f5742b4e.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>探索比特币源码6-公钥</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>继续源码的阅读，本文将对比特币源码中的公钥相关部分进行梳理。</p> 
+  <p>在阅读代码前，先明确一个概念：公钥是如何定义和产生的？</p> 
+  <h2 id="公钥如何产生">公钥如何产生</h2> 
+  <p>我们已经知道，比特币的私钥就是一个256位二进制数字。</p> 
+  <p>通过椭圆曲线乘法可以很容易的从私钥计算得到公钥，这是不可逆转的过程：</p> 
+  <p><code>K = k * G</code></p> 
+  <p>其中k是私钥，G是被称为生成点的常数点(xG,yG)，而K是所得公钥。</p> 
+  <p>比特币系统所使用的椭圆曲线叫做<code>secp256k1</code>，具体参数如下：</p> 
+  <ul> 
+   <li>p = 0xffffffff ffffffff ffffffff ffffffff ffffffff ffffffff fffffffe fffffc2f</li> 
+   <li>a = 0</li> 
+   <li>b = 7</li> 
+   <li>xG = 0x79be667e f9dcbbac 55a06295 ce870b07 029bfcdb 2dce28d9 59f2815b 16f81798</li> 
+   <li>yG = 0x483ada77 26a3c465 5da4fbfc 0e1108a8 fd17b448 a6855419 9c47d08f fb10d4b8</li> 
+   <li>n = 0xffffffff ffffffff ffffffff fffffffe baaedce6 af48a03b bfd25e8c d0364141</li> 
+   <li>h = 1</li> 
+  </ul> 
+  <p>通过椭圆曲线乘法得到的公钥K是二维离散域内的一个点（x，y）</p> 
+  <p>因此公钥K包含两个256bit的二进制数，分别对应其x和y坐标。</p> 
+  <p>需要注意的是，由同一个私钥生成的公钥是唯一的，但是同一个公钥可以有两种不同的格式：</p> 
+  <p><code>压缩格式</code>和<code>非压缩格式</code>（这是由于y可以由x推导出，于是公钥同时存储x和y就浪费了一半的空间，因此有了压缩格式的公钥）</p> 
+  <p>而两种格式后续将会得到两个不同的比特币地址，但任何一个都是合法的。</p> 
+  <p>为了标识公钥使用的哪种格式，需要前缀进行标识。</p> 
+  <p><code>04</code>用于标识非压缩格式</p> 
+  <p><code>02</code>或<code>03</code>用于标识压缩格式，y为奇数用<code>03</code>,y为偶数用<code>02</code></p> 
+  <p>以这样一个公钥为例，其坐标x和y如下：</p> 
+  <p>x = F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A</p> 
+  <p>y = 07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE52DDFE2E505BDB</p> 
+  <p>如果用非压缩格式表达，是一个520比特的数字（8+256+256）。这个520比特的数字以前缀04开头，紧接着是x及y坐标，组成格式为04 x y：</p> 
+  <p>K = 04F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A07CF33DA18BD734C600B96A72BBC4749D5141C90EC8AC328AE 52DDFE2E505BDB</p> 
+  <p>如果用压缩格式表达，是一个264比特数字（8+256），其中前缀03表示y坐标是一个奇数：</p> 
+  <p>K = 03F028892BAD7ED57D2FB57BF33081D5CFCF6F9ED3D3D7F159C2E2FFF579DC341A</p> 
+  <h2 id="代码阅读">代码阅读</h2> 
+  <p>公钥的相关源码位于<code>pubkey.h</code>和<code>pubkey.cpp</code>中</p> 
+  <p><code>pubkey.h</code>的源码如下：</p> 
+  <pre class="prettyprint"><code class="language-c++ hljs cpp"><span class="hljs-comment">// Copyright (c) 2009-2010 Satoshi Nakamoto</span>
+<span class="hljs-comment">// Copyright (c) 2009-2018 The Bitcoin Core developers</span>
+<span class="hljs-comment">// Copyright (c) 2017 The Zcash developers</span>
+<span class="hljs-comment">// Distributed under the MIT software license, see the accompanying</span>
+<span class="hljs-comment">// file COPYING or http://www.opensource.org/licenses/mit-license.php.</span>
+
+<span class="hljs-preprocessor">#ifndef BITCOIN_PUBKEY_H</span>
+<span class="hljs-preprocessor">#define BITCOIN_PUBKEY_H</span>
+
+<span class="hljs-preprocessor">#include &lt;hash.h&gt;</span>
+<span class="hljs-preprocessor">#include &lt;serialize.h&gt;</span>
+<span class="hljs-preprocessor">#include &lt;uint256.h&gt;</span>
+
+<span class="hljs-preprocessor">#include &lt;stdexcept&gt;</span>
+<span class="hljs-preprocessor">#include &lt;vector&gt;</span>
+
+<span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> BIP32_EXTKEY_SIZE = <span class="hljs-number">74</span>;   <span class="hljs-comment">// 按照上一篇的分析，这应该是HD wallet使用的公钥的大小</span>
+
+<span class="hljs-comment">/** * A reference to a CKey: the Hash160 of its serialized public key * CKeyID用来作为一个CPubKey公钥实例的ID，用公钥的Hash160(SHA-256 + RIPEMD-160)作为唯一引用ID * 因此CKeyID继承自定义类型uint160，本质就是一个160bit的hash二进制数组 * 通过实现来看，CKeyID = RIPEMD-160(SHA-256(publicKey)) * 因此CKeyID其实就是未经 Base58 Check 编码的比特币地址 */</span>
+<span class="hljs-keyword">class</span> CKeyID : <span class="hljs-keyword">public</span> uint160
+{
+<span class="hljs-keyword">public</span>:
+    CKeyID() : uint160() {}
+    <span class="hljs-keyword">explicit</span> CKeyID(<span class="hljs-keyword">const</span> uint160&amp; in) : uint160(in) {}
+};
+
+<span class="hljs-keyword">typedef</span> uint256 ChainCode;   <span class="hljs-comment">// CExtPubKey中的成员变量</span>
+
+<span class="hljs-comment">/** 封装的公钥. */</span>
+<span class="hljs-keyword">class</span> CPubKey
+{
+<span class="hljs-keyword">public</span>:
+    <span class="hljs-comment">/** * secp256k1: */</span>
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">constexpr</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> PUBLIC_KEY_SIZE             = <span class="hljs-number">65</span>;  <span class="hljs-comment">// 非压缩格式公钥的大小（65byte = 520bit）</span>
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">constexpr</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> COMPRESSED_PUBLIC_KEY_SIZE  = <span class="hljs-number">33</span>;  <span class="hljs-comment">// 压缩格式公钥的大小（33byte = 264bit）</span>
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">constexpr</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> SIGNATURE_SIZE              = <span class="hljs-number">72</span>;
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">constexpr</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> COMPACT_SIGNATURE_SIZE      = <span class="hljs-number">65</span>;
+    <span class="hljs-comment">/** * see www.keylength.com * script supports up to 75 for single byte push */</span>
+    <span class="hljs-keyword">static_assert</span>(
+        PUBLIC_KEY_SIZE &gt;= COMPRESSED_PUBLIC_KEY_SIZE,
+        <span class="hljs-string">"COMPRESSED_PUBLIC_KEY_SIZE is larger than PUBLIC_KEY_SIZE"</span>);
+
+<span class="hljs-keyword">private</span>:
+
+    <span class="hljs-comment">/** * Just store the serialized data. 公钥数据 * Its length can very cheaply be computed from the first byte. * 由于第一个字节代表前缀，公钥的长度可以通过前缀轻松的得到 */</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> vch[PUBLIC_KEY_SIZE];
+
+    <span class="hljs-comment">//! Compute the length of a pubkey with a given first byte.</span>
+    <span class="hljs-comment">// 通过一个字节（前缀）得到公钥的长度</span>
+    <span class="hljs-comment">// 函数私有，程序应时刻维护前缀与实际数据相对应。</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> <span class="hljs-keyword">static</span> GetLen(<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> chHeader)
+    {
+        <span class="hljs-keyword">if</span> (chHeader == <span class="hljs-number">2</span> || chHeader == <span class="hljs-number">3</span>) <span class="hljs-comment">// 2或3代表压缩格式公钥，2代表y为偶数，3代表y为奇数</span>
+            <span class="hljs-keyword">return</span> COMPRESSED_PUBLIC_KEY_SIZE;
+        <span class="hljs-keyword">if</span> (chHeader == <span class="hljs-number">4</span> || chHeader == <span class="hljs-number">6</span> || chHeader == <span class="hljs-number">7</span>)  <span class="hljs-comment">// 4代表非压缩公钥，6和7？？？</span>
+            <span class="hljs-keyword">return</span> PUBLIC_KEY_SIZE;
+        <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;
+    }
+
+    <span class="hljs-comment">//! Set this key data to be invalid 使用0xFF前缀标识公钥无效</span>
+    <span class="hljs-keyword">void</span> Invalidate()
+    {
+        vch[<span class="hljs-number">0</span>] = <span class="hljs-number">0xFF</span>;
+    }
+
+<span class="hljs-keyword">public</span>:
+    <span class="hljs-comment">// 验证一个vector&lt;unsigned char&gt;数组的大小是否满足公钥的要求</span>
+    <span class="hljs-keyword">bool</span> <span class="hljs-keyword">static</span> ValidSize(<span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&gt;</span> &amp;vch) {
+      <span class="hljs-keyword">return</span> vch.size() &gt; <span class="hljs-number">0</span> &amp;&amp; GetLen(vch[<span class="hljs-number">0</span>]) == vch.size();
+    }
+
+    <span class="hljs-comment">//! Construct an invalid public key.</span>
+    <span class="hljs-comment">// 初始化一个空的公钥，状态为无效，需要使用Set函数赋值vch</span>
+    CPubKey()
+    {
+        Invalidate();
+    }
+
+    <span class="hljs-comment">//! Initialize a public key using begin/end iterators to byte data.</span>
+    <span class="hljs-comment">// 初始化公钥数据vsh的函数，通过迭代器 begin/end 的方式</span>
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> T&gt;
+    <span class="hljs-keyword">void</span> Set(<span class="hljs-keyword">const</span> T pbegin, <span class="hljs-keyword">const</span> T pend)
+    {
+        <span class="hljs-keyword">int</span> len = pend == pbegin ? <span class="hljs-number">0</span> : GetLen(pbegin[<span class="hljs-number">0</span>]);
+        <span class="hljs-keyword">if</span> (len &amp;&amp; len == (pend - pbegin))
+            <span class="hljs-built_in">memcpy</span>(vch, (<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>*)&amp;pbegin[<span class="hljs-number">0</span>], len);
+        <span class="hljs-keyword">else</span>
+            Invalidate(); <span class="hljs-comment">// 公钥无效（提供数据长度为0 或 数据长度与前缀不一致）</span>
+    }
+
+    <span class="hljs-comment">//! Construct a public key using begin/end iterators to byte data.</span>
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> T&gt;
+    CPubKey(<span class="hljs-keyword">const</span> T pbegin, <span class="hljs-keyword">const</span> T pend)
+    {
+        Set(pbegin, pend);
+    }
+
+    <span class="hljs-comment">//! Construct a public key from a byte vector.</span>
+    <span class="hljs-comment">// 直接用vector&lt;unsigned char&gt;构造</span>
+    <span class="hljs-keyword">explicit</span> CPubKey(<span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&gt;</span>&amp; _vch)
+    {
+        Set(_vch.begin(), _vch.end());
+    }
+
+    <span class="hljs-comment">//! Simple read-only vector-like interface to the pubkey data.</span>
+    <span class="hljs-comment">// 获取公钥数据的一些只读的接口</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> size() <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> GetLen(vch[<span class="hljs-number">0</span>]); }
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>* data() <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> vch; }
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>* begin() <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> vch; }
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>* end() <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> vch + size(); }
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&amp; <span class="hljs-keyword">operator</span>[](<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> pos) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> vch[pos]; }
+
+    <span class="hljs-comment">//! Comparator implementation. 比较两个CPubKey</span>
+    <span class="hljs-comment">// vch是私有成员，因此定义为友元</span>
+    <span class="hljs-keyword">friend</span> <span class="hljs-keyword">bool</span> <span class="hljs-keyword">operator</span>==(<span class="hljs-keyword">const</span> CPubKey&amp; a, <span class="hljs-keyword">const</span> CPubKey&amp; b)
+    {
+        <span class="hljs-keyword">return</span> a.vch[<span class="hljs-number">0</span>] == b.vch[<span class="hljs-number">0</span>] &amp;&amp;
+               <span class="hljs-built_in">memcmp</span>(a.vch, b.vch, a.size()) == <span class="hljs-number">0</span>;
+    }
+    <span class="hljs-keyword">friend</span> <span class="hljs-keyword">bool</span> <span class="hljs-keyword">operator</span>!=(<span class="hljs-keyword">const</span> CPubKey&amp; a, <span class="hljs-keyword">const</span> CPubKey&amp; b)
+    {
+        <span class="hljs-keyword">return</span> !(a == b);
+    }
+    <span class="hljs-comment">// 比较两个公钥可以理解，为什么要比较大小？？？</span>
+    <span class="hljs-keyword">friend</span> <span class="hljs-keyword">bool</span> <span class="hljs-keyword">operator</span>&lt;(<span class="hljs-keyword">const</span> CPubKey&amp; a, <span class="hljs-keyword">const</span> CPubKey&amp; b)
+    {
+        <span class="hljs-keyword">return</span> a.vch[<span class="hljs-number">0</span>] &lt; b.vch[<span class="hljs-number">0</span>] ||
+               (a.vch[<span class="hljs-number">0</span>] == b.vch[<span class="hljs-number">0</span>] &amp;&amp; <span class="hljs-built_in">memcmp</span>(a.vch, b.vch, a.size()) &lt; <span class="hljs-number">0</span>);
+    }
+
+    <span class="hljs-comment">//! Implement serialization, as if this was a byte vector.</span>
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> Stream&gt;
+    <span class="hljs-keyword">void</span> Serialize(Stream&amp; s) <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> len = size();
+        ::WriteCompactSize(s, len);  <span class="hljs-comment">// 函数定义于serialize.h</span>
+        s.write((<span class="hljs-keyword">char</span>*)vch, len);
+    }
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> Stream&gt;
+    <span class="hljs-keyword">void</span> Unserialize(Stream&amp; s)
+    {
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> len = ::ReadCompactSize(s);  <span class="hljs-comment">// 函数定义于serialize.h</span>
+        <span class="hljs-keyword">if</span> (len &lt;= PUBLIC_KEY_SIZE) {
+            s.read((<span class="hljs-keyword">char</span>*)vch, len);  <span class="hljs-comment">// 读取Stream中的数据</span>
+        } <span class="hljs-keyword">else</span> {
+            <span class="hljs-comment">// invalid pubkey, skip available data（将Stream中的数据丢弃）</span>
+            <span class="hljs-keyword">char</span> dummy;
+            <span class="hljs-keyword">while</span> (len--)
+                s.read(&amp;dummy, <span class="hljs-number">1</span>);
+            Invalidate();
+        }
+    }
+
+    <span class="hljs-comment">//! Get the KeyID of this public key (hash of its serialization)</span>
+    <span class="hljs-comment">// 获得公钥数据的Hash160(SHA-256 + RIPEMD-160)作为ID</span>
+    <span class="hljs-comment">// 由此看来，CKeyID其实就是公钥对应的未经Base58校验编码的比特币地址</span>
+    CKeyID GetID() <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">return</span> CKeyID(Hash160(vch, vch + size()));  <span class="hljs-comment">// Hash160函数定义于hash.h中</span>
+    }
+
+    <span class="hljs-comment">//! Get the 256-bit hash of this public key.</span>
+    uint256 GetHash() <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">return</span> Hash(vch, vch + size());
+    }
+
+    <span class="hljs-comment">/* * Check syntactic correctness. 检查公钥是否有效 * IsValid()仅仅按照协议查看前缀，只要不是0xFF，说明有效 * Note that this is consensus critical as CheckSig() calls it! */</span>
+    <span class="hljs-keyword">bool</span> IsValid() <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">return</span> size() &gt; <span class="hljs-number">0</span>;
+    }
+
+    <span class="hljs-comment">//! fully validate whether this is a valid public key (more expensive than IsValid())</span>
+    <span class="hljs-comment">// 完全验证这是否是有效的公钥</span>
+    <span class="hljs-comment">// IsFullyValid()比IsValid()的验证更彻底，进行数学上的验证。</span>
+    <span class="hljs-keyword">bool</span> IsFullyValid() <span class="hljs-keyword">const</span>;
+
+    <span class="hljs-comment">//! Check whether this is a compressed public key.</span>
+    <span class="hljs-comment">// 本质是检查第一个字节的标识符</span>
+    <span class="hljs-keyword">bool</span> IsCompressed() <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">return</span> size() == COMPRESSED_PUBLIC_KEY_SIZE;
+    }
+
+    <span class="hljs-comment">/** * Verify a DER signature (~72 bytes). * If this public key is not fully valid, the return value will be false. */</span>
+    <span class="hljs-keyword">bool</span> Verify(<span class="hljs-keyword">const</span> uint256&amp; hash, <span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&gt;</span>&amp; vchSig) <span class="hljs-keyword">const</span>;
+
+    <span class="hljs-comment">/** * Check whether a signature is normalized (lower-S). */</span>
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">bool</span> CheckLowS(<span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&gt;</span>&amp; vchSig);
+
+    <span class="hljs-comment">//! Recover a public key from a compact signature.</span>
+    <span class="hljs-keyword">bool</span> RecoverCompact(<span class="hljs-keyword">const</span> uint256&amp; hash, <span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span>&gt;</span>&amp; vchSig);
+
+    <span class="hljs-comment">//! Turn this public key into an uncompressed public key.</span>
+    <span class="hljs-keyword">bool</span> Decompress();
+
+    <span class="hljs-comment">//! Derive BIP32 child pubkey.</span>
+    <span class="hljs-keyword">bool</span> Derive(CPubKey&amp; pubkeyChild, ChainCode &amp;ccChild, <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nChild, <span class="hljs-keyword">const</span> ChainCode&amp; cc) <span class="hljs-keyword">const</span>;
+};
+
+<span class="hljs-keyword">struct</span> CExtPubKey {
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> nDepth;
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> vchFingerprint[<span class="hljs-number">4</span>];
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nChild;
+    ChainCode chaincode;
+    CPubKey pubkey;
+
+    <span class="hljs-keyword">friend</span> <span class="hljs-keyword">bool</span> <span class="hljs-keyword">operator</span>==(<span class="hljs-keyword">const</span> CExtPubKey &amp;a, <span class="hljs-keyword">const</span> CExtPubKey &amp;b)
+    {
+        <span class="hljs-keyword">return</span> a.nDepth == b.nDepth &amp;&amp;
+            <span class="hljs-built_in">memcmp</span>(&amp;a.vchFingerprint[<span class="hljs-number">0</span>], &amp;b.vchFingerprint[<span class="hljs-number">0</span>], <span class="hljs-keyword">sizeof</span>(vchFingerprint)) == <span class="hljs-number">0</span> &amp;&amp;
+            a.nChild == b.nChild &amp;&amp;
+            a.chaincode == b.chaincode &amp;&amp;
+            a.pubkey == b.pubkey;
+    }
+
+    <span class="hljs-keyword">void</span> Encode(<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> code[BIP32_EXTKEY_SIZE]) <span class="hljs-keyword">const</span>;
+    <span class="hljs-keyword">void</span> Decode(<span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> code[BIP32_EXTKEY_SIZE]);
+    <span class="hljs-keyword">bool</span> Derive(CExtPubKey&amp; out, <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nChild) <span class="hljs-keyword">const</span>;
+
+    <span class="hljs-keyword">void</span> Serialize(CSizeComputer&amp; s) <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-comment">// Optimized implementation for ::GetSerializeSize that avoids copying.</span>
+        s.seek(BIP32_EXTKEY_SIZE + <span class="hljs-number">1</span>); <span class="hljs-comment">// add one byte for the size (compact int)</span>
+    }
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> Stream&gt;
+    <span class="hljs-keyword">void</span> Serialize(Stream&amp; s) <span class="hljs-keyword">const</span>
+    {
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> len = BIP32_EXTKEY_SIZE;
+        ::WriteCompactSize(s, len);
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> code[BIP32_EXTKEY_SIZE];
+        Encode(code);
+        s.write((<span class="hljs-keyword">const</span> <span class="hljs-keyword">char</span> *)&amp;code[<span class="hljs-number">0</span>], len);
+    }
+    <span class="hljs-keyword">template</span> &lt;<span class="hljs-keyword">typename</span> Stream&gt;
+    <span class="hljs-keyword">void</span> Unserialize(Stream&amp; s)
+    {
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> len = ::ReadCompactSize(s);
+        <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">char</span> code[BIP32_EXTKEY_SIZE];
+        <span class="hljs-keyword">if</span> (len != BIP32_EXTKEY_SIZE)
+            <span class="hljs-keyword">throw</span> <span class="hljs-built_in">std</span>::runtime_error(<span class="hljs-string">"Invalid extended key size\n"</span>);
+        s.read((<span class="hljs-keyword">char</span> *)&amp;code[<span class="hljs-number">0</span>], len);
+        Decode(code);
+    }
+};
+
+<span class="hljs-comment">/** Users of this module must hold an ECCVerifyHandle. The constructor and * destructor of these are not allowed to run in parallel, though. */</span>
+<span class="hljs-keyword">class</span> ECCVerifyHandle
+{
+    <span class="hljs-keyword">static</span> <span class="hljs-keyword">int</span> refcount;
+
+<span class="hljs-keyword">public</span>:
+    ECCVerifyHandle();
+    ~ECCVerifyHandle();
+};
+
+<span class="hljs-preprocessor">#endif <span class="hljs-comment">// BITCOIN_PUBKEY_H</span></span></code></pre> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011583927/article/details/81738403,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011583927/article/details/81738403,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

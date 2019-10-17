@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>EOS代码架构及分析（二）——通信机制分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="EOS代码架构及分析（二）——通信机制分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="没阅读之前的讲解的，比特评级建议先读：EOS代码架构及分析（一）——整体架构 EOS通信机制分析 客户端和服务器端的通信采用RESTful软件架构风格，服务器端的每个资源对应一个唯一的URL地址，客户端将URL地址封装成http请求发送到服务器端，请求对应的资源或者执行相应操作。 客户端发送消息流程 以转账为例，说明EOS消息处理流程。通过cleos客户端发起转账命令，在main函数中，解析transfer命令，通过create_transfer函数将交易发送者、交易接收者、token数量等信息封装成mutable_variant_object对象，然后调用send_action函数，将交易信息发送到服务器端打包进区块链。 # ./cleos transfer sender recipient amount memo programs/cleos/main.cpp main() { … send_actions({create_transfer(sender, recipient, amount, memo)}); … } void send_actions { auto result = push_actions( move(actions), extra_kcpu, compression); … } fc::variant push_actions { signed_transaction trx; trx.actions = std::forward&lt;decltype(actions)&gt;(actions); return push_transaction(trx, extra_kcpu, compression); } fc::variant push_transaction{ trx.set_reference_block(ref_block_id); // 发送 ”/V1/chain/push_transaction” URL地址到服务器端 if (!tx_dont_broadcast) { return call(push_txn_func, packed_transaction(trx, compression)); } } fc::variant call{ try { return eosio::client::http::do_http_call( url, path, fc::variant(v) ); } } fc::variant do_http_call { // 将请求的URL封装成http包 request_stream &lt;&lt; “POST ” &lt;&lt; path_prefix + path &lt;&lt; ” HTTP/1.0\r\n”; request_stream &lt;&lt; “Host: ” &lt;&lt; server &lt;&lt; “\r\n”; request_stream &lt;&lt; “content-length: ” &lt;&lt; postjson.size() &lt;&lt; “\r\n”; request_stream &lt;&lt; “Accept: */*\r\n”; request_stream &lt;&lt; “Connection: close\r\n\r\n”; request_stream &lt;&lt; postjson; // 和服务器建立连接 do_connect(socket, server, port); // 发送http报文，并获取返回结果 re = do_txrx(socket, request, status_code); } 服务器接收消息流程 nodeos服务器先通过http_plugin插件接收客户端发过来的http请求报文，然后解析出请求的URL地址和数据信息，然后调用对应的回调函数处理，并将结果返回给cleos客户端。 # ./nodeos -e -p eosioHTTP消息处理流程 在nodeos的main函数中启动http_plugin插件，注册处理http请求的回调函数（handle_http_request），然后监听socket通信端口，等待建立客户端远程连接。 void http_plugin::plugin_startup() { // 注册http请求处理函数 my-&gt;create_server_for_endpoint(*my-&gt;https_listen_endpoint, my-&gt;https_server); // 监听socket通信端口 my-&gt;https_server.listen(*my-&gt;https_listen_endpoint); // 等待建立客户端远程连接 my-&gt;https_server.start_accept(); } void create_server_for_endpoint{ ws.set_http_handler([&amp;](connection_hdl hdl) { handle_http_request&lt;T&gt;(ws.get_con_from_hdl(hdl)); }); } http请求处理函数从http报文中解析出URL地址（resource）、消息内容（body），然后在url_handlers集合中查找URL对应的回调函数，最后通过handler_itr-&gt;second调用处理函数。 void handle_http_request { … auto body = con-&gt;get_request_body(); auto resource = con-&gt;get_uri()-&gt;get_resource(); auto handler_itr = url_handlers.find(resource); if(handler_itr != url_handlers.end()) { handler_itr-&gt;second(resource, body, [con](int code, string body) { con-&gt;set_body(body); con-&gt;set_status(websocketpp::http::status_code::value(code)); }); } … } 注册URL处理函数 url_handlers是一个URL和处理函数的键值对map集合，由class http_plugin_impl管理，其它插件模块通过add_api函数注册URL回调函数。 plugins/http_plugin/http_plugin.cpp class http_plugin_impl { map&lt;string,url_handler&gt;&nbsp; url_handlers; … } void add_api(const api_description&amp; api) { for (const auto&amp; call : api) add_handler(call.first, call.second); } void http_plugin::add_handler { … my-&gt;url_handlers.insert(std::make_pair(url,handler); } 例如，chain_api_plugin插件在启动函数中注册了以下URL回调函数，包括查询区块信息、处理交易数据： void chain_api_plugin::plugin_startup() { app().get_plugin&lt;http_plugin&gt;().add_api({ CHAIN_RO_CALL(get_info, 200), CHAIN_RO_CALL(get_block, 200), … CHAIN_RW_CALL(push_transaction, 202), CHAIN_RW_CALL(push_transactions, 202) }); } 生产区块流程 客户端发送 ”/V1/chain/push_transaction” URL地址和交易信息到服务器端，然后服务器调用URL对应的回调函数push_transaction将交易信息写入到一个待打包的区块（_pending_block）中。 chain_controller::push_transaction { if( !_pending_block ) { _start_pending_block(); } … return _push_transaction(trx); } chain_controller::_push_transaction { _pending_block-&gt;input_transactions.emplace_back(packed_trx); } 一个区块可以包含很多个transaction，通过input_transactions将这些transaction管理起来，随后由producer_plugin插件将区块打包进区块链中，然后向其它nodeos节点广播区块信息。 struct signed_block : public signed_block_summary { … vector&lt;packed_transaction&gt;&nbsp;&nbsp; input_transactions; } producer_plugin插件启动后，通过schedule_production_loop函数循环生产区块。EOS采用DPoS（委托股权证明）算法，先由EOS持有者（股东）选出21个区块生产者（董事会成员），区块通过这21个生产者轮流产生，每3秒出一个区块，类似操作系统的时间片概念，每个时间片对应一个唯一的生产者，当时间片到来时才能打包区块。 DPoS算法和比特币的POW算法有很大区别，在POW算法中，矿工只要发现交易信息就开始打包区块，而且需要消耗巨大的算力，而且交易确认时间很长。而DPoS算法则通过提前选举出可信节点，避免了信任证明的开销，同时生产者数量的减少（21个）也极大提升了交易确认效率，防止性能差的节点拖慢整个区块链生产速度。DPoS的时间片机制能够保证可信区块链的长度始终比恶意分叉的区块链长（恶意节点数量不大于1/3总节点数量），例如，节点B想自己构造一个分叉链，但是由于每9秒才能产生一个区块，所以始终没有主链长。 void producer_plugin::plugin_startup() { … my-&gt;schedule_production_loop(); … } 计算出现在距离下一个区块时间片的时间间隔time_to_next_block_time，然后启动一个定时器，当下一个时间片到来时调用block_production_loop函数生产区块。 void producer_plugin_impl::schedule_production_loop() { int64_t time_to_next_block_time = (config::block_interval_us) – (now.time_since_epoch().count() % (config::block_interval_us) ); _timer.expires_from_now( boost::posix_time::microseconds(time_to_next_block_time) ); _timer.async_wait( [&amp;](const boost::system::error_code&amp;){ block_production_loop(); } ); } 调用maybe_produce_block函数生产区块，从函数名的maybe可知，不一定能够生产出区块，只是进行尝试，然后处理结果，最后递归调用schedule_production_loop函数进入下一次循环。 producer_plugin_impl::block_production_loop() { result = maybe_produce_block(capture); … schedule_production_loop(); return result; } 获取当前时间对应的生产者，然后调用chain.generate_block函数生产区块，完成后通过broadcast_block函数向其它节点广播区块信息。 producer_plugin_impl::maybe_produce_block { uint32_t slot = chain.get_slot_at_time( now ); … auto scheduled_producer = chain.get_scheduled_producer( slot ); … auto block = chain.generate_block( scheduled_time, scheduled_producer, private_key_itr-&gt;second, _production_skip_flags ); app().get_plugin&lt;net_plugin&gt;().broadcast_block(block); return block_production_condition::produced; } chain_controller::generate_block( … return _generate_block( when, producer, block_signing_private_key ); } 将生产者信息更新到之前的待打包区块_pending_block中，例如，区块时间戳、区块编号、生产者状态等等，最后将区块写入本地区块链中。 chain_controller::_generate_block { _pending_block-&gt;timestamp&nbsp;&nbsp; = when; _pending_block-&gt;producer&nbsp;&nbsp;&nbsp; = producer_obj.owner; _pending_block-&gt;previous&nbsp;&nbsp;&nbsp; = head_block_id(); … if( !(skip &amp; skip_producer_signature) ) _pending_block-&gt;sign( block_signing_key ); _finalize_block( *_pending_block_trace, producer_obj ); } 至此，一次完整的区块处理流程就完成了，后面不断重复打包过程，随着时间推移，形成一个不可逆转的区块链。 阅读更多" />
+<meta property="og:description" content="没阅读之前的讲解的，比特评级建议先读：EOS代码架构及分析（一）——整体架构 EOS通信机制分析 客户端和服务器端的通信采用RESTful软件架构风格，服务器端的每个资源对应一个唯一的URL地址，客户端将URL地址封装成http请求发送到服务器端，请求对应的资源或者执行相应操作。 客户端发送消息流程 以转账为例，说明EOS消息处理流程。通过cleos客户端发起转账命令，在main函数中，解析transfer命令，通过create_transfer函数将交易发送者、交易接收者、token数量等信息封装成mutable_variant_object对象，然后调用send_action函数，将交易信息发送到服务器端打包进区块链。 # ./cleos transfer sender recipient amount memo programs/cleos/main.cpp main() { … send_actions({create_transfer(sender, recipient, amount, memo)}); … } void send_actions { auto result = push_actions( move(actions), extra_kcpu, compression); … } fc::variant push_actions { signed_transaction trx; trx.actions = std::forward&lt;decltype(actions)&gt;(actions); return push_transaction(trx, extra_kcpu, compression); } fc::variant push_transaction{ trx.set_reference_block(ref_block_id); // 发送 ”/V1/chain/push_transaction” URL地址到服务器端 if (!tx_dont_broadcast) { return call(push_txn_func, packed_transaction(trx, compression)); } } fc::variant call{ try { return eosio::client::http::do_http_call( url, path, fc::variant(v) ); } } fc::variant do_http_call { // 将请求的URL封装成http包 request_stream &lt;&lt; “POST ” &lt;&lt; path_prefix + path &lt;&lt; ” HTTP/1.0\r\n”; request_stream &lt;&lt; “Host: ” &lt;&lt; server &lt;&lt; “\r\n”; request_stream &lt;&lt; “content-length: ” &lt;&lt; postjson.size() &lt;&lt; “\r\n”; request_stream &lt;&lt; “Accept: */*\r\n”; request_stream &lt;&lt; “Connection: close\r\n\r\n”; request_stream &lt;&lt; postjson; // 和服务器建立连接 do_connect(socket, server, port); // 发送http报文，并获取返回结果 re = do_txrx(socket, request, status_code); } 服务器接收消息流程 nodeos服务器先通过http_plugin插件接收客户端发过来的http请求报文，然后解析出请求的URL地址和数据信息，然后调用对应的回调函数处理，并将结果返回给cleos客户端。 # ./nodeos -e -p eosioHTTP消息处理流程 在nodeos的main函数中启动http_plugin插件，注册处理http请求的回调函数（handle_http_request），然后监听socket通信端口，等待建立客户端远程连接。 void http_plugin::plugin_startup() { // 注册http请求处理函数 my-&gt;create_server_for_endpoint(*my-&gt;https_listen_endpoint, my-&gt;https_server); // 监听socket通信端口 my-&gt;https_server.listen(*my-&gt;https_listen_endpoint); // 等待建立客户端远程连接 my-&gt;https_server.start_accept(); } void create_server_for_endpoint{ ws.set_http_handler([&amp;](connection_hdl hdl) { handle_http_request&lt;T&gt;(ws.get_con_from_hdl(hdl)); }); } http请求处理函数从http报文中解析出URL地址（resource）、消息内容（body），然后在url_handlers集合中查找URL对应的回调函数，最后通过handler_itr-&gt;second调用处理函数。 void handle_http_request { … auto body = con-&gt;get_request_body(); auto resource = con-&gt;get_uri()-&gt;get_resource(); auto handler_itr = url_handlers.find(resource); if(handler_itr != url_handlers.end()) { handler_itr-&gt;second(resource, body, [con](int code, string body) { con-&gt;set_body(body); con-&gt;set_status(websocketpp::http::status_code::value(code)); }); } … } 注册URL处理函数 url_handlers是一个URL和处理函数的键值对map集合，由class http_plugin_impl管理，其它插件模块通过add_api函数注册URL回调函数。 plugins/http_plugin/http_plugin.cpp class http_plugin_impl { map&lt;string,url_handler&gt;&nbsp; url_handlers; … } void add_api(const api_description&amp; api) { for (const auto&amp; call : api) add_handler(call.first, call.second); } void http_plugin::add_handler { … my-&gt;url_handlers.insert(std::make_pair(url,handler); } 例如，chain_api_plugin插件在启动函数中注册了以下URL回调函数，包括查询区块信息、处理交易数据： void chain_api_plugin::plugin_startup() { app().get_plugin&lt;http_plugin&gt;().add_api({ CHAIN_RO_CALL(get_info, 200), CHAIN_RO_CALL(get_block, 200), … CHAIN_RW_CALL(push_transaction, 202), CHAIN_RW_CALL(push_transactions, 202) }); } 生产区块流程 客户端发送 ”/V1/chain/push_transaction” URL地址和交易信息到服务器端，然后服务器调用URL对应的回调函数push_transaction将交易信息写入到一个待打包的区块（_pending_block）中。 chain_controller::push_transaction { if( !_pending_block ) { _start_pending_block(); } … return _push_transaction(trx); } chain_controller::_push_transaction { _pending_block-&gt;input_transactions.emplace_back(packed_trx); } 一个区块可以包含很多个transaction，通过input_transactions将这些transaction管理起来，随后由producer_plugin插件将区块打包进区块链中，然后向其它nodeos节点广播区块信息。 struct signed_block : public signed_block_summary { … vector&lt;packed_transaction&gt;&nbsp;&nbsp; input_transactions; } producer_plugin插件启动后，通过schedule_production_loop函数循环生产区块。EOS采用DPoS（委托股权证明）算法，先由EOS持有者（股东）选出21个区块生产者（董事会成员），区块通过这21个生产者轮流产生，每3秒出一个区块，类似操作系统的时间片概念，每个时间片对应一个唯一的生产者，当时间片到来时才能打包区块。 DPoS算法和比特币的POW算法有很大区别，在POW算法中，矿工只要发现交易信息就开始打包区块，而且需要消耗巨大的算力，而且交易确认时间很长。而DPoS算法则通过提前选举出可信节点，避免了信任证明的开销，同时生产者数量的减少（21个）也极大提升了交易确认效率，防止性能差的节点拖慢整个区块链生产速度。DPoS的时间片机制能够保证可信区块链的长度始终比恶意分叉的区块链长（恶意节点数量不大于1/3总节点数量），例如，节点B想自己构造一个分叉链，但是由于每9秒才能产生一个区块，所以始终没有主链长。 void producer_plugin::plugin_startup() { … my-&gt;schedule_production_loop(); … } 计算出现在距离下一个区块时间片的时间间隔time_to_next_block_time，然后启动一个定时器，当下一个时间片到来时调用block_production_loop函数生产区块。 void producer_plugin_impl::schedule_production_loop() { int64_t time_to_next_block_time = (config::block_interval_us) – (now.time_since_epoch().count() % (config::block_interval_us) ); _timer.expires_from_now( boost::posix_time::microseconds(time_to_next_block_time) ); _timer.async_wait( [&amp;](const boost::system::error_code&amp;){ block_production_loop(); } ); } 调用maybe_produce_block函数生产区块，从函数名的maybe可知，不一定能够生产出区块，只是进行尝试，然后处理结果，最后递归调用schedule_production_loop函数进入下一次循环。 producer_plugin_impl::block_production_loop() { result = maybe_produce_block(capture); … schedule_production_loop(); return result; } 获取当前时间对应的生产者，然后调用chain.generate_block函数生产区块，完成后通过broadcast_block函数向其它节点广播区块信息。 producer_plugin_impl::maybe_produce_block { uint32_t slot = chain.get_slot_at_time( now ); … auto scheduled_producer = chain.get_scheduled_producer( slot ); … auto block = chain.generate_block( scheduled_time, scheduled_producer, private_key_itr-&gt;second, _production_skip_flags ); app().get_plugin&lt;net_plugin&gt;().broadcast_block(block); return block_production_condition::produced; } chain_controller::generate_block( … return _generate_block( when, producer, block_signing_private_key ); } 将生产者信息更新到之前的待打包区块_pending_block中，例如，区块时间戳、区块编号、生产者状态等等，最后将区块写入本地区块链中。 chain_controller::_generate_block { _pending_block-&gt;timestamp&nbsp;&nbsp; = when; _pending_block-&gt;producer&nbsp;&nbsp;&nbsp; = producer_obj.owner; _pending_block-&gt;previous&nbsp;&nbsp;&nbsp; = head_block_id(); … if( !(skip &amp; skip_producer_signature) ) _pending_block-&gt;sign( block_signing_key ); _finalize_block( *_pending_block_trace, producer_obj ); } 至此，一次完整的区块处理流程就完成了，后面不断重复打包过程，随着时间推移，形成一个不可逆转的区块链。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/04/2278af624ae1fdafb8058b8d6c9f38dc.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/04/2278af624ae1fdafb8058b8d6c9f38dc.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-04T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"没阅读之前的讲解的，比特评级建议先读：EOS代码架构及分析（一）——整体架构 EOS通信机制分析 客户端和服务器端的通信采用RESTful软件架构风格，服务器端的每个资源对应一个唯一的URL地址，客户端将URL地址封装成http请求发送到服务器端，请求对应的资源或者执行相应操作。 客户端发送消息流程 以转账为例，说明EOS消息处理流程。通过cleos客户端发起转账命令，在main函数中，解析transfer命令，通过create_transfer函数将交易发送者、交易接收者、token数量等信息封装成mutable_variant_object对象，然后调用send_action函数，将交易信息发送到服务器端打包进区块链。 # ./cleos transfer sender recipient amount memo programs/cleos/main.cpp main() { … send_actions({create_transfer(sender, recipient, amount, memo)}); … } void send_actions { auto result = push_actions( move(actions), extra_kcpu, compression); … } fc::variant push_actions { signed_transaction trx; trx.actions = std::forward&lt;decltype(actions)&gt;(actions); return push_transaction(trx, extra_kcpu, compression); } fc::variant push_transaction{ trx.set_reference_block(ref_block_id); // 发送 ”/V1/chain/push_transaction” URL地址到服务器端 if (!tx_dont_broadcast) { return call(push_txn_func, packed_transaction(trx, compression)); } } fc::variant call{ try { return eosio::client::http::do_http_call( url, path, fc::variant(v) ); } } fc::variant do_http_call { // 将请求的URL封装成http包 request_stream &lt;&lt; “POST ” &lt;&lt; path_prefix + path &lt;&lt; ” HTTP/1.0\\r\\n”; request_stream &lt;&lt; “Host: ” &lt;&lt; server &lt;&lt; “\\r\\n”; request_stream &lt;&lt; “content-length: ” &lt;&lt; postjson.size() &lt;&lt; “\\r\\n”; request_stream &lt;&lt; “Accept: */*\\r\\n”; request_stream &lt;&lt; “Connection: close\\r\\n\\r\\n”; request_stream &lt;&lt; postjson; // 和服务器建立连接 do_connect(socket, server, port); // 发送http报文，并获取返回结果 re = do_txrx(socket, request, status_code); } 服务器接收消息流程 nodeos服务器先通过http_plugin插件接收客户端发过来的http请求报文，然后解析出请求的URL地址和数据信息，然后调用对应的回调函数处理，并将结果返回给cleos客户端。 # ./nodeos -e -p eosioHTTP消息处理流程 在nodeos的main函数中启动http_plugin插件，注册处理http请求的回调函数（handle_http_request），然后监听socket通信端口，等待建立客户端远程连接。 void http_plugin::plugin_startup() { // 注册http请求处理函数 my-&gt;create_server_for_endpoint(*my-&gt;https_listen_endpoint, my-&gt;https_server); // 监听socket通信端口 my-&gt;https_server.listen(*my-&gt;https_listen_endpoint); // 等待建立客户端远程连接 my-&gt;https_server.start_accept(); } void create_server_for_endpoint{ ws.set_http_handler([&amp;](connection_hdl hdl) { handle_http_request&lt;T&gt;(ws.get_con_from_hdl(hdl)); }); } http请求处理函数从http报文中解析出URL地址（resource）、消息内容（body），然后在url_handlers集合中查找URL对应的回调函数，最后通过handler_itr-&gt;second调用处理函数。 void handle_http_request { … auto body = con-&gt;get_request_body(); auto resource = con-&gt;get_uri()-&gt;get_resource(); auto handler_itr = url_handlers.find(resource); if(handler_itr != url_handlers.end()) { handler_itr-&gt;second(resource, body, [con](int code, string body) { con-&gt;set_body(body); con-&gt;set_status(websocketpp::http::status_code::value(code)); }); } … } 注册URL处理函数 url_handlers是一个URL和处理函数的键值对map集合，由class http_plugin_impl管理，其它插件模块通过add_api函数注册URL回调函数。 plugins/http_plugin/http_plugin.cpp class http_plugin_impl { map&lt;string,url_handler&gt;&nbsp; url_handlers; … } void add_api(const api_description&amp; api) { for (const auto&amp; call : api) add_handler(call.first, call.second); } void http_plugin::add_handler { … my-&gt;url_handlers.insert(std::make_pair(url,handler); } 例如，chain_api_plugin插件在启动函数中注册了以下URL回调函数，包括查询区块信息、处理交易数据： void chain_api_plugin::plugin_startup() { app().get_plugin&lt;http_plugin&gt;().add_api({ CHAIN_RO_CALL(get_info, 200), CHAIN_RO_CALL(get_block, 200), … CHAIN_RW_CALL(push_transaction, 202), CHAIN_RW_CALL(push_transactions, 202) }); } 生产区块流程 客户端发送 ”/V1/chain/push_transaction” URL地址和交易信息到服务器端，然后服务器调用URL对应的回调函数push_transaction将交易信息写入到一个待打包的区块（_pending_block）中。 chain_controller::push_transaction { if( !_pending_block ) { _start_pending_block(); } … return _push_transaction(trx); } chain_controller::_push_transaction { _pending_block-&gt;input_transactions.emplace_back(packed_trx); } 一个区块可以包含很多个transaction，通过input_transactions将这些transaction管理起来，随后由producer_plugin插件将区块打包进区块链中，然后向其它nodeos节点广播区块信息。 struct signed_block : public signed_block_summary { … vector&lt;packed_transaction&gt;&nbsp;&nbsp; input_transactions; } producer_plugin插件启动后，通过schedule_production_loop函数循环生产区块。EOS采用DPoS（委托股权证明）算法，先由EOS持有者（股东）选出21个区块生产者（董事会成员），区块通过这21个生产者轮流产生，每3秒出一个区块，类似操作系统的时间片概念，每个时间片对应一个唯一的生产者，当时间片到来时才能打包区块。 DPoS算法和比特币的POW算法有很大区别，在POW算法中，矿工只要发现交易信息就开始打包区块，而且需要消耗巨大的算力，而且交易确认时间很长。而DPoS算法则通过提前选举出可信节点，避免了信任证明的开销，同时生产者数量的减少（21个）也极大提升了交易确认效率，防止性能差的节点拖慢整个区块链生产速度。DPoS的时间片机制能够保证可信区块链的长度始终比恶意分叉的区块链长（恶意节点数量不大于1/3总节点数量），例如，节点B想自己构造一个分叉链，但是由于每9秒才能产生一个区块，所以始终没有主链长。 void producer_plugin::plugin_startup() { … my-&gt;schedule_production_loop(); … } 计算出现在距离下一个区块时间片的时间间隔time_to_next_block_time，然后启动一个定时器，当下一个时间片到来时调用block_production_loop函数生产区块。 void producer_plugin_impl::schedule_production_loop() { int64_t time_to_next_block_time = (config::block_interval_us) – (now.time_since_epoch().count() % (config::block_interval_us) ); _timer.expires_from_now( boost::posix_time::microseconds(time_to_next_block_time) ); _timer.async_wait( [&amp;](const boost::system::error_code&amp;){ block_production_loop(); } ); } 调用maybe_produce_block函数生产区块，从函数名的maybe可知，不一定能够生产出区块，只是进行尝试，然后处理结果，最后递归调用schedule_production_loop函数进入下一次循环。 producer_plugin_impl::block_production_loop() { result = maybe_produce_block(capture); … schedule_production_loop(); return result; } 获取当前时间对应的生产者，然后调用chain.generate_block函数生产区块，完成后通过broadcast_block函数向其它节点广播区块信息。 producer_plugin_impl::maybe_produce_block { uint32_t slot = chain.get_slot_at_time( now ); … auto scheduled_producer = chain.get_scheduled_producer( slot ); … auto block = chain.generate_block( scheduled_time, scheduled_producer, private_key_itr-&gt;second, _production_skip_flags ); app().get_plugin&lt;net_plugin&gt;().broadcast_block(block); return block_production_condition::produced; } chain_controller::generate_block( … return _generate_block( when, producer, block_signing_private_key ); } 将生产者信息更新到之前的待打包区块_pending_block中，例如，区块时间戳、区块编号、生产者状态等等，最后将区块写入本地区块链中。 chain_controller::_generate_block { _pending_block-&gt;timestamp&nbsp;&nbsp; = when; _pending_block-&gt;producer&nbsp;&nbsp;&nbsp; = producer_obj.owner; _pending_block-&gt;previous&nbsp;&nbsp;&nbsp; = head_block_id(); … if( !(skip &amp; skip_producer_signature) ) _pending_block-&gt;sign( block_signing_key ); _finalize_block( *_pending_block_trace, producer_obj ); } 至此，一次完整的区块处理流程就完成了，后面不断重复打包过程，随着时间推移，形成一个不可逆转的区块链。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/04/2278af624ae1fdafb8058b8d6c9f38dc.html","headline":"EOS代码架构及分析（二）——通信机制分析","dateModified":"2018-08-04T00:00:00+08:00","datePublished":"2018-08-04T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/04/2278af624ae1fdafb8058b8d6c9f38dc.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>EOS代码架构及分析（二）——通信机制分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>没阅读之前的讲解的，比特评级建议先读：<a href="https://bitrating.com/blockchain/96370.html" rel="nofollow">EOS代码架构及分析（一）——整体架构</a></p> 
+  <h2>EOS通信机制分析</h2> 
+  <p>客户端和服务器端的通信采用RESTful软件架构风格，服务器端的每个资源对应一个唯一的URL地址，客户端将URL地址封装成http请求发送到服务器端，请求对应的资源或者执行相应操作。</p> 
+  <p><img alt="EOS代码架构及分析（二）——通信机制分析-比特评级BitRating.com" class="has" src="https://bitrating.com/wp-content/uploads/2018/05/20180513103046-5af7a356dc215.png"></p> 
+  <h3>客户端发送消息流程</h3> 
+  <p>以转账为例，说明EOS消息处理流程。通过cleos客户端发起转账命令，在main函数中，解析transfer命令，通过create_transfer函数将交易发送者、交易接收者、token数量等信息封装成mutable_variant_object对象，然后调用send_action函数，将交易信息发送到服务器端打包进区块链。</p> 
+  <pre>
+# ./cleos transfer sender recipient amount memo
+programs/cleos/main.cpp
+main()
+{
+…
+send_actions({create_transfer(sender, recipient, amount, memo)});
+…
+}
+void send_actions {
+auto result = push_actions( move(actions), extra_kcpu, compression);
+…
+}
+fc::variant push_actions {
+signed_transaction trx;
+trx.actions = std::forward&lt;decltype(actions)&gt;(actions);
+return push_transaction(trx, extra_kcpu, compression);
+}
+fc::variant push_transaction{
+trx.set_reference_block(ref_block_id);
+// 发送 ”/V1/chain/push_transaction” URL地址到服务器端
+if (!tx_dont_broadcast) {
+return call(push_txn_func, packed_transaction(trx, compression));
+}
+}
+fc::variant call{
+try {
+return eosio::client::http::do_http_call( url, path, fc::variant(v) );
+}
+}
+fc::variant do_http_call {
+// 将请求的URL封装成http包
+request_stream &lt;&lt; “POST ” &lt;&lt; path_prefix + path &lt;&lt; ” HTTP/1.0\r\n”;
+request_stream &lt;&lt; “Host: ” &lt;&lt; server &lt;&lt; “\r\n”;
+request_stream &lt;&lt; “content-length: ” &lt;&lt; postjson.size() &lt;&lt; “\r\n”;
+request_stream &lt;&lt; “Accept: */*\r\n”;
+request_stream &lt;&lt; “Connection: close\r\n\r\n”;
+request_stream &lt;&lt; postjson;
+// 和服务器建立连接
+do_connect(socket, server, port);
+// 发送http报文，并获取返回结果
+re = do_txrx(socket, request, status_code);
+}</pre> 
+  <h2>服务器接收消息流程</h2> 
+  <p>nodeos服务器先通过http_plugin插件接收客户端发过来的http请求报文，然后解析出请求的URL地址和数据信息，然后调用对应的回调函数处理，并将结果返回给cleos客户端。</p> 
+  <h2># ./nodeos -e -p eosio<img alt="EOS代码架构及分析（二）——通信机制分析-比特评级BitRating.com" class="has" src="https://bitrating.com/wp-content/uploads/2018/05/20180513103047-5af7a3570aa62.png">HTTP消息处理流程</h2> 
+  <p>在nodeos的main函数中启动http_plugin插件，注册处理http请求的回调函数（handle_http_request），然后监听socket通信端口，等待建立客户端远程连接。</p> 
+  <pre>
+void http_plugin::plugin_startup() {
+// 注册http请求处理函数
+my-&gt;create_server_for_endpoint(*my-&gt;https_listen_endpoint, my-&gt;https_server);
+// 监听socket通信端口
+my-&gt;https_server.listen(*my-&gt;https_listen_endpoint);
+// 等待建立客户端远程连接
+my-&gt;https_server.start_accept();
+}
+void create_server_for_endpoint{
+ws.set_http_handler([&amp;](connection_hdl hdl) {
+handle_http_request&lt;T&gt;(ws.get_con_from_hdl(hdl));
+});
+}</pre> 
+  <p>http请求处理函数从http报文中解析出URL地址（resource）、消息内容（body），然后在url_handlers集合中查找URL对应的回调函数，最后通过handler_itr-&gt;second调用处理函数。</p> 
+  <pre>
+void handle_http_request {
+…
+auto body = con-&gt;get_request_body();
+auto resource = con-&gt;get_uri()-&gt;get_resource();
+auto handler_itr = url_handlers.find(resource);
+if(handler_itr != url_handlers.end()) {
+handler_itr-&gt;second(resource, body, [con](int code, string body) {
+con-&gt;set_body(body);
+con-&gt;set_status(websocketpp::http::status_code::value(code));
+});
+}
+…
+}</pre> 
+  <h2>注册URL处理函数</h2> 
+  <p>url_handlers是一个URL和处理函数的键值对map集合，由class http_plugin_impl管理，其它插件模块通过add_api函数注册URL回调函数。</p> 
+  <pre>
+plugins/http_plugin/http_plugin.cpp
+class http_plugin_impl {
+map&lt;string,url_handler&gt;&nbsp; url_handlers;
+…
+}
+void add_api(const api_description&amp; api) {
+for (const auto&amp; call : api)
+add_handler(call.first, call.second);
+}
+void http_plugin::add_handler {
+…
+my-&gt;url_handlers.insert(std::make_pair(url,handler);
+}</pre> 
+  <p>例如，chain_api_plugin插件在启动函数中注册了以下URL回调函数，包括查询区块信息、处理交易数据：</p> 
+  <pre>
+void chain_api_plugin::plugin_startup() {
+app().get_plugin&lt;http_plugin&gt;().add_api({
+CHAIN_RO_CALL(get_info, 200),
+CHAIN_RO_CALL(get_block, 200),
+…
+CHAIN_RW_CALL(push_transaction, 202),
+CHAIN_RW_CALL(push_transactions, 202)
+});
+}</pre> 
+  <h2>生产区块流程</h2> 
+  <p>客户端发送 ”/V1/chain/push_transaction” URL地址和交易信息到服务器端，然后服务器调用URL对应的回调函数push_transaction将交易信息写入到一个待打包的区块（_pending_block）中。</p> 
+  <pre>
+chain_controller::push_transaction {
+if( !_pending_block ) {
+_start_pending_block();
+}
+…
+return _push_transaction(trx);
+}
+chain_controller::_push_transaction {
+_pending_block-&gt;input_transactions.emplace_back(packed_trx);
+}</pre> 
+  <p>一个区块可以包含很多个transaction，通过input_transactions将这些transaction管理起来，随后由producer_plugin插件将区块打包进区块链中，然后向其它nodeos节点广播区块信息。</p> 
+  <pre>
+struct signed_block : public signed_block_summary {
+…
+vector&lt;packed_transaction&gt;&nbsp;&nbsp; input_transactions;
+}</pre> 
+  <p>producer_plugin插件启动后，通过schedule_production_loop函数循环生产区块。EOS采用DPoS（委托股权证明）算法，先由EOS持有者（股东）选出21个区块生产者（董事会成员），区块通过这21个生产者轮流产生，每3秒出一个区块，类似操作系统的时间片概念，每个时间片对应一个唯一的生产者，当时间片到来时才能打包区块。<img alt="EOS代码架构及分析（二）——通信机制分析-比特评级BitRating.com" class="has" src="https://bitrating.com/wp-content/uploads/2018/05/20180513103047-5af7a35791a69.png"></p> 
+  <p>DPoS算法和比特币的POW算法有很大区别，在POW算法中，矿工只要发现交易信息就开始打包区块，而且需要消耗巨大的算力，而且交易确认时间很长。而DPoS算法则通过提前选举出可信节点，避免了信任证明的开销，同时生产者数量的减少（21个）也极大提升了交易确认效率，防止性能差的节点拖慢整个区块链生产速度。DPoS的时间片机制能够保证可信区块链的长度始终比恶意分叉的区块链长（恶意节点数量不大于1/3总节点数量），例如，节点B想自己构造一个分叉链，但是由于每9秒才能产生一个区块，所以始终没有主链长。</p> 
+  <p><img alt="EOS代码架构及分析（二）——通信机制分析-比特评级BitRating.com" class="has" src="https://bitrating.com/wp-content/uploads/2018/05/20180513103048-5af7a3580dd4f.png"></p> 
+  <pre>
+void producer_plugin::plugin_startup()
+{
+…
+my-&gt;schedule_production_loop();
+…
+}</pre> 
+  <p>计算出现在距离下一个区块时间片的时间间隔time_to_next_block_time，然后启动一个定时器，当下一个时间片到来时调用block_production_loop函数生产区块。</p> 
+  <pre>
+void producer_plugin_impl::schedule_production_loop() {
+int64_t time_to_next_block_time = (config::block_interval_us) – (now.time_since_epoch().count() % (config::block_interval_us) );
+_timer.expires_from_now( boost::posix_time::microseconds(time_to_next_block_time) );
+_timer.async_wait( [&amp;](const boost::system::error_code&amp;){ block_production_loop(); } );
+}</pre> 
+  <p>调用maybe_produce_block函数生产区块，从函数名的maybe可知，不一定能够生产出区块，只是进行尝试，然后处理结果，最后递归调用schedule_production_loop函数进入下一次循环。</p> 
+  <pre>
+producer_plugin_impl::block_production_loop() {
+result = maybe_produce_block(capture);
+…
+schedule_production_loop();
+return result;
+}</pre> 
+  <p>获取当前时间对应的生产者，然后调用chain.generate_block函数生产区块，完成后通过broadcast_block函数向其它节点广播区块信息。</p> 
+  <pre>
+producer_plugin_impl::maybe_produce_block {
+uint32_t slot = chain.get_slot_at_time( now );
+…
+auto scheduled_producer = chain.get_scheduled_producer( slot );
+…
+auto block = chain.generate_block(
+scheduled_time,
+scheduled_producer,
+private_key_itr-&gt;second,
+_production_skip_flags
+);
+app().get_plugin&lt;net_plugin&gt;().broadcast_block(block);
+return block_production_condition::produced;
+}
+chain_controller::generate_block(
+…
+return _generate_block( when, producer, block_signing_private_key );
+}</pre> 
+  <p>将生产者信息更新到之前的待打包区块_pending_block中，例如，区块时间戳、区块编号、生产者状态等等，最后将区块写入本地区块链中。</p> 
+  <pre>
+chain_controller::_generate_block {
+_pending_block-&gt;timestamp&nbsp;&nbsp; = when;
+_pending_block-&gt;producer&nbsp;&nbsp;&nbsp; = producer_obj.owner;
+_pending_block-&gt;previous&nbsp;&nbsp;&nbsp; = head_block_id();
+…
+if( !(skip &amp; skip_producer_signature) )
+_pending_block-&gt;sign( block_signing_key );
+_finalize_block( *_pending_block_trace, producer_obj );
+}</pre> 
+  <p>至此，一次完整的区块处理流程就完成了，后面不断重复打包过程，随着时间推移，形成一个不可逆转的区块链。</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weichanghu_/article/details/81414529,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weichanghu_/article/details/81414529,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析—挖矿与共识 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析—挖矿与共识" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="前言 挖矿(mine)是指矿工节点互相竞争生成新区块以写入整个区块链获得奖励的过程. 共识(consensus)是指区块链各个节点对下一个区块的内容形成一致的过程 在以太坊中, miner包向外提供挖矿功能，consensus包对外提供共识引擎接口 挖矿 miner包主要由miner.go worker.go agent.go 三个文件组成 Miner 负责与外部交互和高层次的挖矿控制 worker 负责低层次的挖矿控制 管理下属所有Agent Agent 负责实际的挖矿计算工作 三者之间的顶层联系如下图所示 下面先从这几个数据结构的定义和创建函数来了解下它们之间的联系 Miner Miner的定义如下 type Miner struct{ mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine .... } 各字段作用如下, 其中标有外的字段表示与Miner包外部有联系 * mux 外 接收来自downloader模块的StartEvent DoneEvent FailedEvent事件通知。在网络中，不可能只有一个矿工节点,当downloader开始从其他节点同步Block时，我们就没有必要再继续挖矿了. * eth 外 通过该接口可查询后台TxPool BlockChain ethdb的数据.举例来说，作为矿工，我们在生成一个新的Block时需要从TxPool中取出pending Tx(待打包成块的交易),然后将它们中的一部分作为新的Block中的Transaction * engine 外 采用的共识引擎,目前以太坊公网采用的是ethash,测试网络采用clique. * worker 对应的worker,从这里看出Miner和worker是一一对应的 * coinbase 本矿工的账户地址,挖矿所得的收入将计入该账户 * mining 标识是否正在挖矿 miner.New()创建一个Miner,它主要完成Miner字段的初始化和以下功能 * 使用miner.newWorker()创建一个worker * 使用miner.newCpuAgent()创建Agent 并用Register方法注册给worker * 启动miner.update() 线程.该线程等待mux上的来自 downloader模块的事件通知用来控制挖矿开始或停止 worker worker成员比较多,其中部分成员的意义如下 * mux engine eth coinbase 这几项都来自与miner, 其中mux相对于Miner里的稍微有点不同, Miner里的mux是用来接收downloader的事件，而worker里用mux来向外部发布已经挖到新Block * txCh 外 从后台eth接收新的Tx的Channel * chainHeadCh 外 从后台eth接收新的Block的Channel * recv 从agents接收挖矿结果的Channel，注意，每个管理的agent都可能将挖出的Block发到该Channel,也就是说,这个收方向Channel是一对多的 * agents 管理的所有Agent组成的集合 miner.newWorker() 创建一个worker,它除了完成各个成员字段的初始化,还做了以下工作 * 向后台eth注册txCh chainHeadCh chainSideCh通道用来接收对应数据 * 启动worker.update() 线程.该线程等待上面几个外部Channel 并作出相应处理 * 启动worker.wait()线程.该线程等待Agent挖出的新Block * 调用worker.commitNewWork() 尝试启动新的挖掘工作 Agent Agent(定义在worker.go)是一个抽象interface ,只要实现了其以下接口就可以充当worker的下属agent type Agent interface { Work() chan &lt;-*Work SetReturnCh (chan&lt;-*Result) Stop() Start() GetHashRate() int64 } 在agent.go中定义了CpuAgent作为一种Agent的实现,其主要成员定义如下 type CpuAgent struct { workCh chan *Work stop chan struct{} returnCh chan&lt;-*Result chain consensus.ChainReader engine consensus.Engine } workCh 接收来自worker下发的工作任务Work returnCh 向worker反馈工作任务的完成情况,实际上就是挖出的新Block stop 使该CpuAgent停止工作的信号 chain 用于访问本地节点BlockChain数据的接口 engine 计算所采用的共识引擎 CpuAgent的创建函数中并没有启动新的线程, Agent的工作线程是由Agent.Start()接口启动的 在CpuAgent实现中,启动了CpuAgent.update()线程来监听workCh和stop信道 func (self *CpuAgent) Start(){ if !atomic.CompareAndSwapInt32(&amp;self.isMining, 0, 1){ return } go self.update() } 而Agent真正的挖矿工作是在收到工作任务’Work’后调用CpuAgent.mine()完成的 以上就是Miner worker Agent三者之间的联系,将它们画成一张图如下: 总结以下就是 * Miner监听后台的数据 * 需要挖矿时,worker发送给各个Agent工作任务Work, Agent挖出后反馈给worker 让我们顺着一次实际的挖掘工作看看一个Block是如何被挖掘出来的以及挖掘出之后的过程 从worker.commitNewWork()开始 1.parent Block是权威链上最新的Block 2.将标识矿工账户的Coinbase填入Header，这里生成的Header只是个半成品 3.对于ehtash来说,这里计算Block的Difficulty 4.工作任务Work 准确地说标识一次挖掘工作的上下文Context,在创建时,它包含了当前最新的各个账户信息state和2中生成的Header,在这个上下中可以通过调用work.commitTransactions()执行这些交易,这就是俗称的打包过程 5.矿工总是选择Price高的交易优先执行,因为这能使其获得更高的收益率,所以对于交易的发起者来说,如果期望自己的交易能尽快被所有人承认,他可以设置更高gasPrice以吸引矿工优先打包这笔交易 6.运行EVM执行这些交易 7.调用共识引擎的Finalize()接口 8.如此,一个Block的大部分原料都已经准备好了,下一步就是发送给Agent来将这个Block挖掘出来 当Cpuagent收到Work后,调用mine()方法 func (self *CpuAgent) mine(work *Work, stop&lt;-chan struct{}) { result, _ = self.engine.Seal(self.chain, work.Block, stop) self.returnCh &lt;- &amp;Result{work,result} } 可以看到实际上是调用的共识接口的Engine.Seal接口，挖掘的细节在后面共识部分详述,这里先略过这部分且不考虑挖矿被Stop的情景，Block被挖掘出来之后将通过CpuAgent.returnCh反馈给worker，worker在wait线程收到接口后将结果写入数据库，通过worker.mux向外发布NewMinedBlockEvent事件，这样以太坊的其他在该mux上订阅了该事件组件就可以收到这个事件 共识 共识部分包含由consensus对外提供共识引擎的接口定义，当前以太坊有两个实现，分别是公网使用的基于POW的ethash包和测试网络使用的基于POA的clique 根据前文的分析，在挖矿过程中主要涉及Prepare() Finalize() Seal() 接口，三者的职责分别为 Prepare() 初始化新Block的Header Finalize() 在执行完交易后，对Block进行修改(比如向矿工发放挖矿所得) Seal() 实际的挖矿工作 ethash ethash是基于POW(Proof-of-Work)，即工作量证明，矿工消耗算力来求得一个nonce，使其满足难度要求HASH(Header) &lt;= C / Diff,注意,这里的HASH是一个很复杂的函数，而nonce是Header的一个成员字段,一旦改变nonce，左边的结果将发生很大的变化。 C是一个非常大的常数，Diff是Block的难度,可由此可知,Diff越大，右式越小，要想找到满足不等式的nonce就越发的困难，而矿工正是消耗自己的算力去不断尝试nonce，如果找到就意味着他挖出这个区块。 本文不打算详述具体的HASH函数,感兴趣的读者可以参考官方文档https://github.com/ethereum/wiki/blob/master/Dagger-Hashimoto.md Prepare() ethash的Prepare()计算新Block需要达到的难度(Diffculty)，这部分理论可见https://www.jianshu.com/p/9e56faac2437 Finalize() ethash的Finalize()向矿工节点发放奖励，再Byzantium时期之前的区块，挖出的区块奖励是5 ETH ，之后的奖励3 ETH，这部分理论比较复杂，准备以后专门写一篇文章。 Seal() 下面来看看ethash具体是怎么实现Seal接口的 core/ethash/sealer.go func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop&lt;-chan struct{})(*types.Block, error){ ...... abort := make(chan struct{}) found:= make(chan *types.Blocks) threads:= runtime.NumCPU() for i := 0; i &lt; threads; i++ { go func(id int, nonce uint64){ ethash.mine(block,id,nonce,abort,found) }(i, uint64(ethash.rand.Int63())) } var result *type.Block select{ case &lt;- stop: .... case result&lt;-found: close(abort) } return result, nil } 可以看到，ethash启动了多个线程调用mine()函数，当有线程挖到Block时，会通过传入的found通道传出结果。 core/ethash/sealer.go func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { ..... search: for { select { case &lt;-abort: ...... default: digest, result := hashimotoFull(dataset.dataset, hash, nonce) if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): ...... case &lt;-abort: } break search } nonce++ } } ...... 可以看到,在主要for循环中，不断递增nonce的值，调用hashimotoFull()函数计算上面公式中的左边，而target则是公式的右边。当找到一个nonce使得左式&lt;=右式时,挖矿结束，nonce填到header.Nonce clique 以太网社区为开发者提供了基于POA(proof on Authortiy)的clique共识算法。与基于POS的ethash不同的是，clique挖矿不消耗矿工的算力。在clique中,节点分为两类: * 经过认证(Authorized)的节点，在源码里称为signer，具有生成(签发)新区块的能力，对应网络里的矿工 * 未经过认证的节点，对应网络里的普通节点 在ethash中，矿工的账户地址存放在Header的Coinbase字段，但在clique中，这个字段另有他用。那么如何知道一个Block的挖掘者呢？答案是，矿工用自己的私钥对Block进行签名(Signature)，存放在Header的Extra字段，其他节点收到后，可以从这个字段提取出数字签名以及签发者(signer)的公钥，使用这个公钥可以计算出矿工(即signer)的账户地址。 一个节点a的认证状态可以互相转换，每个signer在签发Block时，可以附带一个提议(purposal)，提议另一个本地记录为非认证的节点b转变为认证节点，或者相反。网络中的其他节点c收到这个提议后，将其转化为一张选票(Vote)，如果支持节点的选票超过了节点c本地记录的signer数量的一半，那么节点c就承认节点b是signer clique包由api.go clique.go snapshot.go三个文件组成 其中api.go中是一些提供给用户的命令行操作，比如用户可以输入以下命令表示他支持b成为signer clique.propose(&quot;账户b的地址&quot;, true) clique.go和snapshot.go中分别定义两个重要的数据结构Clique和Snapshot Clique数据结构的主要成员定义如下 type Clique struct { config *params.CliqueConfig recents *lru.ARCCache signatures *lrn.ARCCache proposals map[common.Address]bool signer common.Address signFn SignerFn ...... } config 包含两个配置参数，其中Period设置模拟产生新Block的时间间隔，而Epoch表示每隔一定数量的Block就要把当前的投票结果清空并存入数据库，这么做是为了防止节点积压过多的投票信息，类似于单机游戏中的存档 recents 缓存最近访问过的Snapshot，查询的key为Block的Hash值，详见之后的Snapshot signatures 缓存最近访问过的Block的signer，查询的key为Block的Hash值 proposals 本节点待附带的提议池，用户通过propose()命名提交的提议会存放在这里，当本节点作为矿工对一个Block进行签名时，会随机选择池中的一个提议附带出去 signer 矿工节点的账户地址，意义上与ethash中的Coinbase类似 signFn 数字签名函数，它和signer都由Clique.Authorize()进行设置，后者在eth/backend.go中的StartMining()中被调用 Snapshot翻译过来是快照，它记录了区块链在特定的时刻(即特定的区块高度)本地记录的认证地址列表，举个栗子，Block#18731的Snapshot记录了网络中存在3个signer分别为a\b\c，且a已经支持另一个节点d成为signer(a投了d一张支持票)，当Block#18732的挖掘者b也支持d时，Block#18732记录的signer就会增加d的地址 type Snapshot struct{ sigcache *lru.ARCCache Number uint64 Hash Common.Hash Signers map[Common.Address] struct{} Recents map[uint64]common.Address Votes []*Vote Tally map[common.Address]Tally } sigcache 缓存最近访问过的signer，key为Block的Hash值 Number 本Snapshot对应的Block的高度，在创建时确定 Hash 本Snapshot对应的Block的Hash，在创建时确定 Signers 本Snapshot对应时刻网络中认证过的节点地址(矿工)，在创建时确定 Recents 最近若干个Block的signer的集合，即挖出区块的矿工 Votes 由收到的有效proposal计入的选票集合，每张选票记录了投票人/被投票人/投票意见 这里的有效有两层意思 投票人是有效的的，首先他是signer(在Snapshot.Signers中)，并且他不能频繁投票(不在 Snapshot.Recents中) 被投票人是有效的，被投票人的当前认证状态与选票中携带的意见不同 Tally 投票结果map，key为被投票人地址，value为投票计数 Prepare() Prepare()的实现分为两部分 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ header.Coinbase = common.Address{} header.Nonce = types.BlockNonce{} number := header.Number.Uint64() snap, err := c.snapshot(chain, num-1, header.ParentHash, nil) if number % c.config.Epoch { addresses := make ([]common.Address) for address, authorize := range c.proposals{ addresses = append(addresses, address) } header.Coinbase = addresses[rand.Intn(len(addresses))] if c.proposals[header.Coinbase] { copy(header.Nonce[:], nonceAuthVote) } else { copy(header.Nonce[:], nonceDropVote) } } ...... 首先获取上一个Block的Snapshot，它有以下几个获取途径 * Clique的缓存 * 如果Block的高度恰好是在checkpoint 就可从数据库中读取 * 由一个之前已有的Snapshot经过这之间的所有Header推算出来 接下来随机地将本地proposal池中的一个目标节点地址放到Coinbase (注意在ethash中,这个字段填写的是矿工地址) 由于Clique不需要消耗算力，也就不需要计算nonce，因此在Clique中，Header的Nonce的字段被用来表示对目标节点投票的意见 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ ...... header.Difficulty = CalcDifficulty(snap, c.signer) header.Extra = append(header.Extra, make([]byte, extraSeal)) ...... 接下来填充Header中的Difficulty字段，在Clique中这个字段只有 1 和 2 两个取值，取决与本节点是否inturn,这完全是测试网络为了减少Block区块生成冲突的一个技巧，因为测试网络不存在真正的计算，那么如何确定下一个Block由谁确定呢?既然都一样，那就轮流坐庄，inturn的意思就是自己的回合,我们知道，区块链在生成中很容易出现短暂的分叉(fork)，其中难度最大的链为权威(canonocal)链，因此如果一个节点inturn，它就把难度设置为 2 ，否则设置为 1 前面提到过在Clique中，矿工的地址不是存放在Coinbase，而是将自己对区块的数字签名存放在Header的Extra字段，可以看到在Prepare()接口中为数字签名预留了Extra的后 65 bytes Finalize() clique的Finalize()操作比较简单，就是计算了一下Header的Root Hash值 Seal() Seal()接口相对ethash的实现来说比较简单 (省略了一些检查) func (c *Clique) Seal (chain consensus.ChainReader, block *type.Block, stop &lt;-chan struct{}) (*types.Block, error) { header := block.Header() signer, signFn := c.signer, c.signFn snap, err := c.snapshot(chain, number-1, header.ParentHash, nil) delay := time.Unix(header.Time.Int64(), 0).Sub(time.Now()) ...... select { case &lt;- stop: return nil, nil case &lt;-time.After(delay): } sighash, err := signFn(accounts.Account{Address:signer}, sigHash(header).Bytes()) copy(header.Extra[len(header.Extra) - extraSeal:], sighash) return block.WithSeal(header), nil } 总的来说就是延迟了一定时间后对Block进行签名，然后将自己的签名存入header的Extra字段的后 65 bytes，为了减少冲突，对于不是inturn的节点还会多延时一会儿，上面的代码我省略了这部分 总结 挖矿的框架由miner包提供，期间使用了consensus包完成新的Block中一些字段的填充，总的来说挖矿分为打包交易和挖掘两个阶段 以太坊目前实现了ethash和clique两套共识接口实现，分别用于公网环境和测试网络环境，前者消耗算力，后者不消耗。并且，他们对于Header中的字段的一些意义也不尽相同。! 阅读更多" />
+<meta property="og:description" content="前言 挖矿(mine)是指矿工节点互相竞争生成新区块以写入整个区块链获得奖励的过程. 共识(consensus)是指区块链各个节点对下一个区块的内容形成一致的过程 在以太坊中, miner包向外提供挖矿功能，consensus包对外提供共识引擎接口 挖矿 miner包主要由miner.go worker.go agent.go 三个文件组成 Miner 负责与外部交互和高层次的挖矿控制 worker 负责低层次的挖矿控制 管理下属所有Agent Agent 负责实际的挖矿计算工作 三者之间的顶层联系如下图所示 下面先从这几个数据结构的定义和创建函数来了解下它们之间的联系 Miner Miner的定义如下 type Miner struct{ mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine .... } 各字段作用如下, 其中标有外的字段表示与Miner包外部有联系 * mux 外 接收来自downloader模块的StartEvent DoneEvent FailedEvent事件通知。在网络中，不可能只有一个矿工节点,当downloader开始从其他节点同步Block时，我们就没有必要再继续挖矿了. * eth 外 通过该接口可查询后台TxPool BlockChain ethdb的数据.举例来说，作为矿工，我们在生成一个新的Block时需要从TxPool中取出pending Tx(待打包成块的交易),然后将它们中的一部分作为新的Block中的Transaction * engine 外 采用的共识引擎,目前以太坊公网采用的是ethash,测试网络采用clique. * worker 对应的worker,从这里看出Miner和worker是一一对应的 * coinbase 本矿工的账户地址,挖矿所得的收入将计入该账户 * mining 标识是否正在挖矿 miner.New()创建一个Miner,它主要完成Miner字段的初始化和以下功能 * 使用miner.newWorker()创建一个worker * 使用miner.newCpuAgent()创建Agent 并用Register方法注册给worker * 启动miner.update() 线程.该线程等待mux上的来自 downloader模块的事件通知用来控制挖矿开始或停止 worker worker成员比较多,其中部分成员的意义如下 * mux engine eth coinbase 这几项都来自与miner, 其中mux相对于Miner里的稍微有点不同, Miner里的mux是用来接收downloader的事件，而worker里用mux来向外部发布已经挖到新Block * txCh 外 从后台eth接收新的Tx的Channel * chainHeadCh 外 从后台eth接收新的Block的Channel * recv 从agents接收挖矿结果的Channel，注意，每个管理的agent都可能将挖出的Block发到该Channel,也就是说,这个收方向Channel是一对多的 * agents 管理的所有Agent组成的集合 miner.newWorker() 创建一个worker,它除了完成各个成员字段的初始化,还做了以下工作 * 向后台eth注册txCh chainHeadCh chainSideCh通道用来接收对应数据 * 启动worker.update() 线程.该线程等待上面几个外部Channel 并作出相应处理 * 启动worker.wait()线程.该线程等待Agent挖出的新Block * 调用worker.commitNewWork() 尝试启动新的挖掘工作 Agent Agent(定义在worker.go)是一个抽象interface ,只要实现了其以下接口就可以充当worker的下属agent type Agent interface { Work() chan &lt;-*Work SetReturnCh (chan&lt;-*Result) Stop() Start() GetHashRate() int64 } 在agent.go中定义了CpuAgent作为一种Agent的实现,其主要成员定义如下 type CpuAgent struct { workCh chan *Work stop chan struct{} returnCh chan&lt;-*Result chain consensus.ChainReader engine consensus.Engine } workCh 接收来自worker下发的工作任务Work returnCh 向worker反馈工作任务的完成情况,实际上就是挖出的新Block stop 使该CpuAgent停止工作的信号 chain 用于访问本地节点BlockChain数据的接口 engine 计算所采用的共识引擎 CpuAgent的创建函数中并没有启动新的线程, Agent的工作线程是由Agent.Start()接口启动的 在CpuAgent实现中,启动了CpuAgent.update()线程来监听workCh和stop信道 func (self *CpuAgent) Start(){ if !atomic.CompareAndSwapInt32(&amp;self.isMining, 0, 1){ return } go self.update() } 而Agent真正的挖矿工作是在收到工作任务’Work’后调用CpuAgent.mine()完成的 以上就是Miner worker Agent三者之间的联系,将它们画成一张图如下: 总结以下就是 * Miner监听后台的数据 * 需要挖矿时,worker发送给各个Agent工作任务Work, Agent挖出后反馈给worker 让我们顺着一次实际的挖掘工作看看一个Block是如何被挖掘出来的以及挖掘出之后的过程 从worker.commitNewWork()开始 1.parent Block是权威链上最新的Block 2.将标识矿工账户的Coinbase填入Header，这里生成的Header只是个半成品 3.对于ehtash来说,这里计算Block的Difficulty 4.工作任务Work 准确地说标识一次挖掘工作的上下文Context,在创建时,它包含了当前最新的各个账户信息state和2中生成的Header,在这个上下中可以通过调用work.commitTransactions()执行这些交易,这就是俗称的打包过程 5.矿工总是选择Price高的交易优先执行,因为这能使其获得更高的收益率,所以对于交易的发起者来说,如果期望自己的交易能尽快被所有人承认,他可以设置更高gasPrice以吸引矿工优先打包这笔交易 6.运行EVM执行这些交易 7.调用共识引擎的Finalize()接口 8.如此,一个Block的大部分原料都已经准备好了,下一步就是发送给Agent来将这个Block挖掘出来 当Cpuagent收到Work后,调用mine()方法 func (self *CpuAgent) mine(work *Work, stop&lt;-chan struct{}) { result, _ = self.engine.Seal(self.chain, work.Block, stop) self.returnCh &lt;- &amp;Result{work,result} } 可以看到实际上是调用的共识接口的Engine.Seal接口，挖掘的细节在后面共识部分详述,这里先略过这部分且不考虑挖矿被Stop的情景，Block被挖掘出来之后将通过CpuAgent.returnCh反馈给worker，worker在wait线程收到接口后将结果写入数据库，通过worker.mux向外发布NewMinedBlockEvent事件，这样以太坊的其他在该mux上订阅了该事件组件就可以收到这个事件 共识 共识部分包含由consensus对外提供共识引擎的接口定义，当前以太坊有两个实现，分别是公网使用的基于POW的ethash包和测试网络使用的基于POA的clique 根据前文的分析，在挖矿过程中主要涉及Prepare() Finalize() Seal() 接口，三者的职责分别为 Prepare() 初始化新Block的Header Finalize() 在执行完交易后，对Block进行修改(比如向矿工发放挖矿所得) Seal() 实际的挖矿工作 ethash ethash是基于POW(Proof-of-Work)，即工作量证明，矿工消耗算力来求得一个nonce，使其满足难度要求HASH(Header) &lt;= C / Diff,注意,这里的HASH是一个很复杂的函数，而nonce是Header的一个成员字段,一旦改变nonce，左边的结果将发生很大的变化。 C是一个非常大的常数，Diff是Block的难度,可由此可知,Diff越大，右式越小，要想找到满足不等式的nonce就越发的困难，而矿工正是消耗自己的算力去不断尝试nonce，如果找到就意味着他挖出这个区块。 本文不打算详述具体的HASH函数,感兴趣的读者可以参考官方文档https://github.com/ethereum/wiki/blob/master/Dagger-Hashimoto.md Prepare() ethash的Prepare()计算新Block需要达到的难度(Diffculty)，这部分理论可见https://www.jianshu.com/p/9e56faac2437 Finalize() ethash的Finalize()向矿工节点发放奖励，再Byzantium时期之前的区块，挖出的区块奖励是5 ETH ，之后的奖励3 ETH，这部分理论比较复杂，准备以后专门写一篇文章。 Seal() 下面来看看ethash具体是怎么实现Seal接口的 core/ethash/sealer.go func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop&lt;-chan struct{})(*types.Block, error){ ...... abort := make(chan struct{}) found:= make(chan *types.Blocks) threads:= runtime.NumCPU() for i := 0; i &lt; threads; i++ { go func(id int, nonce uint64){ ethash.mine(block,id,nonce,abort,found) }(i, uint64(ethash.rand.Int63())) } var result *type.Block select{ case &lt;- stop: .... case result&lt;-found: close(abort) } return result, nil } 可以看到，ethash启动了多个线程调用mine()函数，当有线程挖到Block时，会通过传入的found通道传出结果。 core/ethash/sealer.go func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { ..... search: for { select { case &lt;-abort: ...... default: digest, result := hashimotoFull(dataset.dataset, hash, nonce) if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): ...... case &lt;-abort: } break search } nonce++ } } ...... 可以看到,在主要for循环中，不断递增nonce的值，调用hashimotoFull()函数计算上面公式中的左边，而target则是公式的右边。当找到一个nonce使得左式&lt;=右式时,挖矿结束，nonce填到header.Nonce clique 以太网社区为开发者提供了基于POA(proof on Authortiy)的clique共识算法。与基于POS的ethash不同的是，clique挖矿不消耗矿工的算力。在clique中,节点分为两类: * 经过认证(Authorized)的节点，在源码里称为signer，具有生成(签发)新区块的能力，对应网络里的矿工 * 未经过认证的节点，对应网络里的普通节点 在ethash中，矿工的账户地址存放在Header的Coinbase字段，但在clique中，这个字段另有他用。那么如何知道一个Block的挖掘者呢？答案是，矿工用自己的私钥对Block进行签名(Signature)，存放在Header的Extra字段，其他节点收到后，可以从这个字段提取出数字签名以及签发者(signer)的公钥，使用这个公钥可以计算出矿工(即signer)的账户地址。 一个节点a的认证状态可以互相转换，每个signer在签发Block时，可以附带一个提议(purposal)，提议另一个本地记录为非认证的节点b转变为认证节点，或者相反。网络中的其他节点c收到这个提议后，将其转化为一张选票(Vote)，如果支持节点的选票超过了节点c本地记录的signer数量的一半，那么节点c就承认节点b是signer clique包由api.go clique.go snapshot.go三个文件组成 其中api.go中是一些提供给用户的命令行操作，比如用户可以输入以下命令表示他支持b成为signer clique.propose(&quot;账户b的地址&quot;, true) clique.go和snapshot.go中分别定义两个重要的数据结构Clique和Snapshot Clique数据结构的主要成员定义如下 type Clique struct { config *params.CliqueConfig recents *lru.ARCCache signatures *lrn.ARCCache proposals map[common.Address]bool signer common.Address signFn SignerFn ...... } config 包含两个配置参数，其中Period设置模拟产生新Block的时间间隔，而Epoch表示每隔一定数量的Block就要把当前的投票结果清空并存入数据库，这么做是为了防止节点积压过多的投票信息，类似于单机游戏中的存档 recents 缓存最近访问过的Snapshot，查询的key为Block的Hash值，详见之后的Snapshot signatures 缓存最近访问过的Block的signer，查询的key为Block的Hash值 proposals 本节点待附带的提议池，用户通过propose()命名提交的提议会存放在这里，当本节点作为矿工对一个Block进行签名时，会随机选择池中的一个提议附带出去 signer 矿工节点的账户地址，意义上与ethash中的Coinbase类似 signFn 数字签名函数，它和signer都由Clique.Authorize()进行设置，后者在eth/backend.go中的StartMining()中被调用 Snapshot翻译过来是快照，它记录了区块链在特定的时刻(即特定的区块高度)本地记录的认证地址列表，举个栗子，Block#18731的Snapshot记录了网络中存在3个signer分别为a\b\c，且a已经支持另一个节点d成为signer(a投了d一张支持票)，当Block#18732的挖掘者b也支持d时，Block#18732记录的signer就会增加d的地址 type Snapshot struct{ sigcache *lru.ARCCache Number uint64 Hash Common.Hash Signers map[Common.Address] struct{} Recents map[uint64]common.Address Votes []*Vote Tally map[common.Address]Tally } sigcache 缓存最近访问过的signer，key为Block的Hash值 Number 本Snapshot对应的Block的高度，在创建时确定 Hash 本Snapshot对应的Block的Hash，在创建时确定 Signers 本Snapshot对应时刻网络中认证过的节点地址(矿工)，在创建时确定 Recents 最近若干个Block的signer的集合，即挖出区块的矿工 Votes 由收到的有效proposal计入的选票集合，每张选票记录了投票人/被投票人/投票意见 这里的有效有两层意思 投票人是有效的的，首先他是signer(在Snapshot.Signers中)，并且他不能频繁投票(不在 Snapshot.Recents中) 被投票人是有效的，被投票人的当前认证状态与选票中携带的意见不同 Tally 投票结果map，key为被投票人地址，value为投票计数 Prepare() Prepare()的实现分为两部分 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ header.Coinbase = common.Address{} header.Nonce = types.BlockNonce{} number := header.Number.Uint64() snap, err := c.snapshot(chain, num-1, header.ParentHash, nil) if number % c.config.Epoch { addresses := make ([]common.Address) for address, authorize := range c.proposals{ addresses = append(addresses, address) } header.Coinbase = addresses[rand.Intn(len(addresses))] if c.proposals[header.Coinbase] { copy(header.Nonce[:], nonceAuthVote) } else { copy(header.Nonce[:], nonceDropVote) } } ...... 首先获取上一个Block的Snapshot，它有以下几个获取途径 * Clique的缓存 * 如果Block的高度恰好是在checkpoint 就可从数据库中读取 * 由一个之前已有的Snapshot经过这之间的所有Header推算出来 接下来随机地将本地proposal池中的一个目标节点地址放到Coinbase (注意在ethash中,这个字段填写的是矿工地址) 由于Clique不需要消耗算力，也就不需要计算nonce，因此在Clique中，Header的Nonce的字段被用来表示对目标节点投票的意见 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ ...... header.Difficulty = CalcDifficulty(snap, c.signer) header.Extra = append(header.Extra, make([]byte, extraSeal)) ...... 接下来填充Header中的Difficulty字段，在Clique中这个字段只有 1 和 2 两个取值，取决与本节点是否inturn,这完全是测试网络为了减少Block区块生成冲突的一个技巧，因为测试网络不存在真正的计算，那么如何确定下一个Block由谁确定呢?既然都一样，那就轮流坐庄，inturn的意思就是自己的回合,我们知道，区块链在生成中很容易出现短暂的分叉(fork)，其中难度最大的链为权威(canonocal)链，因此如果一个节点inturn，它就把难度设置为 2 ，否则设置为 1 前面提到过在Clique中，矿工的地址不是存放在Coinbase，而是将自己对区块的数字签名存放在Header的Extra字段，可以看到在Prepare()接口中为数字签名预留了Extra的后 65 bytes Finalize() clique的Finalize()操作比较简单，就是计算了一下Header的Root Hash值 Seal() Seal()接口相对ethash的实现来说比较简单 (省略了一些检查) func (c *Clique) Seal (chain consensus.ChainReader, block *type.Block, stop &lt;-chan struct{}) (*types.Block, error) { header := block.Header() signer, signFn := c.signer, c.signFn snap, err := c.snapshot(chain, number-1, header.ParentHash, nil) delay := time.Unix(header.Time.Int64(), 0).Sub(time.Now()) ...... select { case &lt;- stop: return nil, nil case &lt;-time.After(delay): } sighash, err := signFn(accounts.Account{Address:signer}, sigHash(header).Bytes()) copy(header.Extra[len(header.Extra) - extraSeal:], sighash) return block.WithSeal(header), nil } 总的来说就是延迟了一定时间后对Block进行签名，然后将自己的签名存入header的Extra字段的后 65 bytes，为了减少冲突，对于不是inturn的节点还会多延时一会儿，上面的代码我省略了这部分 总结 挖矿的框架由miner包提供，期间使用了consensus包完成新的Block中一些字段的填充，总的来说挖矿分为打包交易和挖掘两个阶段 以太坊目前实现了ethash和clique两套共识接口实现，分别用于公网环境和测试网络环境，前者消耗算力，后者不消耗。并且，他们对于Header中的字段的一些意义也不尽相同。! 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/23/1eef2c0a024c8f55333af5d4cb5e08af.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/23/1eef2c0a024c8f55333af5d4cb5e08af.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-23T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"前言 挖矿(mine)是指矿工节点互相竞争生成新区块以写入整个区块链获得奖励的过程. 共识(consensus)是指区块链各个节点对下一个区块的内容形成一致的过程 在以太坊中, miner包向外提供挖矿功能，consensus包对外提供共识引擎接口 挖矿 miner包主要由miner.go worker.go agent.go 三个文件组成 Miner 负责与外部交互和高层次的挖矿控制 worker 负责低层次的挖矿控制 管理下属所有Agent Agent 负责实际的挖矿计算工作 三者之间的顶层联系如下图所示 下面先从这几个数据结构的定义和创建函数来了解下它们之间的联系 Miner Miner的定义如下 type Miner struct{ mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine .... } 各字段作用如下, 其中标有外的字段表示与Miner包外部有联系 * mux 外 接收来自downloader模块的StartEvent DoneEvent FailedEvent事件通知。在网络中，不可能只有一个矿工节点,当downloader开始从其他节点同步Block时，我们就没有必要再继续挖矿了. * eth 外 通过该接口可查询后台TxPool BlockChain ethdb的数据.举例来说，作为矿工，我们在生成一个新的Block时需要从TxPool中取出pending Tx(待打包成块的交易),然后将它们中的一部分作为新的Block中的Transaction * engine 外 采用的共识引擎,目前以太坊公网采用的是ethash,测试网络采用clique. * worker 对应的worker,从这里看出Miner和worker是一一对应的 * coinbase 本矿工的账户地址,挖矿所得的收入将计入该账户 * mining 标识是否正在挖矿 miner.New()创建一个Miner,它主要完成Miner字段的初始化和以下功能 * 使用miner.newWorker()创建一个worker * 使用miner.newCpuAgent()创建Agent 并用Register方法注册给worker * 启动miner.update() 线程.该线程等待mux上的来自 downloader模块的事件通知用来控制挖矿开始或停止 worker worker成员比较多,其中部分成员的意义如下 * mux engine eth coinbase 这几项都来自与miner, 其中mux相对于Miner里的稍微有点不同, Miner里的mux是用来接收downloader的事件，而worker里用mux来向外部发布已经挖到新Block * txCh 外 从后台eth接收新的Tx的Channel * chainHeadCh 外 从后台eth接收新的Block的Channel * recv 从agents接收挖矿结果的Channel，注意，每个管理的agent都可能将挖出的Block发到该Channel,也就是说,这个收方向Channel是一对多的 * agents 管理的所有Agent组成的集合 miner.newWorker() 创建一个worker,它除了完成各个成员字段的初始化,还做了以下工作 * 向后台eth注册txCh chainHeadCh chainSideCh通道用来接收对应数据 * 启动worker.update() 线程.该线程等待上面几个外部Channel 并作出相应处理 * 启动worker.wait()线程.该线程等待Agent挖出的新Block * 调用worker.commitNewWork() 尝试启动新的挖掘工作 Agent Agent(定义在worker.go)是一个抽象interface ,只要实现了其以下接口就可以充当worker的下属agent type Agent interface { Work() chan &lt;-*Work SetReturnCh (chan&lt;-*Result) Stop() Start() GetHashRate() int64 } 在agent.go中定义了CpuAgent作为一种Agent的实现,其主要成员定义如下 type CpuAgent struct { workCh chan *Work stop chan struct{} returnCh chan&lt;-*Result chain consensus.ChainReader engine consensus.Engine } workCh 接收来自worker下发的工作任务Work returnCh 向worker反馈工作任务的完成情况,实际上就是挖出的新Block stop 使该CpuAgent停止工作的信号 chain 用于访问本地节点BlockChain数据的接口 engine 计算所采用的共识引擎 CpuAgent的创建函数中并没有启动新的线程, Agent的工作线程是由Agent.Start()接口启动的 在CpuAgent实现中,启动了CpuAgent.update()线程来监听workCh和stop信道 func (self *CpuAgent) Start(){ if !atomic.CompareAndSwapInt32(&amp;self.isMining, 0, 1){ return } go self.update() } 而Agent真正的挖矿工作是在收到工作任务’Work’后调用CpuAgent.mine()完成的 以上就是Miner worker Agent三者之间的联系,将它们画成一张图如下: 总结以下就是 * Miner监听后台的数据 * 需要挖矿时,worker发送给各个Agent工作任务Work, Agent挖出后反馈给worker 让我们顺着一次实际的挖掘工作看看一个Block是如何被挖掘出来的以及挖掘出之后的过程 从worker.commitNewWork()开始 1.parent Block是权威链上最新的Block 2.将标识矿工账户的Coinbase填入Header，这里生成的Header只是个半成品 3.对于ehtash来说,这里计算Block的Difficulty 4.工作任务Work 准确地说标识一次挖掘工作的上下文Context,在创建时,它包含了当前最新的各个账户信息state和2中生成的Header,在这个上下中可以通过调用work.commitTransactions()执行这些交易,这就是俗称的打包过程 5.矿工总是选择Price高的交易优先执行,因为这能使其获得更高的收益率,所以对于交易的发起者来说,如果期望自己的交易能尽快被所有人承认,他可以设置更高gasPrice以吸引矿工优先打包这笔交易 6.运行EVM执行这些交易 7.调用共识引擎的Finalize()接口 8.如此,一个Block的大部分原料都已经准备好了,下一步就是发送给Agent来将这个Block挖掘出来 当Cpuagent收到Work后,调用mine()方法 func (self *CpuAgent) mine(work *Work, stop&lt;-chan struct{}) { result, _ = self.engine.Seal(self.chain, work.Block, stop) self.returnCh &lt;- &amp;Result{work,result} } 可以看到实际上是调用的共识接口的Engine.Seal接口，挖掘的细节在后面共识部分详述,这里先略过这部分且不考虑挖矿被Stop的情景，Block被挖掘出来之后将通过CpuAgent.returnCh反馈给worker，worker在wait线程收到接口后将结果写入数据库，通过worker.mux向外发布NewMinedBlockEvent事件，这样以太坊的其他在该mux上订阅了该事件组件就可以收到这个事件 共识 共识部分包含由consensus对外提供共识引擎的接口定义，当前以太坊有两个实现，分别是公网使用的基于POW的ethash包和测试网络使用的基于POA的clique 根据前文的分析，在挖矿过程中主要涉及Prepare() Finalize() Seal() 接口，三者的职责分别为 Prepare() 初始化新Block的Header Finalize() 在执行完交易后，对Block进行修改(比如向矿工发放挖矿所得) Seal() 实际的挖矿工作 ethash ethash是基于POW(Proof-of-Work)，即工作量证明，矿工消耗算力来求得一个nonce，使其满足难度要求HASH(Header) &lt;= C / Diff,注意,这里的HASH是一个很复杂的函数，而nonce是Header的一个成员字段,一旦改变nonce，左边的结果将发生很大的变化。 C是一个非常大的常数，Diff是Block的难度,可由此可知,Diff越大，右式越小，要想找到满足不等式的nonce就越发的困难，而矿工正是消耗自己的算力去不断尝试nonce，如果找到就意味着他挖出这个区块。 本文不打算详述具体的HASH函数,感兴趣的读者可以参考官方文档https://github.com/ethereum/wiki/blob/master/Dagger-Hashimoto.md Prepare() ethash的Prepare()计算新Block需要达到的难度(Diffculty)，这部分理论可见https://www.jianshu.com/p/9e56faac2437 Finalize() ethash的Finalize()向矿工节点发放奖励，再Byzantium时期之前的区块，挖出的区块奖励是5 ETH ，之后的奖励3 ETH，这部分理论比较复杂，准备以后专门写一篇文章。 Seal() 下面来看看ethash具体是怎么实现Seal接口的 core/ethash/sealer.go func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop&lt;-chan struct{})(*types.Block, error){ ...... abort := make(chan struct{}) found:= make(chan *types.Blocks) threads:= runtime.NumCPU() for i := 0; i &lt; threads; i++ { go func(id int, nonce uint64){ ethash.mine(block,id,nonce,abort,found) }(i, uint64(ethash.rand.Int63())) } var result *type.Block select{ case &lt;- stop: .... case result&lt;-found: close(abort) } return result, nil } 可以看到，ethash启动了多个线程调用mine()函数，当有线程挖到Block时，会通过传入的found通道传出结果。 core/ethash/sealer.go func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { ..... search: for { select { case &lt;-abort: ...... default: digest, result := hashimotoFull(dataset.dataset, hash, nonce) if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): ...... case &lt;-abort: } break search } nonce++ } } ...... 可以看到,在主要for循环中，不断递增nonce的值，调用hashimotoFull()函数计算上面公式中的左边，而target则是公式的右边。当找到一个nonce使得左式&lt;=右式时,挖矿结束，nonce填到header.Nonce clique 以太网社区为开发者提供了基于POA(proof on Authortiy)的clique共识算法。与基于POS的ethash不同的是，clique挖矿不消耗矿工的算力。在clique中,节点分为两类: * 经过认证(Authorized)的节点，在源码里称为signer，具有生成(签发)新区块的能力，对应网络里的矿工 * 未经过认证的节点，对应网络里的普通节点 在ethash中，矿工的账户地址存放在Header的Coinbase字段，但在clique中，这个字段另有他用。那么如何知道一个Block的挖掘者呢？答案是，矿工用自己的私钥对Block进行签名(Signature)，存放在Header的Extra字段，其他节点收到后，可以从这个字段提取出数字签名以及签发者(signer)的公钥，使用这个公钥可以计算出矿工(即signer)的账户地址。 一个节点a的认证状态可以互相转换，每个signer在签发Block时，可以附带一个提议(purposal)，提议另一个本地记录为非认证的节点b转变为认证节点，或者相反。网络中的其他节点c收到这个提议后，将其转化为一张选票(Vote)，如果支持节点的选票超过了节点c本地记录的signer数量的一半，那么节点c就承认节点b是signer clique包由api.go clique.go snapshot.go三个文件组成 其中api.go中是一些提供给用户的命令行操作，比如用户可以输入以下命令表示他支持b成为signer clique.propose(&quot;账户b的地址&quot;, true) clique.go和snapshot.go中分别定义两个重要的数据结构Clique和Snapshot Clique数据结构的主要成员定义如下 type Clique struct { config *params.CliqueConfig recents *lru.ARCCache signatures *lrn.ARCCache proposals map[common.Address]bool signer common.Address signFn SignerFn ...... } config 包含两个配置参数，其中Period设置模拟产生新Block的时间间隔，而Epoch表示每隔一定数量的Block就要把当前的投票结果清空并存入数据库，这么做是为了防止节点积压过多的投票信息，类似于单机游戏中的存档 recents 缓存最近访问过的Snapshot，查询的key为Block的Hash值，详见之后的Snapshot signatures 缓存最近访问过的Block的signer，查询的key为Block的Hash值 proposals 本节点待附带的提议池，用户通过propose()命名提交的提议会存放在这里，当本节点作为矿工对一个Block进行签名时，会随机选择池中的一个提议附带出去 signer 矿工节点的账户地址，意义上与ethash中的Coinbase类似 signFn 数字签名函数，它和signer都由Clique.Authorize()进行设置，后者在eth/backend.go中的StartMining()中被调用 Snapshot翻译过来是快照，它记录了区块链在特定的时刻(即特定的区块高度)本地记录的认证地址列表，举个栗子，Block#18731的Snapshot记录了网络中存在3个signer分别为a\\b\\c，且a已经支持另一个节点d成为signer(a投了d一张支持票)，当Block#18732的挖掘者b也支持d时，Block#18732记录的signer就会增加d的地址 type Snapshot struct{ sigcache *lru.ARCCache Number uint64 Hash Common.Hash Signers map[Common.Address] struct{} Recents map[uint64]common.Address Votes []*Vote Tally map[common.Address]Tally } sigcache 缓存最近访问过的signer，key为Block的Hash值 Number 本Snapshot对应的Block的高度，在创建时确定 Hash 本Snapshot对应的Block的Hash，在创建时确定 Signers 本Snapshot对应时刻网络中认证过的节点地址(矿工)，在创建时确定 Recents 最近若干个Block的signer的集合，即挖出区块的矿工 Votes 由收到的有效proposal计入的选票集合，每张选票记录了投票人/被投票人/投票意见 这里的有效有两层意思 投票人是有效的的，首先他是signer(在Snapshot.Signers中)，并且他不能频繁投票(不在 Snapshot.Recents中) 被投票人是有效的，被投票人的当前认证状态与选票中携带的意见不同 Tally 投票结果map，key为被投票人地址，value为投票计数 Prepare() Prepare()的实现分为两部分 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ header.Coinbase = common.Address{} header.Nonce = types.BlockNonce{} number := header.Number.Uint64() snap, err := c.snapshot(chain, num-1, header.ParentHash, nil) if number % c.config.Epoch { addresses := make ([]common.Address) for address, authorize := range c.proposals{ addresses = append(addresses, address) } header.Coinbase = addresses[rand.Intn(len(addresses))] if c.proposals[header.Coinbase] { copy(header.Nonce[:], nonceAuthVote) } else { copy(header.Nonce[:], nonceDropVote) } } ...... 首先获取上一个Block的Snapshot，它有以下几个获取途径 * Clique的缓存 * 如果Block的高度恰好是在checkpoint 就可从数据库中读取 * 由一个之前已有的Snapshot经过这之间的所有Header推算出来 接下来随机地将本地proposal池中的一个目标节点地址放到Coinbase (注意在ethash中,这个字段填写的是矿工地址) 由于Clique不需要消耗算力，也就不需要计算nonce，因此在Clique中，Header的Nonce的字段被用来表示对目标节点投票的意见 func (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){ ...... header.Difficulty = CalcDifficulty(snap, c.signer) header.Extra = append(header.Extra, make([]byte, extraSeal)) ...... 接下来填充Header中的Difficulty字段，在Clique中这个字段只有 1 和 2 两个取值，取决与本节点是否inturn,这完全是测试网络为了减少Block区块生成冲突的一个技巧，因为测试网络不存在真正的计算，那么如何确定下一个Block由谁确定呢?既然都一样，那就轮流坐庄，inturn的意思就是自己的回合,我们知道，区块链在生成中很容易出现短暂的分叉(fork)，其中难度最大的链为权威(canonocal)链，因此如果一个节点inturn，它就把难度设置为 2 ，否则设置为 1 前面提到过在Clique中，矿工的地址不是存放在Coinbase，而是将自己对区块的数字签名存放在Header的Extra字段，可以看到在Prepare()接口中为数字签名预留了Extra的后 65 bytes Finalize() clique的Finalize()操作比较简单，就是计算了一下Header的Root Hash值 Seal() Seal()接口相对ethash的实现来说比较简单 (省略了一些检查) func (c *Clique) Seal (chain consensus.ChainReader, block *type.Block, stop &lt;-chan struct{}) (*types.Block, error) { header := block.Header() signer, signFn := c.signer, c.signFn snap, err := c.snapshot(chain, number-1, header.ParentHash, nil) delay := time.Unix(header.Time.Int64(), 0).Sub(time.Now()) ...... select { case &lt;- stop: return nil, nil case &lt;-time.After(delay): } sighash, err := signFn(accounts.Account{Address:signer}, sigHash(header).Bytes()) copy(header.Extra[len(header.Extra) - extraSeal:], sighash) return block.WithSeal(header), nil } 总的来说就是延迟了一定时间后对Block进行签名，然后将自己的签名存入header的Extra字段的后 65 bytes，为了减少冲突，对于不是inturn的节点还会多延时一会儿，上面的代码我省略了这部分 总结 挖矿的框架由miner包提供，期间使用了consensus包完成新的Block中一些字段的填充，总的来说挖矿分为打包交易和挖掘两个阶段 以太坊目前实现了ethash和clique两套共识接口实现，分别用于公网环境和测试网络环境，前者消耗算力，后者不消耗。并且，他们对于Header中的字段的一些意义也不尽相同。! 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/23/1eef2c0a024c8f55333af5d4cb5e08af.html","headline":"以太坊源码分析—挖矿与共识","dateModified":"2018-06-23T00:00:00+08:00","datePublished":"2018-06-23T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/23/1eef2c0a024c8f55333af5d4cb5e08af.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析—挖矿与共识</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="前言">前言</h1> 
+  <p><strong>挖矿(mine)</strong>是指矿工节点互相竞争生成新区块以写入整个区块链获得奖励的过程. <br> <strong>共识(consensus)</strong>是指区块链各个节点对下一个区块的内容形成一致的过程 <br> 在以太坊中, <code>miner</code>包向外提供挖矿功能，<code>consensus</code>包对外提供共识引擎接口</p> 
+  <h1 id="挖矿">挖矿</h1> 
+  <p><code>miner</code>包主要由<code>miner.go</code> <code>worker.go</code> <code>agent.go</code> 三个文件组成 </p> 
+  <ul> 
+   <li><code>Miner</code> 负责与外部交互和高层次的挖矿控制</li> 
+   <li><code>worker</code> 负责低层次的挖矿控制 管理下属所有Agent</li> 
+   <li><code>Agent</code> 负责实际的挖矿计算工作</li> 
+  </ul> 
+  <p>三者之间的顶层联系如下图所示 <br> <img src="https://img-blog.csdn.net/20180623113432642?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2NoZW5tbzE4N0ozWDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="worker_miner_agent" title=""></p> 
+  <h4 id="下面先从这几个数据结构的定义和创建函数来了解下它们之间的联系">下面先从这几个数据结构的定义和创建函数来了解下它们之间的联系</h4> 
+  <h4 id="miner">Miner</h4> 
+  <p>Miner的定义如下</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span> Miner <span class="hljs-keyword">struct</span>{
+    mux *event.TypeMux 
+    worker *worker
+    coinbase common.Address
+    eth  Backend
+    engine consensus.Engine
+    .... 
+}</code></pre> 
+  <p>各字段作用如下, 其中标有<sup><strong>外</strong></sup>的字段表示与Miner包外部有联系 <br> * <code>mux</code> <sup><strong>外</strong></sup> 接收来自<strong>downloader</strong>模块的<em>StartEvent</em> <em>DoneEvent</em> <em>FailedEvent</em>事件通知。在网络中，不可能只有一个矿工节点,当<strong>downloader</strong>开始从其他节点同步Block时，我们就没有必要再继续挖矿了. <br> * <code>eth</code> <sup><strong>外</strong></sup> 通过该接口可查询后台<code>TxPool</code> <code>BlockChain</code> <code>ethdb</code>的数据.举例来说，作为矿工，我们在生成一个新的Block时需要从<code>TxPool</code>中取出<code>pending Tx</code>(待打包成块的交易),然后将它们中的一部分作为新的Block中的Transaction <br> * <code>engine</code> <sup><strong>外</strong></sup> 采用的共识引擎,目前以太坊公网采用的是<code>ethash</code>,测试网络采用<code>clique</code>. <br> * <code>worker</code> 对应的worker,从这里看出Miner和worker是一一对应的 <br> * <code>coinbase</code> 本矿工的账户地址,挖矿所得的收入将计入该账户 <br> * <code>mining</code> 标识是否正在挖矿</p> 
+  <p><code>miner.New()</code>创建一个Miner,它主要完成Miner字段的初始化和以下功能 <br> * 使用<strong>miner.newWorker()</strong>创建一个worker <br> * 使用<strong>miner.newCpuAgent()</strong>创建Agent 并用<code>Register</code>方法注册给<code>worker</code> <br> * 启动<strong>miner.update()</strong> 线程.该线程等待mux上的来自 <strong>downloader</strong>模块的事件通知用来控制挖矿开始或停止</p> 
+  <h4 id="worker">worker</h4> 
+  <p>worker成员比较多,其中部分成员的意义如下 <br> * <code>mux</code> <code>engine</code> <code>eth</code> <code>coinbase</code> 这几项都来自与<code>miner</code>, 其中<code>mux</code>相对于Miner里的稍微有点不同, Miner里的<code>mux</code>是用来接收<strong>downloader</strong>的事件，而worker里用<code>mux</code>来向外部<strong>发布</strong>已经挖到新Block <br> * <code>txCh</code> <sup><strong>外</strong></sup> 从后台<code>eth</code>接收新的Tx的Channel <br> * <code>chainHeadCh</code> <sup><strong>外</strong></sup> 从后台<code>eth</code>接收新的Block的Channel <br> * <code>recv</code> 从agents接收挖矿结果的Channel，注意，每个管理的<code>agent</code>都可能将挖出的Block发到该Channel,也就是说,这个收方向Channel是一对多的 <br> * <code>agents</code> 管理的所有<code>Agent</code>组成的集合</p> 
+  <p><code>miner.newWorker()</code> 创建一个worker,它除了完成各个成员字段的初始化,还做了以下工作 <br> * 向后台<code>eth</code>注册<code>txCh</code> <code>chainHeadCh</code> <code>chainSideCh</code>通道用来接收对应数据 <br> * 启动<strong>worker.update()</strong> 线程.该线程等待上面几个外部Channel 并作出相应处理 <br> * 启动<strong>worker.wait()</strong>线程.该线程等待Agent挖出的新Block <br> * 调用<strong>worker.commitNewWork()</strong> 尝试启动新的挖掘工作</p> 
+  <h4 id="agent">Agent</h4> 
+  <p><code>Agent</code>(定义在worker.go)是一个抽象interface ,只要实现了其以下接口就可以充当<code>worker</code>的下属agent</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span> Agent <span class="hljs-keyword">interface</span> {
+    Work()   <span class="hljs-keyword">chan</span> &lt;-*Work
+    SetReturnCh (<span class="hljs-keyword">chan</span>&lt;-*Result)
+    Stop()
+    Start()
+    GetHashRate() <span class="hljs-typename">int64</span>
+}</code></pre> 
+  <p>在agent.go中定义了<code>CpuAgent</code>作为一种Agent的实现,其主要成员定义如下</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span> CpuAgent <span class="hljs-keyword">struct</span> {
+      workCh      <span class="hljs-keyword">chan</span> *Work
+      stop        <span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{}
+      returnCh    <span class="hljs-keyword">chan</span>&lt;-*Result
+      chain     consensus.ChainReader
+      engine   consensus.Engine
+}</code></pre> 
+  <ul> 
+   <li><code>workCh</code> 接收来自<code>worker</code>下发的工作任务<code>Work</code></li> 
+   <li><code>returnCh</code> 向<code>worker</code>反馈工作任务的完成情况,实际上就是挖出的新Block</li> 
+   <li><code>stop</code> 使该<code>CpuAgent</code>停止工作的信号</li> 
+   <li><code>chain</code> 用于访问本地节点BlockChain数据的接口</li> 
+   <li><code>engine</code> 计算所采用的共识引擎 <br> <code>CpuAgent</code>的创建函数中并没有启动新的线程, <code>Agent</code>的工作线程是由<strong>Agent.Start()</strong>接口启动的 <br> 在<code>CpuAgent</code>实现中,启动了<strong>CpuAgent.update()</strong>线程来监听<code>workCh</code>和<code>stop</code>信道</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (self *CpuAgent) Start(){
+      <span class="hljs-keyword">if</span> !atomic.CompareAndSwapInt32(&amp;self.isMining,<span class="hljs-number"> 0</span>,<span class="hljs-number"> 1</span>){
+            <span class="hljs-keyword">return</span> 
+      }
+      <span class="hljs-keyword">go</span> self.update()
+}</code></pre> 
+  <p>而Agent真正的挖矿工作是在收到工作任务’Work’后调用<strong>CpuAgent.mine()</strong>完成的</p> 
+  <p>以上就是<code>Miner</code> <code>worker</code> <code>Agent</code>三者之间的联系,将它们画成一张图如下:</p> 
+  <p>总结以下就是 <br> * <code>Miner</code>监听后台的数据 <br> * 需要挖矿时,<code>worker</code>发送给各个<code>Agent</code>工作任务<code>Work</code>, <code>Agent</code>挖出后反馈给<code>worker</code></p> 
+  <p>让我们顺着一次实际的挖掘工作看看一个Block是如何被挖掘出来的以及挖掘出之后的过程 <br> 从<code>worker.commitNewWork()</code>开始 <br> <img src="https://img-blog.csdn.net/20180623113502645?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2NoZW5tbzE4N0ozWDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述" title=""> <br> 1.<strong>parent Block</strong>是权威链上最新的Block <br> 2.将标识矿工账户的<strong>Coinbase</strong>填入Header，这里生成的<code>Header</code>只是个半成品 <br> 3.对于<code>ehtash</code>来说,这里计算Block的<strong>Difficulty</strong> <br> 4.工作任务<code>Work</code> 准确地说标识一次挖掘工作的上下文Context,在创建时,它包含了当前最新的各个账户信息<code>state</code>和2中生成的<strong>Header</strong>,在这个上下中可以通过调用<strong>work.commitTransactions()</strong>执行这些交易,这就是俗称的<code>打包</code>过程 <br> 5.矿工总是选择Price高的交易优先执行,因为这能使其获得更高的收益率,所以对于交易的发起者来说,如果期望自己的交易能尽快被所有人承认,他可以设置更高<code>gasPrice</code>以吸引矿工优先打包这笔交易 <br> 6.运行<code>EVM</code>执行这些交易 <br> 7.调用共识引擎的<strong>Finalize()</strong>接口 <br> 8.如此,一个Block的大部分原料都已经准备好了,下一步就是发送给Agent来将这个Block挖掘出来</p> 
+  <p>当<code>Cpuagent</code>收到<code>Work</code>后,调用<strong>mine()</strong>方法</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (self *CpuAgent) mine(work *Work, stop&lt;-<span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{}) {
+        result, _  = self.engine.Seal(self.chain, work.Block, stop) 
+        self.returnCh &lt;- &amp;Result{work,result}
+}</code></pre> 
+  <p>可以看到实际上是调用的共识接口的<code>Engine.Seal</code>接口，挖掘的细节在后面共识部分详述,这里先略过这部分且不考虑挖矿被Stop的情景，Block被挖掘出来之后将通过<code>CpuAgent.returnCh</code>反馈给<code>worker</code>，<code>worker</code>在<code>wait</code>线程收到接口后将结果写入数据库，通过worker.mux向外发布<strong>NewMinedBlockEvent</strong>事件，这样以太坊的其他在该<code>mux</code>上订阅了该事件组件就可以收到这个事件</p> 
+  <h1 id="共识">共识</h1> 
+  <p>共识部分包含由<code>consensus</code>对外提供共识引擎的接口定义，当前以太坊有两个实现，分别是公网使用的基于POW的<code>ethash</code>包和测试网络使用的基于POA的<code>clique</code></p> 
+  <p>根据前文的分析，在挖矿过程中主要涉及<strong>Prepare()</strong> <strong>Finalize()</strong> <strong>Seal()</strong> 接口，三者的职责分别为 <br> <strong>Prepare()</strong> 初始化新Block的Header <br> <strong>Finalize()</strong> 在执行完交易后，对Block进行修改(比如向矿工发放挖矿所得) <br> <strong>Seal()</strong> 实际的挖矿工作</p> 
+  <h3 id="ethash">ethash</h3> 
+  <p><code>ethash</code>是基于POW(Proof-of-Work)，即工作量证明，矿工消耗算力来求得一个<code>nonce</code>，使其满足难度要求<code>HASH(Header) &lt;= C / Diff</code>,注意,这里的<code>HASH</code>是一个很复杂的函数，而<code>nonce</code>是Header的一个成员字段,一旦改变<code>nonce</code>，左边的结果将发生很大的变化。 <code>C</code>是一个非常大的常数，<code>Diff</code>是Block的难度,可由此可知,<code>Diff</code>越大，右式越小，要想找到满足不等式的<code>nonce</code>就越发的困难，而矿工正是消耗自己的算力去不断尝试<code>nonce</code>，如果找到就意味着他<strong>挖出</strong>这个区块。 <br> 本文不打算详述具体的<code>HASH</code>函数,感兴趣的读者可以参考官方文档<a href="https://github.com/ethereum/wiki/blob/master/Dagger-Hashimoto.md" rel="nofollow">https://github.com/ethereum/wiki/blob/master/Dagger-Hashimoto.md</a></p> 
+  <h5 id="prepare">Prepare()</h5> 
+  <p><code>ethash</code>的Prepare()计算新Block需要达到的难度(Diffculty)，这部分理论可见<a href="https://www.jianshu.com/p/9e56faac2437" rel="nofollow">https://www.jianshu.com/p/9e56faac2437</a></p> 
+  <h5 id="finalize">Finalize()</h5> 
+  <p><code>ethash</code>的Finalize()向矿工节点发放奖励，再<strong>Byzantium</strong>时期之前的区块，挖出的区块奖励是<strong>5 ETH</strong> <br> ，之后的奖励<strong>3 ETH</strong>，这部分理论比较复杂，准备以后专门写一篇文章。</p> 
+  <h5 id="seal">Seal()</h5> 
+  <p>下面来看看ethash具体是怎么实现Seal接口的</p> 
+  <pre class="prettyprint"><code class="language-golang hljs ">core/ethash/sealer.<span class="hljs-keyword">go</span>
+<span class="hljs-keyword">func</span> (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop&lt;-<span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{})(*types.Block, error){
+   ......
+   abort := <span class="hljs-built_in">make</span>(<span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{})
+   found:= <span class="hljs-built_in">make</span>(<span class="hljs-keyword">chan</span> *types.Blocks)
+   threads:= runtime.NumCPU()
+   <span class="hljs-keyword">for</span> i :=<span class="hljs-number"> 0</span>; i &lt; threads; i++ {
+        <span class="hljs-keyword">go</span> <span class="hljs-keyword">func</span>(id <span class="hljs-typename">int</span>, nonce <span class="hljs-typename">uint64</span>){
+             ethash.mine(block,id,nonce,abort,found)
+        }(i, <span class="hljs-typename">uint64</span>(ethash.rand.Int63()))
+   }
+   <span class="hljs-keyword">var</span> result *<span class="hljs-keyword">type</span>.Block
+   <span class="hljs-keyword">select</span>{
+       <span class="hljs-keyword">case</span> &lt;- stop:
+       ....
+       <span class="hljs-keyword">case</span> result&lt;-found:
+       <span class="hljs-built_in">close</span>(abort)
+    }
+    <span class="hljs-keyword">return</span> result, <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>可以看到，ethash启动了多个线程调用<strong>mine()</strong>函数，当有线程挖到Block时，会通过传入的<code>found</code>通道传出结果。</p> 
+  <pre class="prettyprint"><code class="language-golang hljs ">core/ethash/sealer.<span class="hljs-keyword">go</span>
+<span class="hljs-keyword">func</span> (ethash *Ethash) mine(block *types.Block, id <span class="hljs-typename">int</span>, 
+seed <span class="hljs-typename">uint64</span>, abort <span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{}, found <span class="hljs-keyword">chan</span> *types.Block) {
+.....
+search:
+    <span class="hljs-keyword">for</span> {
+        <span class="hljs-keyword">select</span> {
+            <span class="hljs-keyword">case</span> &lt;-abort:   
+            ......
+            <span class="hljs-keyword">default</span>:
+            digest, result := hashimotoFull(dataset.dataset, hash, nonce)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">new</span>(big.Int).SetBytes(result).Cmp(target) &lt;=<span class="hljs-number"> 0</span> {
+                <span class="hljs-comment">// Correct nonce found, create a new header with it</span>
+                header = types.CopyHeader(header)
+                header.Nonce = types.EncodeNonce(nonce)
+                <span class="hljs-comment">// Seal and return a block (if still needed)</span>
+                <span class="hljs-keyword">select</span> {
+                    <span class="hljs-keyword">case</span> found &lt;- block.WithSeal(header):
+                    ......
+                    <span class="hljs-keyword">case</span> &lt;-abort:
+                }
+                <span class="hljs-keyword">break</span> search
+            }
+            nonce++
+         }
+    }
+......</code></pre> 
+  <p>可以看到,在主要for循环中，不断递增<code>nonce</code>的值，调用<strong>hashimotoFull()</strong>函数计算上面公式中的左边，而<code>target</code>则是公式的右边。当找到一个<code>nonce</code>使得<strong>左式&lt;=右式</strong>时,挖矿结束，<code>nonce</code>填到<code>header.Nonce</code></p> 
+  <h3 id="clique">clique</h3> 
+  <p>以太网社区为开发者提供了基于POA(proof on Authortiy)的<code>clique</code>共识算法。与基于POS的ethash不同的是，clique挖矿不消耗矿工的算力。在<code>clique</code>中,节点分为两类: <br> * 经过<code>认证</code>(Authorized)的节点，在源码里称为<code>signer</code>，具有生成(签发)新区块的能力，对应网络里的矿工 <br> * 未经过认证的节点，对应网络里的普通节点 <br> 在<code>ethash</code>中，矿工的账户地址存放在Header的<code>Coinbase</code>字段，但在clique中，这个字段另有他用。那么如何知道一个Block的挖掘者呢？答案是，矿工用自己的私钥对Block进行<code>签名</code>(Signature)，存放在Header的<code>Extra</code>字段，其他节点收到后，可以从这个字段提取出数字签名以及签发者(signer)的公钥，使用这个公钥可以计算出矿工(即signer)的账户地址。 <br> 一个节点a的认证状态可以互相转换，每个<code>signer</code>在签发Block时，可以附带一个提议(purposal)，提议另一个本地记录为非认证的节点b转变为认证节点，或者相反。网络中的其他节点c收到这个提议后，将其转化为一张选票(Vote)，如果支持节点的选票超过了节点c本地记录的<code>signer</code>数量的一半，那么节点c就承认节点b是signer</p> 
+  <p><code>clique</code>包由<code>api.go</code> <code>clique.go</code> <code>snapshot.go</code>三个文件组成 <br> 其中<code>api.go</code>中是一些提供给用户的命令行操作，比如用户可以输入以下命令表示他支持b成为<code>signer</code></p> 
+  <pre class="prettyprint"><code class=" hljs bash">clique.propose(<span class="hljs-string">"账户b的地址"</span>, <span class="hljs-literal">true</span>)</code></pre> 
+  <p><code>clique.go</code>和<code>snapshot.go</code>中分别定义两个重要的数据结构<code>Clique</code>和<code>Snapshot</code> <br> <code>Clique</code>数据结构的主要成员定义如下</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span>  Clique <span class="hljs-keyword">struct</span> {
+    config *params.CliqueConfig
+    recents      *lru.ARCCache
+    signatures   *lrn.ARCCache
+    proposals   <span class="hljs-keyword">map</span>[common.Address]<span class="hljs-typename">bool</span>
+    signer common.Address
+    signFn  SignerFn
+    ......
+}</code></pre> 
+  <ul> 
+   <li><code>config</code> 包含两个配置参数，其中<code>Period</code>设置模拟产生新Block的时间间隔，而<code>Epoch</code>表示每隔一定数量的Block就要把当前的投票结果清空并存入数据库，这么做是为了防止节点积压过多的投票信息，类似于单机游戏中的存档</li> 
+   <li><code>recents</code> 缓存最近访问过的<code>Snapshot</code>，查询的key为Block的Hash值，详见之后的<code>Snapshot</code></li> 
+   <li><code>signatures</code> 缓存最近访问过的Block的<code>signer</code>，查询的key为Block的Hash值</li> 
+   <li><code>proposals</code> 本节点待附带的提议池，用户通过propose()命名提交的提议会存放在这里，当本节点作为矿工对一个Block进行签名时，会随机选择池中的一个提议附带出去</li> 
+   <li><code>signer</code> 矿工节点的账户地址，意义上与<code>ethash</code>中的<code>Coinbase</code>类似</li> 
+   <li><code>signFn</code> 数字签名函数，它和signer都由<code>Clique.Authorize()</code>进行设置，后者在eth/backend.go中的<strong>StartMining()</strong>中被调用</li> 
+  </ul> 
+  <p><code>Snapshot</code>翻译过来是<strong>快照</strong>，它记录了区块链在特定的时刻(即特定的区块高度)本地记录的认证地址列表，举个栗子，Block#18731的Snapshot记录了网络中存在3个signer分别为a\b\c，且a已经支持另一个节点d成为signer(a投了d一张支持票)，当Block#18732的挖掘者b也支持d时，Block#18732记录的<code>signer</code>就会增加<code>d</code>的地址</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span> Snapshot <span class="hljs-keyword">struct</span>{
+    sigcache  *lru.ARCCache
+    Number    <span class="hljs-typename">uint64</span>
+    Hash    Common.Hash
+    Signers <span class="hljs-keyword">map</span>[Common.Address] <span class="hljs-keyword">struct</span>{}
+    Recents  <span class="hljs-keyword">map</span>[<span class="hljs-typename">uint64</span>]common.Address
+    Votes    []*Vote
+    Tally    <span class="hljs-keyword">map</span>[common.Address]Tally
+}</code></pre> 
+  <ul> 
+   <li><code>sigcache</code> 缓存最近访问过的<code>signer</code>，key为Block的Hash值</li> 
+   <li><code>Number</code> 本Snapshot对应的Block的高度，在创建时确定 </li> 
+   <li><code>Hash</code> 本Snapshot对应的Block的Hash，在创建时确定</li> 
+   <li><code>Signers</code> 本Snapshot对应时刻网络中<strong>认证过</strong>的节点地址(矿工)，在创建时确定</li> 
+   <li><code>Recents</code> 最近若干个Block的<code>signer</code>的集合，即挖出区块的矿工</li> 
+   <li><code>Votes</code> 由收到的<strong>有效</strong><code>proposal</code>计入的选票集合，每张选票记录了<strong>投票人</strong>/<strong>被投票人</strong>/<strong>投票意见</strong> 这里的有效有两层意思 <br> 
+    <ul>
+     <li>投票人是有效的的，首先他是signer(在<code>Snapshot.Signers</code>中)，并且他不能频繁投票(不在 <code>Snapshot.Recents</code>中)</li> 
+     <li>被投票人是有效的，被投票人的当前认证状态与选票中携带的意见不同</li>
+    </ul></li> 
+   <li><code>Tally</code> 投票结果map，key为被投票人地址，value为投票计数</li> 
+  </ul> 
+  <h5 id="prepare-1"><strong>Prepare()</strong></h5> 
+  <p><strong>Prepare()</strong>的实现分为两部分</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){
+    header.Coinbase = common.Address{}
+    header.Nonce = types.BlockNonce{}
+    number := header.Number.Uint64()
+
+    snap, err := c.snapshot(chain, num<span class="hljs-number">-1</span>, header.ParentHash, <span class="hljs-constant">nil</span>)
+    <span class="hljs-keyword">if</span> number % c.config.Epoch {
+        addresses := <span class="hljs-built_in">make</span> ([]common.Address)
+        <span class="hljs-keyword">for</span> address, authorize := <span class="hljs-keyword">range</span> c.proposals{
+            addresses = <span class="hljs-built_in">append</span>(addresses, address)
+        }
+        header.Coinbase = addresses[rand.Intn(<span class="hljs-built_in">len</span>(addresses))]
+        <span class="hljs-keyword">if</span> c.proposals[header.Coinbase] {
+            <span class="hljs-built_in">copy</span>(header.Nonce[:], nonceAuthVote)
+        }  <span class="hljs-keyword">else</span> {
+            <span class="hljs-built_in">copy</span>(header.Nonce[:], nonceDropVote)
+        }
+    }
+    ......</code></pre> 
+  <p>首先获取上一个Block的<code>Snapshot</code>，它有以下几个获取途径 <br> * <code>Clique</code>的缓存 <br> * 如果Block的高度恰好是在<code>checkpoint</code> 就可从数据库中读取 <br> * 由一个之前已有的<code>Snapshot</code>经过这之间的所有Header推算出来</p> 
+  <p>接下来随机地将本地<code>proposal</code>池中的一个目标节点地址放到<strong>Coinbase</strong> (注意在<code>ethash</code>中,这个字段填写的是矿工地址) 由于<code>Clique</code>不需要消耗算力，也就不需要计算nonce，因此在<code>Clique</code>中，Header的<strong>Nonce</strong>的字段被用来表示对目标节点投票的意见</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (c *Clique) Prepare(chain consensus.ChainReader, header *types.Header){
+   ......
+   header.Difficulty = CalcDifficulty(snap, c.signer)
+   header.Extra  = <span class="hljs-built_in">append</span>(header.Extra, <span class="hljs-built_in">make</span>([]<span class="hljs-typename">byte</span>, extraSeal))
+   ......</code></pre> 
+  <p>接下来填充Header中的<strong>Difficulty</strong>字段，在<code>Clique</code>中这个字段只有 <strong>1</strong> 和 <strong>2</strong> 两个取值，取决与本节点是否<code>inturn</code>,这完全是测试网络为了减少Block区块生成冲突的一个技巧，因为测试网络不存在真正的计算，那么如何确定下一个Block由谁确定呢?既然都一样，那就轮流坐庄，inturn的意思就是<strong>自己的回合</strong>,我们知道，区块链在生成中很容易出现短暂的分叉(<strong>fork</strong>)，其中难度最大的链为权威(<strong>canonocal</strong>)链，因此如果一个节点<strong>inturn</strong>，它就把难度设置为 <strong>2</strong> ，否则设置为 <strong>1</strong> </p> 
+  <p>前面提到过在<code>Clique</code>中，矿工的地址不是存放在<strong>Coinbase</strong>，而是将自己对区块的数字签名存放在Header的<strong>Extra</strong>字段，可以看到在<strong>Prepare()</strong>接口中为数字签名预留了<strong>Extra</strong>的后 <strong>65</strong> bytes</p> 
+  <h5 id="finalize-1"><strong>Finalize()</strong></h5> 
+  <p><code>clique</code>的<strong>Finalize()</strong>操作比较简单，就是计算了一下Header的Root Hash值</p> 
+  <h5 id="seal-1"><strong>Seal()</strong></h5> 
+  <p><strong>Seal()</strong>接口相对<code>ethash</code>的实现来说比较简单 (省略了一些检查)</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (c *Clique) Seal (chain consensus.ChainReader, block *<span class="hljs-keyword">type</span>.Block, stop &lt;-<span class="hljs-keyword">chan</span> <span class="hljs-keyword">struct</span>{})  (*types.Block, error) {
+    header := block.Header()
+    signer, signFn := c.signer, c.signFn
+    snap, err := c.snapshot(chain, number<span class="hljs-number">-1</span>, header.ParentHash, <span class="hljs-constant">nil</span>)
+    delay := time.Unix(header.Time.Int64(),<span class="hljs-number"> 0</span>).Sub(time.Now())
+    ......
+    <span class="hljs-keyword">select</span> {
+    <span class="hljs-keyword">case</span> &lt;- stop:
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, <span class="hljs-constant">nil</span>
+    <span class="hljs-keyword">case</span> &lt;-time.After(delay):
+    }
+
+    sighash, err := signFn(accounts.Account{Address:signer}, sigHash(header).Bytes())
+    <span class="hljs-built_in">copy</span>(header.Extra[<span class="hljs-built_in">len</span>(header.Extra) - extraSeal:], sighash)
+    <span class="hljs-keyword">return</span> block.WithSeal(header), <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>总的来说就是延迟了一定时间后对Block进行签名，然后将自己的签名存入header的<strong>Extra</strong>字段的后 <strong>65</strong> bytes，为了减少冲突，对于不是inturn的节点还会多延时一会儿，上面的代码我省略了这部分</p> 
+  <h1 id="总结">总结</h1> 
+  <ol> 
+   <li>挖矿的框架由<code>miner</code>包提供，期间使用了<code>consensus</code>包完成新的Block中一些字段的填充，总的来说挖矿分为<strong>打包交易</strong>和<strong>挖掘</strong>两个阶段</li> 
+   <li>以太坊目前实现了<code>ethash</code>和<code>clique</code>两套共识接口实现，分别用于公网环境和测试网络环境，前者消耗算力，后者不消耗。并且，他们对于Header中的字段的一些意义也不尽相同。!</li> 
+  </ol> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/chenmo187J3X1/article/details/80782230,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/chenmo187J3X1/article/details/80782230,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>fabric-1.0动态加入组织 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="fabric-1.0动态加入组织" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="fabric的组织配置信息一般是提前写在configtx.yaml文件中的，通过configtx.yaml生成系统创世区块和通道文件。而系统启动和通道创建是通过创世区块和通道文件进行的，因此要在fabric系统运行时添加组织则是非常困难的。 还好，fabric-1.0提供了configtxlator工具，为动态修改fabric通道信息提供可能。本文将介绍如何利用configtxlator为fabric-1.0网络动态添加组织。 运行fabric网络 本文利用fabric-sample项目中的first-network作为测试的示例。文档参考 下载fabric-sample 从github上克隆fabric-sample项目 $ git clone https://github.com/hyperledger/fabric-samples.git $ cd fabric-samples 下载镜像和binary包 $ curl -sSL https://goo.gl/eYdRbX | bash 这一步可能需要翻墙，可以从这里下载，然后运行，或者 $ curl -sSL http://oui195df4.bkt.clouddn.com/download-bin.sh | bash 这一步会拉取fabric-1.0的镜像和binary包 生成证书和通道文件 为了测试添加组织，先利用cryptogen工具生成三个组织的证书。 修改first-network，添加org3 生成证书和通道文件 $ ./byfn.sh -m generate 证书文件在crypto-config文件夹里，通道文件在channel-artifacts文件夹中 启动两个组织的fabric网络 执行 $ ./byfn.sh -m up 启动包括两个组织的fabric网络，cli容器会执行scripts/script.sh脚本进行创建mychannel通道，加入通道，部署chaincode，调用和查询chaincode等。 在系统channel中添加org 参考configtxlator工具的文档。 启动configtxlator服务 $ configtxlator start 获取系统通道的配置 设置MSP为Orderer $ export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/users/Admin\@example.com/msp/ $ export CORE_PEER_LOCALMSPID=OrdererMSP 获取通道 # peer channel fetch config config_block.pb -o orderer.example.com:7050 -c testchainid 生成添加组织的增量文件 将配置信息区块转换为可读的json文件 $ curl -X POST --data-binary @config_block.pb http://127.0.0.1:7059/protolator/decode/common.Block &gt; config_block.json 获取config区域 $ jq .data.data[0].payload.data.config config_block.json &gt; config.json 修改config.json，添加org3信息 这一步可以利用configtxgen工具生成org3的配置信息，并将配置信息添加到config.json文件中，修改后的文件保存为updated_config.json，部分内容如图： 将original config和updated config打包成proto文件 $ curl -X POST --data-binary @config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; config.pb 和 $ curl -X POST --data-binary @updated_config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; updated_config.pb 生成增量文件 $ curl -X POST -F original=@config.pb -F updated=@updated_config.pb http://127.0.0.1:7059/configtxlator/compute/update-from-configs -F channel=testchainid &gt; config_update.pb 至此，更新通道的数据已经准备好了。利用SDK可以签名和打包此消息，发送更新通道交易。值得注意的是，这个交易需要所有通道中已存在的org进行签名。 由于系统channel中只有一个组织——OrdererMSP，因此也可以直接通过命令行发送交易。 更新通道 将增量文件转换为pb格式 $ curl -X POST --data-binary @config_update.pb http://127.0.0.1:7059/protolator/decode/common.ConfigUpdate &gt; config_update.json 打包数据 $ echo &#39;{&quot;payload&quot;:{&quot;header&quot;:{&quot;channel_header&quot;:{&quot;channel_id&quot;:&quot;testchainid&quot;, &quot;type&quot;:2}},&quot;data&quot;:{&quot;config_update&quot;:&#39;$(cat config_update.json)&#39;}}}&#39; &gt; config_update_as_envelope.json 转换为pb文件 $ curl -X POST --data-binary @config_update_as_envelope.json http://127.0.0.1:7059/protolator/encode/common.Envelope &gt; config_update_as_envelope.pb 进入cli，更新通道 root@d96f70c3b3ab:/# root@d96f70c3b3ab:/# peer channel update -f config_update_as_envelope.pb -c testchainid -o 127.0.0.1:7050 此时系统channel——testchainid中则拥有了org3的信息。启动org3，则其可以进入fabric网络。但是org3无法加入mychannel通道，只能新建通道。 向mychannel添加org 向mychannel中添加org和向系统channel中添加org流程上是相同的，不同的是需要用所有PeerOrg进行签名。 生成增量pb文件 通过上述流程，生成增量pb文件，步骤省略。 发送更新通道交易 由于mychannel中有两个org，发送更新通道交易需要两个组织进行对更新交易进行多重签名，而通过执行peer channel update命令无法实现多重签名，因此需要通过SDK发送交易。 本文采用nodejs-sdk，创建更新交易js脚本，部分内容为 var signatures = []; //读取增量pb文件 var config_proto = fs.readFileSync(path.join(__dirname, &#39;mychannel_config_update.pb&#39;)); return Client.newDefaultKeyValueStore({ path: &#39;kvs_&#39; + org }).then((store) =&gt; { client.setStateStore(store); client._userContext = null; return getPeerAdmin(client, &#39;org1&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for org1&#39;); the_user = admin; //org1对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org1&#39;); signatures.push(signature); client._userContext = null; return getPeerAdmin(client, &#39;org2&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for org2&#39;); the_user = admin; //org2对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); client._userContext = null; return getOrdererAdmin(client); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for orderer&#39;); the_user = admin; //orderer对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); let tx_id = client.newTransactionID(); request = { config: config_proto, signatures : signatures, name : channelName, orderer : orderer, txId : tx_id }; //更新通道 return client.updateChannel(request); }).then((result) =&gt; { if(result.status &amp;&amp; result.status === &#39;SUCCESS&#39;) { logger.info(&#39;Successfully updated the channel.&#39;); return sleep(5000); } else { logger.error(&#39;Failed to update the channel. &#39;); Promise.reject(&#39;Failed to update the channel&#39;); } }).then((nothing) =&gt; { logger.info(&#39;Successfully waited to make sure new channel was updated.&#39;); 执行js脚本文件，更新通道。 此时org3则能成功加入mychannel通道。 总结 从流程来看，动态添加组织过程还是比较复杂的，涉及到文件的多次转换，多重签名等步骤。 更重要的是，更新交易需要多个组织进行签名，而在实际运用过程中，一个组织不可能获取所有组织的私钥，因此需要增量数据在各个组织间进行审核、流转，这个过程也是非常繁琐的。因此，未来需要开发在线审核流转工具，协助对数据签名。 by. xuyuzhuang date. 2017-08-22 阅读更多" />
+<meta property="og:description" content="fabric的组织配置信息一般是提前写在configtx.yaml文件中的，通过configtx.yaml生成系统创世区块和通道文件。而系统启动和通道创建是通过创世区块和通道文件进行的，因此要在fabric系统运行时添加组织则是非常困难的。 还好，fabric-1.0提供了configtxlator工具，为动态修改fabric通道信息提供可能。本文将介绍如何利用configtxlator为fabric-1.0网络动态添加组织。 运行fabric网络 本文利用fabric-sample项目中的first-network作为测试的示例。文档参考 下载fabric-sample 从github上克隆fabric-sample项目 $ git clone https://github.com/hyperledger/fabric-samples.git $ cd fabric-samples 下载镜像和binary包 $ curl -sSL https://goo.gl/eYdRbX | bash 这一步可能需要翻墙，可以从这里下载，然后运行，或者 $ curl -sSL http://oui195df4.bkt.clouddn.com/download-bin.sh | bash 这一步会拉取fabric-1.0的镜像和binary包 生成证书和通道文件 为了测试添加组织，先利用cryptogen工具生成三个组织的证书。 修改first-network，添加org3 生成证书和通道文件 $ ./byfn.sh -m generate 证书文件在crypto-config文件夹里，通道文件在channel-artifacts文件夹中 启动两个组织的fabric网络 执行 $ ./byfn.sh -m up 启动包括两个组织的fabric网络，cli容器会执行scripts/script.sh脚本进行创建mychannel通道，加入通道，部署chaincode，调用和查询chaincode等。 在系统channel中添加org 参考configtxlator工具的文档。 启动configtxlator服务 $ configtxlator start 获取系统通道的配置 设置MSP为Orderer $ export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/users/Admin\@example.com/msp/ $ export CORE_PEER_LOCALMSPID=OrdererMSP 获取通道 # peer channel fetch config config_block.pb -o orderer.example.com:7050 -c testchainid 生成添加组织的增量文件 将配置信息区块转换为可读的json文件 $ curl -X POST --data-binary @config_block.pb http://127.0.0.1:7059/protolator/decode/common.Block &gt; config_block.json 获取config区域 $ jq .data.data[0].payload.data.config config_block.json &gt; config.json 修改config.json，添加org3信息 这一步可以利用configtxgen工具生成org3的配置信息，并将配置信息添加到config.json文件中，修改后的文件保存为updated_config.json，部分内容如图： 将original config和updated config打包成proto文件 $ curl -X POST --data-binary @config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; config.pb 和 $ curl -X POST --data-binary @updated_config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; updated_config.pb 生成增量文件 $ curl -X POST -F original=@config.pb -F updated=@updated_config.pb http://127.0.0.1:7059/configtxlator/compute/update-from-configs -F channel=testchainid &gt; config_update.pb 至此，更新通道的数据已经准备好了。利用SDK可以签名和打包此消息，发送更新通道交易。值得注意的是，这个交易需要所有通道中已存在的org进行签名。 由于系统channel中只有一个组织——OrdererMSP，因此也可以直接通过命令行发送交易。 更新通道 将增量文件转换为pb格式 $ curl -X POST --data-binary @config_update.pb http://127.0.0.1:7059/protolator/decode/common.ConfigUpdate &gt; config_update.json 打包数据 $ echo &#39;{&quot;payload&quot;:{&quot;header&quot;:{&quot;channel_header&quot;:{&quot;channel_id&quot;:&quot;testchainid&quot;, &quot;type&quot;:2}},&quot;data&quot;:{&quot;config_update&quot;:&#39;$(cat config_update.json)&#39;}}}&#39; &gt; config_update_as_envelope.json 转换为pb文件 $ curl -X POST --data-binary @config_update_as_envelope.json http://127.0.0.1:7059/protolator/encode/common.Envelope &gt; config_update_as_envelope.pb 进入cli，更新通道 root@d96f70c3b3ab:/# root@d96f70c3b3ab:/# peer channel update -f config_update_as_envelope.pb -c testchainid -o 127.0.0.1:7050 此时系统channel——testchainid中则拥有了org3的信息。启动org3，则其可以进入fabric网络。但是org3无法加入mychannel通道，只能新建通道。 向mychannel添加org 向mychannel中添加org和向系统channel中添加org流程上是相同的，不同的是需要用所有PeerOrg进行签名。 生成增量pb文件 通过上述流程，生成增量pb文件，步骤省略。 发送更新通道交易 由于mychannel中有两个org，发送更新通道交易需要两个组织进行对更新交易进行多重签名，而通过执行peer channel update命令无法实现多重签名，因此需要通过SDK发送交易。 本文采用nodejs-sdk，创建更新交易js脚本，部分内容为 var signatures = []; //读取增量pb文件 var config_proto = fs.readFileSync(path.join(__dirname, &#39;mychannel_config_update.pb&#39;)); return Client.newDefaultKeyValueStore({ path: &#39;kvs_&#39; + org }).then((store) =&gt; { client.setStateStore(store); client._userContext = null; return getPeerAdmin(client, &#39;org1&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for org1&#39;); the_user = admin; //org1对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org1&#39;); signatures.push(signature); client._userContext = null; return getPeerAdmin(client, &#39;org2&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for org2&#39;); the_user = admin; //org2对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); client._userContext = null; return getOrdererAdmin(client); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \&#39;admin\&#39; for orderer&#39;); the_user = admin; //orderer对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); let tx_id = client.newTransactionID(); request = { config: config_proto, signatures : signatures, name : channelName, orderer : orderer, txId : tx_id }; //更新通道 return client.updateChannel(request); }).then((result) =&gt; { if(result.status &amp;&amp; result.status === &#39;SUCCESS&#39;) { logger.info(&#39;Successfully updated the channel.&#39;); return sleep(5000); } else { logger.error(&#39;Failed to update the channel. &#39;); Promise.reject(&#39;Failed to update the channel&#39;); } }).then((nothing) =&gt; { logger.info(&#39;Successfully waited to make sure new channel was updated.&#39;); 执行js脚本文件，更新通道。 此时org3则能成功加入mychannel通道。 总结 从流程来看，动态添加组织过程还是比较复杂的，涉及到文件的多次转换，多重签名等步骤。 更重要的是，更新交易需要多个组织进行签名，而在实际运用过程中，一个组织不可能获取所有组织的私钥，因此需要增量数据在各个组织间进行审核、流转，这个过程也是非常繁琐的。因此，未来需要开发在线审核流转工具，协助对数据签名。 by. xuyuzhuang date. 2017-08-22 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/03/21/f1ef36169ad29e4c0c48bd3f9c84e061.html" />
+<meta property="og:url" content="https://uzzz.org/2018/03/21/f1ef36169ad29e4c0c48bd3f9c84e061.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-03-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"fabric的组织配置信息一般是提前写在configtx.yaml文件中的，通过configtx.yaml生成系统创世区块和通道文件。而系统启动和通道创建是通过创世区块和通道文件进行的，因此要在fabric系统运行时添加组织则是非常困难的。 还好，fabric-1.0提供了configtxlator工具，为动态修改fabric通道信息提供可能。本文将介绍如何利用configtxlator为fabric-1.0网络动态添加组织。 运行fabric网络 本文利用fabric-sample项目中的first-network作为测试的示例。文档参考 下载fabric-sample 从github上克隆fabric-sample项目 $ git clone https://github.com/hyperledger/fabric-samples.git $ cd fabric-samples 下载镜像和binary包 $ curl -sSL https://goo.gl/eYdRbX | bash 这一步可能需要翻墙，可以从这里下载，然后运行，或者 $ curl -sSL http://oui195df4.bkt.clouddn.com/download-bin.sh | bash 这一步会拉取fabric-1.0的镜像和binary包 生成证书和通道文件 为了测试添加组织，先利用cryptogen工具生成三个组织的证书。 修改first-network，添加org3 生成证书和通道文件 $ ./byfn.sh -m generate 证书文件在crypto-config文件夹里，通道文件在channel-artifacts文件夹中 启动两个组织的fabric网络 执行 $ ./byfn.sh -m up 启动包括两个组织的fabric网络，cli容器会执行scripts/script.sh脚本进行创建mychannel通道，加入通道，部署chaincode，调用和查询chaincode等。 在系统channel中添加org 参考configtxlator工具的文档。 启动configtxlator服务 $ configtxlator start 获取系统通道的配置 设置MSP为Orderer $ export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/users/Admin\\@example.com/msp/ $ export CORE_PEER_LOCALMSPID=OrdererMSP 获取通道 # peer channel fetch config config_block.pb -o orderer.example.com:7050 -c testchainid 生成添加组织的增量文件 将配置信息区块转换为可读的json文件 $ curl -X POST --data-binary @config_block.pb http://127.0.0.1:7059/protolator/decode/common.Block &gt; config_block.json 获取config区域 $ jq .data.data[0].payload.data.config config_block.json &gt; config.json 修改config.json，添加org3信息 这一步可以利用configtxgen工具生成org3的配置信息，并将配置信息添加到config.json文件中，修改后的文件保存为updated_config.json，部分内容如图： 将original config和updated config打包成proto文件 $ curl -X POST --data-binary @config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; config.pb 和 $ curl -X POST --data-binary @updated_config.json http://127.0.0.1:7059/protolator/encode/common.Config &gt; updated_config.pb 生成增量文件 $ curl -X POST -F original=@config.pb -F updated=@updated_config.pb http://127.0.0.1:7059/configtxlator/compute/update-from-configs -F channel=testchainid &gt; config_update.pb 至此，更新通道的数据已经准备好了。利用SDK可以签名和打包此消息，发送更新通道交易。值得注意的是，这个交易需要所有通道中已存在的org进行签名。 由于系统channel中只有一个组织——OrdererMSP，因此也可以直接通过命令行发送交易。 更新通道 将增量文件转换为pb格式 $ curl -X POST --data-binary @config_update.pb http://127.0.0.1:7059/protolator/decode/common.ConfigUpdate &gt; config_update.json 打包数据 $ echo &#39;{&quot;payload&quot;:{&quot;header&quot;:{&quot;channel_header&quot;:{&quot;channel_id&quot;:&quot;testchainid&quot;, &quot;type&quot;:2}},&quot;data&quot;:{&quot;config_update&quot;:&#39;$(cat config_update.json)&#39;}}}&#39; &gt; config_update_as_envelope.json 转换为pb文件 $ curl -X POST --data-binary @config_update_as_envelope.json http://127.0.0.1:7059/protolator/encode/common.Envelope &gt; config_update_as_envelope.pb 进入cli，更新通道 root@d96f70c3b3ab:/# root@d96f70c3b3ab:/# peer channel update -f config_update_as_envelope.pb -c testchainid -o 127.0.0.1:7050 此时系统channel——testchainid中则拥有了org3的信息。启动org3，则其可以进入fabric网络。但是org3无法加入mychannel通道，只能新建通道。 向mychannel添加org 向mychannel中添加org和向系统channel中添加org流程上是相同的，不同的是需要用所有PeerOrg进行签名。 生成增量pb文件 通过上述流程，生成增量pb文件，步骤省略。 发送更新通道交易 由于mychannel中有两个org，发送更新通道交易需要两个组织进行对更新交易进行多重签名，而通过执行peer channel update命令无法实现多重签名，因此需要通过SDK发送交易。 本文采用nodejs-sdk，创建更新交易js脚本，部分内容为 var signatures = []; //读取增量pb文件 var config_proto = fs.readFileSync(path.join(__dirname, &#39;mychannel_config_update.pb&#39;)); return Client.newDefaultKeyValueStore({ path: &#39;kvs_&#39; + org }).then((store) =&gt; { client.setStateStore(store); client._userContext = null; return getPeerAdmin(client, &#39;org1&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \\&#39;admin\\&#39; for org1&#39;); the_user = admin; //org1对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org1&#39;); signatures.push(signature); client._userContext = null; return getPeerAdmin(client, &#39;org2&#39;); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \\&#39;admin\\&#39; for org2&#39;); the_user = admin; //org2对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); client._userContext = null; return getOrdererAdmin(client); }).then((admin) =&gt; { logger.info(&#39;Successfully enrolled user \\&#39;admin\\&#39; for orderer&#39;); the_user = admin; //orderer对config_proto进行签名 var signature = client.signChannelConfig(config_proto); logger.info(&#39;Successfully signed config update by org2&#39;); signatures.push(signature); let tx_id = client.newTransactionID(); request = { config: config_proto, signatures : signatures, name : channelName, orderer : orderer, txId : tx_id }; //更新通道 return client.updateChannel(request); }).then((result) =&gt; { if(result.status &amp;&amp; result.status === &#39;SUCCESS&#39;) { logger.info(&#39;Successfully updated the channel.&#39;); return sleep(5000); } else { logger.error(&#39;Failed to update the channel. &#39;); Promise.reject(&#39;Failed to update the channel&#39;); } }).then((nothing) =&gt; { logger.info(&#39;Successfully waited to make sure new channel was updated.&#39;); 执行js脚本文件，更新通道。 此时org3则能成功加入mychannel通道。 总结 从流程来看，动态添加组织过程还是比较复杂的，涉及到文件的多次转换，多重签名等步骤。 更重要的是，更新交易需要多个组织进行签名，而在实际运用过程中，一个组织不可能获取所有组织的私钥，因此需要增量数据在各个组织间进行审核、流转，这个过程也是非常繁琐的。因此，未来需要开发在线审核流转工具，协助对数据签名。 by. xuyuzhuang date. 2017-08-22 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/03/21/f1ef36169ad29e4c0c48bd3f9c84e061.html","headline":"fabric-1.0动态加入组织","dateModified":"2018-03-21T00:00:00+08:00","datePublished":"2018-03-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/03/21/f1ef36169ad29e4c0c48bd3f9c84e061.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>fabric-1.0动态加入组织</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>fabric的组织配置信息一般是提前写在configtx.yaml文件中的，通过configtx.yaml生成系统创世区块和通道文件。而系统启动和通道创建是通过创世区块和通道文件进行的，因此要在fabric系统运行时添加组织则是非常困难的。</p> 
+  <p>还好，fabric-1.0提供了configtxlator工具，为动态修改fabric通道信息提供可能。本文将介绍如何利用configtxlator为fabric-1.0网络动态添加组织。</p> 
+  <h2 id="运行fabric网络">运行fabric网络</h2> 
+  <p>本文利用fabric-sample项目中的first-network作为测试的示例。<a href="http://hyperledger-fabric.readthedocs.io/en/latest/build_network.html" rel="nofollow">文档参考</a></p> 
+  <h3 id="下载fabric-sample">下载fabric-sample</h3> 
+  <p>从github上克隆fabric-sample项目</p> 
+  <pre class="prettyprint"><code class=" hljs php">$ git <span class="hljs-keyword">clone</span> https:<span class="hljs-comment">//github.com/hyperledger/fabric-samples.git</span>
+$ cd fabric-samples</code></pre> 
+  <h3 id="下载镜像和binary包">下载镜像和binary包</h3> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -sSL <span class="hljs-symbol">https:</span>/<span class="hljs-regexp">/goo.gl/e</span>YdRbX | bash</code></pre> 
+  <p>这一步可能需要翻墙，可以从这里<a href="http://oui195df4.bkt.clouddn.com/download-bin.sh" rel="nofollow">下载</a>，然后运行，或者</p> 
+  <pre class="prettyprint"><code class=" hljs avrasm">$ curl -sSL http://oui195df4<span class="hljs-preprocessor">.bkt</span><span class="hljs-preprocessor">.clouddn</span><span class="hljs-preprocessor">.com</span>/download-bin<span class="hljs-preprocessor">.sh</span> | bash</code></pre> 
+  <p>这一步会拉取fabric-1.0的镜像和binary包</p> 
+  <h3 id="生成证书和通道文件">生成证书和通道文件</h3> 
+  <p>为了测试添加组织，先利用cryptogen工具生成三个组织的证书。 <br> 修改first-network，添加org3</p> 
+  <p><img src="http://oui195df4.bkt.clouddn.com/crypto-config.jpg" alt="crypto-org3" title=""></p> 
+  <p>生成证书和通道文件</p> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>./byfn.sh -m generate</code></pre> 
+  <p>证书文件在crypto-config文件夹里，通道文件在channel-artifacts文件夹中</p> 
+  <h3 id="启动两个组织的fabric网络">启动两个组织的fabric网络</h3> 
+  <p>执行</p> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>./byfn.sh -m up</code></pre> 
+  <p>启动包括两个组织的fabric网络，cli容器会执行scripts/script.sh脚本进行创建mychannel通道，加入通道，部署chaincode，调用和查询chaincode等。</p> 
+  <h2 id="在系统channel中添加org">在系统channel中添加org</h2> 
+  <p>参考configtxlator工具的<a href="http://hyperledger-fabric.readthedocs.io/en/latest/configtxlator.html" rel="nofollow">文档</a>。</p> 
+  <h3 id="启动configtxlator服务">启动configtxlator服务</h3> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>configtxlator start</code></pre> 
+  <h3 id="获取系统通道的配置">获取系统通道的配置</h3> 
+  <p>设置MSP为Orderer</p> 
+  <pre class="prettyprint"><code class=" hljs ruby">
+<span class="hljs-variable">$ </span>export <span class="hljs-constant">CORE_PEER_MSPCONFIGPATH</span>=<span class="hljs-regexp">/opt/gopath</span><span class="hljs-regexp">/src/github</span>.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/users/<span class="hljs-constant">Admin</span>\<span class="hljs-variable">@example</span>.com/msp/
+<span class="hljs-variable">$ </span>export <span class="hljs-constant">CORE_PEER_LOCALMSPID</span>=<span class="hljs-constant">OrdererMSP</span></code></pre> 
+  <p>获取通道</p> 
+  <pre class="prettyprint"><code class=" hljs vala"><span class="hljs-preprocessor"># peer channel fetch config config_block.pb -o orderer.example.com:7050 -c testchainid</span></code></pre> 
+  <h3 id="生成添加组织的增量文件">生成添加组织的增量文件</h3> 
+  <ul> 
+   <li>将配置信息区块转换为可读的json文件</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> --data-binary <span class="hljs-variable">@config_block</span>.pb <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/protolator</span><span class="hljs-regexp">/decode/common</span>.<span class="hljs-constant">Block</span> &gt; config_block.json</code></pre> 
+  <ul> 
+   <li>获取config区域</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs avrasm">$ jq <span class="hljs-preprocessor">.data</span><span class="hljs-preprocessor">.data</span>[<span class="hljs-number">0</span>]<span class="hljs-preprocessor">.payload</span><span class="hljs-preprocessor">.data</span><span class="hljs-preprocessor">.config</span> config_block<span class="hljs-preprocessor">.json</span> &gt; config<span class="hljs-preprocessor">.json</span></code></pre> 
+  <ul> 
+   <li>修改config.json，添加org3信息</li> 
+  </ul> 
+  <p>这一步可以利用configtxgen工具生成org3的配置信息，并将配置信息添加到config.json文件中，修改后的文件保存为updated_config.json，部分内容如图：</p> 
+  <p><img src="http://oui195df4.bkt.clouddn.com/updated-config.jpg" alt="updated-config" title=""></p> 
+  <ul> 
+   <li>将original config和updated config打包成proto文件</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> --data-binary <span class="hljs-variable">@config</span>.json <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/protolator</span><span class="hljs-regexp">/encode/common</span>.<span class="hljs-constant">Config</span> &gt; config.pb</code></pre> 
+  <p>和</p> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> --data-binary <span class="hljs-variable">@updated_config</span>.json <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/protolator</span><span class="hljs-regexp">/encode/common</span>.<span class="hljs-constant">Config</span> &gt; updated_config.pb</code></pre> 
+  <ul> 
+   <li>生成增量文件</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> -<span class="hljs-constant">F</span> original=<span class="hljs-variable">@config</span>.pb -<span class="hljs-constant">F</span> updated=<span class="hljs-variable">@updated_config</span>.pb <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/configtxlator</span><span class="hljs-regexp">/compute/update</span>-from-configs -<span class="hljs-constant">F</span> channel=testchainid &gt; config_update.pb</code></pre> 
+  <p>至此，更新通道的数据已经准备好了。利用SDK可以签名和打包此消息，发送更新通道交易。值得注意的是，这个交易需要所有通道中已存在的org进行签名。</p> 
+  <p>由于系统channel中只有一个组织——OrdererMSP，因此也可以直接通过命令行发送交易。</p> 
+  <h3 id="更新通道">更新通道</h3> 
+  <ul> 
+   <li>将增量文件转换为pb格式</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> --data-binary <span class="hljs-variable">@config_update</span>.pb <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/protolator</span><span class="hljs-regexp">/decode/common</span>.<span class="hljs-constant">ConfigUpdate</span> &gt; config_update.json</code></pre> 
+  <ul> 
+   <li>打包数据</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs scilab">$ echo <span class="hljs-string">'{"</span>payload<span class="hljs-string">":{"</span>header<span class="hljs-string">":{"</span>channel_header<span class="hljs-string">":{"</span>channel_id<span class="hljs-string">":"</span>testchainid<span class="hljs-string">", "</span>type<span class="hljs-string">":2}},"</span>data<span class="hljs-string">":{"</span>config_update<span class="hljs-string">":'</span>$(cat <span class="hljs-transposed_variable">config_update.</span>json)<span class="hljs-string">'}}}'</span> &gt; <span class="hljs-transposed_variable">config_update_as_envelope.</span>json</code></pre> 
+  <ul> 
+   <li>转换为pb文件</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-variable">$ </span>curl -<span class="hljs-constant">X</span> <span class="hljs-constant">POST</span> --data-binary <span class="hljs-variable">@config_update_as_envelope</span>.json <span class="hljs-symbol">http:</span>/<span class="hljs-regexp">/127.0.0.1:7059/protolator</span><span class="hljs-regexp">/encode/common</span>.<span class="hljs-constant">Envelope</span> &gt; config_update_as_envelope.pb</code></pre> 
+  <ul> 
+   <li>进入cli，更新通道</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs ruby">root<span class="hljs-variable">@d96f70c3b3ab</span><span class="hljs-symbol">:/</span><span class="hljs-comment">#</span>
+root<span class="hljs-variable">@d96f70c3b3ab</span><span class="hljs-symbol">:/</span><span class="hljs-comment"># peer channel update -f config_update_as_envelope.pb -c testchainid -o 127.0.0.1:7050</span></code></pre> 
+  <p>此时系统channel——testchainid中则拥有了org3的信息。启动org3，则其可以进入fabric网络。但是org3无法加入mychannel通道，只能新建通道。</p> 
+  <h2 id="向mychannel添加org">向mychannel添加org</h2> 
+  <p>向mychannel中添加org和向系统channel中添加org流程上是相同的，不同的是需要用所有PeerOrg进行签名。</p> 
+  <h3 id="生成增量pb文件">生成增量pb文件</h3> 
+  <p>通过上述流程，生成增量pb文件，步骤省略。</p> 
+  <h3 id="发送更新通道交易">发送更新通道交易</h3> 
+  <p>由于mychannel中有两个org，发送更新通道交易需要两个组织进行对更新交易进行多重签名，而通过执行peer channel update命令无法实现多重签名，因此需要通过SDK发送交易。</p> 
+  <p>本文采用nodejs-sdk，创建更新交易js脚本，部分内容为</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-keyword">var</span> signatures = [];
+<span class="hljs-comment">//读取增量pb文件</span>
+<span class="hljs-keyword">var</span> config_proto = fs.readFileSync(path.join(__dirname, <span class="hljs-string">'mychannel_config_update.pb'</span>));
+
+<span class="hljs-keyword">return</span> Client.newDefaultKeyValueStore({
+        path: <span class="hljs-string">'kvs_'</span> + org
+    }).then((store) =&gt; {
+        client.setStateStore(store);
+        client._userContext = <span class="hljs-literal">null</span>;
+        <span class="hljs-keyword">return</span> getPeerAdmin(client, <span class="hljs-string">'org1'</span>);
+    }).then((admin) =&gt; {
+        logger.info(<span class="hljs-string">'Successfully enrolled user \'admin\' for org1'</span>);
+        the_user = admin;
+        <span class="hljs-comment">//org1对config_proto进行签名</span>
+        <span class="hljs-keyword">var</span> signature = client.signChannelConfig(config_proto);
+        logger.info(<span class="hljs-string">'Successfully signed config update by org1'</span>);
+        signatures.push(signature);
+        client._userContext = <span class="hljs-literal">null</span>;
+        <span class="hljs-keyword">return</span> getPeerAdmin(client, <span class="hljs-string">'org2'</span>);
+    }).then((admin) =&gt; {
+        logger.info(<span class="hljs-string">'Successfully enrolled user \'admin\' for org2'</span>);
+        the_user = admin;
+        <span class="hljs-comment">//org2对config_proto进行签名</span>
+        <span class="hljs-keyword">var</span> signature = client.signChannelConfig(config_proto); 
+        logger.info(<span class="hljs-string">'Successfully signed config update by org2'</span>);
+        signatures.push(signature);
+        client._userContext = <span class="hljs-literal">null</span>;
+        <span class="hljs-keyword">return</span> getOrdererAdmin(client);
+    }).then((admin) =&gt; {
+        logger.info(<span class="hljs-string">'Successfully enrolled user \'admin\' for orderer'</span>);
+        the_user = admin;
+        <span class="hljs-comment">//orderer对config_proto进行签名</span>
+        <span class="hljs-keyword">var</span> signature = client.signChannelConfig(config_proto);
+        logger.info(<span class="hljs-string">'Successfully signed config update by org2'</span>);
+        signatures.push(signature);
+        <span class="hljs-keyword">let</span> tx_id = client.newTransactionID();
+        request = {
+            config: config_proto,
+            signatures : signatures,
+            name : channelName,
+            orderer : orderer,
+            txId  : tx_id
+        };
+        <span class="hljs-comment">//更新通道</span>
+        <span class="hljs-keyword">return</span> client.updateChannel(request);
+    }).then((result) =&gt; {
+        <span class="hljs-keyword">if</span>(result.status &amp;&amp; result.status === <span class="hljs-string">'SUCCESS'</span>) {
+            logger.info(<span class="hljs-string">'Successfully updated the channel.'</span>);
+            <span class="hljs-keyword">return</span> sleep(<span class="hljs-number">5000</span>);
+        } <span class="hljs-keyword">else</span> {
+            logger.error(<span class="hljs-string">'Failed to update the channel. '</span>);
+            Promise.reject(<span class="hljs-string">'Failed to update the channel'</span>);
+        }
+    }).then((nothing) =&gt; {
+        logger.info(<span class="hljs-string">'Successfully waited to make sure new channel was updated.'</span>);</code></pre> 
+  <p>执行js脚本文件，更新通道。</p> 
+  <p>此时org3则能成功加入mychannel通道。</p> 
+  <h2 id="总结">总结</h2> 
+  <p>从流程来看，动态添加组织过程还是比较复杂的，涉及到文件的多次转换，多重签名等步骤。</p> 
+  <p>更重要的是，更新交易需要多个组织进行签名，而在实际运用过程中，一个组织不可能获取所有组织的私钥，因此需要增量数据在各个组织间进行审核、流转，这个过程也是非常繁琐的。因此，未来需要开发在线审核流转工具，协助对数据签名。</p> 
+  <hr> 
+  <p>by. xuyuzhuang <br> date. 2017-08-22</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xuyuzhuang1991/article/details/77450646,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xuyuzhuang1991/article/details/77450646,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

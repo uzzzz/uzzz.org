@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>从源码解析以太坊地址的生成过程 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="从源码解析以太坊地址的生成过程" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，转载请注明来自 http://blog.csdn.net/hello2mao https://blog.csdn.net/hello2mao/article/details/80402646 一、获得一个以太坊钱包地址 通过以太坊命令行客户端geth可以很简单的获得一个以太坊地址，如下： [work@host]$ geth account new INFO [05-22|10:17:57] Maximum peer count ETH=25 LES=0 total=25 Your new account is locked with a password. Please give a password. Do not forget this password. Passphrase: Repeat passphrase: Address: {07a78fc0fb8c175d8e09e942086985d2835b6849} 地址0x07a78fc0fb8c175d8e09e942086985d2835b6849就是新生成的以太坊地址。 二、地址生成解析 下面跟踪geth的源码：https://github.com/ethereum/go-ethereum 来分析其地址生成过程。 geth是用https://github.com/urfave/cli 来做命令行解析的，运行geth account new时的入口在cmd/geth/main.go： func init() { // Initialize the CLI app and start Geth app.Action = geth ... app.Commands = []cli.Command{ ... // See accountcmd.go: accountCommand, ... } ... } 账户相关的命令在cmd/geth/accountcmd.go里，新建账户命令为new: var ( accountCommand = cli.Command{ Name: &quot;account&quot;, Usage: &quot;Manage accounts&quot;, Category: &quot;ACCOUNT COMMANDS&quot;, Description: ``, Subcommands: []cli.Command{ ... { Name: &quot;new&quot;, Usage: &quot;Create a new account&quot;, Action: utils.MigrateFlags(accountCreate), Flags: []cli.Flag{ utils.DataDirFlag, utils.KeyStoreDirFlag, utils.PasswordFileFlag, utils.LightKDFFlag, }, Description: ``, }, ... }, } ) 但new一个新账户的时候，会调用accountCreate： // accountCreate creates a new account into the keystore defined by the CLI flags. func accountCreate(ctx *cli.Context) error { // （1）获取配置 cfg := gethConfig{Node: defaultNodeConfig()} // Load config file. if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } utils.SetNodeConfig(ctx, &amp;cfg.Node) scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // （2）解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // （3）生成地址 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\n&quot;, address) return nil } 分为三步： 获取配置 解析用户密码 生成地址 第三步生成地址调用的keystore.StoreKey（accounts/keystore/keystore_passphrase.go）： // StoreKey generates a key, encrypts with &#39;auth&#39; and stores in the given directory func StoreKey(dir, auth string, scryptN, scryptP int) (common.Address, error) { _, a, err := storeNewKey(&amp;keyStorePassphrase{dir, scryptN, scryptP}, crand.Reader, auth) return a.Address, err } 这边直接调用了storeNewKey（accounts/keystore/key.go）创建新账户： func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 创建一个新的账户 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } func newKey(rand io.Reader) (*Key, error) { // （1）生成公钥和私钥 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // （2）由公钥算出地址并构建一个自定义的Key return newKeyFromECDSA(privateKeyECDSA), nil } 可以看到，newKey创建新账户时， 由secp256k1曲线生成私钥，是由随机的256bit组成 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥，一个私钥只能映射出一个公钥。 然后由公钥算出地址并构建一个自定义的Key 第三步的代码如下： func newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key { id := uuid.NewRandom() key := &amp;Key{ Id: id, Address: crypto.PubkeyToAddress(privateKeyECDSA.PublicKey), PrivateKey: privateKeyECDSA, } return key } 由公钥算出地址是由crypto.PubkeyToAddress（crypto/crypto.go）完成的： func PubkeyToAddress(p ecdsa.PublicKey) common.Address { pubBytes := FromECDSAPub(&amp;p) return common.BytesToAddress(Keccak256(pubBytes[1:])[12:]) } // Keccak256 calculates and returns the Keccak256 hash of the input data. func Keccak256(data ...[]byte) []byte { d := sha3.NewKeccak256() for _, b := range data { d.Write(b) } return d.Sum(nil) } 可以看到公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址。本质上是从256bit的私钥映射到160bit的公共地址。这意味着一个账户可以有不止一个私钥。 三、总结 总得来说，以太坊地址的生成过程如下： 1. 由secp256k1曲线生成私钥，是由随机的256bit组成 2. 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥。 3. 公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，转载请注明来自 http://blog.csdn.net/hello2mao https://blog.csdn.net/hello2mao/article/details/80402646 一、获得一个以太坊钱包地址 通过以太坊命令行客户端geth可以很简单的获得一个以太坊地址，如下： [work@host]$ geth account new INFO [05-22|10:17:57] Maximum peer count ETH=25 LES=0 total=25 Your new account is locked with a password. Please give a password. Do not forget this password. Passphrase: Repeat passphrase: Address: {07a78fc0fb8c175d8e09e942086985d2835b6849} 地址0x07a78fc0fb8c175d8e09e942086985d2835b6849就是新生成的以太坊地址。 二、地址生成解析 下面跟踪geth的源码：https://github.com/ethereum/go-ethereum 来分析其地址生成过程。 geth是用https://github.com/urfave/cli 来做命令行解析的，运行geth account new时的入口在cmd/geth/main.go： func init() { // Initialize the CLI app and start Geth app.Action = geth ... app.Commands = []cli.Command{ ... // See accountcmd.go: accountCommand, ... } ... } 账户相关的命令在cmd/geth/accountcmd.go里，新建账户命令为new: var ( accountCommand = cli.Command{ Name: &quot;account&quot;, Usage: &quot;Manage accounts&quot;, Category: &quot;ACCOUNT COMMANDS&quot;, Description: ``, Subcommands: []cli.Command{ ... { Name: &quot;new&quot;, Usage: &quot;Create a new account&quot;, Action: utils.MigrateFlags(accountCreate), Flags: []cli.Flag{ utils.DataDirFlag, utils.KeyStoreDirFlag, utils.PasswordFileFlag, utils.LightKDFFlag, }, Description: ``, }, ... }, } ) 但new一个新账户的时候，会调用accountCreate： // accountCreate creates a new account into the keystore defined by the CLI flags. func accountCreate(ctx *cli.Context) error { // （1）获取配置 cfg := gethConfig{Node: defaultNodeConfig()} // Load config file. if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } utils.SetNodeConfig(ctx, &amp;cfg.Node) scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // （2）解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // （3）生成地址 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\n&quot;, address) return nil } 分为三步： 获取配置 解析用户密码 生成地址 第三步生成地址调用的keystore.StoreKey（accounts/keystore/keystore_passphrase.go）： // StoreKey generates a key, encrypts with &#39;auth&#39; and stores in the given directory func StoreKey(dir, auth string, scryptN, scryptP int) (common.Address, error) { _, a, err := storeNewKey(&amp;keyStorePassphrase{dir, scryptN, scryptP}, crand.Reader, auth) return a.Address, err } 这边直接调用了storeNewKey（accounts/keystore/key.go）创建新账户： func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 创建一个新的账户 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } func newKey(rand io.Reader) (*Key, error) { // （1）生成公钥和私钥 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // （2）由公钥算出地址并构建一个自定义的Key return newKeyFromECDSA(privateKeyECDSA), nil } 可以看到，newKey创建新账户时， 由secp256k1曲线生成私钥，是由随机的256bit组成 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥，一个私钥只能映射出一个公钥。 然后由公钥算出地址并构建一个自定义的Key 第三步的代码如下： func newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key { id := uuid.NewRandom() key := &amp;Key{ Id: id, Address: crypto.PubkeyToAddress(privateKeyECDSA.PublicKey), PrivateKey: privateKeyECDSA, } return key } 由公钥算出地址是由crypto.PubkeyToAddress（crypto/crypto.go）完成的： func PubkeyToAddress(p ecdsa.PublicKey) common.Address { pubBytes := FromECDSAPub(&amp;p) return common.BytesToAddress(Keccak256(pubBytes[1:])[12:]) } // Keccak256 calculates and returns the Keccak256 hash of the input data. func Keccak256(data ...[]byte) []byte { d := sha3.NewKeccak256() for _, b := range data { d.Write(b) } return d.Sum(nil) } 可以看到公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址。本质上是从256bit的私钥映射到160bit的公共地址。这意味着一个账户可以有不止一个私钥。 三、总结 总得来说，以太坊地址的生成过程如下： 1. 由secp256k1曲线生成私钥，是由随机的256bit组成 2. 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥。 3. 公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/22/12974479973b0a6692500897402613f8.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/22/12974479973b0a6692500897402613f8.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-22T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，转载请注明来自 http://blog.csdn.net/hello2mao https://blog.csdn.net/hello2mao/article/details/80402646 一、获得一个以太坊钱包地址 通过以太坊命令行客户端geth可以很简单的获得一个以太坊地址，如下： [work@host]$ geth account new INFO [05-22|10:17:57] Maximum peer count ETH=25 LES=0 total=25 Your new account is locked with a password. Please give a password. Do not forget this password. Passphrase: Repeat passphrase: Address: {07a78fc0fb8c175d8e09e942086985d2835b6849} 地址0x07a78fc0fb8c175d8e09e942086985d2835b6849就是新生成的以太坊地址。 二、地址生成解析 下面跟踪geth的源码：https://github.com/ethereum/go-ethereum 来分析其地址生成过程。 geth是用https://github.com/urfave/cli 来做命令行解析的，运行geth account new时的入口在cmd/geth/main.go： func init() { // Initialize the CLI app and start Geth app.Action = geth ... app.Commands = []cli.Command{ ... // See accountcmd.go: accountCommand, ... } ... } 账户相关的命令在cmd/geth/accountcmd.go里，新建账户命令为new: var ( accountCommand = cli.Command{ Name: &quot;account&quot;, Usage: &quot;Manage accounts&quot;, Category: &quot;ACCOUNT COMMANDS&quot;, Description: ``, Subcommands: []cli.Command{ ... { Name: &quot;new&quot;, Usage: &quot;Create a new account&quot;, Action: utils.MigrateFlags(accountCreate), Flags: []cli.Flag{ utils.DataDirFlag, utils.KeyStoreDirFlag, utils.PasswordFileFlag, utils.LightKDFFlag, }, Description: ``, }, ... }, } ) 但new一个新账户的时候，会调用accountCreate： // accountCreate creates a new account into the keystore defined by the CLI flags. func accountCreate(ctx *cli.Context) error { // （1）获取配置 cfg := gethConfig{Node: defaultNodeConfig()} // Load config file. if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } utils.SetNodeConfig(ctx, &amp;cfg.Node) scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // （2）解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // （3）生成地址 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\\n&quot;, address) return nil } 分为三步： 获取配置 解析用户密码 生成地址 第三步生成地址调用的keystore.StoreKey（accounts/keystore/keystore_passphrase.go）： // StoreKey generates a key, encrypts with &#39;auth&#39; and stores in the given directory func StoreKey(dir, auth string, scryptN, scryptP int) (common.Address, error) { _, a, err := storeNewKey(&amp;keyStorePassphrase{dir, scryptN, scryptP}, crand.Reader, auth) return a.Address, err } 这边直接调用了storeNewKey（accounts/keystore/key.go）创建新账户： func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 创建一个新的账户 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } func newKey(rand io.Reader) (*Key, error) { // （1）生成公钥和私钥 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // （2）由公钥算出地址并构建一个自定义的Key return newKeyFromECDSA(privateKeyECDSA), nil } 可以看到，newKey创建新账户时， 由secp256k1曲线生成私钥，是由随机的256bit组成 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥，一个私钥只能映射出一个公钥。 然后由公钥算出地址并构建一个自定义的Key 第三步的代码如下： func newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key { id := uuid.NewRandom() key := &amp;Key{ Id: id, Address: crypto.PubkeyToAddress(privateKeyECDSA.PublicKey), PrivateKey: privateKeyECDSA, } return key } 由公钥算出地址是由crypto.PubkeyToAddress（crypto/crypto.go）完成的： func PubkeyToAddress(p ecdsa.PublicKey) common.Address { pubBytes := FromECDSAPub(&amp;p) return common.BytesToAddress(Keccak256(pubBytes[1:])[12:]) } // Keccak256 calculates and returns the Keccak256 hash of the input data. func Keccak256(data ...[]byte) []byte { d := sha3.NewKeccak256() for _, b := range data { d.Write(b) } return d.Sum(nil) } 可以看到公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址。本质上是从256bit的私钥映射到160bit的公共地址。这意味着一个账户可以有不止一个私钥。 三、总结 总得来说，以太坊地址的生成过程如下： 1. 由secp256k1曲线生成私钥，是由随机的256bit组成 2. 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥。 3. 公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/22/12974479973b0a6692500897402613f8.html","headline":"从源码解析以太坊地址的生成过程","dateModified":"2018-05-22T00:00:00+08:00","datePublished":"2018-05-22T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/22/12974479973b0a6692500897402613f8.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>从源码解析以太坊地址的生成过程</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，转载请注明来自 http://blog.csdn.net/hello2mao https://blog.csdn.net/hello2mao/article/details/80402646 
+ </div> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h1 id="一获得一个以太坊钱包地址">一、获得一个以太坊钱包地址</h1> 
+  <p>通过以太坊命令行客户端geth可以很简单的获得一个以太坊地址，如下：</p> 
+  <pre class="prettyprint"><code class=" hljs oxygene">[work@host]$ geth account <span class="hljs-keyword">new</span>
+INFO [<span class="hljs-number">05</span>-<span class="hljs-number">22</span>|<span class="hljs-number">10</span>:<span class="hljs-number">17</span>:<span class="hljs-number">57</span>] Maximum peer count                       ETH=<span class="hljs-number">25</span> LES=<span class="hljs-number">0</span> total=<span class="hljs-number">25</span>
+Your <span class="hljs-keyword">new</span> account <span class="hljs-keyword">is</span> <span class="hljs-keyword">locked</span> <span class="hljs-keyword">with</span> a password. Please give a password. <span class="hljs-keyword">Do</span> <span class="hljs-keyword">not</span> forget this password.
+Passphrase:
+<span class="hljs-keyword">Repeat</span> passphrase:
+Address: <span class="hljs-comment">{07a78fc0fb8c175d8e09e942086985d2835b6849}</span></code></pre> 
+  <p>地址<strong>0x07a78fc0fb8c175d8e09e942086985d2835b6849</strong>就是新生成的以太坊地址。</p> 
+  <h1 id="二地址生成解析">二、地址生成解析</h1> 
+  <p>下面跟踪geth的源码：<a href="https://github.com/ethereum/go-ethereum" rel="nofollow">https://github.com/ethereum/go-ethereum</a> 来分析其地址生成过程。 <br> geth是用<a href="https://github.com/urfave/cli" rel="nofollow">https://github.com/urfave/cli</a> 来做命令行解析的，运行geth account new时的入口在cmd/geth/main.go：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> init() {
+    <span class="hljs-comment">// Initialize the CLI app and start Geth</span>
+    app.Action = geth
+    ...
+    app.Commands = []cli.Command{
+        ...
+        <span class="hljs-comment">// See accountcmd.go:</span>
+        accountCommand,
+        ...
+    }
+    ...
+}</code></pre> 
+  <p>账户相关的命令在cmd/geth/accountcmd.go里，新建账户命令为new:</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">var</span> (
+    accountCommand = cli.Command{
+        Name:     <span class="hljs-string">"account"</span>,
+        Usage:    <span class="hljs-string">"Manage accounts"</span>,
+        Category: <span class="hljs-string">"ACCOUNT COMMANDS"</span>,
+        Description: <span class="hljs-string">``</span>,
+        Subcommands: []cli.Command{
+        ...
+            {
+                Name:   <span class="hljs-string">"new"</span>,
+                Usage:  <span class="hljs-string">"Create a new account"</span>,
+                Action: utils.MigrateFlags(accountCreate),
+                Flags: []cli.Flag{
+                    utils.DataDirFlag,
+                    utils.KeyStoreDirFlag,
+                    utils.PasswordFileFlag,
+                    utils.LightKDFFlag,
+                },
+                Description: <span class="hljs-string">``</span>,
+            },
+            ...
+        },
+    }
+)</code></pre> 
+  <p>但new一个新账户的时候，会调用accountCreate：</p> 
+  <pre class="prettyprint"><code class="language-goalng hljs livecodeserver">// accountCreate creates <span class="hljs-operator">a</span> <span class="hljs-built_in">new</span> account <span class="hljs-keyword">into</span> <span class="hljs-operator">the</span> keystore defined <span class="hljs-keyword">by</span> <span class="hljs-operator">the</span> CLI flags.
+func accountCreate(ctx *cli.Context) error {
+   <span class="hljs-comment"> // （1）获取配置</span>
+    cfg := gethConfig{Node: defaultNodeConfig()}
+   <span class="hljs-comment"> // Load config file.</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-built_in">file</span> := ctx.GlobalString(configFileFlag.Name); <span class="hljs-built_in">file</span> != <span class="hljs-string">""</span> {
+        <span class="hljs-keyword">if</span> err := loadConfig(<span class="hljs-built_in">file</span>, &amp;cfg); err != nil {
+            utils.Fatalf(<span class="hljs-string">"%v"</span>, err)
+        }
+    }
+    utils.SetNodeConfig(ctx, &amp;cfg.Node)
+    scryptN, scryptP, keydir, err := cfg.Node.AccountConfig()
+
+    <span class="hljs-keyword">if</span> err != nil {
+        utils.Fatalf(<span class="hljs-string">"Failed to read configuration: %v"</span>, err)
+    }
+   <span class="hljs-comment"> // （2）解析用户密码</span>
+    password := getPassPhrase(<span class="hljs-string">"Your new account is locked with a password. Please give a password. Do not forget this password."</span>, <span class="hljs-constant">true</span>, <span class="hljs-number">0</span>, utils.MakePasswordList(ctx))
+   <span class="hljs-comment"> // （3）生成地址</span>
+    address, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
+
+    <span class="hljs-keyword">if</span> err != nil {
+        utils.Fatalf(<span class="hljs-string">"Failed to create account: %v"</span>, err)
+    }
+    fmt.Printf(<span class="hljs-string">"Address: {%x}\n"</span>, address)
+    <span class="hljs-constant">return</span> nil
+}</code></pre> 
+  <p>分为三步：</p> 
+  <ol> 
+   <li>获取配置</li> 
+   <li>解析用户密码</li> 
+   <li>生成地址</li> 
+  </ol> 
+  <p>第三步生成地址调用的keystore.StoreKey（accounts/keystore/keystore_passphrase.go）：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-comment">// StoreKey generates a key, encrypts with 'auth' and stores in the given directory</span>
+<span class="hljs-keyword">func</span> StoreKey(dir, auth <span class="hljs-typename">string</span>, scryptN, scryptP <span class="hljs-typename">int</span>) (common.Address, error) {
+    _, a, err := storeNewKey(&amp;keyStorePassphrase{dir, scryptN, scryptP}, crand.Reader, auth)
+    <span class="hljs-keyword">return</span> a.Address, err
+}</code></pre> 
+  <p>这边直接调用了storeNewKey（accounts/keystore/key.go）创建新账户：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> storeNewKey(ks keyStore, rand io.Reader, auth <span class="hljs-typename">string</span>) (*Key, accounts.Account, error) {
+    <span class="hljs-comment">// 创建一个新的账户</span>
+    key, err := newKey(rand)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, accounts.Account{}, err
+    }
+    a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}}
+    <span class="hljs-keyword">if</span> err := ks.StoreKey(a.URL.Path, key, auth); err != <span class="hljs-constant">nil</span> {
+        zeroKey(key.PrivateKey)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, a, err
+    }
+    <span class="hljs-keyword">return</span> key, a, err
+}
+
+<span class="hljs-keyword">func</span> newKey(rand io.Reader) (*Key, error) {
+    <span class="hljs-comment">// （1）生成公钥和私钥</span>
+    privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    <span class="hljs-comment">// （2）由公钥算出地址并构建一个自定义的Key</span>
+    <span class="hljs-keyword">return</span> newKeyFromECDSA(privateKeyECDSA), <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>可以看到，newKey创建新账户时，</p> 
+  <ol> 
+   <li>由secp256k1曲线生成私钥，是由随机的256bit组成</li> 
+   <li>采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥，一个私钥只能映射出一个公钥。</li> 
+   <li>然后由公钥算出地址并构建一个自定义的Key</li> 
+  </ol> 
+  <p>第三步的代码如下：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key {
+    id := uuid.NewRandom()
+    key := &amp;Key{
+        Id:         id,
+        Address:    crypto.PubkeyToAddress(privateKeyECDSA.PublicKey),
+        PrivateKey: privateKeyECDSA,
+    }
+    <span class="hljs-keyword">return</span> key
+}</code></pre> 
+  <p>由公钥算出地址是由crypto.PubkeyToAddress（crypto/crypto.go）完成的：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> PubkeyToAddress(p ecdsa.PublicKey) common.Address {
+    pubBytes := FromECDSAPub(&amp;p)
+    <span class="hljs-keyword">return</span> common.BytesToAddress(Keccak256(pubBytes<span class="hljs-number">[1</span>:])<span class="hljs-number">[12</span>:])
+}
+
+<span class="hljs-comment">// Keccak256 calculates and returns the Keccak256 hash of the input data.</span>
+<span class="hljs-keyword">func</span> Keccak256(data ...[]<span class="hljs-typename">byte</span>) []<span class="hljs-typename">byte</span> {
+    d := sha3.NewKeccak256()
+    <span class="hljs-keyword">for</span> _, b := <span class="hljs-keyword">range</span> data {
+        d.Write(b)
+    }
+    <span class="hljs-keyword">return</span> d.Sum(<span class="hljs-constant">nil</span>)
+}</code></pre> 
+  <p>可以看到公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址。本质上是从256bit的私钥映射到160bit的公共地址。这意味着一个账户可以有不止一个私钥。</p> 
+  <h1 id="三总结">三、总结</h1> 
+  <p>总得来说，以太坊地址的生成过程如下： <br> 1. 由secp256k1曲线生成私钥，是由随机的256bit组成 <br> 2. 采用椭圆曲线数字签名算法（ECDSA）将私钥映射成公钥。 <br> 3. 公钥经过Keccak-256单向散列函数变成了256bit，然后取160bit作为地址</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-7f770a53f2.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/hello2mao/article/details/80402646,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/hello2mao/article/details/80402646,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

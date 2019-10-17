@@ -1,0 +1,940 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>open-ethereum-pool以太坊矿池源码分析(4)-policy模块 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="open-ethereum-pool以太坊矿池源码分析(4)-policy模块" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="# open-ethereum-pool以太坊矿池-policy模块 ## PolicyServer定义 ```go type PolicyServer struct { &nbsp;&nbsp;&nbsp;&nbsp;sync.RWMutex &nbsp;&nbsp;&nbsp;&nbsp;statsMu sync.Mutex &nbsp;&nbsp;&nbsp;&nbsp;config *Config &nbsp;&nbsp;&nbsp;&nbsp;stats map[ string]*Stats &nbsp;&nbsp;&nbsp;&nbsp;banChannel chan string &nbsp;&nbsp;&nbsp;&nbsp;startedAt int64 &nbsp;&nbsp;&nbsp;&nbsp;grace int64 &nbsp;&nbsp;&nbsp;&nbsp;timeout int64 &nbsp;&nbsp;&nbsp;&nbsp;blacklist [] string &nbsp;&nbsp;&nbsp;&nbsp;whitelist [] string &nbsp;&nbsp;&nbsp;&nbsp;storage *storage.RedisClient } ``` ## policy流程图 ![]( policy.png) ## GetBlacklist和GetWhitelist ```go // Always returns list of addresses. If Redis fails it will return empty list. func (r *RedisClient) GetBlacklist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:blacklist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;blacklist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } // Always returns list of IPs. If Redis fails it will return empty list. func (r *RedisClient) GetWhitelist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:whitelist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;whitelist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } ``` ## IsBanned ```go func (s *PolicyServer) IsBanned(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp; return atomic.LoadInt32(&amp;x.Banned) &gt; 0 } func (s *PolicyServer) Get(ip string) *Stats { &nbsp;&nbsp;&nbsp;&nbsp;s.statsMu.Lock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.statsMu.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; if x, ok := s.stats[ip]; !ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x = s.NewStats() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.stats[ip] = x &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} } func (s *PolicyServer) NewStats() *Stats { &nbsp;&nbsp;&nbsp;&nbsp;x := &amp;Stats{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ConnLimit: s.config.Limits.Limit, &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp; return x } ``` ## 处理ApplyMalformedPolicy ```go //应用格式错误的策略 //malformedLimit为5次 func (s *PolicyServer) ApplyMalformedPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;n := x.incrMalformed() &nbsp;&nbsp;&nbsp;&nbsp; if n &gt;= s.config.Banning.MalformedLimit { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) incrMalformed() int32 { &nbsp;&nbsp;&nbsp;&nbsp; return atomic.AddInt32(&amp;x.Malformed, 1) } func (s *PolicyServer) forceBan(x *Stats, ip string) { &nbsp;&nbsp;&nbsp;&nbsp; //没启用Banning或在白名单 &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Banning.Enabled || s.InWhiteList(ip) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt64(&amp;x.BannedAt, util.MakeTimestamp()) &nbsp;&nbsp;&nbsp;&nbsp; //x.Banned赋值为1 &nbsp;&nbsp;&nbsp;&nbsp; if atomic.CompareAndSwapInt32(&amp;x.Banned, 0, 1) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;ipset&quot;: &quot;blacklist&quot;, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(s.config.Banning.IPSet) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.banChannel &lt;- ip &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Println( &quot;Banned peer&quot;, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplyLoginPolicy(addy, ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if s.InBlackList(addy) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (s *PolicyServer) InBlackList(addy string) bool { &nbsp;&nbsp;&nbsp;&nbsp;s.RLock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.RUnlock() &nbsp;&nbsp;&nbsp;&nbsp; return util.StringInSlice(addy, s.blacklist) } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplySharePolicy(ip string, validShare bool) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;x.Lock() &nbsp;&nbsp;&nbsp;&nbsp; if validShare { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Increase allowed number of connections on each valid share &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //每个有效share可以增加的连接数 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;limitJump&quot;: 10 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.incrLimit(s.config.Limits.LimitJump) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares++ &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;totalShares := x.ValidShares + x.InvalidShares &nbsp;&nbsp;&nbsp;&nbsp; //Check after after miner submitted this number of shares &nbsp;&nbsp;&nbsp;&nbsp; //30个shares后检查 &nbsp;&nbsp;&nbsp;&nbsp; //&quot;checkThreshold&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if totalShares &lt; s.config.Banning.CheckThreshold { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;validShares := float32(x.ValidShares) &nbsp;&nbsp;&nbsp;&nbsp;invalidShares := float32(x.InvalidShares) &nbsp;&nbsp;&nbsp;&nbsp;x.resetShares() &nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; //无效share比例 &nbsp;&nbsp;&nbsp;&nbsp;ratio := invalidShares / validShares &nbsp;&nbsp;&nbsp;&nbsp; // Percent of invalid shares from all shares to ban miner &nbsp;&nbsp;&nbsp;&nbsp; //&quot;invalidPercent&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if ratio &gt;= s.config.Banning.InvalidPercent/ 100.0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } //加 func (x *Stats) incrLimit(n int32) { &nbsp;&nbsp;&nbsp;&nbsp;atomic.AddInt32(&amp;x.ConnLimit, n) } //reset func (x *Stats) resetShares() { &nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares = 0 &nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares = 0 } ``` ## 处理ApplyLimitPolicy ```go func (s *PolicyServer) ApplyLimitPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp; //&quot;grace&quot;: &quot;5m&quot;, &nbsp;&nbsp;&nbsp;&nbsp; if now-s.startedAt &gt; s.grace { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //减1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return s.Get(ip).decrLimit() &gt; 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) decrLimit() int32 { return atomic.AddInt32(&amp;x.ConnLimit, - 1) } ``` ## 处理BanClient ```go func (s *PolicyServer) BanClient(ip string) { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) } ``` 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="# open-ethereum-pool以太坊矿池-policy模块 ## PolicyServer定义 ```go type PolicyServer struct { &nbsp;&nbsp;&nbsp;&nbsp;sync.RWMutex &nbsp;&nbsp;&nbsp;&nbsp;statsMu sync.Mutex &nbsp;&nbsp;&nbsp;&nbsp;config *Config &nbsp;&nbsp;&nbsp;&nbsp;stats map[ string]*Stats &nbsp;&nbsp;&nbsp;&nbsp;banChannel chan string &nbsp;&nbsp;&nbsp;&nbsp;startedAt int64 &nbsp;&nbsp;&nbsp;&nbsp;grace int64 &nbsp;&nbsp;&nbsp;&nbsp;timeout int64 &nbsp;&nbsp;&nbsp;&nbsp;blacklist [] string &nbsp;&nbsp;&nbsp;&nbsp;whitelist [] string &nbsp;&nbsp;&nbsp;&nbsp;storage *storage.RedisClient } ``` ## policy流程图 ![]( policy.png) ## GetBlacklist和GetWhitelist ```go // Always returns list of addresses. If Redis fails it will return empty list. func (r *RedisClient) GetBlacklist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:blacklist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;blacklist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } // Always returns list of IPs. If Redis fails it will return empty list. func (r *RedisClient) GetWhitelist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:whitelist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;whitelist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } ``` ## IsBanned ```go func (s *PolicyServer) IsBanned(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp; return atomic.LoadInt32(&amp;x.Banned) &gt; 0 } func (s *PolicyServer) Get(ip string) *Stats { &nbsp;&nbsp;&nbsp;&nbsp;s.statsMu.Lock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.statsMu.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; if x, ok := s.stats[ip]; !ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x = s.NewStats() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.stats[ip] = x &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} } func (s *PolicyServer) NewStats() *Stats { &nbsp;&nbsp;&nbsp;&nbsp;x := &amp;Stats{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ConnLimit: s.config.Limits.Limit, &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp; return x } ``` ## 处理ApplyMalformedPolicy ```go //应用格式错误的策略 //malformedLimit为5次 func (s *PolicyServer) ApplyMalformedPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;n := x.incrMalformed() &nbsp;&nbsp;&nbsp;&nbsp; if n &gt;= s.config.Banning.MalformedLimit { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) incrMalformed() int32 { &nbsp;&nbsp;&nbsp;&nbsp; return atomic.AddInt32(&amp;x.Malformed, 1) } func (s *PolicyServer) forceBan(x *Stats, ip string) { &nbsp;&nbsp;&nbsp;&nbsp; //没启用Banning或在白名单 &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Banning.Enabled || s.InWhiteList(ip) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt64(&amp;x.BannedAt, util.MakeTimestamp()) &nbsp;&nbsp;&nbsp;&nbsp; //x.Banned赋值为1 &nbsp;&nbsp;&nbsp;&nbsp; if atomic.CompareAndSwapInt32(&amp;x.Banned, 0, 1) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;ipset&quot;: &quot;blacklist&quot;, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(s.config.Banning.IPSet) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.banChannel &lt;- ip &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Println( &quot;Banned peer&quot;, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplyLoginPolicy(addy, ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if s.InBlackList(addy) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (s *PolicyServer) InBlackList(addy string) bool { &nbsp;&nbsp;&nbsp;&nbsp;s.RLock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.RUnlock() &nbsp;&nbsp;&nbsp;&nbsp; return util.StringInSlice(addy, s.blacklist) } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplySharePolicy(ip string, validShare bool) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;x.Lock() &nbsp;&nbsp;&nbsp;&nbsp; if validShare { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Increase allowed number of connections on each valid share &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //每个有效share可以增加的连接数 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;limitJump&quot;: 10 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.incrLimit(s.config.Limits.LimitJump) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares++ &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;totalShares := x.ValidShares + x.InvalidShares &nbsp;&nbsp;&nbsp;&nbsp; //Check after after miner submitted this number of shares &nbsp;&nbsp;&nbsp;&nbsp; //30个shares后检查 &nbsp;&nbsp;&nbsp;&nbsp; //&quot;checkThreshold&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if totalShares &lt; s.config.Banning.CheckThreshold { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;validShares := float32(x.ValidShares) &nbsp;&nbsp;&nbsp;&nbsp;invalidShares := float32(x.InvalidShares) &nbsp;&nbsp;&nbsp;&nbsp;x.resetShares() &nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; //无效share比例 &nbsp;&nbsp;&nbsp;&nbsp;ratio := invalidShares / validShares &nbsp;&nbsp;&nbsp;&nbsp; // Percent of invalid shares from all shares to ban miner &nbsp;&nbsp;&nbsp;&nbsp; //&quot;invalidPercent&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if ratio &gt;= s.config.Banning.InvalidPercent/ 100.0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } //加 func (x *Stats) incrLimit(n int32) { &nbsp;&nbsp;&nbsp;&nbsp;atomic.AddInt32(&amp;x.ConnLimit, n) } //reset func (x *Stats) resetShares() { &nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares = 0 &nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares = 0 } ``` ## 处理ApplyLimitPolicy ```go func (s *PolicyServer) ApplyLimitPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp; //&quot;grace&quot;: &quot;5m&quot;, &nbsp;&nbsp;&nbsp;&nbsp; if now-s.startedAt &gt; s.grace { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //减1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return s.Get(ip).decrLimit() &gt; 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) decrLimit() int32 { return atomic.AddInt32(&amp;x.ConnLimit, - 1) } ``` ## 处理BanClient ```go func (s *PolicyServer) BanClient(ip string) { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) } ``` 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/21/8d5d8d332b0d588ed25255e93b66effc.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/21/8d5d8d332b0d588ed25255e93b66effc.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"# open-ethereum-pool以太坊矿池-policy模块 ## PolicyServer定义 ```go type PolicyServer struct { &nbsp;&nbsp;&nbsp;&nbsp;sync.RWMutex &nbsp;&nbsp;&nbsp;&nbsp;statsMu sync.Mutex &nbsp;&nbsp;&nbsp;&nbsp;config *Config &nbsp;&nbsp;&nbsp;&nbsp;stats map[ string]*Stats &nbsp;&nbsp;&nbsp;&nbsp;banChannel chan string &nbsp;&nbsp;&nbsp;&nbsp;startedAt int64 &nbsp;&nbsp;&nbsp;&nbsp;grace int64 &nbsp;&nbsp;&nbsp;&nbsp;timeout int64 &nbsp;&nbsp;&nbsp;&nbsp;blacklist [] string &nbsp;&nbsp;&nbsp;&nbsp;whitelist [] string &nbsp;&nbsp;&nbsp;&nbsp;storage *storage.RedisClient } ``` ## policy流程图 ![]( policy.png) ## GetBlacklist和GetWhitelist ```go // Always returns list of addresses. If Redis fails it will return empty list. func (r *RedisClient) GetBlacklist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:blacklist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;blacklist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } // Always returns list of IPs. If Redis fails it will return empty list. func (r *RedisClient) GetWhitelist() ([] string, error) { &nbsp;&nbsp;&nbsp;&nbsp; //SMEMBERS eth:whitelist &nbsp;&nbsp;&nbsp;&nbsp; //Smembers 命令返回集合中的所有的成员 &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey( &quot;whitelist&quot;)) &nbsp;&nbsp;&nbsp;&nbsp; if cmd.Err() != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return [] string{}, cmd.Err() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return cmd.Val(), nil } ``` ## IsBanned ```go func (s *PolicyServer) IsBanned(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp; return atomic.LoadInt32(&amp;x.Banned) &gt; 0 } func (s *PolicyServer) Get(ip string) *Stats { &nbsp;&nbsp;&nbsp;&nbsp;s.statsMu.Lock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.statsMu.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; if x, ok := s.stats[ip]; !ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x = s.NewStats() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.stats[ip] = x &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return x &nbsp;&nbsp;&nbsp;&nbsp;} } func (s *PolicyServer) NewStats() *Stats { &nbsp;&nbsp;&nbsp;&nbsp;x := &amp;Stats{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ConnLimit: s.config.Limits.Limit, &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat() &nbsp;&nbsp;&nbsp;&nbsp; return x } ``` ## 处理ApplyMalformedPolicy ```go //应用格式错误的策略 //malformedLimit为5次 func (s *PolicyServer) ApplyMalformedPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;n := x.incrMalformed() &nbsp;&nbsp;&nbsp;&nbsp; if n &gt;= s.config.Banning.MalformedLimit { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) incrMalformed() int32 { &nbsp;&nbsp;&nbsp;&nbsp; return atomic.AddInt32(&amp;x.Malformed, 1) } func (s *PolicyServer) forceBan(x *Stats, ip string) { &nbsp;&nbsp;&nbsp;&nbsp; //没启用Banning或在白名单 &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Banning.Enabled || s.InWhiteList(ip) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt64(&amp;x.BannedAt, util.MakeTimestamp()) &nbsp;&nbsp;&nbsp;&nbsp; //x.Banned赋值为1 &nbsp;&nbsp;&nbsp;&nbsp; if atomic.CompareAndSwapInt32(&amp;x.Banned, 0, 1) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;ipset&quot;: &quot;blacklist&quot;, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if len(s.config.Banning.IPSet) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.banChannel &lt;- ip &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Println( &quot;Banned peer&quot;, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplyLoginPolicy(addy, ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if s.InBlackList(addy) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (s *PolicyServer) InBlackList(addy string) bool { &nbsp;&nbsp;&nbsp;&nbsp;s.RLock() &nbsp;&nbsp;&nbsp;&nbsp; defer s.RUnlock() &nbsp;&nbsp;&nbsp;&nbsp; return util.StringInSlice(addy, s.blacklist) } ``` ## 处理ApplyLoginPolicy ```go func (s *PolicyServer) ApplySharePolicy(ip string, validShare bool) bool { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;x.Lock() &nbsp;&nbsp;&nbsp;&nbsp; if validShare { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //Increase allowed number of connections on each valid share &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //每个有效share可以增加的连接数 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //&quot;limitJump&quot;: 10 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.incrLimit(s.config.Limits.LimitJump) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares++ &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;totalShares := x.ValidShares + x.InvalidShares &nbsp;&nbsp;&nbsp;&nbsp; //Check after after miner submitted this number of shares &nbsp;&nbsp;&nbsp;&nbsp; //30个shares后检查 &nbsp;&nbsp;&nbsp;&nbsp; //&quot;checkThreshold&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if totalShares &lt; s.config.Banning.CheckThreshold { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;validShares := float32(x.ValidShares) &nbsp;&nbsp;&nbsp;&nbsp;invalidShares := float32(x.InvalidShares) &nbsp;&nbsp;&nbsp;&nbsp;x.resetShares() &nbsp;&nbsp;&nbsp;&nbsp;x.Unlock() &nbsp;&nbsp;&nbsp;&nbsp; //无效share比例 &nbsp;&nbsp;&nbsp;&nbsp;ratio := invalidShares / validShares &nbsp;&nbsp;&nbsp;&nbsp; // Percent of invalid shares from all shares to ban miner &nbsp;&nbsp;&nbsp;&nbsp; //&quot;invalidPercent&quot;: 30, &nbsp;&nbsp;&nbsp;&nbsp; if ratio &gt;= s.config.Banning.InvalidPercent/ 100.0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return false &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } //加 func (x *Stats) incrLimit(n int32) { &nbsp;&nbsp;&nbsp;&nbsp;atomic.AddInt32(&amp;x.ConnLimit, n) } //reset func (x *Stats) resetShares() { &nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares = 0 &nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares = 0 } ``` ## 处理ApplyLimitPolicy ```go func (s *PolicyServer) ApplyLimitPolicy(ip string) bool { &nbsp;&nbsp;&nbsp;&nbsp; if !s.config.Limits.Enabled { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp() &nbsp;&nbsp;&nbsp;&nbsp; //&quot;grace&quot;: &quot;5m&quot;, &nbsp;&nbsp;&nbsp;&nbsp; if now-s.startedAt &gt; s.grace { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; //减1 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return s.Get(ip).decrLimit() &gt; 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; return true } func (x *Stats) decrLimit() int32 { return atomic.AddInt32(&amp;x.ConnLimit, - 1) } ``` ## 处理BanClient ```go func (s *PolicyServer) BanClient(ip string) { &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip) &nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip) } ``` 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/21/8d5d8d332b0d588ed25255e93b66effc.html","headline":"open-ethereum-pool以太坊矿池源码分析(4)-policy模块","dateModified":"2018-05-21T00:00:00+08:00","datePublished":"2018-05-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/21/8d5d8d332b0d588ed25255e93b66effc.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>open-ethereum-pool以太坊矿池源码分析(4)-policy模块</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div class="blog-content-box" style="background:rgb(255,255,255);color:rgb(51,51,51);font-family:'SF Pro Display', Roboto, Noto, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;font-size:14px;">
+   <div class="article_content clearfix csdn-tracking-statistics">
+    <div class="htmledit_views">
+     <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;"># open-ethereum-pool以太坊矿池-policy模块</span></span>
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## PolicyServer定义</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">type</span> 
+       <span style="color:rgb(78,201,176);">PolicyServer</span> 
+       <span style="color:rgb(86,156,214);">struct</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;sync.RWMutex
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;statsMu sync.Mutex
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;config *Config
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;stats 
+       <span style="color:rgb(86,156,214);">map</span>[
+       <span style="color:rgb(78,201,176);">string</span>]*Stats
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;banChannel 
+       <span style="color:rgb(86,156,214);">chan</span> 
+       <span style="color:rgb(78,201,176);">string</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;startedAt 
+       <span style="color:rgb(78,201,176);">int64</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;grace 
+       <span style="color:rgb(78,201,176);">int64</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;timeout 
+       <span style="color:rgb(78,201,176);">int64</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;blacklist []
+       <span style="color:rgb(78,201,176);">string</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;whitelist []
+       <span style="color:rgb(78,201,176);">string</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;storage *storage.RedisClient
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## policy流程图</span></span>
+      </div>
+      <br>
+      <div>
+       ![](
+       <span>policy.png</span>)
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## GetBlacklist和GetWhitelist</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(96,139,78);">// Always returns list of addresses. If Redis fails it will return empty list.</span>
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) GetBlacklist() ([]
+       <span style="color:rgb(78,201,176);">string</span>, 
+       <span style="color:rgb(86,156,214);">error</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//SMEMBERS eth:blacklist</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//Smembers 命令返回集合中的所有的成员</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey(
+       <span style="color:rgb(206,145,120);">"blacklist"</span>))
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> cmd.Err() != 
+       <span style="color:rgb(86,156,214);">nil</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> []
+       <span style="color:rgb(78,201,176);">string</span>{}, cmd.Err()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> cmd.Val(), 
+       <span style="color:rgb(86,156,214);">nil</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(96,139,78);">// Always returns list of IPs. If Redis fails it will return empty list.</span>
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (r *RedisClient) GetWhitelist() ([]
+       <span style="color:rgb(78,201,176);">string</span>, 
+       <span style="color:rgb(86,156,214);">error</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//SMEMBERS eth:whitelist</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//Smembers 命令返回集合中的所有的成员</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;cmd := r.client.SMembers(r.formatKey(
+       <span style="color:rgb(206,145,120);">"whitelist"</span>))
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> cmd.Err() != 
+       <span style="color:rgb(86,156,214);">nil</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> []
+       <span style="color:rgb(78,201,176);">string</span>{}, cmd.Err()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> cmd.Val(), 
+       <span style="color:rgb(86,156,214);">nil</span>
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## IsBanned</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) IsBanned(ip 
+       <span style="color:rgb(78,201,176);">string</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> atomic.LoadInt32(&amp;x.Banned) &gt; 
+       <span style="color:rgb(181,206,168);">0</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) Get(ip 
+       <span style="color:rgb(78,201,176);">string</span>) *Stats {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;s.statsMu.Lock()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">defer</span> s.statsMu.Unlock()
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> x, ok := s.stats[ip]; !ok {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x = s.NewStats()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.stats[ip] = x
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> x
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;} 
+       <span style="color:rgb(197,134,192);">else</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> x
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) NewStats() *Stats {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x := &amp;Stats{
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ConnLimit: s.config.Limits.Limit,
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.heartbeat()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> x
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 处理ApplyMalformedPolicy</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(96,139,78);">//应用格式错误的策略</span>
+      </div>
+      <div>
+       <span style="color:rgb(96,139,78);">//malformedLimit为5次</span>
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) ApplyMalformedPolicy(ip 
+       <span style="color:rgb(78,201,176);">string</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;n := x.incrMalformed()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> n &gt;= s.config.Banning.MalformedLimit {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">false</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (x *Stats) incrMalformed() 
+       <span style="color:rgb(78,201,176);">int32</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> atomic.AddInt32(&amp;x.Malformed, 
+       <span style="color:rgb(181,206,168);">1</span>)
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) forceBan(x *Stats, ip 
+       <span style="color:rgb(78,201,176);">string</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//没启用Banning或在白名单</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> !s.config.Banning.Enabled || s.InWhiteList(ip) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt64(&amp;x.BannedAt, util.MakeTimestamp())
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//x.Banned赋值为1</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> atomic.CompareAndSwapInt32(&amp;x.Banned, 
+       <span style="color:rgb(181,206,168);">0</span>, 
+       <span style="color:rgb(181,206,168);">1</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//"ipset": "blacklist",</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> 
+       <span style="color:rgb(220,220,170);">len</span>(s.config.Banning.IPSet) &gt; 
+       <span style="color:rgb(181,206,168);">0</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.banChannel &lt;- ip
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} 
+       <span style="color:rgb(197,134,192);">else</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Println(
+       <span style="color:rgb(206,145,120);">"Banned peer"</span>, ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 处理ApplyLoginPolicy</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) ApplyLoginPolicy(addy, ip 
+       <span style="color:rgb(78,201,176);">string</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> s.InBlackList(addy) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">false</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) InBlackList(addy 
+       <span style="color:rgb(78,201,176);">string</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;s.RLock()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">defer</span> s.RUnlock()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> util.StringInSlice(addy, s.blacklist)
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 处理ApplyLoginPolicy</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) ApplySharePolicy(ip 
+       <span style="color:rgb(78,201,176);">string</span>, validShare 
+       <span style="color:rgb(78,201,176);">bool</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.Lock()
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> validShare {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares++
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> s.config.Limits.Enabled {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//Increase allowed number of connections on each valid share</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//每个有效share可以增加的连接数</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//"limitJump": 10</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.incrLimit(s.config.Limits.LimitJump)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;} 
+       <span style="color:rgb(197,134,192);">else</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares++
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;totalShares := x.ValidShares + x.InvalidShares
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//Check after after miner submitted this number of shares</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//30个shares后检查</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//"checkThreshold": 30,</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> totalShares &lt; s.config.Banning.CheckThreshold {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;x.Unlock()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;validShares := float32(x.ValidShares)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;invalidShares := float32(x.InvalidShares)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.resetShares()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.Unlock()
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//无效share比例</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;ratio := invalidShares / validShares
+      </div>
+      <br>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">// Percent of invalid shares from all shares to ban miner</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//"invalidPercent": 30,</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> ratio &gt;= s.config.Banning.InvalidPercent/
+       <span style="color:rgb(181,206,168);">100.0</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">false</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(96,139,78);">//加</span>
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (x *Stats) incrLimit(n 
+       <span style="color:rgb(78,201,176);">int32</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;atomic.AddInt32(&amp;x.ConnLimit, n)
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(96,139,78);">//reset</span>
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (x *Stats) resetShares() {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.ValidShares = 
+       <span style="color:rgb(181,206,168);">0</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x.InvalidShares = 
+       <span style="color:rgb(181,206,168);">0</span>
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 处理ApplyLimitPolicy</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) ApplyLimitPolicy(ip 
+       <span style="color:rgb(78,201,176);">string</span>) 
+       <span style="color:rgb(78,201,176);">bool</span> {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> !s.config.Limits.Enabled {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;now := util.MakeTimestamp()
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//"grace": "5m",</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">if</span> now-s.startedAt &gt; s.grace {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(96,139,78);">//减1</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> s.Get(ip).decrLimit() &gt; 
+       <span style="color:rgb(181,206,168);">0</span>
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;}
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;
+       <span style="color:rgb(197,134,192);">return</span> 
+       <span style="color:rgb(86,156,214);">true</span>
+      </div>
+      <div>
+       }
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (x *Stats) decrLimit() 
+       <span style="color:rgb(78,201,176);">int32</span> {
+      </div>
+      <div> 
+       <span style="color:rgb(197,134,192);">return</span> atomic.AddInt32(&amp;x.ConnLimit, -
+       <span style="color:rgb(181,206,168);">1</span>)
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+      <br>
+      <div>
+       <span style="color:rgb(86,156,214);"><span style="font-weight:700;">## 处理BanClient</span></span>
+      </div>
+      <br>
+      <div>
+       ```go
+      </div>
+      <div>
+       <span style="color:rgb(86,156,214);">func</span> (s *PolicyServer) BanClient(ip 
+       <span style="color:rgb(78,201,176);">string</span>) {
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;x := s.Get(ip)
+      </div>
+      <div>
+       &nbsp;&nbsp;&nbsp;&nbsp;s.forceBan(x, ip)
+      </div>
+      <div>
+       }
+      </div>
+      <div>
+       ```
+      </div>
+     </div>
+     <p></p>
+     <p><br></p>
+     <p><br><br></p>
+     <p style="font-family:Consolas, 'Courier New', monospace;"><span><br style="color:rgb(51,51,51);font-size:14px;"><br style="color:rgb(51,51,51);font-size:14px;"></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>网址：http://www.qukuailianxueyuan.io/<br></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>欲领取造币技术与全套虚拟机资料</span></p>
+     <p style="font-family:Consolas, 'Courier New', monospace;"><span><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></span></p>
+     <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>尹成学院微信：备注：CSDN</span></p>
+     <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></span></p>
+     <br>
+     <div>
+      <p style="font-family:Consolas, 'Courier New', monospace;"><span><br style="color:rgb(51,51,51);font-size:14px;"><br style="color:rgb(51,51,51);font-size:14px;"></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>网址：http://www.qukuailianxueyuan.io/<br></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>欲领取造币技术与全套虚拟机资料</span></p>
+      <p style="font-family:Consolas, 'Courier New', monospace;"><span><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></span></p>
+      <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><span>尹成学院微信：备注：CSDN</span></p>
+      <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;"><span><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></span></p>
+     </div>
+    </div>
+   </div>
+  </div>
+  <div class="edu-promotion" style="background:rgb(255,255,255);color:rgb(51,51,51);font-family:'SF Pro Display', Roboto, Noto, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;font-size:14px;"></div>
+  <a style="color:rgb(51,51,51);font-family:'SF Pro Display', Roboto, Noto, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;font-size:14px;background-color:rgb(245,246,247);"></a>
+  <span style="color:rgb(51,51,51);font-family:'SF Pro Display', Roboto, Noto, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;font-size:14px;background-color:rgb(245,246,247);"></span>
+  <div class="comment-box" style="background:rgb(255,255,255);color:rgb(51,51,51);font-family:'SF Pro Display', Roboto, Noto, Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;font-size:14px;">
+   <div class="comment-edit-box d-flex">
+    <a style="color:rgb(51,51,51);"></a>
+    <div class="user-img">
+     <img src="https://avatar.csdn.net/A/F/C/3_yincheng01.jpg" style="width:24px;" alt="">
+    </div>
+   </div>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80391547,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80391547,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

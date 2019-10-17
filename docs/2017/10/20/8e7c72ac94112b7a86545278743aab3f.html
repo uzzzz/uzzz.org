@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Hyperledger Fabric 排序节点启动过程 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Hyperledger Fabric 排序节点启动过程" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="Hyperledger 源码分析之 Fabric Orderer 节点启动通过&nbsp;orderer&nbsp;包下的 main() 方法实现，会进一步调用到&nbsp;orderer/common/server&nbsp;包中的&nbsp;Main()&nbsp;方法。 核心代码如下所示。 // Main is the entry point of orderer processfunc Main() { fullCmd := kingpin.MustParse(app.Parse(os.Args[1:])) // &quot;version&quot; command if fullCmd == version.FullCommand() { fmt.Println(metadata.GetVersionInfo()) return } conf := config.Load() initializeLoggingLevel(conf) initializeLocalMsp(conf) Start(fullCmd, conf)} 包括配置初始化过程和核心启动过程两个部分： config.Load()：从本地配置文件和环境变量中读取配置信息，构建配置树结构。 initializeLoggingLevel(conf)：配置日志级别。 initializeLocalMsp(conf)：配置 MSP 结构。 Start()：完成启动后的核心工作。 整体过程 核心启动过程都在&nbsp;orderer/common/server包中的 Start() 方法，如下图所示。 Start() 方法会初始化 gRPC 服务需要的结构，然后启动服务。 核心代码如下所示。 func Start(cmd string, conf *config.TopLevel) { logger.Debugf(&quot;Start()&quot;) signer := localmsp.NewSigner() manager := initializeMultichannelRegistrar(conf, signer) server := NewServer(manager, signer, &amp;conf.Debug) switch cmd { case start.FullCommand(): // &quot;start&quot; command logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) initializeProfilingService(conf) grpcServer := initializeGrpcServer(conf) ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) grpcServer.Start() case benchmark.FullCommand(): // &quot;benchmark&quot; command logger.Info(&quot;Starting orderer in benchmark mode&quot;) benchmarkServer := performance.GetBenchmarkServer() benchmarkServer.RegisterService(server) benchmarkServer.Start() }} 包括两大部分： gRPC 服务结构初始化； gRPC 服务启动。 gRPC 服务结构初始化 包括创建新的 MSP 签名结构，初始化 Registrar 结构来管理各个账本结构，启动共识过程，以及创建 gRPC 服务端结构。 核心过程包括： signer := localmsp.NewSigner() // 初始化签名结构manager := initializeMultichannelRegistrar(conf, signer) // 初始化账本管理器（Registrar）结构 其中，initializeMultichannelRegistrar(conf, signer)&nbsp;方法最为关键，核心代码如下： func initializeMultichannelRegistrar(conf *config.TopLevel, signer crypto.LocalSigner) *multichannel.Registrar { // 创建账本操作的工厂结构 lf, _ := createLedgerFactory(conf) // 如果是新启动情况，创建系统通道的账本结构 if len(lf.ChainIDs()) == 0 { logger.Debugf(&quot;There is no chain, hence we must be in bootstrapping&quot;) initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //初始化共识插件 consenters := make(map[string]consensus.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version, conf.Kafka.Verbose) // 创建各个账本的管理器（Registrar）结构，并启动共识过程 return multichannel.NewRegistrar(lf, consenters, signer)} 利用传入的配置信息和签名信息完成如下步骤： 创建账本操作的工厂结构； 如果是新启动情况，利用给定的系统初始区块文件初始化系统通道的相关结构； 完成共识插件（包括&nbsp;solo&nbsp;和&nbsp;kafka&nbsp;两种）的初始化； multichannel.NewRegistrar(lf, consenters, signer) 方法会扫描本地账本数据（此时至少已存在系统通道），创建 Registrar 结构，并为每个账本都启动共识（如 Kafka 排序）过程。 说明：Registrar 结构（位于&nbsp;orderer.common.multichannel&nbsp;包）是 Orderer 组件中最核心的结构，管理了 Orderer 中所有的账本、共识插件等数据结构。 创建 Registrar 结构并启动共识过程 NewRegistrar(lf, consenters, signer)&nbsp;方法位于&nbsp;orderer.common.multichannel&nbsp;包，负责初始化链支持、消息处理器等重要数据结构，并为各个账本启动共识过程。 核心代码如下： existingChains := ledgerFactory.ChainIDs()for _, chainID := range existingChains { if _, ok := ledgerResources.ConsortiumsConfig(); ok { // 如果是系统账本 chain := newChainSupport(r, ledgerResources, consenters, signer) chain.Processor = msgprocessor.NewSystemChannel(chain, r.templator, msgprocessor.CreateSystemChannelFilters(r, chain)) r.chains[chainID] = chain r.systemChannelID = chainID r.systemChannel = chain defer chain.start() // 启动共识过程 else // 如果是应用账本 chain := newChainSupport(r, ledgerResources, consenters, signer) r.chains[chainID] = chain chain.start() // 启动共识过程 } chain.start()&nbsp;方法负责启动共识过程，以 Kafka 共识插件为例，最终调用到&nbsp;orderer.consensus.kafka&nbsp;包中的&nbsp;startThread()&nbsp;方法。 startThread()&nbsp;方法将为指定的账本结构配置共识服务，并将其启动，核心代码包括： // 创建 Producer 结构chain.producer, err = setupProducerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 发送 CONNECT 消息sendConnectMessage(chain.consenter.retryOptions(), chain.haltChan, chain.producer, chain.channel)// 创建处理对应 Kafka topic 的 Consumer 结构chain.parentConsumer, err = setupParentConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 配置从指定 partition 读取消息的 PartitionConsumer 结构chain.channelConsumer, err = setupChannelConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentConsumer, chain.channel, chain.lastOffsetPersisted+1)// 从该链对应的分区读取消息，并进行处理过程chain.processMessagesToBlocks() 主要包括如下步骤： 创建到 Kafka 集群的 Producer 结构并发送 CONNECT 消息； 为对应的 topic 创建 Consumer 结构，并配置从指定分区读取消息的 PartitionConsumer 结构； 启动链对应的 Kafka 分区中消息的循环处理过程。processMessagesToBlocks()&nbsp;方法不断从分区中 Consume 消息并进行处理，同时定时发送 TimeToCut 消息。处理消息类型包括 Connect 消息（Producer 启动后发出）、TimeToCut 消息和 Regular 消息（普通的交易）。分别调用对应方法进行处理。 gRPC 服务启动 初始化 gRPC 服务结构，完成绑定并启动监听。 // 初始化 gRPC 服务端结构server := NewServer(manager, signer, &amp;conf.Debug)// 创建 gRPC 服务连接grpcServer := initializeGrpcServer(conf)// 绑定 gRPC 服务并启动ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server)grpcServer.Start() 其中，NewServer(manager, signer, &amp;conf.Debug)&nbsp;方法（位于&nbsp;orderer.common.server&nbsp;包）最为核心，将 gRPC 相关的服务结构进行初始化，并绑定到 gRPC 请求上。分别响应&nbsp;Deliver()&nbsp;和&nbsp;Broadcast()&nbsp;两个 gRPC 调用。 // NewServer creates an ab.AtomicBroadcastServer based on the broadcast target and ledger Readerfunc NewServer(r *multichannel.Registrar, _ crypto.LocalSigner, debug *localconfig.Debug) ab.AtomicBroadcastServer { s := &amp;server{ dh: deliver.NewHandlerImpl(deliverSupport{Registrar: r}), bh: broadcast.NewHandlerImpl(broadcastSupport{Registrar: r}), debug: debug, } return s} =========================== 《区块链原理、设计与应用》一书已经正式出版，以超级账本项目为例，介绍了区块链和分布式账本技术的底层原理、设计架构、应用实践的大量细节，欢迎大家阅读指正。 ===== 关于 TechFirst 公众号 ===== 专注金融科技、人工智能、云计算、大数据相关领域的热门技术与前瞻方向。 发送关键词（如区块链、云计算、大数据、容器），获取热门点评与技术干货。 欢迎投稿！ 阅读更多" />
+<meta property="og:description" content="Hyperledger 源码分析之 Fabric Orderer 节点启动通过&nbsp;orderer&nbsp;包下的 main() 方法实现，会进一步调用到&nbsp;orderer/common/server&nbsp;包中的&nbsp;Main()&nbsp;方法。 核心代码如下所示。 // Main is the entry point of orderer processfunc Main() { fullCmd := kingpin.MustParse(app.Parse(os.Args[1:])) // &quot;version&quot; command if fullCmd == version.FullCommand() { fmt.Println(metadata.GetVersionInfo()) return } conf := config.Load() initializeLoggingLevel(conf) initializeLocalMsp(conf) Start(fullCmd, conf)} 包括配置初始化过程和核心启动过程两个部分： config.Load()：从本地配置文件和环境变量中读取配置信息，构建配置树结构。 initializeLoggingLevel(conf)：配置日志级别。 initializeLocalMsp(conf)：配置 MSP 结构。 Start()：完成启动后的核心工作。 整体过程 核心启动过程都在&nbsp;orderer/common/server包中的 Start() 方法，如下图所示。 Start() 方法会初始化 gRPC 服务需要的结构，然后启动服务。 核心代码如下所示。 func Start(cmd string, conf *config.TopLevel) { logger.Debugf(&quot;Start()&quot;) signer := localmsp.NewSigner() manager := initializeMultichannelRegistrar(conf, signer) server := NewServer(manager, signer, &amp;conf.Debug) switch cmd { case start.FullCommand(): // &quot;start&quot; command logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) initializeProfilingService(conf) grpcServer := initializeGrpcServer(conf) ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) grpcServer.Start() case benchmark.FullCommand(): // &quot;benchmark&quot; command logger.Info(&quot;Starting orderer in benchmark mode&quot;) benchmarkServer := performance.GetBenchmarkServer() benchmarkServer.RegisterService(server) benchmarkServer.Start() }} 包括两大部分： gRPC 服务结构初始化； gRPC 服务启动。 gRPC 服务结构初始化 包括创建新的 MSP 签名结构，初始化 Registrar 结构来管理各个账本结构，启动共识过程，以及创建 gRPC 服务端结构。 核心过程包括： signer := localmsp.NewSigner() // 初始化签名结构manager := initializeMultichannelRegistrar(conf, signer) // 初始化账本管理器（Registrar）结构 其中，initializeMultichannelRegistrar(conf, signer)&nbsp;方法最为关键，核心代码如下： func initializeMultichannelRegistrar(conf *config.TopLevel, signer crypto.LocalSigner) *multichannel.Registrar { // 创建账本操作的工厂结构 lf, _ := createLedgerFactory(conf) // 如果是新启动情况，创建系统通道的账本结构 if len(lf.ChainIDs()) == 0 { logger.Debugf(&quot;There is no chain, hence we must be in bootstrapping&quot;) initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //初始化共识插件 consenters := make(map[string]consensus.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version, conf.Kafka.Verbose) // 创建各个账本的管理器（Registrar）结构，并启动共识过程 return multichannel.NewRegistrar(lf, consenters, signer)} 利用传入的配置信息和签名信息完成如下步骤： 创建账本操作的工厂结构； 如果是新启动情况，利用给定的系统初始区块文件初始化系统通道的相关结构； 完成共识插件（包括&nbsp;solo&nbsp;和&nbsp;kafka&nbsp;两种）的初始化； multichannel.NewRegistrar(lf, consenters, signer) 方法会扫描本地账本数据（此时至少已存在系统通道），创建 Registrar 结构，并为每个账本都启动共识（如 Kafka 排序）过程。 说明：Registrar 结构（位于&nbsp;orderer.common.multichannel&nbsp;包）是 Orderer 组件中最核心的结构，管理了 Orderer 中所有的账本、共识插件等数据结构。 创建 Registrar 结构并启动共识过程 NewRegistrar(lf, consenters, signer)&nbsp;方法位于&nbsp;orderer.common.multichannel&nbsp;包，负责初始化链支持、消息处理器等重要数据结构，并为各个账本启动共识过程。 核心代码如下： existingChains := ledgerFactory.ChainIDs()for _, chainID := range existingChains { if _, ok := ledgerResources.ConsortiumsConfig(); ok { // 如果是系统账本 chain := newChainSupport(r, ledgerResources, consenters, signer) chain.Processor = msgprocessor.NewSystemChannel(chain, r.templator, msgprocessor.CreateSystemChannelFilters(r, chain)) r.chains[chainID] = chain r.systemChannelID = chainID r.systemChannel = chain defer chain.start() // 启动共识过程 else // 如果是应用账本 chain := newChainSupport(r, ledgerResources, consenters, signer) r.chains[chainID] = chain chain.start() // 启动共识过程 } chain.start()&nbsp;方法负责启动共识过程，以 Kafka 共识插件为例，最终调用到&nbsp;orderer.consensus.kafka&nbsp;包中的&nbsp;startThread()&nbsp;方法。 startThread()&nbsp;方法将为指定的账本结构配置共识服务，并将其启动，核心代码包括： // 创建 Producer 结构chain.producer, err = setupProducerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 发送 CONNECT 消息sendConnectMessage(chain.consenter.retryOptions(), chain.haltChan, chain.producer, chain.channel)// 创建处理对应 Kafka topic 的 Consumer 结构chain.parentConsumer, err = setupParentConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 配置从指定 partition 读取消息的 PartitionConsumer 结构chain.channelConsumer, err = setupChannelConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentConsumer, chain.channel, chain.lastOffsetPersisted+1)// 从该链对应的分区读取消息，并进行处理过程chain.processMessagesToBlocks() 主要包括如下步骤： 创建到 Kafka 集群的 Producer 结构并发送 CONNECT 消息； 为对应的 topic 创建 Consumer 结构，并配置从指定分区读取消息的 PartitionConsumer 结构； 启动链对应的 Kafka 分区中消息的循环处理过程。processMessagesToBlocks()&nbsp;方法不断从分区中 Consume 消息并进行处理，同时定时发送 TimeToCut 消息。处理消息类型包括 Connect 消息（Producer 启动后发出）、TimeToCut 消息和 Regular 消息（普通的交易）。分别调用对应方法进行处理。 gRPC 服务启动 初始化 gRPC 服务结构，完成绑定并启动监听。 // 初始化 gRPC 服务端结构server := NewServer(manager, signer, &amp;conf.Debug)// 创建 gRPC 服务连接grpcServer := initializeGrpcServer(conf)// 绑定 gRPC 服务并启动ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server)grpcServer.Start() 其中，NewServer(manager, signer, &amp;conf.Debug)&nbsp;方法（位于&nbsp;orderer.common.server&nbsp;包）最为核心，将 gRPC 相关的服务结构进行初始化，并绑定到 gRPC 请求上。分别响应&nbsp;Deliver()&nbsp;和&nbsp;Broadcast()&nbsp;两个 gRPC 调用。 // NewServer creates an ab.AtomicBroadcastServer based on the broadcast target and ledger Readerfunc NewServer(r *multichannel.Registrar, _ crypto.LocalSigner, debug *localconfig.Debug) ab.AtomicBroadcastServer { s := &amp;server{ dh: deliver.NewHandlerImpl(deliverSupport{Registrar: r}), bh: broadcast.NewHandlerImpl(broadcastSupport{Registrar: r}), debug: debug, } return s} =========================== 《区块链原理、设计与应用》一书已经正式出版，以超级账本项目为例，介绍了区块链和分布式账本技术的底层原理、设计架构、应用实践的大量细节，欢迎大家阅读指正。 ===== 关于 TechFirst 公众号 ===== 专注金融科技、人工智能、云计算、大数据相关领域的热门技术与前瞻方向。 发送关键词（如区块链、云计算、大数据、容器），获取热门点评与技术干货。 欢迎投稿！ 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/10/20/8e7c72ac94112b7a86545278743aab3f.html" />
+<meta property="og:url" content="https://uzzz.org/2017/10/20/8e7c72ac94112b7a86545278743aab3f.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-10-20T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"Hyperledger 源码分析之 Fabric Orderer 节点启动通过&nbsp;orderer&nbsp;包下的 main() 方法实现，会进一步调用到&nbsp;orderer/common/server&nbsp;包中的&nbsp;Main()&nbsp;方法。 核心代码如下所示。 // Main is the entry point of orderer processfunc Main() { fullCmd := kingpin.MustParse(app.Parse(os.Args[1:])) // &quot;version&quot; command if fullCmd == version.FullCommand() { fmt.Println(metadata.GetVersionInfo()) return } conf := config.Load() initializeLoggingLevel(conf) initializeLocalMsp(conf) Start(fullCmd, conf)} 包括配置初始化过程和核心启动过程两个部分： config.Load()：从本地配置文件和环境变量中读取配置信息，构建配置树结构。 initializeLoggingLevel(conf)：配置日志级别。 initializeLocalMsp(conf)：配置 MSP 结构。 Start()：完成启动后的核心工作。 整体过程 核心启动过程都在&nbsp;orderer/common/server包中的 Start() 方法，如下图所示。 Start() 方法会初始化 gRPC 服务需要的结构，然后启动服务。 核心代码如下所示。 func Start(cmd string, conf *config.TopLevel) { logger.Debugf(&quot;Start()&quot;) signer := localmsp.NewSigner() manager := initializeMultichannelRegistrar(conf, signer) server := NewServer(manager, signer, &amp;conf.Debug) switch cmd { case start.FullCommand(): // &quot;start&quot; command logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) initializeProfilingService(conf) grpcServer := initializeGrpcServer(conf) ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) grpcServer.Start() case benchmark.FullCommand(): // &quot;benchmark&quot; command logger.Info(&quot;Starting orderer in benchmark mode&quot;) benchmarkServer := performance.GetBenchmarkServer() benchmarkServer.RegisterService(server) benchmarkServer.Start() }} 包括两大部分： gRPC 服务结构初始化； gRPC 服务启动。 gRPC 服务结构初始化 包括创建新的 MSP 签名结构，初始化 Registrar 结构来管理各个账本结构，启动共识过程，以及创建 gRPC 服务端结构。 核心过程包括： signer := localmsp.NewSigner() // 初始化签名结构manager := initializeMultichannelRegistrar(conf, signer) // 初始化账本管理器（Registrar）结构 其中，initializeMultichannelRegistrar(conf, signer)&nbsp;方法最为关键，核心代码如下： func initializeMultichannelRegistrar(conf *config.TopLevel, signer crypto.LocalSigner) *multichannel.Registrar { // 创建账本操作的工厂结构 lf, _ := createLedgerFactory(conf) // 如果是新启动情况，创建系统通道的账本结构 if len(lf.ChainIDs()) == 0 { logger.Debugf(&quot;There is no chain, hence we must be in bootstrapping&quot;) initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //初始化共识插件 consenters := make(map[string]consensus.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version, conf.Kafka.Verbose) // 创建各个账本的管理器（Registrar）结构，并启动共识过程 return multichannel.NewRegistrar(lf, consenters, signer)} 利用传入的配置信息和签名信息完成如下步骤： 创建账本操作的工厂结构； 如果是新启动情况，利用给定的系统初始区块文件初始化系统通道的相关结构； 完成共识插件（包括&nbsp;solo&nbsp;和&nbsp;kafka&nbsp;两种）的初始化； multichannel.NewRegistrar(lf, consenters, signer) 方法会扫描本地账本数据（此时至少已存在系统通道），创建 Registrar 结构，并为每个账本都启动共识（如 Kafka 排序）过程。 说明：Registrar 结构（位于&nbsp;orderer.common.multichannel&nbsp;包）是 Orderer 组件中最核心的结构，管理了 Orderer 中所有的账本、共识插件等数据结构。 创建 Registrar 结构并启动共识过程 NewRegistrar(lf, consenters, signer)&nbsp;方法位于&nbsp;orderer.common.multichannel&nbsp;包，负责初始化链支持、消息处理器等重要数据结构，并为各个账本启动共识过程。 核心代码如下： existingChains := ledgerFactory.ChainIDs()for _, chainID := range existingChains { if _, ok := ledgerResources.ConsortiumsConfig(); ok { // 如果是系统账本 chain := newChainSupport(r, ledgerResources, consenters, signer) chain.Processor = msgprocessor.NewSystemChannel(chain, r.templator, msgprocessor.CreateSystemChannelFilters(r, chain)) r.chains[chainID] = chain r.systemChannelID = chainID r.systemChannel = chain defer chain.start() // 启动共识过程 else // 如果是应用账本 chain := newChainSupport(r, ledgerResources, consenters, signer) r.chains[chainID] = chain chain.start() // 启动共识过程 } chain.start()&nbsp;方法负责启动共识过程，以 Kafka 共识插件为例，最终调用到&nbsp;orderer.consensus.kafka&nbsp;包中的&nbsp;startThread()&nbsp;方法。 startThread()&nbsp;方法将为指定的账本结构配置共识服务，并将其启动，核心代码包括： // 创建 Producer 结构chain.producer, err = setupProducerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 发送 CONNECT 消息sendConnectMessage(chain.consenter.retryOptions(), chain.haltChan, chain.producer, chain.channel)// 创建处理对应 Kafka topic 的 Consumer 结构chain.parentConsumer, err = setupParentConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.SharedConfig().KafkaBrokers(), chain.consenter.brokerConfig(), chain.channel)// 配置从指定 partition 读取消息的 PartitionConsumer 结构chain.channelConsumer, err = setupChannelConsumerForChannel(chain.consenter.retryOptions(), chain.haltChan, chain.parentConsumer, chain.channel, chain.lastOffsetPersisted+1)// 从该链对应的分区读取消息，并进行处理过程chain.processMessagesToBlocks() 主要包括如下步骤： 创建到 Kafka 集群的 Producer 结构并发送 CONNECT 消息； 为对应的 topic 创建 Consumer 结构，并配置从指定分区读取消息的 PartitionConsumer 结构； 启动链对应的 Kafka 分区中消息的循环处理过程。processMessagesToBlocks()&nbsp;方法不断从分区中 Consume 消息并进行处理，同时定时发送 TimeToCut 消息。处理消息类型包括 Connect 消息（Producer 启动后发出）、TimeToCut 消息和 Regular 消息（普通的交易）。分别调用对应方法进行处理。 gRPC 服务启动 初始化 gRPC 服务结构，完成绑定并启动监听。 // 初始化 gRPC 服务端结构server := NewServer(manager, signer, &amp;conf.Debug)// 创建 gRPC 服务连接grpcServer := initializeGrpcServer(conf)// 绑定 gRPC 服务并启动ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server)grpcServer.Start() 其中，NewServer(manager, signer, &amp;conf.Debug)&nbsp;方法（位于&nbsp;orderer.common.server&nbsp;包）最为核心，将 gRPC 相关的服务结构进行初始化，并绑定到 gRPC 请求上。分别响应&nbsp;Deliver()&nbsp;和&nbsp;Broadcast()&nbsp;两个 gRPC 调用。 // NewServer creates an ab.AtomicBroadcastServer based on the broadcast target and ledger Readerfunc NewServer(r *multichannel.Registrar, _ crypto.LocalSigner, debug *localconfig.Debug) ab.AtomicBroadcastServer { s := &amp;server{ dh: deliver.NewHandlerImpl(deliverSupport{Registrar: r}), bh: broadcast.NewHandlerImpl(broadcastSupport{Registrar: r}), debug: debug, } return s} =========================== 《区块链原理、设计与应用》一书已经正式出版，以超级账本项目为例，介绍了区块链和分布式账本技术的底层原理、设计架构、应用实践的大量细节，欢迎大家阅读指正。 ===== 关于 TechFirst 公众号 ===== 专注金融科技、人工智能、云计算、大数据相关领域的热门技术与前瞻方向。 发送关键词（如区块链、云计算、大数据、容器），获取热门点评与技术干货。 欢迎投稿！ 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/10/20/8e7c72ac94112b7a86545278743aab3f.html","headline":"Hyperledger Fabric 排序节点启动过程","dateModified":"2017-10-20T00:00:00+08:00","datePublished":"2017-10-20T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/10/20/8e7c72ac94112b7a86545278743aab3f.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Hyperledger Fabric 排序节点启动过程</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> </p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <a href="https://github.com/yeasy/hyperledger_code_fabric/" rel="nofollow">Hyperledger 源码分析之 Fabric</a></p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> Orderer 节点启动通过&nbsp;<code>orderer</code>&nbsp;包下的 main() 方法实现，会进一步调用到&nbsp;<code>orderer/common/server</code>&nbsp;包中的&nbsp;<code>Main()</code>&nbsp;方法。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 核心代码如下所示。</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="color:rgb(153,153,136);"><em>// Main is the entry point of orderer process</em></span><span style="font-weight:bold;">func</span> <span>Main</span><span>()</span> <span>{</span>
+    <span>fullCmd</span> <span style="font-weight:bold;">:=</span> <span>kingpin</span><span>.</span><span>MustParse</span><span>(</span><span>app</span><span>.</span><span>Parse</span><span>(</span><span>os</span><span>.</span><span>Args</span><span>[</span><span style="color:rgb(0,153,153);">1</span><span>:]))</span>
+
+    <span style="color:rgb(153,153,136);"><em>// "version" command</em></span>
+    <span style="font-weight:bold;">if</span> <span>fullCmd</span> <span style="font-weight:bold;">==</span> <span>version</span><span>.</span><span>FullCommand</span><span>()</span> <span>{</span>
+        <span>fmt</span><span>.</span><span>Println</span><span>(</span><span>metadata</span><span>.</span><span>GetVersionInfo</span><span>())</span>
+        <span style="font-weight:bold;">return</span>
+    <span>}</span>
+
+    <span>conf</span> <span style="font-weight:bold;">:=</span> <span>config</span><span>.</span><span>Load</span><span>()</span>
+    <span>initializeLoggingLevel</span><span>(</span><span>conf</span><span>)</span>
+    <span>initializeLocalMsp</span><span>(</span><span>conf</span><span>)</span>
+
+    <span>Start</span><span>(</span><span>fullCmd</span><span>,</span> <span>conf</span><span>)</span><span>}</span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 包括配置初始化过程和核心启动过程两个部分：</p> 
+  <ul class="list-paddingleft-2" style="color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;">
+   <li> <p style="clear:both;min-height:1em;"> config.Load()：从本地配置文件和环境变量中读取配置信息，构建配置树结构。</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> initializeLoggingLevel(conf)：配置日志级别。</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> initializeLocalMsp(conf)：配置 MSP 结构。</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> Start()：完成启动后的核心工作。</p> </li>
+  </ul>
+  <h3 style="font-size:1.5em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;line-height:1.43;color:rgb(51,51,51);"> 整体过程</h3> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 核心启动过程都在&nbsp;<code>orderer/common/server</code>包中的 Start() 方法，如下图所示。</p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20171020192504850?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQveWVhc3k=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/Center" alt=""><br></p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> Start() 方法会初始化 gRPC 服务需要的结构，然后启动服务。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 核心代码如下所示。</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="font-weight:bold;">func</span> <span>Start</span><span>(</span><span>cmd</span> <span style="color:rgb(68,85,136);"><strong>string</strong></span><span>,</span> <span>conf</span> <span style="font-weight:bold;">*</span><span>config</span><span>.</span><span>TopLevel</span><span>)</span> <span>{</span>
+    <span>logger</span><span>.</span><span>Debugf</span><span>(</span><span style="color:rgb(221,17,68);">"Start()"</span><span>)</span>
+    <span>signer</span> <span style="font-weight:bold;">:=</span> <span>localmsp</span><span>.</span><span>NewSigner</span><span>()</span>
+    <span>manager</span> <span style="font-weight:bold;">:=</span> <span>initializeMultichannelRegistrar</span><span>(</span><span>conf</span><span>,</span> <span>signer</span><span>)</span>
+    <span>server</span> <span style="font-weight:bold;">:=</span> <span>NewServer</span><span>(</span><span>manager</span><span>,</span> <span>signer</span><span>,</span> <span style="font-weight:bold;">&amp;</span><span>conf</span><span>.</span><span>Debug</span><span>)</span>
+
+    <span style="font-weight:bold;">switch</span> <span>cmd</span> <span>{</span>
+    <span style="font-weight:bold;">case</span> <span>start</span><span>.</span><span>FullCommand</span><span>():</span> <span style="color:rgb(153,153,136);"><em>// "start" command</em></span>
+        <span>logger</span><span>.</span><span>Infof</span><span>(</span><span style="color:rgb(221,17,68);">"Starting %s"</span><span>,</span> <span>metadata</span><span>.</span><span>GetVersionInfo</span><span>())</span>
+        <span>initializeProfilingService</span><span>(</span><span>conf</span><span>)</span>
+        <span>grpcServer</span> <span style="font-weight:bold;">:=</span> <span>initializeGrpcServer</span><span>(</span><span>conf</span><span>)</span>
+        <span>ab</span><span>.</span><span>RegisterAtomicBroadcastServer</span><span>(</span><span>grpcServer</span><span>.</span><span>Server</span><span>(),</span> <span>server</span><span>)</span>
+        <span>logger</span><span>.</span><span>Info</span><span>(</span><span style="color:rgb(221,17,68);">"Beginning to serve requests"</span><span>)</span>
+        <span>grpcServer</span><span>.</span><span>Start</span><span>()</span>
+    <span style="font-weight:bold;">case</span> <span>benchmark</span><span>.</span><span>FullCommand</span><span>():</span> <span style="color:rgb(153,153,136);"><em>// "benchmark" command</em></span>
+        <span>logger</span><span>.</span><span>Info</span><span>(</span><span style="color:rgb(221,17,68);">"Starting orderer in benchmark mode"</span><span>)</span>
+        <span>benchmarkServer</span> <span style="font-weight:bold;">:=</span> <span>performance</span><span>.</span><span>GetBenchmarkServer</span><span>()</span>
+        <span>benchmarkServer</span><span>.</span><span>RegisterService</span><span>(</span><span>server</span><span>)</span>
+        <span>benchmarkServer</span><span>.</span><span>Start</span><span>()</span>
+    <span>}</span><span>}</span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 包括两大部分：</p> 
+  <ul class="list-paddingleft-2" style="color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;">
+   <li> <p style="clear:both;min-height:1em;"> gRPC 服务结构初始化；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> gRPC 服务启动。</p> </li>
+  </ul>
+  <h3 style="font-size:1.5em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;line-height:1.43;color:rgb(51,51,51);"> gRPC 服务结构初始化</h3> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 包括创建新的 MSP 签名结构，初始化 Registrar 结构来管理各个账本结构，启动共识过程，以及创建 gRPC 服务端结构。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 核心过程包括：</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span>signer</span> <span style="font-weight:bold;">:=</span> <span>localmsp</span><span>.</span><span>NewSigner</span><span>()</span> <span style="color:rgb(153,153,136);"><em>// 初始化签名结构</em></span><span>manager</span> <span style="font-weight:bold;">:=</span> <span>initializeMultichannelRegistrar</span><span>(</span><span>conf</span><span>,</span> <span>signer</span><span>)</span> <span style="color:rgb(153,153,136);"><em>// 初始化账本管理器（Registrar）结构</em></span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 其中，<code>initializeMultichannelRegistrar(conf, signer)</code>&nbsp;方法最为关键，核心代码如下：</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="font-weight:bold;">func</span> <span>initializeMultichannelRegistrar</span><span>(</span><span>conf</span> <span style="font-weight:bold;">*</span><span>config</span><span>.</span><span>TopLevel</span><span>,</span> <span>signer</span> <span>crypto</span><span>.</span><span>LocalSigner</span><span>)</span> <span style="font-weight:bold;">*</span><span>multichannel</span><span>.</span><span>Registrar</span> <span>{</span>
+    <span style="color:rgb(153,153,136);"><em>// 创建账本操作的工厂结构</em></span>
+    <span>lf</span><span>,</span> <span>_</span> <span style="font-weight:bold;">:=</span> <span>createLedgerFactory</span><span>(</span><span>conf</span><span>)</span>
+
+    <span style="color:rgb(153,153,136);"><em>// 如果是新启动情况，创建系统通道的账本结构</em></span>
+    <span style="font-weight:bold;">if</span> <span style="color:rgb(0,134,179);">len</span><span>(</span><span>lf</span><span>.</span><span>ChainIDs</span><span>())</span> <span style="font-weight:bold;">==</span> <span style="color:rgb(0,153,153);">0</span> <span>{</span>
+        <span>logger</span><span>.</span><span>Debugf</span><span>(</span><span style="color:rgb(221,17,68);">"There is no chain, hence we must be in bootstrapping"</span><span>)</span>
+        <span>initializeBootstrapChannel</span><span>(</span><span>conf</span><span>,</span> <span>lf</span><span>)</span>
+    <span>}</span> <span style="font-weight:bold;">else</span> <span>{</span>
+        <span>logger</span><span>.</span><span>Info</span><span>(</span><span style="color:rgb(221,17,68);">"Not bootstrapping because of existing chains"</span><span>)</span>
+    <span>}</span>
+    <span style="color:rgb(153,153,136);"><em>//初始化共识插件</em></span>
+    <span>consenters</span> <span style="font-weight:bold;">:=</span> <span style="color:rgb(0,134,179);">make</span><span>(</span><span style="font-weight:bold;">map</span><span>[</span><span style="color:rgb(68,85,136);"><strong>string</strong></span><span>]</span><span>consensus</span><span>.</span><span>Consenter</span><span>)</span>
+    <span>consenters</span><span>[</span><span style="color:rgb(221,17,68);">"solo"</span><span>]</span> <span>=</span> <span>solo</span><span>.</span><span>New</span><span>()</span>
+    <span>consenters</span><span>[</span><span style="color:rgb(221,17,68);">"kafka"</span><span>]</span> <span>=</span> <span>kafka</span><span>.</span><span>New</span><span>(</span><span>conf</span><span>.</span><span>Kafka</span><span>.</span><span>TLS</span><span>,</span> <span>conf</span><span>.</span><span>Kafka</span><span>.</span><span>Retry</span><span>,</span> <span>conf</span><span>.</span><span>Kafka</span><span>.</span><span>Version</span><span>,</span> <span>conf</span><span>.</span><span>Kafka</span><span>.</span><span>Verbose</span><span>)</span>
+
+    <span style="color:rgb(153,153,136);"><em>// 创建各个账本的管理器（Registrar）结构，并启动共识过程</em></span>
+    <span style="font-weight:bold;">return</span> <span>multichannel</span><span>.</span><span>NewRegistrar</span><span>(</span><span>lf</span><span>,</span> <span>consenters</span><span>,</span> <span>signer</span><span>)</span><span>}</span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 利用传入的配置信息和签名信息完成如下步骤：</p> 
+  <ul class="list-paddingleft-2" style="color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;">
+   <li> <p style="clear:both;min-height:1em;"> 创建账本操作的工厂结构；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> 如果是新启动情况，利用给定的系统初始区块文件初始化系统通道的相关结构；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> 完成共识插件（包括&nbsp;<code>solo</code>&nbsp;和&nbsp;<code>kafka</code>&nbsp;两种）的初始化；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> <code>multichannel.NewRegistrar(lf, consenters, signer)</code><br> 方法会扫描本地账本数据（此时至少已存在系统通道），创建 Registrar 结构，并为每个账本都启动共识（如 Kafka 排序）过程。</p> </li>
+  </ul>
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <span>说明：Registrar 结构（位于&nbsp;<code>orderer.common.multichannel</code>&nbsp;包）是 Orderer 组件中最核心的结构，管理了 Orderer 中所有的账本、共识插件等数据结构。</span></p> 
+  <h4 style="font-size:1.25em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;line-height:1.4;color:rgb(51,51,51);"> 创建 Registrar 结构并启动共识过程</h4> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <code>NewRegistrar(lf, consenters, signer)</code>&nbsp;方法位于&nbsp;<code>orderer.common.multichannel</code>&nbsp;包，负责初始化链支持、消息处理器等重要数据结构，并为各个账本启动共识过程。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 核心代码如下：</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span>existingChains</span> <span style="font-weight:bold;">:=</span> <span>ledgerFactory</span><span>.</span><span>ChainIDs</span><span>()</span><span style="font-weight:bold;">for</span> <span>_</span><span>,</span> <span>chainID</span> <span style="font-weight:bold;">:=</span> <span style="font-weight:bold;">range</span> <span>existingChains</span> <span>{</span>
+    <span style="font-weight:bold;">if</span> <span>_</span><span>,</span> <span>ok</span> <span style="font-weight:bold;">:=</span> <span>ledgerResources</span><span>.</span><span>ConsortiumsConfig</span><span>();</span> <span>ok</span> <span>{</span> <span style="color:rgb(153,153,136);"><em>// 如果是系统账本</em></span>
+        <span>chain</span> <span style="font-weight:bold;">:=</span> <span>newChainSupport</span><span>(</span><span>r</span><span>,</span> <span>ledgerResources</span><span>,</span> <span>consenters</span><span>,</span> <span>signer</span><span>)</span>
+        <span>chain</span><span>.</span><span>Processor</span> <span>=</span> <span>msgprocessor</span><span>.</span><span>NewSystemChannel</span><span>(</span><span>chain</span><span>,</span> <span>r</span><span>.</span><span>templator</span><span>,</span> <span>msgprocessor</span><span>.</span><span>CreateSystemChannelFilters</span><span>(</span><span>r</span><span>,</span> <span>chain</span><span>))</span>
+        <span>r</span><span>.</span><span>chains</span><span>[</span><span>chainID</span><span>]</span> <span>=</span> <span>chain</span>
+        <span>r</span><span>.</span><span>systemChannelID</span> <span>=</span> <span>chainID</span>
+        <span>r</span><span>.</span><span>systemChannel</span> <span>=</span> <span>chain</span>
+        <span style="font-weight:bold;">defer</span> <span>chain</span><span>.</span><span>start</span><span>()</span> <span style="color:rgb(153,153,136);"><em>// 启动共识过程</em></span>
+    <span style="font-weight:bold;">else</span> <span style="color:rgb(153,153,136);"><em>// 如果是应用账本</em></span>
+        <span>chain</span> <span style="font-weight:bold;">:=</span> <span>newChainSupport</span><span>(</span><span>r</span><span>,</span> <span>ledgerResources</span><span>,</span> <span>consenters</span><span>,</span> <span>signer</span><span>)</span>
+        <span>r</span><span>.</span><span>chains</span><span>[</span><span>chainID</span><span>]</span> <span>=</span> <span>chain</span>
+        <span>chain</span><span>.</span><span>start</span><span>()</span>  <span style="color:rgb(153,153,136);"><em>// 启动共识过程</em></span>
+    <span>}</span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <code>chain.start()</code>&nbsp;方法负责启动共识过程，以 Kafka 共识插件为例，最终调用到&nbsp;<code>orderer.consensus.kafka</code>&nbsp;包中的&nbsp;<code>startThread()</code>&nbsp;方法。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <code>startThread()</code>&nbsp;方法将为指定的账本结构配置共识服务，并将其启动，核心代码包括：</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="color:rgb(153,153,136);"><em>// 创建 Producer 结构</em></span><span>chain</span><span>.</span><span>producer</span><span>,</span> <span>err</span> <span>=</span> <span>setupProducerForChannel</span><span>(</span><span>chain</span><span>.</span><span>consenter</span><span>.</span><span>retryOptions</span><span>(),</span> <span>chain</span><span>.</span><span>haltChan</span><span>,</span> <span>chain</span><span>.</span><span>SharedConfig</span><span>().</span><span>KafkaBrokers</span><span>(),</span> <span>chain</span><span>.</span><span>consenter</span><span>.</span><span>brokerConfig</span><span>(),</span> <span>chain</span><span>.</span><span>channel</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 发送 CONNECT 消息</em></span><span>sendConnectMessage</span><span>(</span><span>chain</span><span>.</span><span>consenter</span><span>.</span><span>retryOptions</span><span>(),</span> <span>chain</span><span>.</span><span>haltChan</span><span>,</span> <span>chain</span><span>.</span><span>producer</span><span>,</span> <span>chain</span><span>.</span><span>channel</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 创建处理对应 Kafka topic 的 Consumer 结构</em></span><span>chain</span><span>.</span><span>parentConsumer</span><span>,</span> <span>err</span> <span>=</span> <span>setupParentConsumerForChannel</span><span>(</span><span>chain</span><span>.</span><span>consenter</span><span>.</span><span>retryOptions</span><span>(),</span> <span>chain</span><span>.</span><span>haltChan</span><span>,</span> <span>chain</span><span>.</span><span>SharedConfig</span><span>().</span><span>KafkaBrokers</span><span>(),</span> <span>chain</span><span>.</span><span>consenter</span><span>.</span><span>brokerConfig</span><span>(),</span> <span>chain</span><span>.</span><span>channel</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 配置从指定 partition 读取消息的 PartitionConsumer 结构</em></span><span>chain</span><span>.</span><span>channelConsumer</span><span>,</span> <span>err</span> <span>=</span> <span>setupChannelConsumerForChannel</span><span>(</span><span>chain</span><span>.</span><span>consenter</span><span>.</span><span>retryOptions</span><span>(),</span> <span>chain</span><span>.</span><span>haltChan</span><span>,</span> <span>chain</span><span>.</span><span>parentConsumer</span><span>,</span> <span>chain</span><span>.</span><span>channel</span><span>,</span> <span>chain</span><span>.</span><span>lastOffsetPersisted</span><span style="font-weight:bold;">+</span><span style="color:rgb(0,153,153);">1</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 从该链对应的分区读取消息，并进行处理过程</em></span><span>chain</span><span>.</span><span>processMessagesToBlocks</span><span>()</span> </pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 主要包括如下步骤：</p> 
+  <ul class="list-paddingleft-2" style="color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;">
+   <li> <p style="clear:both;min-height:1em;"> 创建到 Kafka 集群的 Producer 结构并发送 CONNECT 消息；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> 为对应的 topic 创建 Consumer 结构，并配置从指定分区读取消息的 PartitionConsumer 结构；</p> </li>
+   <li> <p style="clear:both;min-height:1em;"> 启动链对应的 Kafka 分区中消息的循环处理过程。<code>processMessagesToBlocks()</code>&nbsp;方法不断从分区中 Consume 消息并进行处理，同时定时发送 TimeToCut 消息。处理消息类型包括 Connect 消息（Producer 启动后发出）、TimeToCut 消息和 Regular 消息（普通的交易）。分别调用对应方法进行处理。</p> </li>
+  </ul>
+  <h3 style="font-size:1.5em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;line-height:1.43;color:rgb(51,51,51);"> gRPC 服务启动</h3> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 初始化 gRPC 服务结构，完成绑定并启动监听。</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="color:rgb(153,153,136);"><em>// 初始化 gRPC 服务端结构</em></span><span>server</span> <span style="font-weight:bold;">:=</span> <span>NewServer</span><span>(</span><span>manager</span><span>,</span> <span>signer</span><span>,</span> <span style="font-weight:bold;">&amp;</span><span>conf</span><span>.</span><span>Debug</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 创建 gRPC 服务连接</em></span><span>grpcServer</span> <span style="font-weight:bold;">:=</span> <span>initializeGrpcServer</span><span>(</span><span>conf</span><span>)</span><span style="color:rgb(153,153,136);"><em>// 绑定 gRPC 服务并启动</em></span><span>ab</span><span>.</span><span>RegisterAtomicBroadcastServer</span><span>(</span><span>grpcServer</span><span>.</span><span>Server</span><span>(),</span> <span>server</span><span>)</span><span>grpcServer</span><span>.</span><span>Start</span><span>()</span></pre> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 其中，<code>NewServer(manager, signer, &amp;conf.Debug)</code>&nbsp;方法（位于&nbsp;<code>orderer.common.server</code>&nbsp;包）最为核心，将 gRPC 相关的服务结构进行初始化，并绑定到 gRPC 请求上。分别响应&nbsp;Deliver()&nbsp;和&nbsp;Broadcast()&nbsp;两个 gRPC 调用。</p> 
+  <pre style="color:rgb(62,62,62);font-size:16px;overflow:auto;"><span style="color:rgb(153,153,136);"><em>// NewServer creates an ab.AtomicBroadcastServer based on the broadcast target and ledger Reader</em></span><span style="font-weight:bold;">func</span> <span>NewServer</span><span>(</span><span>r</span> <span style="font-weight:bold;">*</span><span>multichannel</span><span>.</span><span>Registrar</span><span>,</span> <span>_</span> <span>crypto</span><span>.</span><span>LocalSigner</span><span>,</span> <span>debug</span> <span style="font-weight:bold;">*</span><span>localconfig</span><span>.</span><span>Debug</span><span>)</span> <span>ab</span><span>.</span><span>AtomicBroadcastServer</span> <span>{</span>
+    <span>s</span> <span style="font-weight:bold;">:=</span> <span style="font-weight:bold;">&amp;</span><span>server</span><span>{</span>
+        <span>dh</span><span>:</span>    <span>deliver</span><span>.</span><span>NewHandlerImpl</span><span>(</span><span>deliverSupport</span><span>{</span><span>Registrar</span><span>:</span> <span>r</span><span>}),</span>
+        <span>bh</span><span>:</span>    <span>broadcast</span><span>.</span><span>NewHandlerImpl</span><span>(</span><span>broadcastSupport</span><span>{</span><span>Registrar</span><span>:</span> <span>r</span><span>}),</span>
+        <span>debug</span><span>:</span> <span>debug</span><span>,</span>
+    <span>}</span>
+    <span style="font-weight:bold;">return</span> <span>s</span><span>}</span></pre> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <br></p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> ===========================</p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <br></p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <a href="http://mp.weixin.qq.com/s?__biz=MzA5MTAxNzI2Mw==&amp;mid=2650508869&amp;idx=1&amp;sn=d9fe5237f0eecd438aba0399b98fbab4&amp;chksm=880df705bf7a7e1302fefb22b57229653ab042f5bf989c05a1175ed6d5e81e55abcd6761e5cb&amp;scene=21#wechat_redirect" rel="nofollow" style="color:rgb(96,127,166);">《区块链原理、设计与应用》一书已经正式出版，以超级账本项目为例，介绍了区块链和分布式账本技术的底层原理、设计架构、应用实践的大量细节，欢迎大家阅读指正。</a></p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <br></p> 
+  <p style="clear:both;min-height:1em;color:rgb(62,62,62);font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;"> <br></p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> ===== 关于 TechFirst 公众号 =====</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 专注金融科技、人工智能、云计算、大数据相关领域的热门技术与前瞻方向。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 发送关键词（如区块链、云计算、大数据、容器），获取热门点评与技术干货。</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> 欢迎投稿！</p> 
+  <p style="clear:both;min-height:1em;font-family:'Helvetica Neue', Helvetica, 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;font-size:16px;color:rgb(51,51,51);"> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20171214080319811?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQveWVhc3k=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/Center" alt=""><br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/yeasy/article/details/78298639,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/yeasy/article/details/78298639,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

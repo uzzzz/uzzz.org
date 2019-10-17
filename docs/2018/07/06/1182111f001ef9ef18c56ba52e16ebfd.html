@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>比特币全节点Go语言实现BTCD之交易的独立校验源码 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="比特币全节点Go语言实现BTCD之交易的独立校验源码" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="钱包软件通过收集UTXO、提供正确的解锁脚本、构造一个新的支出（支付）给接收者这一系列的方式来创建交易。产生的交易随后将被发送到比特币网络临近的节点，从而使得该交易能够在整个比特币网络中传播。 ​然而，在交易传递到临近的节点前，每一个收到交易的比特币节点将会首先验证该交易，这将确保只有有效的交易才会 在网络中传播，而无效的交易将会在第一个节点处被废弃。 每一个节点在校验每一笔交易时，都需要对照一个长长的标准列表： ▷交易的语法和数据结构必须正确。 ▷输入与输出列表都不能为空。 ▷交易的字节大小是小于 MAX_BLOCK_SIZE 的。 ▷每一个输出值，以及总量，必须在规定值的范围内 （小于2,100万个币，大于0）。 ▷没有哈希等于0，N等于-1的输入（coinbase交易不应当被传递）。 ▷nLockTime是小于或等于 INT_MAX 的。或者nLocktime and nSequence的值满足MedianTimePast（译者注：MedianTime是这个块的前面11个块按照block time排序后的中间时间） ▷交易的字节大小是大于或等于100的。 ▷交易中的签名数量(SIGOPS)应小于签名操作数量上限。 ▷解锁脚本（ scriptSig ）只能够将数字压入栈中，并且锁定脚本（ scriptPubkey ）必须要符合isStandard的格式 （该格式将会拒绝非标准交易）。 ▷池中或位于主分支区块中的一个匹配交易必须是存在的。 ▷对于每一个输入，引用的输出是必须存在的，并且没有被花费。 ▷对于每一个输入，如果引用的输出存在于池中任何别的交易中，该交易将被拒绝。 ▷对于每一个输入，在主分支和交易池中寻找引用的输出交易。如果输出交易缺少任何一个输入，该交易将成为一个孤 立的交易。如果与其匹配的交易还没有出现在池中，那么将被加入到孤立交易池中。 ▷对于每一个输入，如果引用的输出交易是一个coinbase输出，该输入必须至少获得 COINBASE_MATURITY(100)个确认。 ▷使用引用的输出交易获得输入值，并检查每一个输入值和总值是否在规定值的范围内 （小于2100万个币，大于0）。 ▷如果输入值的总和小于输出值的总和，交易将被中止。 ▷如果交易费用太低以至于无法进入一个空的区块，交易将被拒绝。 ▷每一个输入的解锁脚本必须依据相应输出的锁定脚本来验证。 主要代码如下： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // A standalone transaction must not be a coinbase transaction. if blockchain.IsCoinBase(tx) { str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v is not standard: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } err = mp.checkPoolDoubleSpend(tx) if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Don&#39;t allow the transaction if it exists in the main chain and is not // not already fully spent. prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v has a non-standard &quot;+ &quot;input: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } // TODO(roasbeef): last bool should be conditional on segwit activation sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Add to transaction pool. txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { // A transaction must have at least one input. msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } // A transaction must not exceed the maximum allowed block payload when // serialized. serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } // Two&#39;s complement int64 overflow guarantees that any overflow // is detected and reported. This is impossible for Bitcoin, but // perhaps possible if an alt increases the total money supply. totalSatoshi += satoshi if totalSatoshi &lt; 0 { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs exceeds max allowed value of %v&quot;, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } if totalSatoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs is %v which is higher than max &quot;+ &quot;allowed value of %v&quot;, totalSatoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { // Previous transaction outputs referenced by the inputs to this // transaction must not be null. for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } 阅读更多" />
+<meta property="og:description" content="钱包软件通过收集UTXO、提供正确的解锁脚本、构造一个新的支出（支付）给接收者这一系列的方式来创建交易。产生的交易随后将被发送到比特币网络临近的节点，从而使得该交易能够在整个比特币网络中传播。 ​然而，在交易传递到临近的节点前，每一个收到交易的比特币节点将会首先验证该交易，这将确保只有有效的交易才会 在网络中传播，而无效的交易将会在第一个节点处被废弃。 每一个节点在校验每一笔交易时，都需要对照一个长长的标准列表： ▷交易的语法和数据结构必须正确。 ▷输入与输出列表都不能为空。 ▷交易的字节大小是小于 MAX_BLOCK_SIZE 的。 ▷每一个输出值，以及总量，必须在规定值的范围内 （小于2,100万个币，大于0）。 ▷没有哈希等于0，N等于-1的输入（coinbase交易不应当被传递）。 ▷nLockTime是小于或等于 INT_MAX 的。或者nLocktime and nSequence的值满足MedianTimePast（译者注：MedianTime是这个块的前面11个块按照block time排序后的中间时间） ▷交易的字节大小是大于或等于100的。 ▷交易中的签名数量(SIGOPS)应小于签名操作数量上限。 ▷解锁脚本（ scriptSig ）只能够将数字压入栈中，并且锁定脚本（ scriptPubkey ）必须要符合isStandard的格式 （该格式将会拒绝非标准交易）。 ▷池中或位于主分支区块中的一个匹配交易必须是存在的。 ▷对于每一个输入，引用的输出是必须存在的，并且没有被花费。 ▷对于每一个输入，如果引用的输出存在于池中任何别的交易中，该交易将被拒绝。 ▷对于每一个输入，在主分支和交易池中寻找引用的输出交易。如果输出交易缺少任何一个输入，该交易将成为一个孤 立的交易。如果与其匹配的交易还没有出现在池中，那么将被加入到孤立交易池中。 ▷对于每一个输入，如果引用的输出交易是一个coinbase输出，该输入必须至少获得 COINBASE_MATURITY(100)个确认。 ▷使用引用的输出交易获得输入值，并检查每一个输入值和总值是否在规定值的范围内 （小于2100万个币，大于0）。 ▷如果输入值的总和小于输出值的总和，交易将被中止。 ▷如果交易费用太低以至于无法进入一个空的区块，交易将被拒绝。 ▷每一个输入的解锁脚本必须依据相应输出的锁定脚本来验证。 主要代码如下： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // A standalone transaction must not be a coinbase transaction. if blockchain.IsCoinBase(tx) { str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v is not standard: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } err = mp.checkPoolDoubleSpend(tx) if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Don&#39;t allow the transaction if it exists in the main chain and is not // not already fully spent. prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v has a non-standard &quot;+ &quot;input: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } // TODO(roasbeef): last bool should be conditional on segwit activation sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Add to transaction pool. txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { // A transaction must have at least one input. msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } // A transaction must not exceed the maximum allowed block payload when // serialized. serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } // Two&#39;s complement int64 overflow guarantees that any overflow // is detected and reported. This is impossible for Bitcoin, but // perhaps possible if an alt increases the total money supply. totalSatoshi += satoshi if totalSatoshi &lt; 0 { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs exceeds max allowed value of %v&quot;, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } if totalSatoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs is %v which is higher than max &quot;+ &quot;allowed value of %v&quot;, totalSatoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { // Previous transaction outputs referenced by the inputs to this // transaction must not be null. for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/06/1182111f001ef9ef18c56ba52e16ebfd.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/06/1182111f001ef9ef18c56ba52e16ebfd.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-06T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"钱包软件通过收集UTXO、提供正确的解锁脚本、构造一个新的支出（支付）给接收者这一系列的方式来创建交易。产生的交易随后将被发送到比特币网络临近的节点，从而使得该交易能够在整个比特币网络中传播。 ​然而，在交易传递到临近的节点前，每一个收到交易的比特币节点将会首先验证该交易，这将确保只有有效的交易才会 在网络中传播，而无效的交易将会在第一个节点处被废弃。 每一个节点在校验每一笔交易时，都需要对照一个长长的标准列表： ▷交易的语法和数据结构必须正确。 ▷输入与输出列表都不能为空。 ▷交易的字节大小是小于 MAX_BLOCK_SIZE 的。 ▷每一个输出值，以及总量，必须在规定值的范围内 （小于2,100万个币，大于0）。 ▷没有哈希等于0，N等于-1的输入（coinbase交易不应当被传递）。 ▷nLockTime是小于或等于 INT_MAX 的。或者nLocktime and nSequence的值满足MedianTimePast（译者注：MedianTime是这个块的前面11个块按照block time排序后的中间时间） ▷交易的字节大小是大于或等于100的。 ▷交易中的签名数量(SIGOPS)应小于签名操作数量上限。 ▷解锁脚本（ scriptSig ）只能够将数字压入栈中，并且锁定脚本（ scriptPubkey ）必须要符合isStandard的格式 （该格式将会拒绝非标准交易）。 ▷池中或位于主分支区块中的一个匹配交易必须是存在的。 ▷对于每一个输入，引用的输出是必须存在的，并且没有被花费。 ▷对于每一个输入，如果引用的输出存在于池中任何别的交易中，该交易将被拒绝。 ▷对于每一个输入，在主分支和交易池中寻找引用的输出交易。如果输出交易缺少任何一个输入，该交易将成为一个孤 立的交易。如果与其匹配的交易还没有出现在池中，那么将被加入到孤立交易池中。 ▷对于每一个输入，如果引用的输出交易是一个coinbase输出，该输入必须至少获得 COINBASE_MATURITY(100)个确认。 ▷使用引用的输出交易获得输入值，并检查每一个输入值和总值是否在规定值的范围内 （小于2100万个币，大于0）。 ▷如果输入值的总和小于输出值的总和，交易将被中止。 ▷如果交易费用太低以至于无法进入一个空的区块，交易将被拒绝。 ▷每一个输入的解锁脚本必须依据相应输出的锁定脚本来验证。 主要代码如下： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // A standalone transaction must not be a coinbase transaction. if blockchain.IsCoinBase(tx) { str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v is not standard: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } err = mp.checkPoolDoubleSpend(tx) if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Don&#39;t allow the transaction if it exists in the main chain and is not // not already fully spent. prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) if err != nil { // Attempt to extract a reject code from the error so // it can be retained. When not possible, fall back to // a non standard error. rejectCode, found := extractRejectCode(err) if !found { rejectCode = wire.RejectNonstandard } str := fmt.Sprintf(&quot;transaction %v has a non-standard &quot;+ &quot;input: %v&quot;, txHash, err) return nil, nil, txRuleError(rejectCode, str) } } // TODO(roasbeef): last bool should be conditional on segwit activation sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } // Add to transaction pool. txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { // A transaction must have at least one input. msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } // A transaction must not exceed the maximum allowed block payload when // serialized. serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } // Two&#39;s complement int64 overflow guarantees that any overflow // is detected and reported. This is impossible for Bitcoin, but // perhaps possible if an alt increases the total money supply. totalSatoshi += satoshi if totalSatoshi &lt; 0 { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs exceeds max allowed value of %v&quot;, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } if totalSatoshi &gt; btcutil.MaxSatoshi { str := fmt.Sprintf(&quot;total value of all transaction &quot;+ &quot;outputs is %v which is higher than max &quot;+ &quot;allowed value of %v&quot;, totalSatoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { // Previous transaction outputs referenced by the inputs to this // transaction must not be null. for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/06/1182111f001ef9ef18c56ba52e16ebfd.html","headline":"比特币全节点Go语言实现BTCD之交易的独立校验源码","dateModified":"2018-07-06T00:00:00+08:00","datePublished":"2018-07-06T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/06/1182111f001ef9ef18c56ba52e16ebfd.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>比特币全节点Go语言实现BTCD之交易的独立校验源码</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p><br></p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">钱包软件通过收集UTXO、提供正确的解锁脚本、构造一个新的支出（支付）给接收者这一系列的方式来创建交易。产生的交易随后将被发送到比特币网络临近的节点，从而使得该交易能够在整个比特币网络中传播。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">​然而，在交易传递到临近的节点前，每一个收到交易的比特币节点将会首先验证该交易，这将确保只有有效的交易才会 在网络中传播，而无效的交易将会在第一个节点处被废弃。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">每一个节点在校验每一笔交易时，都需要对照一个长长的标准列表：</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷交易的语法和数据结构必须正确。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷输入与输出列表都不能为空。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷交易的字节大小是小于 MAX_BLOCK_SIZE 的。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷每一个输出值，以及总量，必须在规定值的范围内 （小于2,100万个币，大于0）。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷没有哈希等于0，N等于-1的输入（coinbase交易不应当被传递）。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷nLockTime是小于或等于 INT_MAX 的。或者nLocktime and nSequence的值满足MedianTimePast（译者注：MedianTime是这个块的前面11个块按照block time排序后的中间时间）</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷交易的字节大小是大于或等于100的。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷交易中的签名数量(SIGOPS)应小于签名操作数量上限。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷解锁脚本（ scriptSig ）只能够将数字压入栈中，并且锁定脚本（ scriptPubkey ）必须要符合isStandard的格式 （该格式将会拒绝非标准交易）。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷池中或位于主分支区块中的一个匹配交易必须是存在的。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷对于每一个输入，引用的输出是必须存在的，并且没有被花费。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷对于每一个输入，如果引用的输出存在于池中任何别的交易中，该交易将被拒绝。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷对于每一个输入，在主分支和交易池中寻找引用的输出交易。如果输出交易缺少任何一个输入，该交易将成为一个孤 立的交易。如果与其匹配的交易还没有出现在池中，那么将被加入到孤立交易池中。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷对于每一个输入，如果引用的输出交易是一个coinbase输出，该输入必须至少获得 COINBASE_MATURITY(100)个确认。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷使用引用的输出交易获得输入值，并检查每一个输入值和总值是否在规定值的范围内 （小于2100万个币，大于0）。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷如果输入值的总和小于输出值的总和，交易将被中止。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷如果交易费用太低以至于无法进入一个空的区块，交易将被拒绝。</p>
+  <p style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">▷每一个输入的解锁脚本必须依据相应输出的锁定脚本来验证。</p>
+  <p><br></p>
+  <p>主要代码如下：</p>
+  <p></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(mp *TxPool) <span style="color:#ffc66d;">maybeAcceptTransaction</span>(tx *btcutil.Tx<span style="color:#cc7832;">, </span>isNew<span style="color:#cc7832;">, </span>rateLimit<span style="color:#cc7832;">, </span>rejectDupOrphans <span style="color:#769aa5;">bool</span>) ([]*chainhash.Hash<span style="color:#cc7832;">, </span>*TxDesc<span style="color:#cc7832;">, </span><span style="color:#769aa5;">error</span>) {
+   txHash := tx.Hash()
+
+   <span style="color:#cc7832;"><strong>if </strong></span>tx.MsgTx().HasWitness() {
+      segwitActive<span style="color:#cc7832;">, </span>err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit)
+      <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+      }
+
+      <span style="color:#cc7832;"><strong>if </strong></span>!segwitActive {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has witness data, "</span>+
+            <span style="color:#6a8759;">"but segwit isn't active yet"</span><span style="color:#cc7832;">, </span>txHash)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp;
+      mp.isOrphanInPool(txHash)) {
+
+      str := fmt.Sprintf(<span style="color:#6a8759;">"already have transaction %v"</span><span style="color:#cc7832;">, </span>txHash)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">, </span>str)
+   }
+
+   err := blockchain.CheckTransactionSanity(tx)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#808080;">// A standalone transaction must not be a coinbase transaction.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>blockchain.IsCoinBase(tx) {
+      str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v is an individual coinbase"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>txHash)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInvalid<span style="color:#cc7832;">, </span>str)
+   }
+
+   bestHeight := mp.cfg.BestHeight()
+   nextBlockHeight := bestHeight + <span style="color:#6897bb;">1
+</span><span style="color:#6897bb;">
+</span><span style="color:#6897bb;">   </span>medianTimePast := mp.cfg.MedianTimePast()
+
+   <span style="color:#cc7832;"><strong>if </strong></span>!mp.cfg.Policy.AcceptNonStd {
+      err = checkTransactionStandard(tx<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>medianTimePast<span style="color:#cc7832;">, </span>mp.cfg.Policy.MinRelayTxFee<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>mp.cfg.Policy.MaxTxVersion)
+      <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+         <span style="color:#808080;">// Attempt to extract a reject code from the error so
+</span><span style="color:#808080;">         // it can be retained.  When not possible, fall back to
+</span><span style="color:#808080;">         // a non standard error.
+</span><span style="color:#808080;">         </span>rejectCode<span style="color:#cc7832;">, </span>found := extractRejectCode(err)
+         <span style="color:#cc7832;"><strong>if </strong></span>!found {
+            rejectCode = wire.RejectNonstandard
+         }
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v is not standard: %v"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>txHash<span style="color:#cc7832;">, </span>err)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(rejectCode<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   err = mp.checkPoolDoubleSpend(tx)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   utxoView<span style="color:#cc7832;">, </span>err := mp.fetchInputUtxos(tx)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#808080;">// Don't allow the transaction if it exists in the main chain and is not
+</span><span style="color:#808080;">   // not already fully spent.
+</span><span style="color:#808080;">   </span>prevOut := wire.OutPoint{Hash: *txHash}
+   <span style="color:#cc7832;"><strong>for </strong></span>txOutIdx := <span style="color:#cc7832;"><strong>range </strong></span>tx.MsgTx().TxOut {
+      prevOut.Index = <span style="color:#769aa5;">uint32</span>(txOutIdx)
+      entry := utxoView.LookupEntry(prevOut)
+      <span style="color:#cc7832;"><strong>if </strong></span>entry != nil &amp;&amp; !entry.IsSpent() {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span><span style="color:#6a8759;">"transaction already exists"</span>)
+      }
+      utxoView.RemoveEntry(prevOut)
+   }
+
+   <span style="color:#cc7832;"><strong>var </strong></span>missingParents []*chainhash.Hash
+   <span style="color:#cc7832;"><strong>for </strong></span>outpoint<span style="color:#cc7832;">, </span>entry := <span style="color:#cc7832;"><strong>range </strong></span>utxoView.Entries() {
+      <span style="color:#cc7832;"><strong>if </strong></span>entry == nil || entry.IsSpent() {
+
+         hashCopy := outpoint.Hash
+         missingParents = append(missingParents<span style="color:#cc7832;">, </span>&amp;hashCopy)
+      }
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>len(missingParents) &gt; <span style="color:#6897bb;">0 </span>{
+      <span style="color:#cc7832;"><strong>return </strong></span>missingParents<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>nil
+   }
+
+   sequenceLock<span style="color:#cc7832;">, </span>err := mp.cfg.CalcSequenceLock(tx<span style="color:#cc7832;">, </span>utxoView)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>!blockchain.SequenceLockActive(sequenceLock<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>medianTimePast) {
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span><span style="color:#6a8759;">"transaction's sequence locks on inputs not met"</span>)
+   }
+
+   txFee<span style="color:#cc7832;">, </span>err := blockchain.CheckTransactionInputs(tx<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>utxoView<span style="color:#cc7832;">, </span>mp.cfg.ChainParams)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>!mp.cfg.Policy.AcceptNonStd {
+      err := checkInputsStandard(tx<span style="color:#cc7832;">, </span>utxoView)
+      <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+         <span style="color:#808080;">// Attempt to extract a reject code from the error so
+</span><span style="color:#808080;">         // it can be retained.  When not possible, fall back to
+</span><span style="color:#808080;">         // a non standard error.
+</span><span style="color:#808080;">         </span>rejectCode<span style="color:#cc7832;">, </span>found := extractRejectCode(err)
+         <span style="color:#cc7832;"><strong>if </strong></span>!found {
+            rejectCode = wire.RejectNonstandard
+         }
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has a non-standard "</span>+
+            <span style="color:#6a8759;">"input: %v"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">, </span>err)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(rejectCode<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#808080;">// </span><span style="color:#a8c023;"><em>TODO(roasbeef): last bool should be conditional on segwit activation </em></span><span style="color:#a8c023;"><em> </em></span>sigOpCost<span style="color:#cc7832;">, </span>err := blockchain.GetSigOpCost(tx<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>false</em></span><span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span>)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx {
+      str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v sigop cost is too high: %d &gt; %d"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>txHash<span style="color:#cc7832;">, </span>sigOpCost<span style="color:#cc7832;">, </span>mp.cfg.Policy.MaxSigOpCostPerTx)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">, </span>str)
+   }
+
+   serializedSize := GetTxVirtualSize(tx)
+   minFee := calcMinRequiredTxRelayFee(serializedSize<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>mp.cfg.Policy.MinRelayTxFee)
+   <span style="color:#cc7832;"><strong>if </strong></span>serializedSize &gt;= (DefaultBlockPrioritySize-<span style="color:#6897bb;">1000</span>) &amp;&amp; txFee &lt; minFee {
+      str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has %d fees which is under "</span>+
+         <span style="color:#6a8759;">"the required amount of %d"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">, </span>txFee<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>minFee)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee {
+      currentPriority := mining.CalcPriority(tx.MsgTx()<span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>nextBlockHeight)
+      <span style="color:#cc7832;"><strong>if </strong></span>currentPriority &lt;= mining.MinHighPriority {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has insufficient "</span>+
+            <span style="color:#6a8759;">"priority (%g &lt;= %g)"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>currentPriority<span style="color:#cc7832;">, </span>mining.MinHighPriority)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+      }
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>rateLimit &amp;&amp; txFee &lt; minFee {
+      nowUnix := time.Now().Unix()
+      <span style="color:#808080;">// Decay passed data with an exponentially decaying ~10 minute
+</span><span style="color:#808080;">      // window - matches bitcoind handling.
+</span><span style="color:#808080;">      </span>mp.pennyTotal *= math.Pow(<span style="color:#6897bb;">1.0</span>-<span style="color:#6897bb;">1.0</span>/<span style="color:#6897bb;">600.0</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span><span style="color:#769aa5;">float64</span>(nowUnix-mp.lastPennyUnix))
+      mp.lastPennyUnix = nowUnix
+
+      <span style="color:#808080;">// Are we still over the limit?
+</span><span style="color:#808080;">      </span><span style="color:#cc7832;"><strong>if </strong></span>mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*<span style="color:#6897bb;">10</span>*<span style="color:#6897bb;">1000 </span>{
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has been rejected "</span>+
+            <span style="color:#6a8759;">"by the rate limiter due to low fees"</span><span style="color:#cc7832;">, </span>txHash)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+      }
+      oldTotal := mp.pennyTotal
+
+      mp.pennyTotal += <span style="color:#769aa5;">float64</span>(serializedSize)
+      log.Tracef(<span style="color:#6a8759;">"rate limit: curTotal %v, nextTotal: %v, "</span>+
+         <span style="color:#6a8759;">"limit %v"</span><span style="color:#cc7832;">, </span>oldTotal<span style="color:#cc7832;">, </span>mp.pennyTotal<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>mp.cfg.Policy.FreeTxRelayLimit*<span style="color:#6897bb;">10</span>*<span style="color:#6897bb;">1000</span>)
+   }
+   
+   err = blockchain.ValidateTransactionScripts(tx<span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>txscript.StandardVerifyFlags<span style="color:#cc7832;">, </span>mp.cfg.SigCache<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>mp.cfg.HashCache)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#808080;">// Add to transaction pool.
+</span><span style="color:#808080;">   </span>txD := mp.addTransaction(utxoView<span style="color:#cc7832;">, </span>tx<span style="color:#cc7832;">, </span>bestHeight<span style="color:#cc7832;">, </span>txFee)
+
+   log.Debugf(<span style="color:#6a8759;">"Accepted transaction %v (pool size: %v)"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>len(mp.pool))
+
+   <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>txD<span style="color:#cc7832;">, </span>nil
+}
+
+<span style="color:#cc7832;"><strong>func </strong></span><span style="color:#ffc66d;">CheckTransactionSanity</span>(tx *btcutil.Tx) <span style="color:#769aa5;">error </span>{
+   <span style="color:#808080;">// A transaction must have at least one input.
+</span><span style="color:#808080;">   </span>msgTx := tx.MsgTx()
+   <span style="color:#cc7832;"><strong>if </strong></span>len(msgTx.TxIn) == <span style="color:#6897bb;">0 </span>{
+      <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrNoTxInputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction has no inputs"</span>)
+   }
+
+   <span style="color:#808080;">// A transaction must have at least one output.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>len(msgTx.TxOut) == <span style="color:#6897bb;">0 </span>{
+      <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrNoTxOutputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction has no outputs"</span>)
+   }
+
+   <span style="color:#808080;">// A transaction must not exceed the maximum allowed block payload when
+</span><span style="color:#808080;">   // serialized.
+</span><span style="color:#808080;">   </span>serializedTxSize := tx.MsgTx().SerializeSizeStripped()
+   <span style="color:#cc7832;"><strong>if </strong></span>serializedTxSize &gt; MaxBlockBaseSize {
+      str := fmt.Sprintf(<span style="color:#6a8759;">"serialized transaction is too big - got "</span>+
+         <span style="color:#6a8759;">"%d, max %d"</span><span style="color:#cc7832;">, </span>serializedTxSize<span style="color:#cc7832;">, </span>MaxBlockBaseSize)
+      <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrTxTooBig<span style="color:#cc7832;">, </span>str)
+   }
+
+   <span style="color:#cc7832;"><strong>var </strong></span>totalSatoshi <span style="color:#769aa5;">int64
+</span><span style="color:#769aa5;">   </span><span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txOut := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxOut {
+      satoshi := txOut.Value
+      <span style="color:#cc7832;"><strong>if </strong></span>satoshi &lt; <span style="color:#6897bb;">0 </span>{
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction output has negative "</span>+
+            <span style="color:#6a8759;">"value of %v"</span><span style="color:#cc7832;">, </span>satoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+      <span style="color:#cc7832;"><strong>if </strong></span>satoshi &gt; btcutil.MaxSatoshi {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction output value of %v is "</span>+
+            <span style="color:#6a8759;">"higher than max allowed value of %v"</span><span style="color:#cc7832;">, </span>satoshi<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>btcutil.MaxSatoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+
+      <span style="color:#808080;">// Two's complement int64 overflow guarantees that any overflow
+</span><span style="color:#808080;">      // is detected and reported.  This is impossible for Bitcoin, but
+</span><span style="color:#808080;">      // perhaps possible if an alt increases the total money supply.
+</span><span style="color:#808080;">      </span>totalSatoshi += satoshi
+      <span style="color:#cc7832;"><strong>if </strong></span>totalSatoshi &lt; <span style="color:#6897bb;">0 </span>{
+         str := fmt.Sprintf(<span style="color:#6a8759;">"total value of all transaction "</span>+
+            <span style="color:#6a8759;">"outputs exceeds max allowed value of %v"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>btcutil.MaxSatoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+      <span style="color:#cc7832;"><strong>if </strong></span>totalSatoshi &gt; btcutil.MaxSatoshi {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"total value of all transaction "</span>+
+            <span style="color:#6a8759;">"outputs is %v which is higher than max "</span>+
+            <span style="color:#6a8759;">"allowed value of %v"</span><span style="color:#cc7832;">, </span>totalSatoshi<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>btcutil.MaxSatoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#808080;">// Check for duplicate transaction inputs.
+</span><span style="color:#808080;">   </span>existingTxOut := <span style="color:#ffc66d;">make</span>(<span style="color:#cc7832;"><strong>map</strong></span>[wire.OutPoint]<span style="color:#cc7832;"><strong>struct</strong></span>{})
+   <span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txIn := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxIn {
+      <span style="color:#cc7832;"><strong>if </strong></span>_<span style="color:#cc7832;">, </span>exists := existingTxOut[txIn.PreviousOutPoint]<span style="color:#cc7832;">; </span>exists {
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrDuplicateTxInputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction "</span>+
+            <span style="color:#6a8759;">"contains duplicate inputs"</span>)
+      }
+      existingTxOut[txIn.PreviousOutPoint] = <span style="color:#cc7832;"><strong>struct</strong></span>{}{}
+   }
+
+   <span style="color:#808080;">// Coinbase script length must be between min and max length.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>IsCoinBase(tx) {
+      slen := len(msgTx.TxIn[<span style="color:#6897bb;">0</span>].SignatureScript)
+      <span style="color:#cc7832;"><strong>if </strong></span>slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"coinbase transaction script length "</span>+
+            <span style="color:#6a8759;">"of %d is out of range (min: %d, max: %d)"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>slen<span style="color:#cc7832;">, </span>MinCoinbaseScriptLen<span style="color:#cc7832;">, </span>MaxCoinbaseScriptLen)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadCoinbaseScriptLen<span style="color:#cc7832;">, </span>str)
+      }
+   } <span style="color:#cc7832;"><strong>else </strong></span>{
+      <span style="color:#808080;">// Previous transaction outputs referenced by the inputs to this
+</span><span style="color:#808080;">      // transaction must not be null.
+</span><span style="color:#808080;">      </span><span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txIn := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxIn {
+         <span style="color:#cc7832;"><strong>if </strong></span>isNullOutpoint(&amp;txIn.PreviousOutPoint) {
+            <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxInput<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction "</span>+
+               <span style="color:#6a8759;">"input refers to previous output that "</span>+
+               <span style="color:#6a8759;">"is null"</span>)
+         }
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>return </strong></span>nil
+}</pre>
+  <br> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/vohyeah/article/details/80713417,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/vohyeah/article/details/80713417,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

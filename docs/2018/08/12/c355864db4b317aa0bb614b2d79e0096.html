@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>EOS 之demux源码解析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="EOS 之demux源码解析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="EOS 之demux源码解析 Demux从Facebook的Flux Architecture架构模式和Redux（JavaScript程序的状态容器，即应用数据流框架）中汲取灵感，创建了一个后端基础架构模式。Demux赋予区块链事件溯源技术，可以准确地更新EOSIO上应用程序的可查询数据库。 Demux的一大优势是允许区块链事件自动地（并且可验证地）更新到Mongo或Postgres SQL数据库，这意味着存储在其中的数据仍然可以通过区块链进行验证。并且兼具传统数据库的灵活性和速度，及区块链的信任和不可变属性，达到了两全其美的效果。 如上图所示： Action Reader 负责读取bloackchain的数据。 Action watcher 负责调度Action Reader检测新的chain数据。 Action Handler 负责过滤和分发updaters 和effects事件。 目前我们项目是在updaters里面更新数据库数据，effects事件的具体作用还没有研究到。 通过example来解读源码 index.js const { readers: { eos: { NodeosActionReader } }, watchers: { BaseActionWatcher }, } = require(&quot;../../dist/&quot;) const ObjectActionHandler = require(&quot;./ObjectActionHandler&quot;) const updaters = require(&quot;./updaters&quot;) const effects = require(&quot;./effects&quot;) // 设置handler分发的updaters和effects const actionHandler = new ObjectActionHandler( updaters, effects, ) // 定义reader获取数据地址，读取位置 const actionReader = new NodeosActionReader( &quot;http://mainnet.eoscalgary.io&quot;, // Thanks EOS Calgary! 0, // Start at most recent blocks true, // 设置是否获取不可逆的数据 ) // 将reader和handler设置到watcher const actionWatcher = new BaseActionWatcher( actionReader, actionHandler, 500, ) // 开始轮询监控chain数据 actionWatcher.watch() example里面的代码就不贴了，有兴趣可以自己看看源码。 BaseActionWatcher &quot;use strict&quot;; var __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(function (resolve, reject) { function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } } function rejected(value) { try { step(generator[&quot;throw&quot;](value)); } catch (e) { reject(e); } } function step(result) { result.done ? resolve(result.value) : new P(function (resolve) { resolve(result.value); }).then(fulfilled, rejected); } step((generator = generator.apply(thisArg, _arguments || [])).next()); }); }; Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }); /** * Cooredinates implementations of `AbstractActionReader`s and `AbstractActionHandler`s in * a polling loop. */ class BaseActionWatcher { constructor(actionReader, actionHandler, pollInterval) { this.actionReader = actionReader; this.actionHandler = actionHandler; this.pollInterval = pollInterval; } /** * Starts a polling loop running in replay mode. */ replay() { return __awaiter(this, void 0, void 0, function* () { yield this.actionReader.seekToBlock(this.actionReader.startAtBlock); yield this.watch(); }); } /** * Uses the given actionReader and actionHandler to poll and process new blocks. */ watch() { return __awaiter(this, void 0, void 0, function* () { // Record start time const startTime = new Date().getTime(); // Process blocks until we&#39;re at the head block let headBlockNumber = 0; while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock(); // Handle block (and the actions within them) let needToSeek = false; let seekBlockNum = 0; if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock); } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1); } headBlockNumber = this.actionReader.headBlockNumber; } // Record end time const endTime = new Date().getTime(); // Calculate timing for next iteration const duration = endTime - startTime; let waitTime = this.pollInterval - duration; if (waitTime &lt; 0) { waitTime = 0; } // Schedule next iteration setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); }); } } exports.BaseActionWatcher = BaseActionWatcher; 下面这段代码通过递归调用watch()一直轮询到最新数据 setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); 下面看看对ActionReader的调度，以及handler时间的分发代码 while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock() // Handle block (and the actions within them) let needToSeek = false let seekBlockNum = 0 if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock) } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1) } headBlockNumber = this.actionReader.headBlockNumber } while 的条件!headBlockNumber初始化的时候为true，这时候进入调度。通过this.actionReader.nextBlock()方法获取区块信息blockData和是否回滚isRollBack。我们再来看看ActionReader的代码，看看nextBlock()做了什么事情。 const __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(((resolve, reject) =&gt; { function fulfilled(value) { try { step(generator.next(value)) } catch (e) { reject(e) } } function rejected(value) { try { step(generator.throw(value)) } catch (e) { reject(e) } } function step(result) { result.done ? resolve(result.value) : new P(((resolve) =&gt; { resolve(result.value) })).then(fulfilled, rejected) } step((generator = generator.apply(thisArg, _arguments || [])).next()) })) } Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }) /** * Reads blocks from a blockchain, outputting normalized `Block` objects. */ class AbstractActionReader { constructor(startAtBlock = 1, onlyIrreversible = false, maxHistoryLength = 600) { this.startAtBlock = startAtBlock this.onlyIrreversible = onlyIrreversible this.maxHistoryLength = maxHistoryLength this.headBlockNumber = 0 this.isFirstBlock = true this.currentBlockData = null this.blockHistory = [] this.currentBlockNumber = startAtBlock - 1 } /** * Loads the next block with chainInterface after validating, updating all relevant state. * If block fails validation, rollback will be called, and will update state to last block unseen. */ nextBlock() { return __awaiter(this, void 0, void 0, function* () { let blockData = null let isRollback = false // If we&#39;re on the head block, refresh current head block //在nextBlock中通过下面代码判断是否在最新区块信息上面，不再则刷新区块信息，其中getHeadBlockNumber()在eos目录下面的NodeosActionReaders里面，就是获取最新区块链信息。没有特别的代码。 //构造函数中this.headBlockNumber = 0，所以这里回去获取区块链最新的number，并更新headBlockNumber。 if (this.currentBlockNumber === this.headBlockNumber || !this.headBlockNumber) { this.headBlockNumber = yield this.getHeadBlockNumber() } // If currentBlockNumber is negative, it means we wrap to the end of the chain (most recent blocks) // This should only ever happen when we first start, so we check that there&#39;s no block history //判断是不是第一次启动，如果是第一次启动并将需要更新的数据指向最新的block if (this.currentBlockNumber &lt; 0 &amp;&amp; this.blockHistory.length === 0) { this.currentBlockNumber = this.headBlockNumber + this.currentBlockNumber this.startAtBlock = this.currentBlockNumber + 1 } // If we&#39;re now behind one or more new blocks, process them //解析数据 if (this.currentBlockNumber &lt; this.headBlockNumber) { const unvalidatedBlockData = yield this.getBlock(this.currentBlockNumber + 1) const expectedHash = this.currentBlockData !== null ? this.currentBlockData.blockHash : &quot;INVALID&quot; const actualHash = unvalidatedBlockData.previousBlockHash // Continue if the new block is on the same chain as our history, or if we&#39;ve just started //判断是否需要回滚，不回滚则将当前number获取的区块信息开始记录信息 if (expectedHash === actualHash || this.blockHistory.length === 0) { blockData = unvalidatedBlockData // Block is now validated if (this.currentBlockData) { this.blockHistory.push(this.currentBlockData) // No longer current, belongs on history } this.blockHistory.splice(0, this.blockHistory.length - this.maxHistoryLength) // Trim history this.currentBlockData = blockData // Replaced with the real current block this.currentBlockNumber = this.currentBlockData.blockNumber } else { // Since the new block did not match our history, we can assume our history is wrong // and need to roll back yield this.rollback() isRollback = true // Signal action handler that we must roll back // Reset for safety, as new fork could have less blocks than the previous fork this.headBlockNumber = yield this.getHeadBlockNumber() } } // Let handler know if this is the earliest block we&#39;ll send this.isFirstBlock = this.currentBlockNumber === this.startAtBlock if (this.currentBlockData === null) { throw Error(&quot;currentBlockData must not be null.&quot;) } //返回当前区块信息，是否回滚信息 return [this.currentBlockData, isRollback] }) } /** * Incrementally rolls back reader state one block at a time, comparing the blockHistory with * newly fetched blocks. Rollback is finished when either the current block&#39;s previous hash * matches the previous block&#39;s hash, or when history is exhausted. * * @return {Promise&lt;void&gt;} */ rollback() { return __awaiter(this, void 0, void 0, function* () { console.info(&quot;!! Fork detected !!&quot;) let blocksToRewind // Rewind at least 1 block back if (this.blockHistory.length &gt; 0) { // TODO: // check and throw error if undefined const block = this.blockHistory.pop() if (block === undefined) { throw Error(&quot;block history should not have undefined entries.&quot;) } this.currentBlockData = yield this.getBlock(block.blockNumber) blocksToRewind = 1 } // Pop off blocks from cached block history and compare them with freshly fetched blocks while (this.blockHistory.length &gt; 0) { const [cachedPreviousBlockData] = this.blockHistory.slice(-1) const previousBlockData = yield this.getBlock(cachedPreviousBlockData.blockNumber) // TODO: // add null guards const currentBlock = this.currentBlockData if (currentBlock !== null) { if (currentBlock.previousBlockHash === previousBlockData.blockHash) { console.info(`✓ BLOCK ${currentBlock.blockNumber} MATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(`Rewinding ${blocksToRewind} blocks to block (${currentBlock.blockNumber})...`) break } console.info(`✕ BLOCK ${currentBlock.blockNumber} MISMATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(&quot;Rollback history has been exhausted!&quot;) } this.currentBlockData = previousBlockData this.blockHistory.pop() blocksToRewind += 1 } if (this.blockHistory.length === 0) { yield this.rollbackExhausted() } }) } /** * When history is exhausted in rollback(), this is run to handle the situation. If left unimplemented, * then only instantiate with `onlyIrreversible` set to true. */ rollbackExhausted() { throw Error(&quot;Rollback history has been exhausted, and no rollback exhaustion handling has been implemented.&quot;) } /** * Move to the specified block. * 跳转到指定区块，开始读取数据 */ seekToBlock(blockNumber) { return __awaiter(this, void 0, void 0, function* () { // Clear current block data this.currentBlockData = null this.headBlockNumber = 0 // If we&#39;re going back to the first block, we don&#39;t want to get the preceding block if (blockNumber === 1) { this.blockHistory = [] return } // Check if block exists in history let toDelete = -1 for (let i = this.blockHistory.length - 1; i &gt;= 0; i--) { if (this.blockHistory[i].blockNumber === blockNumber) { break } else { toDelete += 1 } } if (toDelete &gt;= 0) { this.blockHistory.splice(toDelete) this.currentBlockData = this.blockHistory.pop() || null } // Load current block this.currentBlockNumber = blockNumber - 1 if (!this.currentBlockData) { this.currentBlockData = yield this.getBlock(this.currentBlockNumber) } }) } } exports.AbstractActionReader = AbstractActionReader 构造函数定义了currentBlockNumber（当前区块number），startAtBlock（开始区块number）等信息。具体的逻辑都在注释里面。 通过ActionReader获取了当前区块信息，下面看看在获取的blockData之后，ActionHandler做了什么事情。 public async handleBlock( block: Block, isRollback: boolean, isFirstBlock: boolean, isReplay: boolean = false, ): Promise&lt;[boolean, number]&gt; { if (isRollback) { await this.rollbackTo(block.blockNumber - 1) } if (!this.lastProcessedBlockHash &amp;&amp; this.lastProcessedBlockNumber === 0) { //获取indexState，这个可以在自定义handler的子类中重写，用于设置最开始的区块信息。 const { blockNumber: indexStateBlockNumber, blockHash: indexStateBlockHash } = await this.loadIndexState() if (indexStateBlockNumber &amp;&amp; indexStateBlockHash) { this.lastProcessedBlockNumber = indexStateBlockNumber this.lastProcessedBlockHash = indexStateBlockHash } } const nextBlockNeeded = this.lastProcessedBlockNumber + 1 // Just processed this block; skip //处理过的信息，最新信息已处理，不需要继续处理 if (block.blockNumber === this.lastProcessedBlockNumber &amp;&amp; block.blockHash === this.lastProcessedBlockHash) { return [false, 0] } // If it&#39;s the first block but we&#39;ve already processed blocks, seek to next block //如果是第一条信息，但是后续信息未处理，则返回需要跳转到指定区块，继续调用watcher更新整个区块信息。 if (isFirstBlock &amp;&amp; this.lastProcessedBlockHash) { return [true, nextBlockNeeded] } // Only check if this is the block we need if it&#39;s not the first block //如果不是第一个区块 if (!isFirstBlock) { //如果当前区块number不想等，则返回需要跳转到下一区块 if (block.blockNumber !== nextBlockNeeded) { return [true, nextBlockNeeded] } // Block sequence consistency should be handled by the ActionReader instance if (block.previousBlockHash !== this.lastProcessedBlockHash) { throw Error(&quot;Block hashes do not match; block not part of current chain.&quot;) } } //调用updaters和effects处理客户端数据 const handleWithArgs: (state: any, context?: any) =&gt; void = async (state: any, context: any = {}) =&gt; { await this.handleActions(state, block, context, isReplay) } await this.handleWithState(handleWithArgs) return [false, 0] } 这里就是判断获取到的数据是否需要给予updaters和effects处理，如果需要处理则调用handleWithState来通知updater和effects来处理数据。updater和effects则根据自己定义的actionTypes来处理相应数据。 其中loadIndexState()获取的信息如果和区块链上对应节点信息相同，则数据将从loadIndexState()中获取的节点信息开始更新数据，否则从reader初始化的节点数据开始获取数据。ps：为什么这么设置，目前小编还没有想明白，欢迎告知。 最后如果handler返回需要跳转到指定的block，则调用reader的seekToBlock来更新当前节点的数据。从而在指定的节点开始重新获取数据。 至此，整个抓取EOS区块链数据的递归逻辑就分析完毕。如有不当，期望指出！ 谢谢。 阅读更多" />
+<meta property="og:description" content="EOS 之demux源码解析 Demux从Facebook的Flux Architecture架构模式和Redux（JavaScript程序的状态容器，即应用数据流框架）中汲取灵感，创建了一个后端基础架构模式。Demux赋予区块链事件溯源技术，可以准确地更新EOSIO上应用程序的可查询数据库。 Demux的一大优势是允许区块链事件自动地（并且可验证地）更新到Mongo或Postgres SQL数据库，这意味着存储在其中的数据仍然可以通过区块链进行验证。并且兼具传统数据库的灵活性和速度，及区块链的信任和不可变属性，达到了两全其美的效果。 如上图所示： Action Reader 负责读取bloackchain的数据。 Action watcher 负责调度Action Reader检测新的chain数据。 Action Handler 负责过滤和分发updaters 和effects事件。 目前我们项目是在updaters里面更新数据库数据，effects事件的具体作用还没有研究到。 通过example来解读源码 index.js const { readers: { eos: { NodeosActionReader } }, watchers: { BaseActionWatcher }, } = require(&quot;../../dist/&quot;) const ObjectActionHandler = require(&quot;./ObjectActionHandler&quot;) const updaters = require(&quot;./updaters&quot;) const effects = require(&quot;./effects&quot;) // 设置handler分发的updaters和effects const actionHandler = new ObjectActionHandler( updaters, effects, ) // 定义reader获取数据地址，读取位置 const actionReader = new NodeosActionReader( &quot;http://mainnet.eoscalgary.io&quot;, // Thanks EOS Calgary! 0, // Start at most recent blocks true, // 设置是否获取不可逆的数据 ) // 将reader和handler设置到watcher const actionWatcher = new BaseActionWatcher( actionReader, actionHandler, 500, ) // 开始轮询监控chain数据 actionWatcher.watch() example里面的代码就不贴了，有兴趣可以自己看看源码。 BaseActionWatcher &quot;use strict&quot;; var __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(function (resolve, reject) { function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } } function rejected(value) { try { step(generator[&quot;throw&quot;](value)); } catch (e) { reject(e); } } function step(result) { result.done ? resolve(result.value) : new P(function (resolve) { resolve(result.value); }).then(fulfilled, rejected); } step((generator = generator.apply(thisArg, _arguments || [])).next()); }); }; Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }); /** * Cooredinates implementations of `AbstractActionReader`s and `AbstractActionHandler`s in * a polling loop. */ class BaseActionWatcher { constructor(actionReader, actionHandler, pollInterval) { this.actionReader = actionReader; this.actionHandler = actionHandler; this.pollInterval = pollInterval; } /** * Starts a polling loop running in replay mode. */ replay() { return __awaiter(this, void 0, void 0, function* () { yield this.actionReader.seekToBlock(this.actionReader.startAtBlock); yield this.watch(); }); } /** * Uses the given actionReader and actionHandler to poll and process new blocks. */ watch() { return __awaiter(this, void 0, void 0, function* () { // Record start time const startTime = new Date().getTime(); // Process blocks until we&#39;re at the head block let headBlockNumber = 0; while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock(); // Handle block (and the actions within them) let needToSeek = false; let seekBlockNum = 0; if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock); } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1); } headBlockNumber = this.actionReader.headBlockNumber; } // Record end time const endTime = new Date().getTime(); // Calculate timing for next iteration const duration = endTime - startTime; let waitTime = this.pollInterval - duration; if (waitTime &lt; 0) { waitTime = 0; } // Schedule next iteration setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); }); } } exports.BaseActionWatcher = BaseActionWatcher; 下面这段代码通过递归调用watch()一直轮询到最新数据 setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); 下面看看对ActionReader的调度，以及handler时间的分发代码 while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock() // Handle block (and the actions within them) let needToSeek = false let seekBlockNum = 0 if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock) } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1) } headBlockNumber = this.actionReader.headBlockNumber } while 的条件!headBlockNumber初始化的时候为true，这时候进入调度。通过this.actionReader.nextBlock()方法获取区块信息blockData和是否回滚isRollBack。我们再来看看ActionReader的代码，看看nextBlock()做了什么事情。 const __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(((resolve, reject) =&gt; { function fulfilled(value) { try { step(generator.next(value)) } catch (e) { reject(e) } } function rejected(value) { try { step(generator.throw(value)) } catch (e) { reject(e) } } function step(result) { result.done ? resolve(result.value) : new P(((resolve) =&gt; { resolve(result.value) })).then(fulfilled, rejected) } step((generator = generator.apply(thisArg, _arguments || [])).next()) })) } Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }) /** * Reads blocks from a blockchain, outputting normalized `Block` objects. */ class AbstractActionReader { constructor(startAtBlock = 1, onlyIrreversible = false, maxHistoryLength = 600) { this.startAtBlock = startAtBlock this.onlyIrreversible = onlyIrreversible this.maxHistoryLength = maxHistoryLength this.headBlockNumber = 0 this.isFirstBlock = true this.currentBlockData = null this.blockHistory = [] this.currentBlockNumber = startAtBlock - 1 } /** * Loads the next block with chainInterface after validating, updating all relevant state. * If block fails validation, rollback will be called, and will update state to last block unseen. */ nextBlock() { return __awaiter(this, void 0, void 0, function* () { let blockData = null let isRollback = false // If we&#39;re on the head block, refresh current head block //在nextBlock中通过下面代码判断是否在最新区块信息上面，不再则刷新区块信息，其中getHeadBlockNumber()在eos目录下面的NodeosActionReaders里面，就是获取最新区块链信息。没有特别的代码。 //构造函数中this.headBlockNumber = 0，所以这里回去获取区块链最新的number，并更新headBlockNumber。 if (this.currentBlockNumber === this.headBlockNumber || !this.headBlockNumber) { this.headBlockNumber = yield this.getHeadBlockNumber() } // If currentBlockNumber is negative, it means we wrap to the end of the chain (most recent blocks) // This should only ever happen when we first start, so we check that there&#39;s no block history //判断是不是第一次启动，如果是第一次启动并将需要更新的数据指向最新的block if (this.currentBlockNumber &lt; 0 &amp;&amp; this.blockHistory.length === 0) { this.currentBlockNumber = this.headBlockNumber + this.currentBlockNumber this.startAtBlock = this.currentBlockNumber + 1 } // If we&#39;re now behind one or more new blocks, process them //解析数据 if (this.currentBlockNumber &lt; this.headBlockNumber) { const unvalidatedBlockData = yield this.getBlock(this.currentBlockNumber + 1) const expectedHash = this.currentBlockData !== null ? this.currentBlockData.blockHash : &quot;INVALID&quot; const actualHash = unvalidatedBlockData.previousBlockHash // Continue if the new block is on the same chain as our history, or if we&#39;ve just started //判断是否需要回滚，不回滚则将当前number获取的区块信息开始记录信息 if (expectedHash === actualHash || this.blockHistory.length === 0) { blockData = unvalidatedBlockData // Block is now validated if (this.currentBlockData) { this.blockHistory.push(this.currentBlockData) // No longer current, belongs on history } this.blockHistory.splice(0, this.blockHistory.length - this.maxHistoryLength) // Trim history this.currentBlockData = blockData // Replaced with the real current block this.currentBlockNumber = this.currentBlockData.blockNumber } else { // Since the new block did not match our history, we can assume our history is wrong // and need to roll back yield this.rollback() isRollback = true // Signal action handler that we must roll back // Reset for safety, as new fork could have less blocks than the previous fork this.headBlockNumber = yield this.getHeadBlockNumber() } } // Let handler know if this is the earliest block we&#39;ll send this.isFirstBlock = this.currentBlockNumber === this.startAtBlock if (this.currentBlockData === null) { throw Error(&quot;currentBlockData must not be null.&quot;) } //返回当前区块信息，是否回滚信息 return [this.currentBlockData, isRollback] }) } /** * Incrementally rolls back reader state one block at a time, comparing the blockHistory with * newly fetched blocks. Rollback is finished when either the current block&#39;s previous hash * matches the previous block&#39;s hash, or when history is exhausted. * * @return {Promise&lt;void&gt;} */ rollback() { return __awaiter(this, void 0, void 0, function* () { console.info(&quot;!! Fork detected !!&quot;) let blocksToRewind // Rewind at least 1 block back if (this.blockHistory.length &gt; 0) { // TODO: // check and throw error if undefined const block = this.blockHistory.pop() if (block === undefined) { throw Error(&quot;block history should not have undefined entries.&quot;) } this.currentBlockData = yield this.getBlock(block.blockNumber) blocksToRewind = 1 } // Pop off blocks from cached block history and compare them with freshly fetched blocks while (this.blockHistory.length &gt; 0) { const [cachedPreviousBlockData] = this.blockHistory.slice(-1) const previousBlockData = yield this.getBlock(cachedPreviousBlockData.blockNumber) // TODO: // add null guards const currentBlock = this.currentBlockData if (currentBlock !== null) { if (currentBlock.previousBlockHash === previousBlockData.blockHash) { console.info(`✓ BLOCK ${currentBlock.blockNumber} MATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(`Rewinding ${blocksToRewind} blocks to block (${currentBlock.blockNumber})...`) break } console.info(`✕ BLOCK ${currentBlock.blockNumber} MISMATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(&quot;Rollback history has been exhausted!&quot;) } this.currentBlockData = previousBlockData this.blockHistory.pop() blocksToRewind += 1 } if (this.blockHistory.length === 0) { yield this.rollbackExhausted() } }) } /** * When history is exhausted in rollback(), this is run to handle the situation. If left unimplemented, * then only instantiate with `onlyIrreversible` set to true. */ rollbackExhausted() { throw Error(&quot;Rollback history has been exhausted, and no rollback exhaustion handling has been implemented.&quot;) } /** * Move to the specified block. * 跳转到指定区块，开始读取数据 */ seekToBlock(blockNumber) { return __awaiter(this, void 0, void 0, function* () { // Clear current block data this.currentBlockData = null this.headBlockNumber = 0 // If we&#39;re going back to the first block, we don&#39;t want to get the preceding block if (blockNumber === 1) { this.blockHistory = [] return } // Check if block exists in history let toDelete = -1 for (let i = this.blockHistory.length - 1; i &gt;= 0; i--) { if (this.blockHistory[i].blockNumber === blockNumber) { break } else { toDelete += 1 } } if (toDelete &gt;= 0) { this.blockHistory.splice(toDelete) this.currentBlockData = this.blockHistory.pop() || null } // Load current block this.currentBlockNumber = blockNumber - 1 if (!this.currentBlockData) { this.currentBlockData = yield this.getBlock(this.currentBlockNumber) } }) } } exports.AbstractActionReader = AbstractActionReader 构造函数定义了currentBlockNumber（当前区块number），startAtBlock（开始区块number）等信息。具体的逻辑都在注释里面。 通过ActionReader获取了当前区块信息，下面看看在获取的blockData之后，ActionHandler做了什么事情。 public async handleBlock( block: Block, isRollback: boolean, isFirstBlock: boolean, isReplay: boolean = false, ): Promise&lt;[boolean, number]&gt; { if (isRollback) { await this.rollbackTo(block.blockNumber - 1) } if (!this.lastProcessedBlockHash &amp;&amp; this.lastProcessedBlockNumber === 0) { //获取indexState，这个可以在自定义handler的子类中重写，用于设置最开始的区块信息。 const { blockNumber: indexStateBlockNumber, blockHash: indexStateBlockHash } = await this.loadIndexState() if (indexStateBlockNumber &amp;&amp; indexStateBlockHash) { this.lastProcessedBlockNumber = indexStateBlockNumber this.lastProcessedBlockHash = indexStateBlockHash } } const nextBlockNeeded = this.lastProcessedBlockNumber + 1 // Just processed this block; skip //处理过的信息，最新信息已处理，不需要继续处理 if (block.blockNumber === this.lastProcessedBlockNumber &amp;&amp; block.blockHash === this.lastProcessedBlockHash) { return [false, 0] } // If it&#39;s the first block but we&#39;ve already processed blocks, seek to next block //如果是第一条信息，但是后续信息未处理，则返回需要跳转到指定区块，继续调用watcher更新整个区块信息。 if (isFirstBlock &amp;&amp; this.lastProcessedBlockHash) { return [true, nextBlockNeeded] } // Only check if this is the block we need if it&#39;s not the first block //如果不是第一个区块 if (!isFirstBlock) { //如果当前区块number不想等，则返回需要跳转到下一区块 if (block.blockNumber !== nextBlockNeeded) { return [true, nextBlockNeeded] } // Block sequence consistency should be handled by the ActionReader instance if (block.previousBlockHash !== this.lastProcessedBlockHash) { throw Error(&quot;Block hashes do not match; block not part of current chain.&quot;) } } //调用updaters和effects处理客户端数据 const handleWithArgs: (state: any, context?: any) =&gt; void = async (state: any, context: any = {}) =&gt; { await this.handleActions(state, block, context, isReplay) } await this.handleWithState(handleWithArgs) return [false, 0] } 这里就是判断获取到的数据是否需要给予updaters和effects处理，如果需要处理则调用handleWithState来通知updater和effects来处理数据。updater和effects则根据自己定义的actionTypes来处理相应数据。 其中loadIndexState()获取的信息如果和区块链上对应节点信息相同，则数据将从loadIndexState()中获取的节点信息开始更新数据，否则从reader初始化的节点数据开始获取数据。ps：为什么这么设置，目前小编还没有想明白，欢迎告知。 最后如果handler返回需要跳转到指定的block，则调用reader的seekToBlock来更新当前节点的数据。从而在指定的节点开始重新获取数据。 至此，整个抓取EOS区块链数据的递归逻辑就分析完毕。如有不当，期望指出！ 谢谢。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/12/c355864db4b317aa0bb614b2d79e0096.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/12/c355864db4b317aa0bb614b2d79e0096.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-12T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"EOS 之demux源码解析 Demux从Facebook的Flux Architecture架构模式和Redux（JavaScript程序的状态容器，即应用数据流框架）中汲取灵感，创建了一个后端基础架构模式。Demux赋予区块链事件溯源技术，可以准确地更新EOSIO上应用程序的可查询数据库。 Demux的一大优势是允许区块链事件自动地（并且可验证地）更新到Mongo或Postgres SQL数据库，这意味着存储在其中的数据仍然可以通过区块链进行验证。并且兼具传统数据库的灵活性和速度，及区块链的信任和不可变属性，达到了两全其美的效果。 如上图所示： Action Reader 负责读取bloackchain的数据。 Action watcher 负责调度Action Reader检测新的chain数据。 Action Handler 负责过滤和分发updaters 和effects事件。 目前我们项目是在updaters里面更新数据库数据，effects事件的具体作用还没有研究到。 通过example来解读源码 index.js const { readers: { eos: { NodeosActionReader } }, watchers: { BaseActionWatcher }, } = require(&quot;../../dist/&quot;) const ObjectActionHandler = require(&quot;./ObjectActionHandler&quot;) const updaters = require(&quot;./updaters&quot;) const effects = require(&quot;./effects&quot;) // 设置handler分发的updaters和effects const actionHandler = new ObjectActionHandler( updaters, effects, ) // 定义reader获取数据地址，读取位置 const actionReader = new NodeosActionReader( &quot;http://mainnet.eoscalgary.io&quot;, // Thanks EOS Calgary! 0, // Start at most recent blocks true, // 设置是否获取不可逆的数据 ) // 将reader和handler设置到watcher const actionWatcher = new BaseActionWatcher( actionReader, actionHandler, 500, ) // 开始轮询监控chain数据 actionWatcher.watch() example里面的代码就不贴了，有兴趣可以自己看看源码。 BaseActionWatcher &quot;use strict&quot;; var __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(function (resolve, reject) { function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } } function rejected(value) { try { step(generator[&quot;throw&quot;](value)); } catch (e) { reject(e); } } function step(result) { result.done ? resolve(result.value) : new P(function (resolve) { resolve(result.value); }).then(fulfilled, rejected); } step((generator = generator.apply(thisArg, _arguments || [])).next()); }); }; Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }); /** * Cooredinates implementations of `AbstractActionReader`s and `AbstractActionHandler`s in * a polling loop. */ class BaseActionWatcher { constructor(actionReader, actionHandler, pollInterval) { this.actionReader = actionReader; this.actionHandler = actionHandler; this.pollInterval = pollInterval; } /** * Starts a polling loop running in replay mode. */ replay() { return __awaiter(this, void 0, void 0, function* () { yield this.actionReader.seekToBlock(this.actionReader.startAtBlock); yield this.watch(); }); } /** * Uses the given actionReader and actionHandler to poll and process new blocks. */ watch() { return __awaiter(this, void 0, void 0, function* () { // Record start time const startTime = new Date().getTime(); // Process blocks until we&#39;re at the head block let headBlockNumber = 0; while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock(); // Handle block (and the actions within them) let needToSeek = false; let seekBlockNum = 0; if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock); } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1); } headBlockNumber = this.actionReader.headBlockNumber; } // Record end time const endTime = new Date().getTime(); // Calculate timing for next iteration const duration = endTime - startTime; let waitTime = this.pollInterval - duration; if (waitTime &lt; 0) { waitTime = 0; } // Schedule next iteration setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); }); } } exports.BaseActionWatcher = BaseActionWatcher; 下面这段代码通过递归调用watch()一直轮询到最新数据 setTimeout(() =&gt; __awaiter(this, void 0, void 0, function* () { return yield this.watch(); }), waitTime); 下面看看对ActionReader的调度，以及handler时间的分发代码 while (!headBlockNumber || this.actionReader.currentBlockNumber &lt; headBlockNumber) { const [blockData, isRollback] = yield this.actionReader.nextBlock() // Handle block (and the actions within them) let needToSeek = false let seekBlockNum = 0 if (blockData) { [needToSeek, seekBlockNum] = yield this.actionHandler.handleBlock(blockData, isRollback, this.actionReader.isFirstBlock) } // Seek to next needed block at the request of the action handler if (needToSeek) { yield this.actionReader.seekToBlock(seekBlockNum - 1) } headBlockNumber = this.actionReader.headBlockNumber } while 的条件!headBlockNumber初始化的时候为true，这时候进入调度。通过this.actionReader.nextBlock()方法获取区块信息blockData和是否回滚isRollBack。我们再来看看ActionReader的代码，看看nextBlock()做了什么事情。 const __awaiter = (this &amp;&amp; this.__awaiter) || function (thisArg, _arguments, P, generator) { return new (P || (P = Promise))(((resolve, reject) =&gt; { function fulfilled(value) { try { step(generator.next(value)) } catch (e) { reject(e) } } function rejected(value) { try { step(generator.throw(value)) } catch (e) { reject(e) } } function step(result) { result.done ? resolve(result.value) : new P(((resolve) =&gt; { resolve(result.value) })).then(fulfilled, rejected) } step((generator = generator.apply(thisArg, _arguments || [])).next()) })) } Object.defineProperty(exports, &quot;__esModule&quot;, { value: true }) /** * Reads blocks from a blockchain, outputting normalized `Block` objects. */ class AbstractActionReader { constructor(startAtBlock = 1, onlyIrreversible = false, maxHistoryLength = 600) { this.startAtBlock = startAtBlock this.onlyIrreversible = onlyIrreversible this.maxHistoryLength = maxHistoryLength this.headBlockNumber = 0 this.isFirstBlock = true this.currentBlockData = null this.blockHistory = [] this.currentBlockNumber = startAtBlock - 1 } /** * Loads the next block with chainInterface after validating, updating all relevant state. * If block fails validation, rollback will be called, and will update state to last block unseen. */ nextBlock() { return __awaiter(this, void 0, void 0, function* () { let blockData = null let isRollback = false // If we&#39;re on the head block, refresh current head block //在nextBlock中通过下面代码判断是否在最新区块信息上面，不再则刷新区块信息，其中getHeadBlockNumber()在eos目录下面的NodeosActionReaders里面，就是获取最新区块链信息。没有特别的代码。 //构造函数中this.headBlockNumber = 0，所以这里回去获取区块链最新的number，并更新headBlockNumber。 if (this.currentBlockNumber === this.headBlockNumber || !this.headBlockNumber) { this.headBlockNumber = yield this.getHeadBlockNumber() } // If currentBlockNumber is negative, it means we wrap to the end of the chain (most recent blocks) // This should only ever happen when we first start, so we check that there&#39;s no block history //判断是不是第一次启动，如果是第一次启动并将需要更新的数据指向最新的block if (this.currentBlockNumber &lt; 0 &amp;&amp; this.blockHistory.length === 0) { this.currentBlockNumber = this.headBlockNumber + this.currentBlockNumber this.startAtBlock = this.currentBlockNumber + 1 } // If we&#39;re now behind one or more new blocks, process them //解析数据 if (this.currentBlockNumber &lt; this.headBlockNumber) { const unvalidatedBlockData = yield this.getBlock(this.currentBlockNumber + 1) const expectedHash = this.currentBlockData !== null ? this.currentBlockData.blockHash : &quot;INVALID&quot; const actualHash = unvalidatedBlockData.previousBlockHash // Continue if the new block is on the same chain as our history, or if we&#39;ve just started //判断是否需要回滚，不回滚则将当前number获取的区块信息开始记录信息 if (expectedHash === actualHash || this.blockHistory.length === 0) { blockData = unvalidatedBlockData // Block is now validated if (this.currentBlockData) { this.blockHistory.push(this.currentBlockData) // No longer current, belongs on history } this.blockHistory.splice(0, this.blockHistory.length - this.maxHistoryLength) // Trim history this.currentBlockData = blockData // Replaced with the real current block this.currentBlockNumber = this.currentBlockData.blockNumber } else { // Since the new block did not match our history, we can assume our history is wrong // and need to roll back yield this.rollback() isRollback = true // Signal action handler that we must roll back // Reset for safety, as new fork could have less blocks than the previous fork this.headBlockNumber = yield this.getHeadBlockNumber() } } // Let handler know if this is the earliest block we&#39;ll send this.isFirstBlock = this.currentBlockNumber === this.startAtBlock if (this.currentBlockData === null) { throw Error(&quot;currentBlockData must not be null.&quot;) } //返回当前区块信息，是否回滚信息 return [this.currentBlockData, isRollback] }) } /** * Incrementally rolls back reader state one block at a time, comparing the blockHistory with * newly fetched blocks. Rollback is finished when either the current block&#39;s previous hash * matches the previous block&#39;s hash, or when history is exhausted. * * @return {Promise&lt;void&gt;} */ rollback() { return __awaiter(this, void 0, void 0, function* () { console.info(&quot;!! Fork detected !!&quot;) let blocksToRewind // Rewind at least 1 block back if (this.blockHistory.length &gt; 0) { // TODO: // check and throw error if undefined const block = this.blockHistory.pop() if (block === undefined) { throw Error(&quot;block history should not have undefined entries.&quot;) } this.currentBlockData = yield this.getBlock(block.blockNumber) blocksToRewind = 1 } // Pop off blocks from cached block history and compare them with freshly fetched blocks while (this.blockHistory.length &gt; 0) { const [cachedPreviousBlockData] = this.blockHistory.slice(-1) const previousBlockData = yield this.getBlock(cachedPreviousBlockData.blockNumber) // TODO: // add null guards const currentBlock = this.currentBlockData if (currentBlock !== null) { if (currentBlock.previousBlockHash === previousBlockData.blockHash) { console.info(`✓ BLOCK ${currentBlock.blockNumber} MATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(`Rewinding ${blocksToRewind} blocks to block (${currentBlock.blockNumber})...`) break } console.info(`✕ BLOCK ${currentBlock.blockNumber} MISMATCH:`) console.info(` expected: ${currentBlock.previousBlockHash}`) console.info(` received: ${previousBlockData.blockHash}`) console.info(&quot;Rollback history has been exhausted!&quot;) } this.currentBlockData = previousBlockData this.blockHistory.pop() blocksToRewind += 1 } if (this.blockHistory.length === 0) { yield this.rollbackExhausted() } }) } /** * When history is exhausted in rollback(), this is run to handle the situation. If left unimplemented, * then only instantiate with `onlyIrreversible` set to true. */ rollbackExhausted() { throw Error(&quot;Rollback history has been exhausted, and no rollback exhaustion handling has been implemented.&quot;) } /** * Move to the specified block. * 跳转到指定区块，开始读取数据 */ seekToBlock(blockNumber) { return __awaiter(this, void 0, void 0, function* () { // Clear current block data this.currentBlockData = null this.headBlockNumber = 0 // If we&#39;re going back to the first block, we don&#39;t want to get the preceding block if (blockNumber === 1) { this.blockHistory = [] return } // Check if block exists in history let toDelete = -1 for (let i = this.blockHistory.length - 1; i &gt;= 0; i--) { if (this.blockHistory[i].blockNumber === blockNumber) { break } else { toDelete += 1 } } if (toDelete &gt;= 0) { this.blockHistory.splice(toDelete) this.currentBlockData = this.blockHistory.pop() || null } // Load current block this.currentBlockNumber = blockNumber - 1 if (!this.currentBlockData) { this.currentBlockData = yield this.getBlock(this.currentBlockNumber) } }) } } exports.AbstractActionReader = AbstractActionReader 构造函数定义了currentBlockNumber（当前区块number），startAtBlock（开始区块number）等信息。具体的逻辑都在注释里面。 通过ActionReader获取了当前区块信息，下面看看在获取的blockData之后，ActionHandler做了什么事情。 public async handleBlock( block: Block, isRollback: boolean, isFirstBlock: boolean, isReplay: boolean = false, ): Promise&lt;[boolean, number]&gt; { if (isRollback) { await this.rollbackTo(block.blockNumber - 1) } if (!this.lastProcessedBlockHash &amp;&amp; this.lastProcessedBlockNumber === 0) { //获取indexState，这个可以在自定义handler的子类中重写，用于设置最开始的区块信息。 const { blockNumber: indexStateBlockNumber, blockHash: indexStateBlockHash } = await this.loadIndexState() if (indexStateBlockNumber &amp;&amp; indexStateBlockHash) { this.lastProcessedBlockNumber = indexStateBlockNumber this.lastProcessedBlockHash = indexStateBlockHash } } const nextBlockNeeded = this.lastProcessedBlockNumber + 1 // Just processed this block; skip //处理过的信息，最新信息已处理，不需要继续处理 if (block.blockNumber === this.lastProcessedBlockNumber &amp;&amp; block.blockHash === this.lastProcessedBlockHash) { return [false, 0] } // If it&#39;s the first block but we&#39;ve already processed blocks, seek to next block //如果是第一条信息，但是后续信息未处理，则返回需要跳转到指定区块，继续调用watcher更新整个区块信息。 if (isFirstBlock &amp;&amp; this.lastProcessedBlockHash) { return [true, nextBlockNeeded] } // Only check if this is the block we need if it&#39;s not the first block //如果不是第一个区块 if (!isFirstBlock) { //如果当前区块number不想等，则返回需要跳转到下一区块 if (block.blockNumber !== nextBlockNeeded) { return [true, nextBlockNeeded] } // Block sequence consistency should be handled by the ActionReader instance if (block.previousBlockHash !== this.lastProcessedBlockHash) { throw Error(&quot;Block hashes do not match; block not part of current chain.&quot;) } } //调用updaters和effects处理客户端数据 const handleWithArgs: (state: any, context?: any) =&gt; void = async (state: any, context: any = {}) =&gt; { await this.handleActions(state, block, context, isReplay) } await this.handleWithState(handleWithArgs) return [false, 0] } 这里就是判断获取到的数据是否需要给予updaters和effects处理，如果需要处理则调用handleWithState来通知updater和effects来处理数据。updater和effects则根据自己定义的actionTypes来处理相应数据。 其中loadIndexState()获取的信息如果和区块链上对应节点信息相同，则数据将从loadIndexState()中获取的节点信息开始更新数据，否则从reader初始化的节点数据开始获取数据。ps：为什么这么设置，目前小编还没有想明白，欢迎告知。 最后如果handler返回需要跳转到指定的block，则调用reader的seekToBlock来更新当前节点的数据。从而在指定的节点开始重新获取数据。 至此，整个抓取EOS区块链数据的递归逻辑就分析完毕。如有不当，期望指出！ 谢谢。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/12/c355864db4b317aa0bb614b2d79e0096.html","headline":"EOS 之demux源码解析","dateModified":"2018-08-12T00:00:00+08:00","datePublished":"2018-08-12T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/12/c355864db4b317aa0bb614b2d79e0096.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>EOS 之demux源码解析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="eos-之demux源码解析">EOS 之demux源码解析</h1> 
+  <p>Demux从Facebook的Flux Architecture架构模式和Redux（JavaScript程序的状态容器，即应用数据流框架）中汲取灵感，创建了一个后端基础架构模式。Demux赋予区块链事件溯源技术，可以准确地更新EOSIO上应用程序的可查询数据库。 <br> Demux的一大优势是允许区块链事件自动地（并且可验证地）更新到Mongo或Postgres SQL数据库，这意味着存储在其中的数据仍然可以通过区块链进行验证。并且兼具传统数据库的灵活性和速度，及区块链的信任和不可变属性，达到了两全其美的效果。 <br> <img src="https://upload-images.jianshu.io/upload_images/13043506-0b0d285a496d72ae?imageMogr2/auto-orient/strip%7CimageView2/2/w/700" alt="这里写图片描述" title=""></p> 
+  <p>如上图所示： <br> Action Reader 负责读取bloackchain的数据。 <br> Action watcher 负责调度Action Reader检测新的chain数据。 <br> Action Handler 负责过滤和分发updaters 和effects事件。 <br> 目前我们项目是在updaters里面更新数据库数据，effects事件的具体作用还没有研究到。</p> 
+  <h1 id="通过example来解读源码">通过example来解读源码</h1> 
+  <hr> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018081122383681?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0hhcmJvdXJmeQ==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述" title=""></p> 
+  <h1 id="indexjs">index.js</h1> 
+  <pre class="prettyprint"><code class=" hljs javascript"><span class="hljs-keyword">const</span> {
+  readers: { eos: { NodeosActionReader } },
+  watchers: { BaseActionWatcher },
+} = <span class="hljs-built_in">require</span>(<span class="hljs-string">"../../dist/"</span>)
+<span class="hljs-keyword">const</span> ObjectActionHandler = <span class="hljs-built_in">require</span>(<span class="hljs-string">"./ObjectActionHandler"</span>)
+<span class="hljs-keyword">const</span> updaters = <span class="hljs-built_in">require</span>(<span class="hljs-string">"./updaters"</span>)
+<span class="hljs-keyword">const</span> effects = <span class="hljs-built_in">require</span>(<span class="hljs-string">"./effects"</span>)
+<span class="hljs-comment">// 设置handler分发的updaters和effects</span>
+<span class="hljs-keyword">const</span> actionHandler = <span class="hljs-keyword">new</span> ObjectActionHandler(
+  updaters,
+  effects,
+)
+<span class="hljs-comment">// 定义reader获取数据地址，读取位置</span>
+<span class="hljs-keyword">const</span> actionReader = <span class="hljs-keyword">new</span> NodeosActionReader(
+  <span class="hljs-string">"http://mainnet.eoscalgary.io"</span>, <span class="hljs-comment">// Thanks EOS Calgary!</span>
+  <span class="hljs-number">0</span>, <span class="hljs-comment">// Start at most recent blocks</span>
+  <span class="hljs-literal">true</span>, <span class="hljs-comment">// 设置是否获取不可逆的数据</span>
+)
+<span class="hljs-comment">// 将reader和handler设置到watcher</span>
+<span class="hljs-keyword">const</span> actionWatcher = <span class="hljs-keyword">new</span> BaseActionWatcher(
+  actionReader,
+  actionHandler,
+  <span class="hljs-number">500</span>,
+)
+<span class="hljs-comment">// 开始轮询监控chain数据</span>
+actionWatcher.watch()
+</code></pre> 
+  <p>example里面的代码就不贴了，有兴趣可以自己看看源码。</p> 
+  <h1 id="baseactionwatcher">BaseActionWatcher</h1> 
+  <pre class="prettyprint"><code class=" hljs javascript"><span class="hljs-pi">"use strict"</span>;
+<span class="hljs-keyword">var</span> __awaiter = (<span class="hljs-keyword">this</span> &amp;&amp; <span class="hljs-keyword">this</span>.__awaiter) || <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-params">(thisArg, _arguments, P, generator)</span> {</span>
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> (P || (P = Promise))(<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-params">(resolve, reject)</span> {</span>
+        <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">fulfilled</span><span class="hljs-params">(value)</span> {</span> <span class="hljs-keyword">try</span> { step(generator.next(value)); } <span class="hljs-keyword">catch</span> (e) { reject(e); } }
+        <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">rejected</span><span class="hljs-params">(value)</span> {</span> <span class="hljs-keyword">try</span> { step(generator[<span class="hljs-string">"throw"</span>](value)); } <span class="hljs-keyword">catch</span> (e) { reject(e); } }
+        <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">step</span><span class="hljs-params">(result)</span> {</span> result.done ? resolve(result.value) : <span class="hljs-keyword">new</span> P(<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-params">(resolve)</span> {</span> resolve(result.value); }).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+<span class="hljs-built_in">Object</span>.defineProperty(exports, <span class="hljs-string">"__esModule"</span>, { value: <span class="hljs-literal">true</span> });
+<span class="hljs-comment">/** * Cooredinates implementations of `AbstractActionReader`s and `AbstractActionHandler`s in * a polling loop. */</span>
+<span class="hljs-keyword">class</span> BaseActionWatcher {
+    constructor(actionReader, actionHandler, pollInterval) {
+        <span class="hljs-keyword">this</span>.actionReader = actionReader;
+        <span class="hljs-keyword">this</span>.actionHandler = actionHandler;
+        <span class="hljs-keyword">this</span>.pollInterval = pollInterval;
+    }
+    <span class="hljs-comment">/** * Starts a polling loop running in replay mode. */</span>
+    replay() {
+        <span class="hljs-keyword">return</span> __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-function"><span class="hljs-keyword">function</span>* <span class="hljs-params">()</span> {</span>
+            <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionReader.seekToBlock(<span class="hljs-keyword">this</span>.actionReader.startAtBlock);
+            <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.watch();
+        });
+    }
+    <span class="hljs-comment">/** * Uses the given actionReader and actionHandler to poll and process new blocks. */</span>
+    watch() {
+        <span class="hljs-keyword">return</span> __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-function"><span class="hljs-keyword">function</span>* <span class="hljs-params">()</span> {</span>
+            <span class="hljs-comment">// Record start time</span>
+            <span class="hljs-keyword">const</span> startTime = <span class="hljs-keyword">new</span> <span class="hljs-built_in">Date</span>().getTime();
+            <span class="hljs-comment">// Process blocks until we're at the head block</span>
+            <span class="hljs-keyword">let</span> headBlockNumber = <span class="hljs-number">0</span>;
+            <span class="hljs-keyword">while</span> (!headBlockNumber || <span class="hljs-keyword">this</span>.actionReader.currentBlockNumber &lt; headBlockNumber) {
+
+                <span class="hljs-keyword">const</span> [blockData, isRollback] = <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionReader.nextBlock();
+                <span class="hljs-comment">// Handle block (and the actions within them)</span>
+                <span class="hljs-keyword">let</span> needToSeek = <span class="hljs-literal">false</span>;
+                <span class="hljs-keyword">let</span> seekBlockNum = <span class="hljs-number">0</span>;
+                <span class="hljs-keyword">if</span> (blockData) {
+                    [needToSeek, seekBlockNum] = <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionHandler.handleBlock(blockData, isRollback, <span class="hljs-keyword">this</span>.actionReader.isFirstBlock);
+                }
+                <span class="hljs-comment">// Seek to next needed block at the request of the action handler</span>
+                <span class="hljs-keyword">if</span> (needToSeek) {
+                    <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionReader.seekToBlock(seekBlockNum - <span class="hljs-number">1</span>);
+                }
+                headBlockNumber = <span class="hljs-keyword">this</span>.actionReader.headBlockNumber;
+            }
+            <span class="hljs-comment">// Record end time</span>
+            <span class="hljs-keyword">const</span> endTime = <span class="hljs-keyword">new</span> <span class="hljs-built_in">Date</span>().getTime();
+            <span class="hljs-comment">// Calculate timing for next iteration</span>
+            <span class="hljs-keyword">const</span> duration = endTime - startTime;
+            <span class="hljs-keyword">let</span> waitTime = <span class="hljs-keyword">this</span>.pollInterval - duration;
+            <span class="hljs-keyword">if</span> (waitTime &lt; <span class="hljs-number">0</span>) {
+                waitTime = <span class="hljs-number">0</span>;
+            }
+            <span class="hljs-comment">// Schedule next iteration</span>
+            setTimeout(() =&gt; __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-function"><span class="hljs-keyword">function</span>* <span class="hljs-params">()</span> {</span> <span class="hljs-keyword">return</span> <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.watch(); }), waitTime);
+        });
+    }
+}
+exports.BaseActionWatcher = BaseActionWatcher;</code></pre> 
+  <p>下面这段代码通过递归调用watch()一直轮询到最新数据</p> 
+  <pre class="prettyprint"><code class=" hljs coffeescript">setTimeout<span class="hljs-function"><span class="hljs-params">(() =&gt; __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-reserved">void</span> <span class="hljs-number">0</span>, <span class="hljs-reserved">void</span> <span class="hljs-number">0</span>, <span class="hljs-reserved">function</span>* () { <span class="hljs-keyword">return</span> yield <span class="hljs-keyword">this</span>.watch(); }), waitTime)</span>;</span></code></pre> 
+  <p>下面看看对ActionReader的调度，以及handler时间的分发代码</p> 
+  <pre class="prettyprint"><code class=" hljs cs">
+<span class="hljs-keyword">while</span> (!headBlockNumber || <span class="hljs-keyword">this</span>.actionReader.currentBlockNumber &lt; headBlockNumber) {
+        <span class="hljs-keyword">const</span> [blockData, isRollback] = <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionReader.nextBlock()
+        <span class="hljs-comment">// Handle block (and the actions within them)</span>
+        <span class="hljs-keyword">let</span> needToSeek = <span class="hljs-keyword">false</span>
+        <span class="hljs-keyword">let</span> seekBlockNum = <span class="hljs-number">0</span>
+        <span class="hljs-keyword">if</span> (blockData) {
+          [needToSeek, seekBlockNum] = <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionHandler.handleBlock(blockData, isRollback, <span class="hljs-keyword">this</span>.actionReader.isFirstBlock)
+        }
+        <span class="hljs-comment">// Seek to next needed block at the request of the action handler</span>
+        <span class="hljs-keyword">if</span> (needToSeek) {
+          <span class="hljs-keyword">yield</span> <span class="hljs-keyword">this</span>.actionReader.seekToBlock(seekBlockNum - <span class="hljs-number">1</span>)
+        }
+        headBlockNumber = <span class="hljs-keyword">this</span>.actionReader.headBlockNumber
+      }</code></pre> 
+  <p>while 的条件!headBlockNumber初始化的时候为true，这时候进入调度。通过this.actionReader.nextBlock()方法获取区块信息blockData和是否回滚isRollBack。我们再来看看ActionReader的代码，看看nextBlock()做了什么事情。</p> 
+  <pre class="prettyprint"><code class=" hljs java">
+<span class="hljs-keyword">const</span> __awaiter = (<span class="hljs-keyword">this</span> &amp;&amp; <span class="hljs-keyword">this</span>.__awaiter) || function (thisArg, _arguments, P, generator) {
+  <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> (P || (P = Promise))(((resolve, reject) =&gt; {
+    function fulfilled(value) { <span class="hljs-keyword">try</span> { step(generator.next(value)) } <span class="hljs-keyword">catch</span> (e) { reject(e) } }
+    function rejected(value) { <span class="hljs-keyword">try</span> { step(generator.<span class="hljs-keyword">throw</span>(value)) } <span class="hljs-keyword">catch</span> (e) { reject(e) } }
+    function step(result) { result.done ? resolve(result.value) : <span class="hljs-keyword">new</span> P(((resolve) =&gt; { resolve(result.value) })).then(fulfilled, rejected) }
+    step((generator = generator.apply(thisArg, _arguments || [])).next())
+  }))
+}
+Object.defineProperty(exports, <span class="hljs-string">"__esModule"</span>, { value: <span class="hljs-keyword">true</span> })
+<span class="hljs-javadoc">/** * Reads blocks from a blockchain, outputting normalized `Block` objects. */</span>
+class AbstractActionReader {
+  constructor(startAtBlock = <span class="hljs-number">1</span>, onlyIrreversible = <span class="hljs-keyword">false</span>, maxHistoryLength = <span class="hljs-number">600</span>) {
+    <span class="hljs-keyword">this</span>.startAtBlock = startAtBlock
+    <span class="hljs-keyword">this</span>.onlyIrreversible = onlyIrreversible
+    <span class="hljs-keyword">this</span>.maxHistoryLength = maxHistoryLength
+    <span class="hljs-keyword">this</span>.headBlockNumber = <span class="hljs-number">0</span>
+    <span class="hljs-keyword">this</span>.isFirstBlock = <span class="hljs-keyword">true</span>
+    <span class="hljs-keyword">this</span>.currentBlockData = <span class="hljs-keyword">null</span>
+    <span class="hljs-keyword">this</span>.blockHistory = []
+    <span class="hljs-keyword">this</span>.currentBlockNumber = startAtBlock - <span class="hljs-number">1</span>
+  }
+  <span class="hljs-javadoc">/** * Loads the next block with chainInterface after validating, updating all relevant state. * If block fails validation, rollback will be called, and will update state to last block unseen. */</span>
+  nextBlock() {
+    <span class="hljs-keyword">return</span> __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, function* () {
+      let blockData = <span class="hljs-keyword">null</span>
+      let isRollback = <span class="hljs-keyword">false</span>
+      <span class="hljs-comment">// If we're on the head block, refresh current head block</span>
+      <span class="hljs-comment">//在nextBlock中通过下面代码判断是否在最新区块信息上面，不再则刷新区块信息，其中getHeadBlockNumber()在eos目录下面的NodeosActionReaders里面，就是获取最新区块链信息。没有特别的代码。</span>
+      <span class="hljs-comment">//构造函数中this.headBlockNumber = 0，所以这里回去获取区块链最新的number，并更新headBlockNumber。</span>
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.currentBlockNumber === <span class="hljs-keyword">this</span>.headBlockNumber || !<span class="hljs-keyword">this</span>.headBlockNumber) {
+        <span class="hljs-keyword">this</span>.headBlockNumber = yield <span class="hljs-keyword">this</span>.getHeadBlockNumber()
+      }
+      <span class="hljs-comment">// If currentBlockNumber is negative, it means we wrap to the end of the chain (most recent blocks)</span>
+      <span class="hljs-comment">// This should only ever happen when we first start, so we check that there's no block history</span>
+      <span class="hljs-comment">//判断是不是第一次启动，如果是第一次启动并将需要更新的数据指向最新的block</span>
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.currentBlockNumber &lt; <span class="hljs-number">0</span> &amp;&amp; <span class="hljs-keyword">this</span>.blockHistory.length === <span class="hljs-number">0</span>) {
+        <span class="hljs-keyword">this</span>.currentBlockNumber = <span class="hljs-keyword">this</span>.headBlockNumber + <span class="hljs-keyword">this</span>.currentBlockNumber
+        <span class="hljs-keyword">this</span>.startAtBlock = <span class="hljs-keyword">this</span>.currentBlockNumber + <span class="hljs-number">1</span>
+      }
+      <span class="hljs-comment">// If we're now behind one or more new blocks, process them</span>
+      <span class="hljs-comment">//解析数据</span>
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.currentBlockNumber &lt; <span class="hljs-keyword">this</span>.headBlockNumber) {
+        <span class="hljs-keyword">const</span> unvalidatedBlockData = yield <span class="hljs-keyword">this</span>.getBlock(<span class="hljs-keyword">this</span>.currentBlockNumber + <span class="hljs-number">1</span>)
+        <span class="hljs-keyword">const</span> expectedHash = <span class="hljs-keyword">this</span>.currentBlockData !== <span class="hljs-keyword">null</span> ? <span class="hljs-keyword">this</span>.currentBlockData.blockHash : <span class="hljs-string">"INVALID"</span>
+        <span class="hljs-keyword">const</span> actualHash = unvalidatedBlockData.previousBlockHash
+        <span class="hljs-comment">// Continue if the new block is on the same chain as our history, or if we've just started</span>
+        <span class="hljs-comment">//判断是否需要回滚，不回滚则将当前number获取的区块信息开始记录信息</span>
+        <span class="hljs-keyword">if</span> (expectedHash === actualHash || <span class="hljs-keyword">this</span>.blockHistory.length === <span class="hljs-number">0</span>) {
+          blockData = unvalidatedBlockData <span class="hljs-comment">// Block is now validated</span>
+          <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.currentBlockData) {
+            <span class="hljs-keyword">this</span>.blockHistory.push(<span class="hljs-keyword">this</span>.currentBlockData) <span class="hljs-comment">// No longer current, belongs on history</span>
+          }
+          <span class="hljs-keyword">this</span>.blockHistory.splice(<span class="hljs-number">0</span>, <span class="hljs-keyword">this</span>.blockHistory.length - <span class="hljs-keyword">this</span>.maxHistoryLength) <span class="hljs-comment">// Trim history</span>
+          <span class="hljs-keyword">this</span>.currentBlockData = blockData <span class="hljs-comment">// Replaced with the real current block</span>
+          <span class="hljs-keyword">this</span>.currentBlockNumber = <span class="hljs-keyword">this</span>.currentBlockData.blockNumber
+        } <span class="hljs-keyword">else</span> {
+          <span class="hljs-comment">// Since the new block did not match our history, we can assume our history is wrong</span>
+          <span class="hljs-comment">// and need to roll back</span>
+          yield <span class="hljs-keyword">this</span>.rollback()
+          isRollback = <span class="hljs-keyword">true</span> <span class="hljs-comment">// Signal action handler that we must roll back</span>
+          <span class="hljs-comment">// Reset for safety, as new fork could have less blocks than the previous fork</span>
+          <span class="hljs-keyword">this</span>.headBlockNumber = yield <span class="hljs-keyword">this</span>.getHeadBlockNumber()
+        }
+      }
+      <span class="hljs-comment">// Let handler know if this is the earliest block we'll send</span>
+      <span class="hljs-keyword">this</span>.isFirstBlock = <span class="hljs-keyword">this</span>.currentBlockNumber === <span class="hljs-keyword">this</span>.startAtBlock
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.currentBlockData === <span class="hljs-keyword">null</span>) {
+        <span class="hljs-keyword">throw</span> Error(<span class="hljs-string">"currentBlockData must not be null."</span>)
+      }
+      <span class="hljs-comment">//返回当前区块信息，是否回滚信息</span>
+      <span class="hljs-keyword">return</span> [<span class="hljs-keyword">this</span>.currentBlockData, isRollback]
+    })
+  }
+  <span class="hljs-javadoc">/** * Incrementally rolls back reader state one block at a time, comparing the blockHistory with * newly fetched blocks. Rollback is finished when either the current block's previous hash * matches the previous block's hash, or when history is exhausted. * *<span class="hljs-javadoctag"> @return</span> {Promise&lt;void&gt;} */</span>
+  rollback() {
+    <span class="hljs-keyword">return</span> __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, function* () {
+      console.info(<span class="hljs-string">"!! Fork detected !!"</span>)
+      let blocksToRewind
+      <span class="hljs-comment">// Rewind at least 1 block back</span>
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.blockHistory.length &gt; <span class="hljs-number">0</span>) {
+        <span class="hljs-comment">// TODO:</span>
+        <span class="hljs-comment">// check and throw error if undefined</span>
+        <span class="hljs-keyword">const</span> block = <span class="hljs-keyword">this</span>.blockHistory.pop()
+        <span class="hljs-keyword">if</span> (block === undefined) {
+          <span class="hljs-keyword">throw</span> Error(<span class="hljs-string">"block history should not have undefined entries."</span>)
+        }
+        <span class="hljs-keyword">this</span>.currentBlockData = yield <span class="hljs-keyword">this</span>.getBlock(block.blockNumber)
+        blocksToRewind = <span class="hljs-number">1</span>
+      }
+      <span class="hljs-comment">// Pop off blocks from cached block history and compare them with freshly fetched blocks</span>
+      <span class="hljs-keyword">while</span> (<span class="hljs-keyword">this</span>.blockHistory.length &gt; <span class="hljs-number">0</span>) {
+        <span class="hljs-keyword">const</span> [cachedPreviousBlockData] = <span class="hljs-keyword">this</span>.blockHistory.slice(-<span class="hljs-number">1</span>)
+        <span class="hljs-keyword">const</span> previousBlockData = yield <span class="hljs-keyword">this</span>.getBlock(cachedPreviousBlockData.blockNumber)
+        <span class="hljs-comment">// TODO:</span>
+        <span class="hljs-comment">// add null guards</span>
+        <span class="hljs-keyword">const</span> currentBlock = <span class="hljs-keyword">this</span>.currentBlockData
+        <span class="hljs-keyword">if</span> (currentBlock !== <span class="hljs-keyword">null</span>) {
+          <span class="hljs-keyword">if</span> (currentBlock.previousBlockHash === previousBlockData.blockHash) {
+            console.info(`✓ BLOCK ${currentBlock.blockNumber} MATCH:`)
+            console.info(`  expected: ${currentBlock.previousBlockHash}`)
+            console.info(`  received: ${previousBlockData.blockHash}`)
+            console.info(`Rewinding ${blocksToRewind} blocks to block (${currentBlock.blockNumber})...`)
+            <span class="hljs-keyword">break</span>
+          }
+          console.info(`✕ BLOCK ${currentBlock.blockNumber} MISMATCH:`)
+          console.info(`  expected: ${currentBlock.previousBlockHash}`)
+          console.info(`  received: ${previousBlockData.blockHash}`)
+          console.info(<span class="hljs-string">"Rollback history has been exhausted!"</span>)
+        }
+        <span class="hljs-keyword">this</span>.currentBlockData = previousBlockData
+        <span class="hljs-keyword">this</span>.blockHistory.pop()
+        blocksToRewind += <span class="hljs-number">1</span>
+      }
+      <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.blockHistory.length === <span class="hljs-number">0</span>) {
+        yield <span class="hljs-keyword">this</span>.rollbackExhausted()
+      }
+    })
+  }
+  <span class="hljs-javadoc">/** * When history is exhausted in rollback(), this is run to handle the situation. If left unimplemented, * then only instantiate with `onlyIrreversible` set to true. */</span>
+  rollbackExhausted() {
+    <span class="hljs-keyword">throw</span> Error(<span class="hljs-string">"Rollback history has been exhausted, and no rollback exhaustion handling has been implemented."</span>)
+  }
+  <span class="hljs-javadoc">/** * Move to the specified block. * 跳转到指定区块，开始读取数据 */</span>
+  seekToBlock(blockNumber) {
+    <span class="hljs-keyword">return</span> __awaiter(<span class="hljs-keyword">this</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, <span class="hljs-keyword">void</span> <span class="hljs-number">0</span>, function* () {
+      <span class="hljs-comment">// Clear current block data</span>
+      <span class="hljs-keyword">this</span>.currentBlockData = <span class="hljs-keyword">null</span>
+      <span class="hljs-keyword">this</span>.headBlockNumber = <span class="hljs-number">0</span>
+      <span class="hljs-comment">// If we're going back to the first block, we don't want to get the preceding block</span>
+      <span class="hljs-keyword">if</span> (blockNumber === <span class="hljs-number">1</span>) {
+        <span class="hljs-keyword">this</span>.blockHistory = []
+        <span class="hljs-keyword">return</span>
+      }
+      <span class="hljs-comment">// Check if block exists in history</span>
+      let toDelete = -<span class="hljs-number">1</span>
+      <span class="hljs-keyword">for</span> (let i = <span class="hljs-keyword">this</span>.blockHistory.length - <span class="hljs-number">1</span>; i &gt;= <span class="hljs-number">0</span>; i--) {
+        <span class="hljs-keyword">if</span> (<span class="hljs-keyword">this</span>.blockHistory[i].blockNumber === blockNumber) {
+          <span class="hljs-keyword">break</span>
+        } <span class="hljs-keyword">else</span> {
+          toDelete += <span class="hljs-number">1</span>
+        }
+      }
+      <span class="hljs-keyword">if</span> (toDelete &gt;= <span class="hljs-number">0</span>) {
+        <span class="hljs-keyword">this</span>.blockHistory.splice(toDelete)
+        <span class="hljs-keyword">this</span>.currentBlockData = <span class="hljs-keyword">this</span>.blockHistory.pop() || <span class="hljs-keyword">null</span>
+      }
+      <span class="hljs-comment">// Load current block</span>
+      <span class="hljs-keyword">this</span>.currentBlockNumber = blockNumber - <span class="hljs-number">1</span>
+      <span class="hljs-keyword">if</span> (!<span class="hljs-keyword">this</span>.currentBlockData) {
+        <span class="hljs-keyword">this</span>.currentBlockData = yield <span class="hljs-keyword">this</span>.getBlock(<span class="hljs-keyword">this</span>.currentBlockNumber)
+      }
+    })
+  }
+}
+exports.AbstractActionReader = AbstractActionReader</code></pre> 
+  <p>构造函数定义了currentBlockNumber（当前区块number），startAtBlock（开始区块number）等信息。具体的逻辑都在注释里面。 <br> 通过ActionReader获取了当前区块信息，下面看看在获取的blockData之后，ActionHandler做了什么事情。</p> 
+  <pre class="prettyprint"><code class=" hljs cs"><span class="hljs-keyword">public</span> <span class="hljs-keyword">async</span> <span class="hljs-title">handleBlock</span>(
+    block: Block,
+    isRollback: boolean,
+    isFirstBlock: boolean,
+    isReplay: boolean = <span class="hljs-keyword">false</span>,
+  ): Promise&lt;[boolean, number]&gt; {
+
+    <span class="hljs-keyword">if</span> (isRollback) {
+      <span class="hljs-keyword">await</span> <span class="hljs-keyword">this</span>.rollbackTo(block.blockNumber - <span class="hljs-number">1</span>)
+    }
+
+    <span class="hljs-keyword">if</span> (!<span class="hljs-keyword">this</span>.lastProcessedBlockHash &amp;&amp; <span class="hljs-keyword">this</span>.lastProcessedBlockNumber === <span class="hljs-number">0</span>) {
+    <span class="hljs-comment">//获取indexState，这个可以在自定义handler的子类中重写，用于设置最开始的区块信息。</span>
+      <span class="hljs-keyword">const</span> { blockNumber: indexStateBlockNumber, blockHash: indexStateBlockHash } = <span class="hljs-keyword">await</span> <span class="hljs-keyword">this</span>.loadIndexState()
+      <span class="hljs-keyword">if</span> (indexStateBlockNumber &amp;&amp; indexStateBlockHash) {
+        <span class="hljs-keyword">this</span>.lastProcessedBlockNumber = indexStateBlockNumber
+        <span class="hljs-keyword">this</span>.lastProcessedBlockHash = indexStateBlockHash
+      }
+    }
+
+    <span class="hljs-keyword">const</span> nextBlockNeeded = <span class="hljs-keyword">this</span>.lastProcessedBlockNumber + <span class="hljs-number">1</span>
+
+    <span class="hljs-comment">// Just processed this block; skip</span>
+    <span class="hljs-comment">//处理过的信息，最新信息已处理，不需要继续处理</span>
+    <span class="hljs-keyword">if</span> (block.blockNumber === <span class="hljs-keyword">this</span>.lastProcessedBlockNumber
+        &amp;&amp; block.blockHash === <span class="hljs-keyword">this</span>.lastProcessedBlockHash) {
+      <span class="hljs-keyword">return</span> [<span class="hljs-keyword">false</span>, <span class="hljs-number">0</span>]
+    }
+
+    <span class="hljs-comment">// If it's the first block but we've already processed blocks, seek to next block</span>
+    <span class="hljs-comment">//如果是第一条信息，但是后续信息未处理，则返回需要跳转到指定区块，继续调用watcher更新整个区块信息。</span>
+    <span class="hljs-keyword">if</span> (isFirstBlock &amp;&amp; <span class="hljs-keyword">this</span>.lastProcessedBlockHash) {
+      <span class="hljs-keyword">return</span> [<span class="hljs-keyword">true</span>, nextBlockNeeded]
+    }
+    <span class="hljs-comment">// Only check if this is the block we need if it's not the first block</span>
+    <span class="hljs-comment">//如果不是第一个区块</span>
+    <span class="hljs-keyword">if</span> (!isFirstBlock) {
+    <span class="hljs-comment">//如果当前区块number不想等，则返回需要跳转到下一区块</span>
+      <span class="hljs-keyword">if</span> (block.blockNumber !== nextBlockNeeded) {
+        <span class="hljs-keyword">return</span> [<span class="hljs-keyword">true</span>, nextBlockNeeded]
+      }
+      <span class="hljs-comment">// Block sequence consistency should be handled by the ActionReader instance</span>
+      <span class="hljs-keyword">if</span> (block.previousBlockHash !== <span class="hljs-keyword">this</span>.lastProcessedBlockHash) {
+        <span class="hljs-keyword">throw</span> Error(<span class="hljs-string">"Block hashes do not match; block not part of current chain."</span>)
+      }
+    }
+<span class="hljs-comment">//调用updaters和effects处理客户端数据</span>
+    <span class="hljs-keyword">const</span> handleWithArgs: (state: any, context?: any) =&gt; <span class="hljs-keyword">void</span> = <span class="hljs-keyword">async</span> (state: any, context: any = {}) =&gt; {
+      <span class="hljs-keyword">await</span> <span class="hljs-keyword">this</span>.handleActions(state, block, context, isReplay)
+    }
+    <span class="hljs-keyword">await</span> <span class="hljs-keyword">this</span>.handleWithState(handleWithArgs)
+    <span class="hljs-keyword">return</span> [<span class="hljs-keyword">false</span>, <span class="hljs-number">0</span>]
+  }</code></pre> 
+  <p>这里就是判断获取到的数据是否需要给予updaters和effects处理，如果需要处理则调用handleWithState来通知updater和effects来处理数据。updater和effects则根据自己定义的actionTypes来处理相应数据。 <br> 其中loadIndexState()获取的信息如果和区块链上对应节点信息相同，则数据将从loadIndexState()中获取的节点信息开始更新数据，否则从reader初始化的节点数据开始获取数据。ps：为什么这么设置，目前小编还没有想明白，欢迎告知。 <br> 最后如果handler返回需要跳转到指定的block，则调用reader的seekToBlock来更新当前节点的数据。从而在指定的节点开始重新获取数据。 <br> 至此，整个抓取EOS区块链数据的递归逻辑就分析完毕。如有不当，期望指出！ <br> 谢谢。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Harbourfy/article/details/81591947,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Harbourfy/article/details/81591947,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

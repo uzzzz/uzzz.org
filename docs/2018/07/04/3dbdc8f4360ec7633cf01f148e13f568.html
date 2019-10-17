@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>比特币全节点Go语言实现BTCD之双重支付代码解析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="比特币全节点Go语言实现BTCD之双重支付代码解析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="双重支付是成功支付了1次以上的情况。比特币通过对添加到区块中的每笔交易进行验证来防止双重支付，确保交易的输入没有被支付过。 区块中的交易采用的是UTXO模型，每个节点进行打包的时候都会对交易进行验证，交易的输入是否在之前区块存在过，每个节点收到区块时也会对区块及区块中的交易进行合法性校验。 OK，看代码： func btcdMain(serverChan chan&lt;- *server) error { 主入口 func (s *server) Start() { 启动server对象 go s.peerHandler() 启动节点操作 s.syncManager.Start() 启动同步管理器，负责同步区块、交易等 go s.connManager.Start()启动连接管理器，负责建立节点的连接，并监听消息 启动syncManager，会调用 go sm.blockHandler() 此方法负责同步各种消息的处理，代码： func (sm *SyncManager) blockHandler() { out: for { select { case m := &lt;-sm.msgChan: switch msg := m.(type) { case *newPeerMsg: sm.handleNewPeerMsg(msg.peer) case *txMsg: sm.handleTxMsg(msg) msg.reply &lt;- struct{}{} case *blockMsg: sm.handleBlockMsg(msg) msg.reply &lt;- struct{}{} case *invMsg: sm.handleInvMsg(msg) case *headersMsg: sm.handleHeadersMsg(msg) case *donePeerMsg: sm.handleDonePeerMsg(msg.peer) case getSyncPeerMsg: var peerID int32 if sm.syncPeer != nil { peerID = sm.syncPeer.ID() } msg.reply &lt;- peerID case processBlockMsg: _, isOrphan, err := sm.chain.ProcessBlock( msg.block, msg.flags) if err != nil { msg.reply &lt;- processBlockResponse{ isOrphan: false, err: err, } } msg.reply &lt;- processBlockResponse{ isOrphan: isOrphan, err: nil, } case isCurrentMsg: msg.reply &lt;- sm.current() case pauseMsg: // Wait until the sender unpauses the manager. &lt;-msg.unpause default: log.Warnf(&quot;Invalid message type in block &quot;+ &quot;handler: %T&quot;, msg) } case &lt;-sm.quit: break out } } sm.wg.Done() log.Trace(&quot;Block handler done&quot;) } sm.handleTxMsg(msg) 即是处理交易信息，主要代码逻辑： func (sm *SyncManager) handleTxMsg(tmsg *txMsg) { peer := tmsg.peer state, exists := sm.peerStates[peer] txHash := tmsg.tx.Hash() acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) delete(state.requestedTxns, *txHash) delete(sm.requestedTxns, *txHash) sm.peerNotifier.AnnounceNewTransactions(acceptedTxs) } acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) 这一行代码交给交易内存池处理消息带的交易。 func (mp *TxPool) ProcessTransaction(tx *btcutil.Tx, allowOrphan, rateLimit bool, tag Tag) ([]*TxDesc, error) { // Potentially accept the transaction to the memory pool. missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) if err != nil { return nil, err } if len(missingParents) == 0 { newTxs := mp.processOrphans(tx) acceptedTxs := make([]*TxDesc, len(newTxs)+1) // Add the parent transaction first so remote nodes // do not add orphans. acceptedTxs[0] = txD copy(acceptedTxs[1:], newTxs) return acceptedTxs, nil } // The transaction is an orphan (has inputs missing). Reject // it if the flag to allow orphans is not set. if !allowOrphan { str := fmt.Sprintf(&quot;orphan transaction %v references &quot;+ &quot;outputs of unknown or fully-spent &quot;+ &quot;transaction %v&quot;, tx.Hash(), missingParents[0]) return nil, txRuleError(wire.RejectDuplicate, str) } // Potentially add the orphan transaction to the orphan pool. err = mp.maybeAddOrphan(tx, tag) return nil, err } missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) maybeAcceptTransaction方法主要负责验证交易的合法性，处理逻辑很多，缩减后主要逻辑： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { // 是否是见证隔离交易 segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { //若不支持见证隔离则返回 str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { //是否已存在交易池中 str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) //检查交易合法性，代码下面会详细分析 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if blockchain.IsCoinBase(tx) { //不能是coinbase交易,coinbase交易单独处理 str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { //如不接受非标准交易，则需要对交易进行标准化验证 err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) } err = mp.checkPoolDoubleSpend(tx) //在交易池中检查输入是否已经被花费，代码在下方 if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) //取这个交易相关的区块上的所有utxo prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { //检查是否已经被花费 return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } // Transaction is an orphan var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { // Must make a copy of the hash here since the iterator // is replaced and taking its address directly would // result in all of the entries pointing to the same // memory location and thus all be the final hash. hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil //孤立交易，父交易还不存在 } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) //计算交易锁定时间 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { //交易是否还需要等待 return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) //检查输入标准化 } sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { //检查多签数量 str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { //检查交易大小及交易费用是否优先处理 str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) //验证交易签名脚本 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) //合格交易加入到交易池 log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { //检查交易的合法性 msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { //需要有输入 return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { //至少一个输出 return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { //交易不能超过允许的最大块大小 str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { //输出不能为负 str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { //不能超过最大值 str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) //输入不能重复 for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { //是coinbase交易 slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { //验证脚本长度 str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } func (mp *TxPool) checkPoolDoubleSpend(tx *btcutil.Tx) error { for _, txIn := range tx.MsgTx().TxIn { if txR, exists := mp.outpoints[txIn.PreviousOutPoint]; exists { str := fmt.Sprintf(&quot;output %v already spent by &quot;+ &quot;transaction %v in the memory pool&quot;, txIn.PreviousOutPoint, txR.Hash()) return txRuleError(wire.RejectDuplicate, str) } } return nil } 本文作者：architect.bian，欢迎收藏，转载请保留原文地址并保留版权声明！谢谢~ 还没完！往下看！！！ 阅读更多" />
+<meta property="og:description" content="双重支付是成功支付了1次以上的情况。比特币通过对添加到区块中的每笔交易进行验证来防止双重支付，确保交易的输入没有被支付过。 区块中的交易采用的是UTXO模型，每个节点进行打包的时候都会对交易进行验证，交易的输入是否在之前区块存在过，每个节点收到区块时也会对区块及区块中的交易进行合法性校验。 OK，看代码： func btcdMain(serverChan chan&lt;- *server) error { 主入口 func (s *server) Start() { 启动server对象 go s.peerHandler() 启动节点操作 s.syncManager.Start() 启动同步管理器，负责同步区块、交易等 go s.connManager.Start()启动连接管理器，负责建立节点的连接，并监听消息 启动syncManager，会调用 go sm.blockHandler() 此方法负责同步各种消息的处理，代码： func (sm *SyncManager) blockHandler() { out: for { select { case m := &lt;-sm.msgChan: switch msg := m.(type) { case *newPeerMsg: sm.handleNewPeerMsg(msg.peer) case *txMsg: sm.handleTxMsg(msg) msg.reply &lt;- struct{}{} case *blockMsg: sm.handleBlockMsg(msg) msg.reply &lt;- struct{}{} case *invMsg: sm.handleInvMsg(msg) case *headersMsg: sm.handleHeadersMsg(msg) case *donePeerMsg: sm.handleDonePeerMsg(msg.peer) case getSyncPeerMsg: var peerID int32 if sm.syncPeer != nil { peerID = sm.syncPeer.ID() } msg.reply &lt;- peerID case processBlockMsg: _, isOrphan, err := sm.chain.ProcessBlock( msg.block, msg.flags) if err != nil { msg.reply &lt;- processBlockResponse{ isOrphan: false, err: err, } } msg.reply &lt;- processBlockResponse{ isOrphan: isOrphan, err: nil, } case isCurrentMsg: msg.reply &lt;- sm.current() case pauseMsg: // Wait until the sender unpauses the manager. &lt;-msg.unpause default: log.Warnf(&quot;Invalid message type in block &quot;+ &quot;handler: %T&quot;, msg) } case &lt;-sm.quit: break out } } sm.wg.Done() log.Trace(&quot;Block handler done&quot;) } sm.handleTxMsg(msg) 即是处理交易信息，主要代码逻辑： func (sm *SyncManager) handleTxMsg(tmsg *txMsg) { peer := tmsg.peer state, exists := sm.peerStates[peer] txHash := tmsg.tx.Hash() acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) delete(state.requestedTxns, *txHash) delete(sm.requestedTxns, *txHash) sm.peerNotifier.AnnounceNewTransactions(acceptedTxs) } acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) 这一行代码交给交易内存池处理消息带的交易。 func (mp *TxPool) ProcessTransaction(tx *btcutil.Tx, allowOrphan, rateLimit bool, tag Tag) ([]*TxDesc, error) { // Potentially accept the transaction to the memory pool. missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) if err != nil { return nil, err } if len(missingParents) == 0 { newTxs := mp.processOrphans(tx) acceptedTxs := make([]*TxDesc, len(newTxs)+1) // Add the parent transaction first so remote nodes // do not add orphans. acceptedTxs[0] = txD copy(acceptedTxs[1:], newTxs) return acceptedTxs, nil } // The transaction is an orphan (has inputs missing). Reject // it if the flag to allow orphans is not set. if !allowOrphan { str := fmt.Sprintf(&quot;orphan transaction %v references &quot;+ &quot;outputs of unknown or fully-spent &quot;+ &quot;transaction %v&quot;, tx.Hash(), missingParents[0]) return nil, txRuleError(wire.RejectDuplicate, str) } // Potentially add the orphan transaction to the orphan pool. err = mp.maybeAddOrphan(tx, tag) return nil, err } missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) maybeAcceptTransaction方法主要负责验证交易的合法性，处理逻辑很多，缩减后主要逻辑： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { // 是否是见证隔离交易 segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { //若不支持见证隔离则返回 str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { //是否已存在交易池中 str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) //检查交易合法性，代码下面会详细分析 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if blockchain.IsCoinBase(tx) { //不能是coinbase交易,coinbase交易单独处理 str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { //如不接受非标准交易，则需要对交易进行标准化验证 err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) } err = mp.checkPoolDoubleSpend(tx) //在交易池中检查输入是否已经被花费，代码在下方 if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) //取这个交易相关的区块上的所有utxo prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { //检查是否已经被花费 return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } // Transaction is an orphan var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { // Must make a copy of the hash here since the iterator // is replaced and taking its address directly would // result in all of the entries pointing to the same // memory location and thus all be the final hash. hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil //孤立交易，父交易还不存在 } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) //计算交易锁定时间 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { //交易是否还需要等待 return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) //检查输入标准化 } sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { //检查多签数量 str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { //检查交易大小及交易费用是否优先处理 str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) //验证交易签名脚本 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) //合格交易加入到交易池 log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { //检查交易的合法性 msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { //需要有输入 return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { //至少一个输出 return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { //交易不能超过允许的最大块大小 str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { //输出不能为负 str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { //不能超过最大值 str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) //输入不能重复 for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { //是coinbase交易 slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { //验证脚本长度 str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } func (mp *TxPool) checkPoolDoubleSpend(tx *btcutil.Tx) error { for _, txIn := range tx.MsgTx().TxIn { if txR, exists := mp.outpoints[txIn.PreviousOutPoint]; exists { str := fmt.Sprintf(&quot;output %v already spent by &quot;+ &quot;transaction %v in the memory pool&quot;, txIn.PreviousOutPoint, txR.Hash()) return txRuleError(wire.RejectDuplicate, str) } } return nil } 本文作者：architect.bian，欢迎收藏，转载请保留原文地址并保留版权声明！谢谢~ 还没完！往下看！！！ 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/04/3dbdc8f4360ec7633cf01f148e13f568.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/04/3dbdc8f4360ec7633cf01f148e13f568.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-04T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"双重支付是成功支付了1次以上的情况。比特币通过对添加到区块中的每笔交易进行验证来防止双重支付，确保交易的输入没有被支付过。 区块中的交易采用的是UTXO模型，每个节点进行打包的时候都会对交易进行验证，交易的输入是否在之前区块存在过，每个节点收到区块时也会对区块及区块中的交易进行合法性校验。 OK，看代码： func btcdMain(serverChan chan&lt;- *server) error { 主入口 func (s *server) Start() { 启动server对象 go s.peerHandler() 启动节点操作 s.syncManager.Start() 启动同步管理器，负责同步区块、交易等 go s.connManager.Start()启动连接管理器，负责建立节点的连接，并监听消息 启动syncManager，会调用 go sm.blockHandler() 此方法负责同步各种消息的处理，代码： func (sm *SyncManager) blockHandler() { out: for { select { case m := &lt;-sm.msgChan: switch msg := m.(type) { case *newPeerMsg: sm.handleNewPeerMsg(msg.peer) case *txMsg: sm.handleTxMsg(msg) msg.reply &lt;- struct{}{} case *blockMsg: sm.handleBlockMsg(msg) msg.reply &lt;- struct{}{} case *invMsg: sm.handleInvMsg(msg) case *headersMsg: sm.handleHeadersMsg(msg) case *donePeerMsg: sm.handleDonePeerMsg(msg.peer) case getSyncPeerMsg: var peerID int32 if sm.syncPeer != nil { peerID = sm.syncPeer.ID() } msg.reply &lt;- peerID case processBlockMsg: _, isOrphan, err := sm.chain.ProcessBlock( msg.block, msg.flags) if err != nil { msg.reply &lt;- processBlockResponse{ isOrphan: false, err: err, } } msg.reply &lt;- processBlockResponse{ isOrphan: isOrphan, err: nil, } case isCurrentMsg: msg.reply &lt;- sm.current() case pauseMsg: // Wait until the sender unpauses the manager. &lt;-msg.unpause default: log.Warnf(&quot;Invalid message type in block &quot;+ &quot;handler: %T&quot;, msg) } case &lt;-sm.quit: break out } } sm.wg.Done() log.Trace(&quot;Block handler done&quot;) } sm.handleTxMsg(msg) 即是处理交易信息，主要代码逻辑： func (sm *SyncManager) handleTxMsg(tmsg *txMsg) { peer := tmsg.peer state, exists := sm.peerStates[peer] txHash := tmsg.tx.Hash() acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) delete(state.requestedTxns, *txHash) delete(sm.requestedTxns, *txHash) sm.peerNotifier.AnnounceNewTransactions(acceptedTxs) } acceptedTxs, err := sm.txMemPool.ProcessTransaction(tmsg.tx, true, true, mempool.Tag(peer.ID())) 这一行代码交给交易内存池处理消息带的交易。 func (mp *TxPool) ProcessTransaction(tx *btcutil.Tx, allowOrphan, rateLimit bool, tag Tag) ([]*TxDesc, error) { // Potentially accept the transaction to the memory pool. missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) if err != nil { return nil, err } if len(missingParents) == 0 { newTxs := mp.processOrphans(tx) acceptedTxs := make([]*TxDesc, len(newTxs)+1) // Add the parent transaction first so remote nodes // do not add orphans. acceptedTxs[0] = txD copy(acceptedTxs[1:], newTxs) return acceptedTxs, nil } // The transaction is an orphan (has inputs missing). Reject // it if the flag to allow orphans is not set. if !allowOrphan { str := fmt.Sprintf(&quot;orphan transaction %v references &quot;+ &quot;outputs of unknown or fully-spent &quot;+ &quot;transaction %v&quot;, tx.Hash(), missingParents[0]) return nil, txRuleError(wire.RejectDuplicate, str) } // Potentially add the orphan transaction to the orphan pool. err = mp.maybeAddOrphan(tx, tag) return nil, err } missingParents, txD, err := mp.maybeAcceptTransaction(tx, true, rateLimit, true) maybeAcceptTransaction方法主要负责验证交易的合法性，处理逻辑很多，缩减后主要逻辑： func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit, rejectDupOrphans bool) ([]*chainhash.Hash, *TxDesc, error) { txHash := tx.Hash() if tx.MsgTx().HasWitness() { // 是否是见证隔离交易 segwitActive, err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit) if err != nil { return nil, nil, err } if !segwitActive { //若不支持见证隔离则返回 str := fmt.Sprintf(&quot;transaction %v has witness data, &quot;+ &quot;but segwit isn&#39;t active yet&quot;, txHash) return nil, nil, txRuleError(wire.RejectNonstandard, str) } } if mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { //是否已存在交易池中 str := fmt.Sprintf(&quot;already have transaction %v&quot;, txHash) return nil, nil, txRuleError(wire.RejectDuplicate, str) } err := blockchain.CheckTransactionSanity(tx) //检查交易合法性，代码下面会详细分析 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if blockchain.IsCoinBase(tx) { //不能是coinbase交易,coinbase交易单独处理 str := fmt.Sprintf(&quot;transaction %v is an individual coinbase&quot;, txHash) return nil, nil, txRuleError(wire.RejectInvalid, str) } bestHeight := mp.cfg.BestHeight() nextBlockHeight := bestHeight + 1 medianTimePast := mp.cfg.MedianTimePast() if !mp.cfg.Policy.AcceptNonStd { //如不接受非标准交易，则需要对交易进行标准化验证 err = checkTransactionStandard(tx, nextBlockHeight, medianTimePast, mp.cfg.Policy.MinRelayTxFee, mp.cfg.Policy.MaxTxVersion) } err = mp.checkPoolDoubleSpend(tx) //在交易池中检查输入是否已经被花费，代码在下方 if err != nil { return nil, nil, err } utxoView, err := mp.fetchInputUtxos(tx) //取这个交易相关的区块上的所有utxo prevOut := wire.OutPoint{Hash: *txHash} for txOutIdx := range tx.MsgTx().TxOut { prevOut.Index = uint32(txOutIdx) entry := utxoView.LookupEntry(prevOut) if entry != nil &amp;&amp; !entry.IsSpent() { //检查是否已经被花费 return nil, nil, txRuleError(wire.RejectDuplicate, &quot;transaction already exists&quot;) } utxoView.RemoveEntry(prevOut) } // Transaction is an orphan var missingParents []*chainhash.Hash for outpoint, entry := range utxoView.Entries() { if entry == nil || entry.IsSpent() { // Must make a copy of the hash here since the iterator // is replaced and taking its address directly would // result in all of the entries pointing to the same // memory location and thus all be the final hash. hashCopy := outpoint.Hash missingParents = append(missingParents, &amp;hashCopy) } } if len(missingParents) &gt; 0 { return missingParents, nil, nil //孤立交易，父交易还不存在 } sequenceLock, err := mp.cfg.CalcSequenceLock(tx, utxoView) //计算交易锁定时间 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if !blockchain.SequenceLockActive(sequenceLock, nextBlockHeight, medianTimePast) { //交易是否还需要等待 return nil, nil, txRuleError(wire.RejectNonstandard, &quot;transaction&#39;s sequence locks on inputs not met&quot;) } txFee, err := blockchain.CheckTransactionInputs(tx, nextBlockHeight, utxoView, mp.cfg.ChainParams) if !mp.cfg.Policy.AcceptNonStd { err := checkInputsStandard(tx, utxoView) //检查输入标准化 } sigOpCost, err := blockchain.GetSigOpCost(tx, false, utxoView, true, true) if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } if sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { //检查多签数量 str := fmt.Sprintf(&quot;transaction %v sigop cost is too high: %d &gt; %d&quot;, txHash, sigOpCost, mp.cfg.Policy.MaxSigOpCostPerTx) return nil, nil, txRuleError(wire.RejectNonstandard, str) } serializedSize := GetTxVirtualSize(tx) minFee := calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee) if serializedSize &gt;= (DefaultBlockPrioritySize-1000) &amp;&amp; txFee &lt; minFee { //检查交易大小及交易费用是否优先处理 str := fmt.Sprintf(&quot;transaction %v has %d fees which is under &quot;+ &quot;the required amount of %d&quot;, txHash, txFee, minFee) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } if isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee { currentPriority := mining.CalcPriority(tx.MsgTx(), utxoView, nextBlockHeight) if currentPriority &lt;= mining.MinHighPriority { str := fmt.Sprintf(&quot;transaction %v has insufficient &quot;+ &quot;priority (%g &lt;= %g)&quot;, txHash, currentPriority, mining.MinHighPriority) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } } if rateLimit &amp;&amp; txFee &lt; minFee { nowUnix := time.Now().Unix() // Decay passed data with an exponentially decaying ~10 minute // window - matches bitcoind handling. mp.pennyTotal *= math.Pow(1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix)) mp.lastPennyUnix = nowUnix // Are we still over the limit? if mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*10*1000 { str := fmt.Sprintf(&quot;transaction %v has been rejected &quot;+ &quot;by the rate limiter due to low fees&quot;, txHash) return nil, nil, txRuleError(wire.RejectInsufficientFee, str) } oldTotal := mp.pennyTotal mp.pennyTotal += float64(serializedSize) log.Tracef(&quot;rate limit: curTotal %v, nextTotal: %v, &quot;+ &quot;limit %v&quot;, oldTotal, mp.pennyTotal, mp.cfg.Policy.FreeTxRelayLimit*10*1000) } err = blockchain.ValidateTransactionScripts(tx, utxoView, txscript.StandardVerifyFlags, mp.cfg.SigCache, mp.cfg.HashCache) //验证交易签名脚本 if err != nil { if cerr, ok := err.(blockchain.RuleError); ok { return nil, nil, chainRuleError(cerr) } return nil, nil, err } txD := mp.addTransaction(utxoView, tx, bestHeight, txFee) //合格交易加入到交易池 log.Debugf(&quot;Accepted transaction %v (pool size: %v)&quot;, txHash, len(mp.pool)) return nil, txD, nil } func CheckTransactionSanity(tx *btcutil.Tx) error { //检查交易的合法性 msgTx := tx.MsgTx() if len(msgTx.TxIn) == 0 { //需要有输入 return ruleError(ErrNoTxInputs, &quot;transaction has no inputs&quot;) } // A transaction must have at least one output. if len(msgTx.TxOut) == 0 { //至少一个输出 return ruleError(ErrNoTxOutputs, &quot;transaction has no outputs&quot;) } serializedTxSize := tx.MsgTx().SerializeSizeStripped() if serializedTxSize &gt; MaxBlockBaseSize { //交易不能超过允许的最大块大小 str := fmt.Sprintf(&quot;serialized transaction is too big - got &quot;+ &quot;%d, max %d&quot;, serializedTxSize, MaxBlockBaseSize) return ruleError(ErrTxTooBig, str) } var totalSatoshi int64 for _, txOut := range msgTx.TxOut { satoshi := txOut.Value if satoshi &lt; 0 { //输出不能为负 str := fmt.Sprintf(&quot;transaction output has negative &quot;+ &quot;value of %v&quot;, satoshi) return ruleError(ErrBadTxOutValue, str) } if satoshi &gt; btcutil.MaxSatoshi { //不能超过最大值 str := fmt.Sprintf(&quot;transaction output value of %v is &quot;+ &quot;higher than max allowed value of %v&quot;, satoshi, btcutil.MaxSatoshi) return ruleError(ErrBadTxOutValue, str) } } // Check for duplicate transaction inputs. existingTxOut := make(map[wire.OutPoint]struct{}) //输入不能重复 for _, txIn := range msgTx.TxIn { if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists { return ruleError(ErrDuplicateTxInputs, &quot;transaction &quot;+ &quot;contains duplicate inputs&quot;) } existingTxOut[txIn.PreviousOutPoint] = struct{}{} } // Coinbase script length must be between min and max length. if IsCoinBase(tx) { //是coinbase交易 slen := len(msgTx.TxIn[0].SignatureScript) if slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { //验证脚本长度 str := fmt.Sprintf(&quot;coinbase transaction script length &quot;+ &quot;of %d is out of range (min: %d, max: %d)&quot;, slen, MinCoinbaseScriptLen, MaxCoinbaseScriptLen) return ruleError(ErrBadCoinbaseScriptLen, str) } } else { for _, txIn := range msgTx.TxIn { if isNullOutpoint(&amp;txIn.PreviousOutPoint) { return ruleError(ErrBadTxInput, &quot;transaction &quot;+ &quot;input refers to previous output that &quot;+ &quot;is null&quot;) } } } return nil } func (mp *TxPool) checkPoolDoubleSpend(tx *btcutil.Tx) error { for _, txIn := range tx.MsgTx().TxIn { if txR, exists := mp.outpoints[txIn.PreviousOutPoint]; exists { str := fmt.Sprintf(&quot;output %v already spent by &quot;+ &quot;transaction %v in the memory pool&quot;, txIn.PreviousOutPoint, txR.Hash()) return txRuleError(wire.RejectDuplicate, str) } } return nil } 本文作者：architect.bian，欢迎收藏，转载请保留原文地址并保留版权声明！谢谢~ 还没完！往下看！！！ 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/04/3dbdc8f4360ec7633cf01f148e13f568.html","headline":"比特币全节点Go语言实现BTCD之双重支付代码解析","dateModified":"2018-07-04T00:00:00+08:00","datePublished":"2018-07-04T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/04/3dbdc8f4360ec7633cf01f148e13f568.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>比特币全节点Go语言实现BTCD之双重支付代码解析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">双重支付是成功支付了1次以上的情况。比特币通过对添加到区块中的每笔交易进行验证来防止双重支付，<strong>确保交易的输入没有被支付过</strong>。</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">区块中的交易采用的是UTXO模型，每个节点进行打包的时候都会对交易进行验证，交易的输入是否在之前区块存在过，每个节点收到区块时也会对区块及区块中的交易进行合法性校验。</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">OK，看代码：</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span><span style="color:#ffc66d;">btcdMain</span>(serverChan <span style="color:#cc7832;"><strong>chan</strong></span>&lt;- *<span style="color:#769aa5;">server</span>) <span style="color:#769aa5;">error </span>{</pre>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">主入口</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(s *<span style="color:#769aa5;">server</span>) <span style="color:#ffc66d;">Start</span>() {</pre>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">启动server对象</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>go </strong></span>s.peerHandler()</pre>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">启动节点操作</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;">s.syncManager.Start()</pre>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);">启动同步管理器，负责同步区块、交易等</span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>go </strong></span>s.connManager.Start()</pre>启动连接管理器，负责建立节点的连接，并监听消息
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);">启动syncManager，会调用</span></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>go </strong></span>sm.blockHandler()</pre>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);">此方法负责同步各种消息的处理，代码：</span></span></p>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);"></span></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(sm *<span style="color:#769aa5;">SyncManager</span>) <span style="color:#ffc66d;">blockHandler</span>() {
+out:
+   <span style="color:#cc7832;"><strong>for </strong></span>{
+      <span style="color:#cc7832;"><strong>select </strong></span>{
+      <span style="color:#cc7832;"><strong>case </strong></span>m := &lt;-sm.msgChan:
+         <span style="color:#cc7832;"><strong>switch </strong></span>msg := m.(<span style="color:#cc7832;"><strong>type</strong></span>) {
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">newPeerMsg</span>:
+            sm.handleNewPeerMsg(msg.peer)
+
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">txMsg</span>:
+            sm.handleTxMsg(msg)
+            msg.reply &lt;- <span style="color:#cc7832;"><strong>struct</strong></span>{}{}
+
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">blockMsg</span>:
+            sm.handleBlockMsg(msg)
+            msg.reply &lt;- <span style="color:#cc7832;"><strong>struct</strong></span>{}{}
+
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">invMsg</span>:
+            sm.handleInvMsg(msg)
+
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">headersMsg</span>:
+            sm.handleHeadersMsg(msg)
+
+         <span style="color:#cc7832;"><strong>case </strong></span>*<span style="color:#769aa5;">donePeerMsg</span>:
+            sm.handleDonePeerMsg(msg.peer)
+
+         <span style="color:#cc7832;"><strong>case </strong></span><span style="color:#769aa5;">getSyncPeerMsg</span>:
+            <span style="color:#cc7832;"><strong>var </strong></span>peerID <span style="color:#769aa5;">int32
+</span><span style="color:#769aa5;">            </span><span style="color:#cc7832;"><strong>if </strong></span>sm.syncPeer != nil {
+               peerID = sm.syncPeer.ID()
+            }
+            msg.reply &lt;- peerID
+
+         <span style="color:#cc7832;"><strong>case </strong></span><span style="color:#769aa5;">processBlockMsg</span>:
+            _<span style="color:#cc7832;">, </span>isOrphan<span style="color:#cc7832;">, </span>err := sm.chain.ProcessBlock(
+               msg.block<span style="color:#cc7832;">, </span>msg.flags)
+            <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+               msg.reply &lt;- <span style="color:#769aa5;">processBlockResponse</span>{
+                  isOrphan: <span style="color:#9876aa;"><em>false</em></span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">                  </span>err:      err<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">               </span>}
+            }
+
+            msg.reply &lt;- <span style="color:#769aa5;">processBlockResponse</span>{
+               isOrphan: isOrphan<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">               </span>err:      nil<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>}
+
+         <span style="color:#cc7832;"><strong>case </strong></span><span style="color:#769aa5;">isCurrentMsg</span>:
+            msg.reply &lt;- sm.current()
+
+         <span style="color:#cc7832;"><strong>case </strong></span><span style="color:#769aa5;">pauseMsg</span>:
+            <span style="color:#808080;">// Wait until the sender unpauses the manager.
+</span><span style="color:#808080;">            </span>&lt;-msg.unpause
+
+         <span style="color:#cc7832;"><strong>default</strong></span>:
+            log.Warnf(<span style="color:#6a8759;">"Invalid message type in block "</span>+
+               <span style="color:#6a8759;">"handler: %T"</span><span style="color:#cc7832;">, </span>msg)
+         }
+
+      <span style="color:#cc7832;"><strong>case </strong></span>&lt;-sm.quit:
+         <span style="color:#cc7832;"><strong>break </strong></span>out
+      }
+   }
+
+   sm.wg.Done()
+   log.Trace(<span style="color:#6a8759;">"Block handler done"</span>)
+}</pre>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;">sm.handleTxMsg(msg)</pre>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);">即是处理交易信息，主要代码逻辑：</span></span></p>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);"></span></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(sm *<span style="color:#769aa5;">SyncManager</span>) <span style="color:#ffc66d;">handleTxMsg</span>(tmsg *<span style="color:#769aa5;">txMsg</span>) {
+   peer := tmsg.peer
+   state<span style="color:#cc7832;">, </span>exists := sm.peerStates[peer]<span style="color:#808080;">
+</span><span style="color:#808080;">   </span>txHash := tmsg.tx.Hash()
+<span style="color:#808080;">
+</span><span style="color:#808080;">   </span>acceptedTxs<span style="color:#cc7832;">, </span>err := sm.txMemPool.ProcessTransaction(tmsg.tx<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span>mempool.Tag(peer.ID()))
+<span style="color:#808080;">
+</span><span style="color:#808080;">   </span>delete(state.requestedTxns<span style="color:#cc7832;">, </span>*txHash)
+   delete(sm.requestedTxns<span style="color:#cc7832;">, </span>*txHash)
+
+   sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
+}</pre>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;">acceptedTxs<span style="color:#cc7832;">, </span>err := sm.txMemPool.ProcessTransaction(tmsg.tx<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span>mempool.Tag(peer.ID()))</pre>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);">这一行代码交给交易内存池处理消息带的交易。</span></span></p>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);"></span></span></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(mp *<span style="color:#769aa5;">TxPool</span>) <span style="color:#ffc66d;">ProcessTransaction</span>(tx *btcutil.Tx<span style="color:#cc7832;">, </span>allowOrphan<span style="color:#cc7832;">, </span>rateLimit <span style="color:#769aa5;">bool</span><span style="color:#cc7832;">, </span>tag <span style="color:#769aa5;">Tag</span>) ([]*<span style="color:#769aa5;">TxDesc</span><span style="color:#cc7832;">, </span><span style="color:#769aa5;">error</span>) {
+
+   <span style="color:#808080;">// Potentially accept the transaction to the memory pool.
+</span><span style="color:#808080;">   </span>missingParents<span style="color:#cc7832;">, </span>txD<span style="color:#cc7832;">, </span>err := mp.maybeAcceptTransaction(tx<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span>rateLimit<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span>)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>len(missingParents) == <span style="color:#6897bb;">0 </span>{<span style="color:#808080;">
+</span><span style="color:#808080;">      </span>newTxs := mp.processOrphans(tx)
+      acceptedTxs := <span style="color:#ffc66d;">make</span>([]*<span style="color:#769aa5;">TxDesc</span><span style="color:#cc7832;">, </span>len(newTxs)+<span style="color:#6897bb;">1</span>)
+
+      <span style="color:#808080;">// Add the parent transaction first so remote nodes
+</span><span style="color:#808080;">      // do not add orphans.
+</span><span style="color:#808080;">      </span>acceptedTxs[<span style="color:#6897bb;">0</span>] = txD
+      copy(acceptedTxs[<span style="color:#6897bb;">1</span>:]<span style="color:#cc7832;">, </span>newTxs)
+
+      <span style="color:#cc7832;"><strong>return </strong></span>acceptedTxs<span style="color:#cc7832;">, </span>nil
+   }
+
+   <span style="color:#808080;">// The transaction is an orphan (has inputs missing).  Reject
+</span><span style="color:#808080;">   // it if the flag to allow orphans is not set.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>!allowOrphan {<span style="color:#808080;">
+</span><span style="color:#808080;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"orphan transaction %v references "</span>+
+         <span style="color:#6a8759;">"outputs of unknown or fully-spent "</span>+
+         <span style="color:#6a8759;">"transaction %v"</span><span style="color:#cc7832;">, </span>tx.Hash()<span style="color:#cc7832;">, </span>missingParents[<span style="color:#6897bb;">0</span>])
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">, </span>str)
+   }
+
+   <span style="color:#808080;">// Potentially add the orphan transaction to the orphan pool.
+</span><span style="color:#808080;">   </span>err = mp.maybeAddOrphan(tx<span style="color:#cc7832;">, </span>tag)
+   <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>err
+}</pre>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;">missingParents<span style="color:#cc7832;">, </span>txD<span style="color:#cc7832;">, </span>err := mp.maybeAcceptTransaction(tx<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span>rateLimit<span style="color:#cc7832;">,</span><span style="color:#cc7832;"> </span><span style="color:#9876aa;"><em>true</em></span>)</pre>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);">maybeAcceptTransaction方法主要负责验证交易的合法性，处理逻辑很多，缩减后主要逻辑：</span></span></p>
+  <p></p>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(mp *TxPool) <span style="color:#ffc66d;">maybeAcceptTransaction</span>(tx *btcutil.Tx<span style="color:#cc7832;">, </span>isNew<span style="color:#cc7832;">, </span>rateLimit<span style="color:#cc7832;">, </span>rejectDupOrphans <span style="color:#769aa5;">bool</span>) ([]*chainhash.Hash<span style="color:#cc7832;">, </span>*TxDesc<span style="color:#cc7832;">, </span><span style="color:#769aa5;">error</span>) {
+   txHash := tx.Hash()
+
+   <span style="color:#cc7832;"><strong>if </strong></span>tx.MsgTx().HasWitness() { <span style="color:#808080;">// </span><span style="color:#808080;font-family:SimSun;">是否是见证隔离交易
+</span><span style="color:#808080;font-family:SimSun;">      </span>segwitActive<span style="color:#cc7832;">, </span>err := mp.cfg.IsDeploymentActive(chaincfg.DeploymentSegwit)
+      <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+      }
+
+      <span style="color:#cc7832;"><strong>if </strong></span>!segwitActive { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">若不支持见证隔离则返回
+</span><span style="color:#808080;font-family:SimSun;">         </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has witness data, "</span>+
+            <span style="color:#6a8759;">"but segwit isn't active yet"</span><span style="color:#cc7832;">, </span>txHash)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>mp.isTransactionInPool(txHash) || (rejectDupOrphans &amp;&amp; mp.isOrphanInPool(txHash)) { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">是否已存在交易池中
+</span><span style="color:#808080;font-family:SimSun;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"already have transaction %v"</span><span style="color:#cc7832;">, </span>txHash)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">, </span>str)
+   }
+
+   err := blockchain.CheckTransactionSanity(tx) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查交易合法性，代码下面会详细分析
+</span><span style="color:#808080;font-family:SimSun;">   </span><span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>blockchain.IsCoinBase(tx) { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">不能是</span><span style="color:#808080;">coinbase</span><span style="color:#808080;font-family:SimSun;">交易</span><span style="color:#808080;">,coinbase</span><span style="color:#808080;font-family:SimSun;">交易单独处理
+</span><span style="color:#808080;font-family:SimSun;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v is an individual coinbase"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>txHash)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInvalid<span style="color:#cc7832;">, </span>str)
+   }
+
+   bestHeight := mp.cfg.BestHeight()
+   nextBlockHeight := bestHeight + <span style="color:#6897bb;">1
+</span><span style="color:#6897bb;">
+</span><span style="color:#6897bb;">   </span>medianTimePast := mp.cfg.MedianTimePast()
+
+   <span style="color:#cc7832;"><strong>if </strong></span>!mp.cfg.Policy.AcceptNonStd { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">如不接受非标准交易，则需要对交易进行标准化验证
+</span><span style="color:#808080;font-family:SimSun;">      </span>err = checkTransactionStandard(tx<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>medianTimePast<span style="color:#cc7832;">, </span>mp.cfg.Policy.MinRelayTxFee<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>mp.cfg.Policy.MaxTxVersion)
+   }
+
+   err = mp.checkPoolDoubleSpend(tx) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">在交易池中检查输入是否已经被花费，代码在下方
+</span><span style="color:#808080;font-family:SimSun;">   </span><span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   utxoView<span style="color:#cc7832;">, </span>err := mp.fetchInputUtxos(tx) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">取这个交易相关的区块上的所有</span><span style="color:#808080;">utxo
+</span><span style="color:#808080;">
+</span><span style="color:#808080;">   </span>prevOut := wire.OutPoint{Hash: *txHash}
+   <span style="color:#cc7832;"><strong>for </strong></span>txOutIdx := <span style="color:#cc7832;"><strong>range </strong></span>tx.MsgTx().TxOut {
+      prevOut.Index = <span style="color:#769aa5;">uint32</span>(txOutIdx)
+      entry := utxoView.LookupEntry(prevOut)
+      <span style="color:#cc7832;"><strong>if </strong></span>entry != nil &amp;&amp; !entry.IsSpent() { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查是否已经被花费
+</span><span style="color:#808080;font-family:SimSun;">         </span><span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span><span style="color:#6a8759;">"transaction already exists"</span>)
+      }
+      utxoView.RemoveEntry(prevOut)
+   }
+
+   <span style="color:#808080;">// Transaction is an orphan
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>var </strong></span>missingParents []*chainhash.Hash
+   <span style="color:#cc7832;"><strong>for </strong></span>outpoint<span style="color:#cc7832;">, </span>entry := <span style="color:#cc7832;"><strong>range </strong></span>utxoView.Entries() {
+      <span style="color:#cc7832;"><strong>if </strong></span>entry == nil || entry.IsSpent() {
+         <span style="color:#808080;">// Must make a copy of the hash here since the iterator
+</span><span style="color:#808080;">         // is replaced and taking its address directly would
+</span><span style="color:#808080;">         // result in all of the entries pointing to the same
+</span><span style="color:#808080;">         // memory location and thus all be the final hash.
+</span><span style="color:#808080;">         </span>hashCopy := outpoint.Hash
+         missingParents = append(missingParents<span style="color:#cc7832;">, </span>&amp;hashCopy)
+      }
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>len(missingParents) &gt; <span style="color:#6897bb;">0 </span>{
+      <span style="color:#cc7832;"><strong>return </strong></span>missingParents<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>nil <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">孤立交易，父交易还不存在
+</span><span style="color:#808080;font-family:SimSun;">   </span>}
+
+   sequenceLock<span style="color:#cc7832;">, </span>err := mp.cfg.CalcSequenceLock(tx<span style="color:#cc7832;">, </span>utxoView) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">计算交易锁定时间
+</span><span style="color:#808080;font-family:SimSun;">   </span><span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>!blockchain.SequenceLockActive(sequenceLock<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>medianTimePast) { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">交易是否还需要等待
+</span><span style="color:#808080;font-family:SimSun;">      </span><span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span><span style="color:#6a8759;">"transaction's sequence locks on inputs not met"</span>)
+   }
+
+   txFee<span style="color:#cc7832;">, </span>err := blockchain.CheckTransactionInputs(tx<span style="color:#cc7832;">, </span>nextBlockHeight<span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">, </span>mp.cfg.ChainParams)
+
+   <span style="color:#cc7832;"><strong>if </strong></span>!mp.cfg.Policy.AcceptNonStd {
+      err := checkInputsStandard(tx<span style="color:#cc7832;">, </span>utxoView) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查输入标准化
+</span><span style="color:#808080;font-family:SimSun;">   </span>}
+
+   sigOpCost<span style="color:#cc7832;">, </span>err := blockchain.GetSigOpCost(tx<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>false</em></span><span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span><span style="color:#cc7832;">, </span><span style="color:#9876aa;"><em>true</em></span>)
+   <span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+   <span style="color:#cc7832;"><strong>if </strong></span>sigOpCost &gt; mp.cfg.Policy.MaxSigOpCostPerTx { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查多签数量
+</span><span style="color:#808080;font-family:SimSun;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v sigop cost is too high: %d &gt; %d"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>txHash<span style="color:#cc7832;">, </span>sigOpCost<span style="color:#cc7832;">, </span>mp.cfg.Policy.MaxSigOpCostPerTx)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectNonstandard<span style="color:#cc7832;">, </span>str)
+   }
+
+   serializedSize := GetTxVirtualSize(tx)
+   minFee := calcMinRequiredTxRelayFee(serializedSize<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>mp.cfg.Policy.MinRelayTxFee)
+   <span style="color:#cc7832;"><strong>if </strong></span>serializedSize &gt;= (DefaultBlockPrioritySize-<span style="color:#6897bb;">1000</span>) &amp;&amp; txFee &lt; minFee { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查交易大小及交易费用是否优先处理
+</span><span style="color:#808080;font-family:SimSun;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has %d fees which is under "</span>+
+         <span style="color:#6a8759;">"the required amount of %d"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">, </span>txFee<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>minFee)
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>isNew &amp;&amp; !mp.cfg.Policy.DisableRelayPriority &amp;&amp; txFee &lt; minFee {
+      currentPriority := mining.CalcPriority(tx.MsgTx()<span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">, </span>nextBlockHeight)
+      <span style="color:#cc7832;"><strong>if </strong></span>currentPriority &lt;= mining.MinHighPriority {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has insufficient "</span>+ <span style="color:#6a8759;">"priority (%g &lt;= %g)"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>currentPriority<span style="color:#cc7832;">, </span>mining.MinHighPriority)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>if </strong></span>rateLimit &amp;&amp; txFee &lt; minFee {
+      nowUnix := time.Now().Unix()
+      <span style="color:#808080;">// Decay passed data with an exponentially decaying ~10 minute
+</span><span style="color:#808080;">      // window - matches bitcoind handling.
+</span><span style="color:#808080;">      </span>mp.pennyTotal *= math.Pow(<span style="color:#6897bb;">1.0</span>-<span style="color:#6897bb;">1.0</span>/<span style="color:#6897bb;">600.0</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span><span style="color:#769aa5;">float64</span>(nowUnix-mp.lastPennyUnix))
+      mp.lastPennyUnix = nowUnix
+
+      <span style="color:#808080;">// Are we still over the limit?
+</span><span style="color:#808080;">      </span><span style="color:#cc7832;"><strong>if </strong></span>mp.pennyTotal &gt;= mp.cfg.Policy.FreeTxRelayLimit*<span style="color:#6897bb;">10</span>*<span style="color:#6897bb;">1000 </span>{
+         str := fmt.Sprintf(<span style="color:#6a8759;">"transaction %v has been rejected "</span>+
+            <span style="color:#6a8759;">"by the rate limiter due to low fees"</span><span style="color:#cc7832;">, </span>txHash)
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>txRuleError(wire.RejectInsufficientFee<span style="color:#cc7832;">, </span>str)
+      }
+      oldTotal := mp.pennyTotal
+
+      mp.pennyTotal += <span style="color:#769aa5;">float64</span>(serializedSize)
+      log.Tracef(<span style="color:#6a8759;">"rate limit: curTotal %v, nextTotal: %v, "</span>+
+         <span style="color:#6a8759;">"limit %v"</span><span style="color:#cc7832;">, </span>oldTotal<span style="color:#cc7832;">, </span>mp.pennyTotal<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">         </span>mp.cfg.Policy.FreeTxRelayLimit*<span style="color:#6897bb;">10</span>*<span style="color:#6897bb;">1000</span>)
+   }
+
+   err = blockchain.ValidateTransactionScripts(tx<span style="color:#cc7832;">, </span>utxoView<span style="color:#cc7832;">, </span>txscript.StandardVerifyFlags<span style="color:#cc7832;">, </span>mp.cfg.SigCache<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">      </span>mp.cfg.HashCache) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">验证交易签名脚本
+</span><span style="color:#808080;font-family:SimSun;">   </span><span style="color:#cc7832;"><strong>if </strong></span>err != nil {
+      <span style="color:#cc7832;"><strong>if </strong></span>cerr<span style="color:#cc7832;">, </span>ok := err.(blockchain.RuleError)<span style="color:#cc7832;">; </span>ok {
+         <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>chainRuleError(cerr)
+      }
+      <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>nil<span style="color:#cc7832;">, </span>err
+   }
+
+   txD := mp.addTransaction(utxoView<span style="color:#cc7832;">, </span>tx<span style="color:#cc7832;">, </span>bestHeight<span style="color:#cc7832;">, </span>txFee) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">合格交易加入到交易池
+</span><span style="color:#808080;font-family:SimSun;">
+</span><span style="color:#808080;font-family:SimSun;">   </span>log.Debugf(<span style="color:#6a8759;">"Accepted transaction %v (pool size: %v)"</span><span style="color:#cc7832;">, </span>txHash<span style="color:#cc7832;">, </span>len(mp.pool))
+
+   <span style="color:#cc7832;"><strong>return </strong></span>nil<span style="color:#cc7832;">, </span>txD<span style="color:#cc7832;">, </span>nil
+}</pre>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span><span style="color:#ffc66d;">CheckTransactionSanity</span>(tx *btcutil.Tx) <span style="color:#769aa5;">error </span>{ <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">检查交易的合法性
+</span><span style="color:#808080;font-family:SimSun;">   </span>msgTx := tx.MsgTx()
+   <span style="color:#cc7832;"><strong>if </strong></span>len(msgTx.TxIn) == <span style="color:#6897bb;">0 </span>{ <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">需要有输入
+</span><span style="color:#808080;font-family:SimSun;">      </span><span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrNoTxInputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction has no inputs"</span>)
+   }
+
+   <span style="color:#808080;">// A transaction must have at least one output.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>len(msgTx.TxOut) == <span style="color:#6897bb;">0 </span>{ <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">至少一个输出
+</span><span style="color:#808080;font-family:SimSun;">      </span><span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrNoTxOutputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction has no outputs"</span>)
+   }
+
+   serializedTxSize := tx.MsgTx().SerializeSizeStripped()
+   <span style="color:#cc7832;"><strong>if </strong></span>serializedTxSize &gt; MaxBlockBaseSize { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">交易不能超过允许的最大块大小
+</span><span style="color:#808080;font-family:SimSun;">      </span>str := fmt.Sprintf(<span style="color:#6a8759;">"serialized transaction is too big - got "</span>+
+         <span style="color:#6a8759;">"%d, max %d"</span><span style="color:#cc7832;">, </span>serializedTxSize<span style="color:#cc7832;">, </span>MaxBlockBaseSize)
+      <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrTxTooBig<span style="color:#cc7832;">, </span>str)
+   }
+
+   <span style="color:#cc7832;"><strong>var </strong></span>totalSatoshi <span style="color:#769aa5;">int64
+</span><span style="color:#769aa5;">   </span><span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txOut := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxOut {
+      satoshi := txOut.Value
+      <span style="color:#cc7832;"><strong>if </strong></span>satoshi &lt; <span style="color:#6897bb;">0 </span>{ <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">输出不能为负
+</span><span style="color:#808080;font-family:SimSun;">         </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction output has negative "</span>+
+            <span style="color:#6a8759;">"value of %v"</span><span style="color:#cc7832;">, </span>satoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+      <span style="color:#cc7832;"><strong>if </strong></span>satoshi &gt; btcutil.MaxSatoshi { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">不能超过最大值
+</span><span style="color:#808080;font-family:SimSun;">         </span>str := fmt.Sprintf(<span style="color:#6a8759;">"transaction output value of %v is "</span>+
+            <span style="color:#6a8759;">"higher than max allowed value of %v"</span><span style="color:#cc7832;">, </span>satoshi<span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>btcutil.MaxSatoshi)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxOutValue<span style="color:#cc7832;">, </span>str)
+      }
+
+   }
+
+   <span style="color:#808080;">// Check for duplicate transaction inputs.
+</span><span style="color:#808080;">   </span>existingTxOut := <span style="color:#ffc66d;">make</span>(<span style="color:#cc7832;"><strong>map</strong></span>[wire.OutPoint]<span style="color:#cc7832;"><strong>struct</strong></span>{}) <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">输入不能重复
+</span><span style="color:#808080;font-family:SimSun;">   </span><span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txIn := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxIn {
+      <span style="color:#cc7832;"><strong>if </strong></span>_<span style="color:#cc7832;">, </span>exists := existingTxOut[txIn.PreviousOutPoint]<span style="color:#cc7832;">; </span>exists {
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrDuplicateTxInputs<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction "</span>+ <span style="color:#6a8759;">"contains duplicate inputs"</span>)
+      }
+      existingTxOut[txIn.PreviousOutPoint] = <span style="color:#cc7832;"><strong>struct</strong></span>{}{}
+   }
+
+   <span style="color:#808080;">// Coinbase script length must be between min and max length.
+</span><span style="color:#808080;">   </span><span style="color:#cc7832;"><strong>if </strong></span>IsCoinBase(tx) { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">是</span><span style="color:#808080;">coinbase</span><span style="color:#808080;font-family:SimSun;">交易
+</span><span style="color:#808080;font-family:SimSun;">      </span>slen := len(msgTx.TxIn[<span style="color:#6897bb;">0</span>].SignatureScript)
+      <span style="color:#cc7832;"><strong>if </strong></span>slen &lt; MinCoinbaseScriptLen || slen &gt; MaxCoinbaseScriptLen { <span style="color:#808080;">//</span><span style="color:#808080;font-family:SimSun;">验证脚本长度
+</span><span style="color:#808080;font-family:SimSun;">         </span>str := fmt.Sprintf(<span style="color:#6a8759;">"coinbase transaction script length "</span>+
+            <span style="color:#6a8759;">"of %d is out of range (min: %d, max: %d)"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>slen<span style="color:#cc7832;">, </span>MinCoinbaseScriptLen<span style="color:#cc7832;">, </span>MaxCoinbaseScriptLen)
+         <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadCoinbaseScriptLen<span style="color:#cc7832;">, </span>str)
+      }
+   } <span style="color:#cc7832;"><strong>else </strong></span>{
+      <span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txIn := <span style="color:#cc7832;"><strong>range </strong></span>msgTx.TxIn {
+         <span style="color:#cc7832;"><strong>if </strong></span>isNullOutpoint(&amp;txIn.PreviousOutPoint) {
+            <span style="color:#cc7832;"><strong>return </strong></span>ruleError(ErrBadTxInput<span style="color:#cc7832;">, </span><span style="color:#6a8759;">"transaction "</span>+
+               <span style="color:#6a8759;">"input refers to previous output that "</span>+
+               <span style="color:#6a8759;">"is null"</span>)
+         }
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>return </strong></span>nil
+}</pre>
+  <pre style="background-color:#2b2b2b;color:#a9b7c6;font-family:Consolas;font-size:13.5pt;"><span style="color:#cc7832;"><strong>func </strong></span>(mp *TxPool) <span style="color:#ffc66d;">checkPoolDoubleSpend</span>(tx *btcutil.Tx) <span style="color:#769aa5;">error </span>{
+   <span style="color:#cc7832;"><strong>for </strong></span>_<span style="color:#cc7832;">, </span>txIn := <span style="color:#cc7832;"><strong>range </strong></span>tx.MsgTx().TxIn {
+      <span style="color:#cc7832;"><strong>if </strong></span>txR<span style="color:#cc7832;">, </span>exists := mp.outpoints[txIn.PreviousOutPoint]<span style="color:#cc7832;">; </span>exists {
+         str := fmt.Sprintf(<span style="color:#6a8759;">"output %v already spent by "</span>+ <span style="color:#6a8759;">"transaction %v in the memory pool"</span><span style="color:#cc7832;">,
+</span><span style="color:#cc7832;">            </span>txIn.PreviousOutPoint<span style="color:#cc7832;">, </span>txR.Hash())
+         <span style="color:#cc7832;"><strong>return </strong></span>txRuleError(wire.RejectDuplicate<span style="color:#cc7832;">, </span>str)
+      }
+   }
+
+   <span style="color:#cc7832;"><strong>return </strong></span>nil
+}</pre>
+  <br>
+  <br>本文作者：architect.bian，欢迎收藏，转载请保留原文地址并保留版权声明！谢谢~
+  <br>还没完！往下看！！！
+  <br>
+  <p><span style="font-family:'PT Serif', Georgia, 'Times New Roman', serif;color:#515151;"><span style="font-size:20px;background-color:rgb(255,255,255);"><br></span></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p>
+  <p><span style="color:rgb(81,81,81);font-family:'PT Serif', Georgia, 'Times New Roman', serif;font-size:20px;background-color:rgb(255,255,255);"><br></span></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/vohyeah/article/details/80704066,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/vohyeah/article/details/80704066,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

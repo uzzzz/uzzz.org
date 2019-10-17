@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊之Fetcher(收到BlockHash的处理) | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊之Fetcher(收到BlockHash的处理)" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊节点广播block的时候一部分节点广播整个block内容，其余节点广播block的hash， 本篇分析一下节点收到block hash后的处理 收到NewBlockHash eth/handler.go中收到NewBlockHashesMsg消息，看代码的处理： case msg.Code == NewBlockHashesMsg: &nbsp;&nbsp;&nbsp;&nbsp;var announces newBlockHashesData &nbsp;&nbsp;&nbsp;&nbsp;if err := msg.Decode(&amp;announces); err != nil { return errResp(ErrDecode, &quot;%v: %v&quot;, msg, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Mark the hashes as present at the remote node &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { p.MarkBlock(block.Hash) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Schedule all the unknown hashes for retrieval &nbsp;&nbsp;&nbsp;&nbsp;unknown := make(newBlockHashesData, 0, len(announces)) &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { &nbsp;&nbsp;&nbsp;&nbsp;if !pm.blockchain.HasBlock(block.Hash, block.Number) { &nbsp;&nbsp;&nbsp;&nbsp;unknown = append(unknown, block) } &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range unknown { pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestOneHeader, p.RequestBodies) &nbsp;&nbsp;&nbsp;&nbsp;} 收到消息后： 1 遍历收到的block hashes，mark下对端节点拥有此block 2 再遍历收到的hashes，与本地对比看是否已有该block，没有的append到unknown 3 遍历unknown，然后调用fetcher的Notify，带hash，block num，request header函数和request body函数 func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time, headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error { block := &amp;announce{ hash: hash, number: number, time: time, origin: peer, fetchHeader: headerFetcher, fetchBodies: bodyFetcher, } select { case f.notify &lt;- block: return nil case &lt;-f.quit: return errTerminated } } Notify做的事情也很简单，new了一个announce结构，然后写到channel notify，实现了notify的作用，想必是有个地方一直在监听notify channel做事情，找到监听notify的地方 Fetcher获取header和body （代码比较长，暂时先贴着了，要么分段帖也不好贴） func (f *Fetcher) loop() { // Iterate the block fetching until a quit is requested fetchTimer := time.NewTimer(0) completeTimer := time.NewTimer(0) for { // Clean up any expired block fetches for hash, announce := range f.fetching { if time.Since(announce.time) &gt; fetchTimeout { f.forgetHash(hash) } } // Import any queued blocks that could potentially fit height := f.chainHeight() for !f.queue.Empty() { op := f.queue.PopItem().(*inject) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), false) } // If too high up the chain or phase, continue later number := op.block.NumberU64() if number &gt; height+1 { f.queue.Push(op, -float32(op.block.NumberU64())) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), true) } break } // Otherwise if fresh and still unknown, try and import hash := op.block.Hash() if number+maxUncleDist &lt; height || f.getBlock(hash) != nil { f.forgetBlock(hash) continue } f.insert(op.origin, op.block) } // Wait for an outside event to occur select { case &lt;-f.quit: // Fetcher terminating, abort all operations return case notification := &lt;-f.notify: // A block was announced, make sure the peer isn&#39;t DOSing us propAnnounceInMeter.Mark(1) count := f.announces[notification.origin] + 1 if count &gt; hashLimit { log.Debug(&quot;Peer exceeded outstanding announces&quot;, &quot;peer&quot;, notification.origin, &quot;limit&quot;, hashLimit) propAnnounceDOSMeter.Mark(1) break } // If we have a valid block number, check that it&#39;s potentially useful if notification.number &gt; 0 { if dist := int64(notification.number) - int64(f.chainHeight()); dist &lt; -maxUncleDist || dist &gt; maxQueueDist { log.Debug(&quot;Peer discarded announcement&quot;, &quot;peer&quot;, notification.origin, &quot;number&quot;, notification.number, &quot;hash&quot;, notification.hash, &quot;distance&quot;, dist) propAnnounceDropMeter.Mark(1) break } } // All is well, schedule the announce if block&#39;s not yet downloading if _, ok := f.fetching[notification.hash]; ok { break } if _, ok := f.completing[notification.hash]; ok { break } f.announces[notification.origin] = count f.announced[notification.hash] = append(f.announced[notification.hash], notification) if f.announceChangeHook != nil &amp;&amp; len(f.announced[notification.hash]) == 1 { f.announceChangeHook(notification.hash, true) } if len(f.announced) == 1 { f.rescheduleFetch(fetchTimer) } case op := &lt;-f.inject: // A direct block insertion was requested, try and fill any pending gaps propBroadcastInMeter.Mark(1) f.enqueue(op.origin, op.block) case hash := &lt;-f.done: // A pending import finished, remove all traces of the notification f.forgetHash(hash) f.forgetBlock(hash) case &lt;-fetchTimer.C: // At least one block&#39;s timer ran out, check for needing retrieval request := make(map[string][]common.Hash) for hash, announces := range f.announced { if time.Since(announces[0].time) &gt; arriveTimeout-gatherSlack { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for fetching if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.fetching[hash] = announce } } } // Send out all block header requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled headers&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread fetchHeader, hashes := f.fetching[hashes[0]].fetchHeader, hashes go func() { if f.fetchingHook != nil { f.fetchingHook(hashes) } for _, hash := range hashes { headerFetchMeter.Mark(1) fetchHeader(hash) // Suboptimal, but protocol doesn&#39;t allow batch header retrievals } }() } // Schedule the next fetch if blocks are still pending f.rescheduleFetch(fetchTimer) case &lt;-completeTimer.C: // At least one header&#39;s timer ran out, retrieve everything request := make(map[string][]common.Hash) for hash, announces := range f.fetched { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for completion if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.completing[hash] = announce } } // Send out all block body requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled bodies&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread if f.completingHook != nil { f.completingHook(hashes) } bodyFetchMeter.Mark(int64(len(hashes))) go f.completing[hashes[0]].fetchBodies(hashes) } // Schedule the next fetch if blocks are still pending f.rescheduleComplete(completeTimer) case filter := &lt;-f.headerFilter: // Headers arrived from a remote peer. Extract those that were explicitly // requested by the fetcher, and return everything else so it&#39;s delivered // to other parts of the system. var task *headerFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } headerFilterInMeter.Mark(int64(len(task.headers))) // Split the batch of headers into unknown ones (to return to the caller), // known incomplete ones (requiring body retrievals) and completed blocks. unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{} for _, header := range task.headers { hash := header.Hash() // Filter fetcher-requested headers from other synchronisation algorithms if announce := f.fetching[hash]; announce != nil &amp;&amp; announce.origin == task.peer &amp;&amp; f.fetched[hash] == nil &amp;&amp; f.completing[hash] == nil &amp;&amp; f.queued[hash] == nil { // If the delivered header does not match the promised number, drop the announcer if header.Number.Uint64() != announce.number { log.Trace(&quot;Invalid block number fetched&quot;, &quot;peer&quot;, announce.origin, &quot;hash&quot;, header.Hash(), &quot;announced&quot;, announce.number, &quot;provided&quot;, header.Number) f.dropPeer(announce.origin) f.forgetHash(hash) continue } // Only keep if not imported by other means if f.getBlock(hash) == nil { announce.header = header announce.time = task.time // If the block is empty (header only), short circuit into the final import queue if header.TxHash == types.DeriveSha(types.Transactions{}) &amp;&amp; header.UncleHash == types.CalcUncleHash([]*types.Header{}) { log.Trace(&quot;Block empty, skipping body retrieval&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) block := types.NewBlockWithHeader(header) block.ReceivedAt = task.time complete = append(complete, block) f.completing[hash] = announce continue } // Otherwise add to the list of blocks needing completion incomplete = append(incomplete, announce) } else { log.Trace(&quot;Block already imported, discarding header&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) f.forgetHash(hash) } } else { // Fetcher doesn&#39;t know about it, add to the return list unknown = append(unknown, header) } } headerFilterOutMeter.Mark(int64(len(unknown))) select { case filter &lt;- &amp;headerFilterTask{headers: unknown, time: task.time}: case &lt;-f.quit: return } // Schedule the retrieved headers for body completion for _, announce := range incomplete { hash := announce.header.Hash() if _, ok := f.completing[hash]; ok { continue } f.fetched[hash] = append(f.fetched[hash], announce) if len(f.fetched) == 1 { f.rescheduleComplete(completeTimer) } } // Schedule the header-only blocks for import for _, block := range complete { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } case filter := &lt;-f.bodyFilter: // Block bodies arrived, extract any explicitly requested blocks, return the rest var task *bodyFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } bodyFilterInMeter.Mark(int64(len(task.transactions))) blocks := []*types.Block{} for i := 0; i &lt; len(task.transactions) &amp;&amp; i &lt; len(task.uncles); i++ { // Match up a body to any possible completion request matched := false for hash, announce := range f.completing { if f.queued[hash] == nil { txnHash := types.DeriveSha(types.Transactions(task.transactions[i])) uncleHash := types.CalcUncleHash(task.uncles[i]) if txnHash == announce.header.TxHash &amp;&amp; uncleHash == announce.header.UncleHash &amp;&amp; announce.origin == task.peer { // Mark the body matched, reassemble if still unknown matched = true if f.getBlock(hash) == nil { block := types.NewBlockWithHeader(announce.header).WithBody(task.transactions[i], task.uncles[i]) block.ReceivedAt = task.time blocks = append(blocks, block) } else { f.forgetHash(hash) } } } } if matched { task.transactions = append(task.transactions[:i], task.transactions[i+1:]...) task.uncles = append(task.uncles[:i], task.uncles[i+1:]...) i-- continue } } bodyFilterOutMeter.Mark(int64(len(task.transactions))) select { case filter &lt;- task: case &lt;-f.quit: return } // Schedule the retrieved blocks for ordered import for _, block := range blocks { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } } } } 加入hash到announced 果然这里有个loop（），内部是一个for循环，在监听读取一些channel的数据 1 判断f.announces map内从对端peer发来的hash个数是否大于hashLimit（256），如果大于，那么对端peer可能在Dos攻击，break出去 2 判断block的num与自身chain高度的差值，如果小于-maxUncleDist（7）或者大于maxQueueDist（32），也break出去 3 判断是否在f.fetching，如果是break 4 判断是否在f.completing，如果是break 5 加入到f.announced,&nbsp;f.announces加1（此个数用来判断节点是否在Dos攻击） 6 一旦f.announced有元素了，就开始rescheduleFetch(fetchTimer)，内容是reset下fetchTimer，遍历announced中的条目，拿到最早的时间，然后reset fetchTimer为500ms减去最早的条目加入到announced后耗费的时间，目的是让fetchTimer尽快执行而又不浪费资源空转 获取headers 所以接下来看f.announced的处理在哪里 还在本函数中，case &lt;- fetchTimer.C 这个timer一直在跑，每次跑完会reset一下，刚刚上面有讲过它的原理 1 遍历f.announced中的announce，对于同一个block的hash，可能有若干个节点广播过来 &nbsp; &nbsp; if time.Since(announces[0].time) &gt; arriveTimeOut(500ms) - gatherSlack(100ms) 这里判断最早加入的hash的时间要大于400ms（500-100）才去处理，这个逻辑应该是为了等够一定的时间积攒一些节点广播同一个block然后随机挑选一个节点去同步，避免所有节点都向源节点同步造成源节点网络拥堵 把这些要请求的加入到request map内 同时把此hash从f.announced中移除并加入到f.fetching map内 2 遍历request map，启动goroutine去获取指定hash的block header，有几个header就几个goroutine 然后等待对端节点返回header 返回headers 还在本loop（）函数内，返回header是写入到channel f.headerFilter 1 遍历处理收到的headers，从f.fetching内拿到anounce（上一步放入到该map内），并且返回的peer也是获取的peer，不在fetched内，不在completing内，不在queued内才通过判断；否则加入unkonwn map内 2 如果不是要获取的高度的block header，continue 3 如果block是空的：既没有tx也没有uncle，那么直接组成block然后加入到complete map内并且加入f.completing，否则加入到incomplete map内 4 把unkonwn放入到filter处理一下（具体怎么处理再看一下） 5 遍历incomplete map，然后放入到f.fetched map内，表示拿到了header还需要继续拿body。同时rescheduleComplete（），同上面的rescheduleFetch，尽快取block，时间不大于100ms 6 遍历complete map，调用f.enqueue()，目的就是把完成的block加入到f.queued内，处理等后面拿到body一起说下 获取bodies 上面拿到header后把hash加入到f.fetched map内，接着拿body 还是在本loop（）内，等completeTimer到达：case &lt;-completeTimer.C 1 遍历f.fetched，随机选一个去获取body 2 把hash加入到f.completing map内和request内 3 遍历request，启动gorountine去对端节点获取body内容 返回bodies 对端节点处理完返回对应的body后， 还是写入到本loop（）内的channel f.bodyFilter:&nbsp; 1 遍历收到的tx和uncle 2 如果hash不在f.queued（没有处理完成），并且判断收到的tx hash、unclue hash、peer与completing中的一致就加入到blocks map内 3遍历blocks，调用f.enqueue()加入到f.queue 处理完成 接着处理f.queue map，还是在本loop（）内循环处理的 如果f.queue不为空pop一个出来：f.queue.PopItem()，经过简单的check，f.insert（）加入到本地 func (f *Fetcher) insert(peer string, block *types.Block) { hash := block.Hash() // Run the import on a new thread log.Debug(&quot;Importing propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) go func() { defer func() { f.done &lt;- hash }() // If the parent&#39;s unknown, abort insertion parent := f.getBlock(block.ParentHash()) if parent == nil { log.Debug(&quot;Unknown parent of propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;parent&quot;, block.ParentHash()) return } // Quickly validate the header and propagate the block if it passes switch err := f.verifyHeader(block.Header()); err { case nil: // All ok, quickly propagate to our peers propBroadcastOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, true) case consensus.ErrFutureBlock: // Weird future block, don&#39;t fail, but neither propagate default: // Something went very wrong, drop the peer log.Debug(&quot;Propagated block verification failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) f.dropPeer(peer) return } // Run the actual import and log any issues if _, err := f.insertChain(types.Blocks{block}); err != nil { log.Debug(&quot;Propagated block import failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) return } // If import succeeded, broadcast the block propAnnounceOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, false) // Invoke the testing hook if needed if f.importedHook != nil { f.importedHook(block) } }() } 启动gorountine插入到本地： 1 先VerifyHeader，通过后广播block到若干节点 2 f.insertChain()就是写入到本地的leveldb 3 插入成功后，广播block hash到其他节点 有人要问了，为什么广播hash放在最后呢，要做到尽快广播到全网是不是放在1也可以： 1是广播整个区块，3是广播hash，只有等2插入到本地后，3广播出去后，别的节点来获取自己才有东西给别人，这也是3放在2后面的原因 不过其实也是可以放在第1步，只是这么做的话需要做另外的处理，不利于代码的统一性 总结 自此就分析完了节点收到blockhash后的处理，大致如下： 1 交给fetcher处理，先去拿header 2 等拿到header后，如果body为空，直接组织成block；否则接着拿body 3 拿到body后跟header组织成block，然后插入到本地的leveldb 中间有一些小细节： 1 获取header或者body的时候会等一段时间（400ms、100ms）等收到若干个节点广播的hash， 然后随机选一个去获取，这也是网络负载均衡的设计；代价就是要等一段时间才能同步完成一个区块 2 防Dos攻击：会记录同一个节点同时有多少hash在处理，如果大于给定的256就认为是节点在Dos攻击 Fetcher和downloader的区别 看完了fetcher和downloader的代码就知道了二者的区别： 1 downloader是用来当本地与其他节点相差太多的时候同步到最新的区块 2 fetcher是收到其他节点广播的新区块hashes后去获取这些给定的区块的 阅读更多" />
+<meta property="og:description" content="以太坊节点广播block的时候一部分节点广播整个block内容，其余节点广播block的hash， 本篇分析一下节点收到block hash后的处理 收到NewBlockHash eth/handler.go中收到NewBlockHashesMsg消息，看代码的处理： case msg.Code == NewBlockHashesMsg: &nbsp;&nbsp;&nbsp;&nbsp;var announces newBlockHashesData &nbsp;&nbsp;&nbsp;&nbsp;if err := msg.Decode(&amp;announces); err != nil { return errResp(ErrDecode, &quot;%v: %v&quot;, msg, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Mark the hashes as present at the remote node &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { p.MarkBlock(block.Hash) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Schedule all the unknown hashes for retrieval &nbsp;&nbsp;&nbsp;&nbsp;unknown := make(newBlockHashesData, 0, len(announces)) &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { &nbsp;&nbsp;&nbsp;&nbsp;if !pm.blockchain.HasBlock(block.Hash, block.Number) { &nbsp;&nbsp;&nbsp;&nbsp;unknown = append(unknown, block) } &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range unknown { pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestOneHeader, p.RequestBodies) &nbsp;&nbsp;&nbsp;&nbsp;} 收到消息后： 1 遍历收到的block hashes，mark下对端节点拥有此block 2 再遍历收到的hashes，与本地对比看是否已有该block，没有的append到unknown 3 遍历unknown，然后调用fetcher的Notify，带hash，block num，request header函数和request body函数 func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time, headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error { block := &amp;announce{ hash: hash, number: number, time: time, origin: peer, fetchHeader: headerFetcher, fetchBodies: bodyFetcher, } select { case f.notify &lt;- block: return nil case &lt;-f.quit: return errTerminated } } Notify做的事情也很简单，new了一个announce结构，然后写到channel notify，实现了notify的作用，想必是有个地方一直在监听notify channel做事情，找到监听notify的地方 Fetcher获取header和body （代码比较长，暂时先贴着了，要么分段帖也不好贴） func (f *Fetcher) loop() { // Iterate the block fetching until a quit is requested fetchTimer := time.NewTimer(0) completeTimer := time.NewTimer(0) for { // Clean up any expired block fetches for hash, announce := range f.fetching { if time.Since(announce.time) &gt; fetchTimeout { f.forgetHash(hash) } } // Import any queued blocks that could potentially fit height := f.chainHeight() for !f.queue.Empty() { op := f.queue.PopItem().(*inject) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), false) } // If too high up the chain or phase, continue later number := op.block.NumberU64() if number &gt; height+1 { f.queue.Push(op, -float32(op.block.NumberU64())) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), true) } break } // Otherwise if fresh and still unknown, try and import hash := op.block.Hash() if number+maxUncleDist &lt; height || f.getBlock(hash) != nil { f.forgetBlock(hash) continue } f.insert(op.origin, op.block) } // Wait for an outside event to occur select { case &lt;-f.quit: // Fetcher terminating, abort all operations return case notification := &lt;-f.notify: // A block was announced, make sure the peer isn&#39;t DOSing us propAnnounceInMeter.Mark(1) count := f.announces[notification.origin] + 1 if count &gt; hashLimit { log.Debug(&quot;Peer exceeded outstanding announces&quot;, &quot;peer&quot;, notification.origin, &quot;limit&quot;, hashLimit) propAnnounceDOSMeter.Mark(1) break } // If we have a valid block number, check that it&#39;s potentially useful if notification.number &gt; 0 { if dist := int64(notification.number) - int64(f.chainHeight()); dist &lt; -maxUncleDist || dist &gt; maxQueueDist { log.Debug(&quot;Peer discarded announcement&quot;, &quot;peer&quot;, notification.origin, &quot;number&quot;, notification.number, &quot;hash&quot;, notification.hash, &quot;distance&quot;, dist) propAnnounceDropMeter.Mark(1) break } } // All is well, schedule the announce if block&#39;s not yet downloading if _, ok := f.fetching[notification.hash]; ok { break } if _, ok := f.completing[notification.hash]; ok { break } f.announces[notification.origin] = count f.announced[notification.hash] = append(f.announced[notification.hash], notification) if f.announceChangeHook != nil &amp;&amp; len(f.announced[notification.hash]) == 1 { f.announceChangeHook(notification.hash, true) } if len(f.announced) == 1 { f.rescheduleFetch(fetchTimer) } case op := &lt;-f.inject: // A direct block insertion was requested, try and fill any pending gaps propBroadcastInMeter.Mark(1) f.enqueue(op.origin, op.block) case hash := &lt;-f.done: // A pending import finished, remove all traces of the notification f.forgetHash(hash) f.forgetBlock(hash) case &lt;-fetchTimer.C: // At least one block&#39;s timer ran out, check for needing retrieval request := make(map[string][]common.Hash) for hash, announces := range f.announced { if time.Since(announces[0].time) &gt; arriveTimeout-gatherSlack { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for fetching if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.fetching[hash] = announce } } } // Send out all block header requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled headers&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread fetchHeader, hashes := f.fetching[hashes[0]].fetchHeader, hashes go func() { if f.fetchingHook != nil { f.fetchingHook(hashes) } for _, hash := range hashes { headerFetchMeter.Mark(1) fetchHeader(hash) // Suboptimal, but protocol doesn&#39;t allow batch header retrievals } }() } // Schedule the next fetch if blocks are still pending f.rescheduleFetch(fetchTimer) case &lt;-completeTimer.C: // At least one header&#39;s timer ran out, retrieve everything request := make(map[string][]common.Hash) for hash, announces := range f.fetched { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for completion if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.completing[hash] = announce } } // Send out all block body requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled bodies&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread if f.completingHook != nil { f.completingHook(hashes) } bodyFetchMeter.Mark(int64(len(hashes))) go f.completing[hashes[0]].fetchBodies(hashes) } // Schedule the next fetch if blocks are still pending f.rescheduleComplete(completeTimer) case filter := &lt;-f.headerFilter: // Headers arrived from a remote peer. Extract those that were explicitly // requested by the fetcher, and return everything else so it&#39;s delivered // to other parts of the system. var task *headerFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } headerFilterInMeter.Mark(int64(len(task.headers))) // Split the batch of headers into unknown ones (to return to the caller), // known incomplete ones (requiring body retrievals) and completed blocks. unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{} for _, header := range task.headers { hash := header.Hash() // Filter fetcher-requested headers from other synchronisation algorithms if announce := f.fetching[hash]; announce != nil &amp;&amp; announce.origin == task.peer &amp;&amp; f.fetched[hash] == nil &amp;&amp; f.completing[hash] == nil &amp;&amp; f.queued[hash] == nil { // If the delivered header does not match the promised number, drop the announcer if header.Number.Uint64() != announce.number { log.Trace(&quot;Invalid block number fetched&quot;, &quot;peer&quot;, announce.origin, &quot;hash&quot;, header.Hash(), &quot;announced&quot;, announce.number, &quot;provided&quot;, header.Number) f.dropPeer(announce.origin) f.forgetHash(hash) continue } // Only keep if not imported by other means if f.getBlock(hash) == nil { announce.header = header announce.time = task.time // If the block is empty (header only), short circuit into the final import queue if header.TxHash == types.DeriveSha(types.Transactions{}) &amp;&amp; header.UncleHash == types.CalcUncleHash([]*types.Header{}) { log.Trace(&quot;Block empty, skipping body retrieval&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) block := types.NewBlockWithHeader(header) block.ReceivedAt = task.time complete = append(complete, block) f.completing[hash] = announce continue } // Otherwise add to the list of blocks needing completion incomplete = append(incomplete, announce) } else { log.Trace(&quot;Block already imported, discarding header&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) f.forgetHash(hash) } } else { // Fetcher doesn&#39;t know about it, add to the return list unknown = append(unknown, header) } } headerFilterOutMeter.Mark(int64(len(unknown))) select { case filter &lt;- &amp;headerFilterTask{headers: unknown, time: task.time}: case &lt;-f.quit: return } // Schedule the retrieved headers for body completion for _, announce := range incomplete { hash := announce.header.Hash() if _, ok := f.completing[hash]; ok { continue } f.fetched[hash] = append(f.fetched[hash], announce) if len(f.fetched) == 1 { f.rescheduleComplete(completeTimer) } } // Schedule the header-only blocks for import for _, block := range complete { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } case filter := &lt;-f.bodyFilter: // Block bodies arrived, extract any explicitly requested blocks, return the rest var task *bodyFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } bodyFilterInMeter.Mark(int64(len(task.transactions))) blocks := []*types.Block{} for i := 0; i &lt; len(task.transactions) &amp;&amp; i &lt; len(task.uncles); i++ { // Match up a body to any possible completion request matched := false for hash, announce := range f.completing { if f.queued[hash] == nil { txnHash := types.DeriveSha(types.Transactions(task.transactions[i])) uncleHash := types.CalcUncleHash(task.uncles[i]) if txnHash == announce.header.TxHash &amp;&amp; uncleHash == announce.header.UncleHash &amp;&amp; announce.origin == task.peer { // Mark the body matched, reassemble if still unknown matched = true if f.getBlock(hash) == nil { block := types.NewBlockWithHeader(announce.header).WithBody(task.transactions[i], task.uncles[i]) block.ReceivedAt = task.time blocks = append(blocks, block) } else { f.forgetHash(hash) } } } } if matched { task.transactions = append(task.transactions[:i], task.transactions[i+1:]...) task.uncles = append(task.uncles[:i], task.uncles[i+1:]...) i-- continue } } bodyFilterOutMeter.Mark(int64(len(task.transactions))) select { case filter &lt;- task: case &lt;-f.quit: return } // Schedule the retrieved blocks for ordered import for _, block := range blocks { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } } } } 加入hash到announced 果然这里有个loop（），内部是一个for循环，在监听读取一些channel的数据 1 判断f.announces map内从对端peer发来的hash个数是否大于hashLimit（256），如果大于，那么对端peer可能在Dos攻击，break出去 2 判断block的num与自身chain高度的差值，如果小于-maxUncleDist（7）或者大于maxQueueDist（32），也break出去 3 判断是否在f.fetching，如果是break 4 判断是否在f.completing，如果是break 5 加入到f.announced,&nbsp;f.announces加1（此个数用来判断节点是否在Dos攻击） 6 一旦f.announced有元素了，就开始rescheduleFetch(fetchTimer)，内容是reset下fetchTimer，遍历announced中的条目，拿到最早的时间，然后reset fetchTimer为500ms减去最早的条目加入到announced后耗费的时间，目的是让fetchTimer尽快执行而又不浪费资源空转 获取headers 所以接下来看f.announced的处理在哪里 还在本函数中，case &lt;- fetchTimer.C 这个timer一直在跑，每次跑完会reset一下，刚刚上面有讲过它的原理 1 遍历f.announced中的announce，对于同一个block的hash，可能有若干个节点广播过来 &nbsp; &nbsp; if time.Since(announces[0].time) &gt; arriveTimeOut(500ms) - gatherSlack(100ms) 这里判断最早加入的hash的时间要大于400ms（500-100）才去处理，这个逻辑应该是为了等够一定的时间积攒一些节点广播同一个block然后随机挑选一个节点去同步，避免所有节点都向源节点同步造成源节点网络拥堵 把这些要请求的加入到request map内 同时把此hash从f.announced中移除并加入到f.fetching map内 2 遍历request map，启动goroutine去获取指定hash的block header，有几个header就几个goroutine 然后等待对端节点返回header 返回headers 还在本loop（）函数内，返回header是写入到channel f.headerFilter 1 遍历处理收到的headers，从f.fetching内拿到anounce（上一步放入到该map内），并且返回的peer也是获取的peer，不在fetched内，不在completing内，不在queued内才通过判断；否则加入unkonwn map内 2 如果不是要获取的高度的block header，continue 3 如果block是空的：既没有tx也没有uncle，那么直接组成block然后加入到complete map内并且加入f.completing，否则加入到incomplete map内 4 把unkonwn放入到filter处理一下（具体怎么处理再看一下） 5 遍历incomplete map，然后放入到f.fetched map内，表示拿到了header还需要继续拿body。同时rescheduleComplete（），同上面的rescheduleFetch，尽快取block，时间不大于100ms 6 遍历complete map，调用f.enqueue()，目的就是把完成的block加入到f.queued内，处理等后面拿到body一起说下 获取bodies 上面拿到header后把hash加入到f.fetched map内，接着拿body 还是在本loop（）内，等completeTimer到达：case &lt;-completeTimer.C 1 遍历f.fetched，随机选一个去获取body 2 把hash加入到f.completing map内和request内 3 遍历request，启动gorountine去对端节点获取body内容 返回bodies 对端节点处理完返回对应的body后， 还是写入到本loop（）内的channel f.bodyFilter:&nbsp; 1 遍历收到的tx和uncle 2 如果hash不在f.queued（没有处理完成），并且判断收到的tx hash、unclue hash、peer与completing中的一致就加入到blocks map内 3遍历blocks，调用f.enqueue()加入到f.queue 处理完成 接着处理f.queue map，还是在本loop（）内循环处理的 如果f.queue不为空pop一个出来：f.queue.PopItem()，经过简单的check，f.insert（）加入到本地 func (f *Fetcher) insert(peer string, block *types.Block) { hash := block.Hash() // Run the import on a new thread log.Debug(&quot;Importing propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) go func() { defer func() { f.done &lt;- hash }() // If the parent&#39;s unknown, abort insertion parent := f.getBlock(block.ParentHash()) if parent == nil { log.Debug(&quot;Unknown parent of propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;parent&quot;, block.ParentHash()) return } // Quickly validate the header and propagate the block if it passes switch err := f.verifyHeader(block.Header()); err { case nil: // All ok, quickly propagate to our peers propBroadcastOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, true) case consensus.ErrFutureBlock: // Weird future block, don&#39;t fail, but neither propagate default: // Something went very wrong, drop the peer log.Debug(&quot;Propagated block verification failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) f.dropPeer(peer) return } // Run the actual import and log any issues if _, err := f.insertChain(types.Blocks{block}); err != nil { log.Debug(&quot;Propagated block import failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) return } // If import succeeded, broadcast the block propAnnounceOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, false) // Invoke the testing hook if needed if f.importedHook != nil { f.importedHook(block) } }() } 启动gorountine插入到本地： 1 先VerifyHeader，通过后广播block到若干节点 2 f.insertChain()就是写入到本地的leveldb 3 插入成功后，广播block hash到其他节点 有人要问了，为什么广播hash放在最后呢，要做到尽快广播到全网是不是放在1也可以： 1是广播整个区块，3是广播hash，只有等2插入到本地后，3广播出去后，别的节点来获取自己才有东西给别人，这也是3放在2后面的原因 不过其实也是可以放在第1步，只是这么做的话需要做另外的处理，不利于代码的统一性 总结 自此就分析完了节点收到blockhash后的处理，大致如下： 1 交给fetcher处理，先去拿header 2 等拿到header后，如果body为空，直接组织成block；否则接着拿body 3 拿到body后跟header组织成block，然后插入到本地的leveldb 中间有一些小细节： 1 获取header或者body的时候会等一段时间（400ms、100ms）等收到若干个节点广播的hash， 然后随机选一个去获取，这也是网络负载均衡的设计；代价就是要等一段时间才能同步完成一个区块 2 防Dos攻击：会记录同一个节点同时有多少hash在处理，如果大于给定的256就认为是节点在Dos攻击 Fetcher和downloader的区别 看完了fetcher和downloader的代码就知道了二者的区别： 1 downloader是用来当本地与其他节点相差太多的时候同步到最新的区块 2 fetcher是收到其他节点广播的新区块hashes后去获取这些给定的区块的 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/06/0b54c93b342af2b9554dcb68aee22845.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/06/0b54c93b342af2b9554dcb68aee22845.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-06T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊节点广播block的时候一部分节点广播整个block内容，其余节点广播block的hash， 本篇分析一下节点收到block hash后的处理 收到NewBlockHash eth/handler.go中收到NewBlockHashesMsg消息，看代码的处理： case msg.Code == NewBlockHashesMsg: &nbsp;&nbsp;&nbsp;&nbsp;var announces newBlockHashesData &nbsp;&nbsp;&nbsp;&nbsp;if err := msg.Decode(&amp;announces); err != nil { return errResp(ErrDecode, &quot;%v: %v&quot;, msg, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Mark the hashes as present at the remote node &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { p.MarkBlock(block.Hash) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Schedule all the unknown hashes for retrieval &nbsp;&nbsp;&nbsp;&nbsp;unknown := make(newBlockHashesData, 0, len(announces)) &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces { &nbsp;&nbsp;&nbsp;&nbsp;if !pm.blockchain.HasBlock(block.Hash, block.Number) { &nbsp;&nbsp;&nbsp;&nbsp;unknown = append(unknown, block) } &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;for _, block := range unknown { pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestOneHeader, p.RequestBodies) &nbsp;&nbsp;&nbsp;&nbsp;} 收到消息后： 1 遍历收到的block hashes，mark下对端节点拥有此block 2 再遍历收到的hashes，与本地对比看是否已有该block，没有的append到unknown 3 遍历unknown，然后调用fetcher的Notify，带hash，block num，request header函数和request body函数 func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time, headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error { block := &amp;announce{ hash: hash, number: number, time: time, origin: peer, fetchHeader: headerFetcher, fetchBodies: bodyFetcher, } select { case f.notify &lt;- block: return nil case &lt;-f.quit: return errTerminated } } Notify做的事情也很简单，new了一个announce结构，然后写到channel notify，实现了notify的作用，想必是有个地方一直在监听notify channel做事情，找到监听notify的地方 Fetcher获取header和body （代码比较长，暂时先贴着了，要么分段帖也不好贴） func (f *Fetcher) loop() { // Iterate the block fetching until a quit is requested fetchTimer := time.NewTimer(0) completeTimer := time.NewTimer(0) for { // Clean up any expired block fetches for hash, announce := range f.fetching { if time.Since(announce.time) &gt; fetchTimeout { f.forgetHash(hash) } } // Import any queued blocks that could potentially fit height := f.chainHeight() for !f.queue.Empty() { op := f.queue.PopItem().(*inject) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), false) } // If too high up the chain or phase, continue later number := op.block.NumberU64() if number &gt; height+1 { f.queue.Push(op, -float32(op.block.NumberU64())) if f.queueChangeHook != nil { f.queueChangeHook(op.block.Hash(), true) } break } // Otherwise if fresh and still unknown, try and import hash := op.block.Hash() if number+maxUncleDist &lt; height || f.getBlock(hash) != nil { f.forgetBlock(hash) continue } f.insert(op.origin, op.block) } // Wait for an outside event to occur select { case &lt;-f.quit: // Fetcher terminating, abort all operations return case notification := &lt;-f.notify: // A block was announced, make sure the peer isn&#39;t DOSing us propAnnounceInMeter.Mark(1) count := f.announces[notification.origin] + 1 if count &gt; hashLimit { log.Debug(&quot;Peer exceeded outstanding announces&quot;, &quot;peer&quot;, notification.origin, &quot;limit&quot;, hashLimit) propAnnounceDOSMeter.Mark(1) break } // If we have a valid block number, check that it&#39;s potentially useful if notification.number &gt; 0 { if dist := int64(notification.number) - int64(f.chainHeight()); dist &lt; -maxUncleDist || dist &gt; maxQueueDist { log.Debug(&quot;Peer discarded announcement&quot;, &quot;peer&quot;, notification.origin, &quot;number&quot;, notification.number, &quot;hash&quot;, notification.hash, &quot;distance&quot;, dist) propAnnounceDropMeter.Mark(1) break } } // All is well, schedule the announce if block&#39;s not yet downloading if _, ok := f.fetching[notification.hash]; ok { break } if _, ok := f.completing[notification.hash]; ok { break } f.announces[notification.origin] = count f.announced[notification.hash] = append(f.announced[notification.hash], notification) if f.announceChangeHook != nil &amp;&amp; len(f.announced[notification.hash]) == 1 { f.announceChangeHook(notification.hash, true) } if len(f.announced) == 1 { f.rescheduleFetch(fetchTimer) } case op := &lt;-f.inject: // A direct block insertion was requested, try and fill any pending gaps propBroadcastInMeter.Mark(1) f.enqueue(op.origin, op.block) case hash := &lt;-f.done: // A pending import finished, remove all traces of the notification f.forgetHash(hash) f.forgetBlock(hash) case &lt;-fetchTimer.C: // At least one block&#39;s timer ran out, check for needing retrieval request := make(map[string][]common.Hash) for hash, announces := range f.announced { if time.Since(announces[0].time) &gt; arriveTimeout-gatherSlack { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for fetching if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.fetching[hash] = announce } } } // Send out all block header requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled headers&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread fetchHeader, hashes := f.fetching[hashes[0]].fetchHeader, hashes go func() { if f.fetchingHook != nil { f.fetchingHook(hashes) } for _, hash := range hashes { headerFetchMeter.Mark(1) fetchHeader(hash) // Suboptimal, but protocol doesn&#39;t allow batch header retrievals } }() } // Schedule the next fetch if blocks are still pending f.rescheduleFetch(fetchTimer) case &lt;-completeTimer.C: // At least one header&#39;s timer ran out, retrieve everything request := make(map[string][]common.Hash) for hash, announces := range f.fetched { // Pick a random peer to retrieve from, reset all others announce := announces[rand.Intn(len(announces))] f.forgetHash(hash) // If the block still didn&#39;t arrive, queue for completion if f.getBlock(hash) == nil { request[announce.origin] = append(request[announce.origin], hash) f.completing[hash] = announce } } // Send out all block body requests for peer, hashes := range request { log.Trace(&quot;Fetching scheduled bodies&quot;, &quot;peer&quot;, peer, &quot;list&quot;, hashes) // Create a closure of the fetch and schedule in on a new thread if f.completingHook != nil { f.completingHook(hashes) } bodyFetchMeter.Mark(int64(len(hashes))) go f.completing[hashes[0]].fetchBodies(hashes) } // Schedule the next fetch if blocks are still pending f.rescheduleComplete(completeTimer) case filter := &lt;-f.headerFilter: // Headers arrived from a remote peer. Extract those that were explicitly // requested by the fetcher, and return everything else so it&#39;s delivered // to other parts of the system. var task *headerFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } headerFilterInMeter.Mark(int64(len(task.headers))) // Split the batch of headers into unknown ones (to return to the caller), // known incomplete ones (requiring body retrievals) and completed blocks. unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{} for _, header := range task.headers { hash := header.Hash() // Filter fetcher-requested headers from other synchronisation algorithms if announce := f.fetching[hash]; announce != nil &amp;&amp; announce.origin == task.peer &amp;&amp; f.fetched[hash] == nil &amp;&amp; f.completing[hash] == nil &amp;&amp; f.queued[hash] == nil { // If the delivered header does not match the promised number, drop the announcer if header.Number.Uint64() != announce.number { log.Trace(&quot;Invalid block number fetched&quot;, &quot;peer&quot;, announce.origin, &quot;hash&quot;, header.Hash(), &quot;announced&quot;, announce.number, &quot;provided&quot;, header.Number) f.dropPeer(announce.origin) f.forgetHash(hash) continue } // Only keep if not imported by other means if f.getBlock(hash) == nil { announce.header = header announce.time = task.time // If the block is empty (header only), short circuit into the final import queue if header.TxHash == types.DeriveSha(types.Transactions{}) &amp;&amp; header.UncleHash == types.CalcUncleHash([]*types.Header{}) { log.Trace(&quot;Block empty, skipping body retrieval&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) block := types.NewBlockWithHeader(header) block.ReceivedAt = task.time complete = append(complete, block) f.completing[hash] = announce continue } // Otherwise add to the list of blocks needing completion incomplete = append(incomplete, announce) } else { log.Trace(&quot;Block already imported, discarding header&quot;, &quot;peer&quot;, announce.origin, &quot;number&quot;, header.Number, &quot;hash&quot;, header.Hash()) f.forgetHash(hash) } } else { // Fetcher doesn&#39;t know about it, add to the return list unknown = append(unknown, header) } } headerFilterOutMeter.Mark(int64(len(unknown))) select { case filter &lt;- &amp;headerFilterTask{headers: unknown, time: task.time}: case &lt;-f.quit: return } // Schedule the retrieved headers for body completion for _, announce := range incomplete { hash := announce.header.Hash() if _, ok := f.completing[hash]; ok { continue } f.fetched[hash] = append(f.fetched[hash], announce) if len(f.fetched) == 1 { f.rescheduleComplete(completeTimer) } } // Schedule the header-only blocks for import for _, block := range complete { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } case filter := &lt;-f.bodyFilter: // Block bodies arrived, extract any explicitly requested blocks, return the rest var task *bodyFilterTask select { case task = &lt;-filter: case &lt;-f.quit: return } bodyFilterInMeter.Mark(int64(len(task.transactions))) blocks := []*types.Block{} for i := 0; i &lt; len(task.transactions) &amp;&amp; i &lt; len(task.uncles); i++ { // Match up a body to any possible completion request matched := false for hash, announce := range f.completing { if f.queued[hash] == nil { txnHash := types.DeriveSha(types.Transactions(task.transactions[i])) uncleHash := types.CalcUncleHash(task.uncles[i]) if txnHash == announce.header.TxHash &amp;&amp; uncleHash == announce.header.UncleHash &amp;&amp; announce.origin == task.peer { // Mark the body matched, reassemble if still unknown matched = true if f.getBlock(hash) == nil { block := types.NewBlockWithHeader(announce.header).WithBody(task.transactions[i], task.uncles[i]) block.ReceivedAt = task.time blocks = append(blocks, block) } else { f.forgetHash(hash) } } } } if matched { task.transactions = append(task.transactions[:i], task.transactions[i+1:]...) task.uncles = append(task.uncles[:i], task.uncles[i+1:]...) i-- continue } } bodyFilterOutMeter.Mark(int64(len(task.transactions))) select { case filter &lt;- task: case &lt;-f.quit: return } // Schedule the retrieved blocks for ordered import for _, block := range blocks { if announce := f.completing[block.Hash()]; announce != nil { f.enqueue(announce.origin, block) } } } } } 加入hash到announced 果然这里有个loop（），内部是一个for循环，在监听读取一些channel的数据 1 判断f.announces map内从对端peer发来的hash个数是否大于hashLimit（256），如果大于，那么对端peer可能在Dos攻击，break出去 2 判断block的num与自身chain高度的差值，如果小于-maxUncleDist（7）或者大于maxQueueDist（32），也break出去 3 判断是否在f.fetching，如果是break 4 判断是否在f.completing，如果是break 5 加入到f.announced,&nbsp;f.announces加1（此个数用来判断节点是否在Dos攻击） 6 一旦f.announced有元素了，就开始rescheduleFetch(fetchTimer)，内容是reset下fetchTimer，遍历announced中的条目，拿到最早的时间，然后reset fetchTimer为500ms减去最早的条目加入到announced后耗费的时间，目的是让fetchTimer尽快执行而又不浪费资源空转 获取headers 所以接下来看f.announced的处理在哪里 还在本函数中，case &lt;- fetchTimer.C 这个timer一直在跑，每次跑完会reset一下，刚刚上面有讲过它的原理 1 遍历f.announced中的announce，对于同一个block的hash，可能有若干个节点广播过来 &nbsp; &nbsp; if time.Since(announces[0].time) &gt; arriveTimeOut(500ms) - gatherSlack(100ms) 这里判断最早加入的hash的时间要大于400ms（500-100）才去处理，这个逻辑应该是为了等够一定的时间积攒一些节点广播同一个block然后随机挑选一个节点去同步，避免所有节点都向源节点同步造成源节点网络拥堵 把这些要请求的加入到request map内 同时把此hash从f.announced中移除并加入到f.fetching map内 2 遍历request map，启动goroutine去获取指定hash的block header，有几个header就几个goroutine 然后等待对端节点返回header 返回headers 还在本loop（）函数内，返回header是写入到channel f.headerFilter 1 遍历处理收到的headers，从f.fetching内拿到anounce（上一步放入到该map内），并且返回的peer也是获取的peer，不在fetched内，不在completing内，不在queued内才通过判断；否则加入unkonwn map内 2 如果不是要获取的高度的block header，continue 3 如果block是空的：既没有tx也没有uncle，那么直接组成block然后加入到complete map内并且加入f.completing，否则加入到incomplete map内 4 把unkonwn放入到filter处理一下（具体怎么处理再看一下） 5 遍历incomplete map，然后放入到f.fetched map内，表示拿到了header还需要继续拿body。同时rescheduleComplete（），同上面的rescheduleFetch，尽快取block，时间不大于100ms 6 遍历complete map，调用f.enqueue()，目的就是把完成的block加入到f.queued内，处理等后面拿到body一起说下 获取bodies 上面拿到header后把hash加入到f.fetched map内，接着拿body 还是在本loop（）内，等completeTimer到达：case &lt;-completeTimer.C 1 遍历f.fetched，随机选一个去获取body 2 把hash加入到f.completing map内和request内 3 遍历request，启动gorountine去对端节点获取body内容 返回bodies 对端节点处理完返回对应的body后， 还是写入到本loop（）内的channel f.bodyFilter:&nbsp; 1 遍历收到的tx和uncle 2 如果hash不在f.queued（没有处理完成），并且判断收到的tx hash、unclue hash、peer与completing中的一致就加入到blocks map内 3遍历blocks，调用f.enqueue()加入到f.queue 处理完成 接着处理f.queue map，还是在本loop（）内循环处理的 如果f.queue不为空pop一个出来：f.queue.PopItem()，经过简单的check，f.insert（）加入到本地 func (f *Fetcher) insert(peer string, block *types.Block) { hash := block.Hash() // Run the import on a new thread log.Debug(&quot;Importing propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) go func() { defer func() { f.done &lt;- hash }() // If the parent&#39;s unknown, abort insertion parent := f.getBlock(block.ParentHash()) if parent == nil { log.Debug(&quot;Unknown parent of propagated block&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;parent&quot;, block.ParentHash()) return } // Quickly validate the header and propagate the block if it passes switch err := f.verifyHeader(block.Header()); err { case nil: // All ok, quickly propagate to our peers propBroadcastOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, true) case consensus.ErrFutureBlock: // Weird future block, don&#39;t fail, but neither propagate default: // Something went very wrong, drop the peer log.Debug(&quot;Propagated block verification failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) f.dropPeer(peer) return } // Run the actual import and log any issues if _, err := f.insertChain(types.Blocks{block}); err != nil { log.Debug(&quot;Propagated block import failed&quot;, &quot;peer&quot;, peer, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash, &quot;err&quot;, err) return } // If import succeeded, broadcast the block propAnnounceOutTimer.UpdateSince(block.ReceivedAt) go f.broadcastBlock(block, false) // Invoke the testing hook if needed if f.importedHook != nil { f.importedHook(block) } }() } 启动gorountine插入到本地： 1 先VerifyHeader，通过后广播block到若干节点 2 f.insertChain()就是写入到本地的leveldb 3 插入成功后，广播block hash到其他节点 有人要问了，为什么广播hash放在最后呢，要做到尽快广播到全网是不是放在1也可以： 1是广播整个区块，3是广播hash，只有等2插入到本地后，3广播出去后，别的节点来获取自己才有东西给别人，这也是3放在2后面的原因 不过其实也是可以放在第1步，只是这么做的话需要做另外的处理，不利于代码的统一性 总结 自此就分析完了节点收到blockhash后的处理，大致如下： 1 交给fetcher处理，先去拿header 2 等拿到header后，如果body为空，直接组织成block；否则接着拿body 3 拿到body后跟header组织成block，然后插入到本地的leveldb 中间有一些小细节： 1 获取header或者body的时候会等一段时间（400ms、100ms）等收到若干个节点广播的hash， 然后随机选一个去获取，这也是网络负载均衡的设计；代价就是要等一段时间才能同步完成一个区块 2 防Dos攻击：会记录同一个节点同时有多少hash在处理，如果大于给定的256就认为是节点在Dos攻击 Fetcher和downloader的区别 看完了fetcher和downloader的代码就知道了二者的区别： 1 downloader是用来当本地与其他节点相差太多的时候同步到最新的区块 2 fetcher是收到其他节点广播的新区块hashes后去获取这些给定的区块的 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/06/0b54c93b342af2b9554dcb68aee22845.html","headline":"以太坊之Fetcher(收到BlockHash的处理)","dateModified":"2018-06-06T00:00:00+08:00","datePublished":"2018-06-06T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/06/0b54c93b342af2b9554dcb68aee22845.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊之Fetcher(收到BlockHash的处理)</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>以太坊节点广播block的时候一部分节点广播整个block内容，其余节点广播block的hash，</p>
+  <p>本篇分析一下节点收到block hash后的处理</p>
+  <h2>收到NewBlockHash</h2>
+  <p>eth/handler.go中收到NewBlockHashesMsg消息，看代码的处理：</p>
+  <pre><code class="language-plain">case msg.Code == NewBlockHashesMsg:
+&nbsp;&nbsp;&nbsp;&nbsp;var announces newBlockHashesData
+&nbsp;&nbsp;&nbsp;&nbsp;if err := msg.Decode(&amp;announces); err != nil {
+	return errResp(ErrDecode, "%v: %v", msg, err)
+&nbsp;&nbsp;&nbsp;&nbsp;}
+&nbsp;&nbsp;&nbsp;&nbsp;// Mark the hashes as present at the remote node
+&nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces {
+	p.MarkBlock(block.Hash)
+&nbsp;&nbsp;&nbsp;&nbsp;}
+&nbsp;&nbsp;&nbsp;&nbsp;// Schedule all the unknown hashes for retrieval
+&nbsp;&nbsp;&nbsp;&nbsp;unknown := make(newBlockHashesData, 0, len(announces))
+&nbsp;&nbsp;&nbsp;&nbsp;for _, block := range announces {
+&nbsp;&nbsp;&nbsp;&nbsp;if !pm.blockchain.HasBlock(block.Hash, block.Number) {
+	&nbsp;&nbsp;&nbsp;&nbsp;unknown = append(unknown, block)
+	}
+&nbsp;&nbsp;&nbsp;&nbsp;}
+&nbsp;&nbsp;&nbsp;&nbsp;for _, block := range unknown {
+	pm.fetcher.Notify(p.id, block.Hash, block.Number, time.Now(), p.RequestOneHeader, p.RequestBodies)
+&nbsp;&nbsp;&nbsp;&nbsp;}</code></pre>
+  <p>收到消息后：</p>
+  <p>1 遍历收到的block hashes，mark下对端节点拥有此block</p>
+  <p>2 再遍历收到的hashes，与本地对比看是否已有该block，没有的append到unknown</p>
+  <p>3 遍历unknown，然后调用fetcher的Notify，带hash，block num，request header函数和request body函数</p>
+  <pre><code class="language-plain">func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time,
+	headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error {
+	block := &amp;announce{
+		hash:        hash,
+		number:      number,
+		time:        time,
+		origin:      peer,
+		fetchHeader: headerFetcher,
+		fetchBodies: bodyFetcher,
+	}
+	select {
+	case f.notify &lt;- block:
+		return nil
+	case &lt;-f.quit:
+		return errTerminated
+	}
+}</code></pre>
+  <p>Notify做的事情也很简单，new了一个announce结构，然后写到channel notify，实现了notify的作用，想必是有个地方一直在监听notify channel做事情，找到监听notify的地方</p>
+  <h1>Fetcher获取header和body</h1>
+  <p>（代码比较长，暂时先贴着了，要么分段帖也不好贴）</p>
+  <pre><code class="language-plain">func (f *Fetcher) loop() {
+	// Iterate the block fetching until a quit is requested
+	fetchTimer := time.NewTimer(0)
+	completeTimer := time.NewTimer(0)
+
+	for {
+		// Clean up any expired block fetches
+		for hash, announce := range f.fetching {
+			if time.Since(announce.time) &gt; fetchTimeout {
+				f.forgetHash(hash)
+			}
+		}
+		// Import any queued blocks that could potentially fit
+		height := f.chainHeight()
+		for !f.queue.Empty() {
+			op := f.queue.PopItem().(*inject)
+			if f.queueChangeHook != nil {
+				f.queueChangeHook(op.block.Hash(), false)
+			}
+			// If too high up the chain or phase, continue later
+			number := op.block.NumberU64()
+			if number &gt; height+1 {
+				f.queue.Push(op, -float32(op.block.NumberU64()))
+				if f.queueChangeHook != nil {
+					f.queueChangeHook(op.block.Hash(), true)
+				}
+				break
+			}
+			// Otherwise if fresh and still unknown, try and import
+			hash := op.block.Hash()
+			if number+maxUncleDist &lt; height || f.getBlock(hash) != nil {
+				f.forgetBlock(hash)
+				continue
+			}
+			f.insert(op.origin, op.block)
+		}
+		// Wait for an outside event to occur
+		select {
+		case &lt;-f.quit:
+			// Fetcher terminating, abort all operations
+			return
+
+		case notification := &lt;-f.notify:
+			// A block was announced, make sure the peer isn't DOSing us
+			propAnnounceInMeter.Mark(1)
+
+			count := f.announces[notification.origin] + 1
+			if count &gt; hashLimit {
+				log.Debug("Peer exceeded outstanding announces", "peer", notification.origin, "limit", hashLimit)
+				propAnnounceDOSMeter.Mark(1)
+				break
+			}
+			// If we have a valid block number, check that it's potentially useful
+			if notification.number &gt; 0 {
+				if dist := int64(notification.number) - int64(f.chainHeight()); dist &lt; -maxUncleDist || dist &gt; maxQueueDist {
+					log.Debug("Peer discarded announcement", "peer", notification.origin, "number", notification.number, "hash", notification.hash, "distance", dist)
+					propAnnounceDropMeter.Mark(1)
+					break
+				}
+			}
+			// All is well, schedule the announce if block's not yet downloading
+			if _, ok := f.fetching[notification.hash]; ok {
+				break
+			}
+			if _, ok := f.completing[notification.hash]; ok {
+				break
+			}
+			f.announces[notification.origin] = count
+			f.announced[notification.hash] = append(f.announced[notification.hash], notification)
+			if f.announceChangeHook != nil &amp;&amp; len(f.announced[notification.hash]) == 1 {
+				f.announceChangeHook(notification.hash, true)
+			}
+			if len(f.announced) == 1 {
+				f.rescheduleFetch(fetchTimer)
+			}
+
+		case op := &lt;-f.inject:
+			// A direct block insertion was requested, try and fill any pending gaps
+			propBroadcastInMeter.Mark(1)
+			f.enqueue(op.origin, op.block)
+
+		case hash := &lt;-f.done:
+			// A pending import finished, remove all traces of the notification
+			f.forgetHash(hash)
+			f.forgetBlock(hash)
+
+		case &lt;-fetchTimer.C:
+			// At least one block's timer ran out, check for needing retrieval
+			request := make(map[string][]common.Hash)
+
+			for hash, announces := range f.announced {
+				if time.Since(announces[0].time) &gt; arriveTimeout-gatherSlack {
+					// Pick a random peer to retrieve from, reset all others
+					announce := announces[rand.Intn(len(announces))]
+					f.forgetHash(hash)
+
+					// If the block still didn't arrive, queue for fetching
+					if f.getBlock(hash) == nil {
+						request[announce.origin] = append(request[announce.origin], hash)
+						f.fetching[hash] = announce
+					}
+				}
+			}
+			// Send out all block header requests
+			for peer, hashes := range request {
+				log.Trace("Fetching scheduled headers", "peer", peer, "list", hashes)
+
+				// Create a closure of the fetch and schedule in on a new thread
+				fetchHeader, hashes := f.fetching[hashes[0]].fetchHeader, hashes
+				go func() {
+					if f.fetchingHook != nil {
+						f.fetchingHook(hashes)
+					}
+					for _, hash := range hashes {
+						headerFetchMeter.Mark(1)
+						fetchHeader(hash) // Suboptimal, but protocol doesn't allow batch header retrievals
+					}
+				}()
+			}
+			// Schedule the next fetch if blocks are still pending
+			f.rescheduleFetch(fetchTimer)
+
+		case &lt;-completeTimer.C:
+			// At least one header's timer ran out, retrieve everything
+			request := make(map[string][]common.Hash)
+
+			for hash, announces := range f.fetched {
+				// Pick a random peer to retrieve from, reset all others
+				announce := announces[rand.Intn(len(announces))]
+				f.forgetHash(hash)
+
+				// If the block still didn't arrive, queue for completion
+				if f.getBlock(hash) == nil {
+					request[announce.origin] = append(request[announce.origin], hash)
+					f.completing[hash] = announce
+				}
+			}
+			// Send out all block body requests
+			for peer, hashes := range request {
+				log.Trace("Fetching scheduled bodies", "peer", peer, "list", hashes)
+
+				// Create a closure of the fetch and schedule in on a new thread
+				if f.completingHook != nil {
+					f.completingHook(hashes)
+				}
+				bodyFetchMeter.Mark(int64(len(hashes)))
+				go f.completing[hashes[0]].fetchBodies(hashes)
+			}
+			// Schedule the next fetch if blocks are still pending
+			f.rescheduleComplete(completeTimer)
+
+		case filter := &lt;-f.headerFilter:
+			// Headers arrived from a remote peer. Extract those that were explicitly
+			// requested by the fetcher, and return everything else so it's delivered
+			// to other parts of the system.
+			var task *headerFilterTask
+			select {
+			case task = &lt;-filter:
+			case &lt;-f.quit:
+				return
+			}
+			headerFilterInMeter.Mark(int64(len(task.headers)))
+
+			// Split the batch of headers into unknown ones (to return to the caller),
+			// known incomplete ones (requiring body retrievals) and completed blocks.
+			unknown, incomplete, complete := []*types.Header{}, []*announce{}, []*types.Block{}
+			for _, header := range task.headers {
+				hash := header.Hash()
+
+				// Filter fetcher-requested headers from other synchronisation algorithms
+				if announce := f.fetching[hash]; announce != nil &amp;&amp; announce.origin == task.peer &amp;&amp; f.fetched[hash] == nil &amp;&amp; f.completing[hash] == nil &amp;&amp; f.queued[hash] == nil {
+					// If the delivered header does not match the promised number, drop the announcer
+					if header.Number.Uint64() != announce.number {
+						log.Trace("Invalid block number fetched", "peer", announce.origin, "hash", header.Hash(), "announced", announce.number, "provided", header.Number)
+						f.dropPeer(announce.origin)
+						f.forgetHash(hash)
+						continue
+					}
+					// Only keep if not imported by other means
+					if f.getBlock(hash) == nil {
+						announce.header = header
+						announce.time = task.time
+
+						// If the block is empty (header only), short circuit into the final import queue
+						if header.TxHash == types.DeriveSha(types.Transactions{}) &amp;&amp; header.UncleHash == types.CalcUncleHash([]*types.Header{}) {
+							log.Trace("Block empty, skipping body retrieval", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
+
+							block := types.NewBlockWithHeader(header)
+							block.ReceivedAt = task.time
+
+							complete = append(complete, block)
+							f.completing[hash] = announce
+							continue
+						}
+						// Otherwise add to the list of blocks needing completion
+						incomplete = append(incomplete, announce)
+					} else {
+						log.Trace("Block already imported, discarding header", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
+						f.forgetHash(hash)
+					}
+				} else {
+					// Fetcher doesn't know about it, add to the return list
+					unknown = append(unknown, header)
+				}
+			}
+			headerFilterOutMeter.Mark(int64(len(unknown)))
+			select {
+			case filter &lt;- &amp;headerFilterTask{headers: unknown, time: task.time}:
+			case &lt;-f.quit:
+				return
+			}
+			// Schedule the retrieved headers for body completion
+			for _, announce := range incomplete {
+				hash := announce.header.Hash()
+				if _, ok := f.completing[hash]; ok {
+					continue
+				}
+				f.fetched[hash] = append(f.fetched[hash], announce)
+				if len(f.fetched) == 1 {
+					f.rescheduleComplete(completeTimer)
+				}
+			}
+			// Schedule the header-only blocks for import
+			for _, block := range complete {
+				if announce := f.completing[block.Hash()]; announce != nil {
+					f.enqueue(announce.origin, block)
+				}
+			}
+
+		case filter := &lt;-f.bodyFilter:
+			// Block bodies arrived, extract any explicitly requested blocks, return the rest
+			var task *bodyFilterTask
+			select {
+			case task = &lt;-filter:
+			case &lt;-f.quit:
+				return
+			}
+			bodyFilterInMeter.Mark(int64(len(task.transactions)))
+
+			blocks := []*types.Block{}
+			for i := 0; i &lt; len(task.transactions) &amp;&amp; i &lt; len(task.uncles); i++ {
+				// Match up a body to any possible completion request
+				matched := false
+
+				for hash, announce := range f.completing {
+					if f.queued[hash] == nil {
+						txnHash := types.DeriveSha(types.Transactions(task.transactions[i]))
+						uncleHash := types.CalcUncleHash(task.uncles[i])
+
+						if txnHash == announce.header.TxHash &amp;&amp; uncleHash == announce.header.UncleHash &amp;&amp; announce.origin == task.peer {
+							// Mark the body matched, reassemble if still unknown
+							matched = true
+
+							if f.getBlock(hash) == nil {
+								block := types.NewBlockWithHeader(announce.header).WithBody(task.transactions[i], task.uncles[i])
+								block.ReceivedAt = task.time
+
+								blocks = append(blocks, block)
+							} else {
+								f.forgetHash(hash)
+							}
+						}
+					}
+				}
+				if matched {
+					task.transactions = append(task.transactions[:i], task.transactions[i+1:]...)
+					task.uncles = append(task.uncles[:i], task.uncles[i+1:]...)
+					i--
+					continue
+				}
+			}
+
+			bodyFilterOutMeter.Mark(int64(len(task.transactions)))
+			select {
+			case filter &lt;- task:
+			case &lt;-f.quit:
+				return
+			}
+			// Schedule the retrieved blocks for ordered import
+			for _, block := range blocks {
+				if announce := f.completing[block.Hash()]; announce != nil {
+					f.enqueue(announce.origin, block)
+				}
+			}
+		}
+	}
+}</code></pre>
+  <h2>加入hash到announced</h2>
+  <p>果然这里有个loop（），内部是一个for循环，在监听读取一些channel的数据</p>
+  <p>1 判断f.announces map内从对端peer发来的hash个数是否大于hashLimit（256），如果大于，那么对端peer可能在Dos攻击，break出去</p>
+  <p>2 判断block的num与自身chain高度的差值，如果小于-maxUncleDist（7）或者大于maxQueueDist（32），也break出去</p>
+  <p>3 判断是否在f.fetching，如果是break</p>
+  <p>4 判断是否在f.completing，如果是break</p>
+  <p>5 加入到f.announced,&nbsp;f.announces加1（此个数用来判断节点是否在Dos攻击）</p>
+  <p>6 一旦f.announced有元素了，就开始rescheduleFetch(fetchTimer)，内容是reset下fetchTimer，遍历announced中的条目，拿到最早的时间，然后reset fetchTimer为500ms减去最早的条目加入到announced后耗费的时间，目的是让fetchTimer尽快执行而又不浪费资源空转</p>
+  <h2>获取headers</h2>
+  <p>所以接下来看f.announced的处理在哪里</p>
+  <p>还在本函数中，case &lt;- fetchTimer.C</p>
+  <p>这个timer一直在跑，每次跑完会reset一下，刚刚上面有讲过它的原理</p>
+  <p>1 遍历f.announced中的announce，对于同一个block的hash，可能有若干个节点广播过来</p>
+  <p>&nbsp; &nbsp; if time.Since(announces[0].time) &gt; arriveTimeOut(500ms) - gatherSlack(100ms)<br></p>
+  <p>这里判断最早加入的hash的时间要大于400ms（500-100）才去处理，这个逻辑应该是为了等够一定的时间积攒一些节点广播同一个block然后随机挑选一个节点去同步，避免所有节点都向源节点同步造成源节点网络拥堵</p>
+  <p>把这些要请求的加入到request map内</p>
+  <p>同时把此hash从f.announced中移除并加入到f.fetching map内</p>
+  <p>2 遍历request map，启动goroutine去获取指定hash的block header，有几个header就几个goroutine</p>
+  <p>然后等待对端节点返回header</p>
+  <h2>返回headers</h2>
+  <p>还在本loop（）函数内，返回header是写入到channel f.headerFilter</p>
+  <p>1 遍历处理收到的headers，从f.fetching内拿到anounce（上一步放入到该map内），并且返回的peer也是获取的peer，不在fetched内，不在completing内，不在queued内才通过判断；否则加入unkonwn map内</p>
+  <p>2 如果不是要获取的高度的block header，continue</p>
+  <p>3 如果block是空的：既没有tx也没有uncle，那么直接组成block然后加入到complete map内并且加入f.completing，否则加入到incomplete map内</p>
+  <p>4 把unkonwn放入到filter处理一下（具体怎么处理再看一下）</p>
+  <p>5 遍历incomplete map，然后放入到f.fetched map内，表示拿到了header还需要继续拿body。同时rescheduleComplete（），同上面的rescheduleFetch，尽快取block，时间不大于100ms</p>
+  <p>6 遍历complete map，调用f.enqueue()，目的就是把完成的block加入到f.queued内，处理等后面拿到body一起说下</p>
+  <h2>获取bodies</h2>
+  <h2></h2>
+  <p>上面拿到header后把hash加入到f.fetched map内，接着拿body</p>
+  <p>还是在本loop（）内，等completeTimer到达：case &lt;-completeTimer.C</p>
+  <p>1 遍历f.fetched，随机选一个去获取body</p>
+  <p>2 把hash加入到f.completing map内和request内</p>
+  <p>3 遍历request，启动gorountine去对端节点获取body内容</p>
+  <h2>返回bodies</h2>
+  <h2></h2>
+  <p>对端节点处理完返回对应的body后， 还是写入到本loop（）内的channel f.bodyFilter:&nbsp;</p>
+  <p>1 遍历收到的tx和uncle</p>
+  <p>2 如果hash不在f.queued（没有处理完成），并且判断收到的tx hash、unclue hash、peer与completing中的一致就加入到blocks map内</p>
+  <p>3遍历blocks，调用f.enqueue()加入到f.queue</p>
+  <h2>处理完成</h2>
+  <p>接着处理f.queue map，还是在本loop（）内循环处理的</p>
+  <p>如果f.queue不为空pop一个出来：f.queue.PopItem()，经过简单的check，f.insert（）加入到本地</p>
+  <pre><code class="language-plain">func (f *Fetcher) insert(peer string, block *types.Block) {
+	hash := block.Hash()
+
+	// Run the import on a new thread
+	log.Debug("Importing propagated block", "peer", peer, "number", block.Number(), "hash", hash)
+	go func() {
+		defer func() { f.done &lt;- hash }()
+
+		// If the parent's unknown, abort insertion
+		parent := f.getBlock(block.ParentHash())
+		if parent == nil {
+			log.Debug("Unknown parent of propagated block", "peer", peer, "number", block.Number(), "hash", hash, "parent", block.ParentHash())
+			return
+		}
+		// Quickly validate the header and propagate the block if it passes
+		switch err := f.verifyHeader(block.Header()); err {
+		case nil:
+			// All ok, quickly propagate to our peers
+			propBroadcastOutTimer.UpdateSince(block.ReceivedAt)
+			go f.broadcastBlock(block, true)
+
+		case consensus.ErrFutureBlock:
+			// Weird future block, don't fail, but neither propagate
+
+		default:
+			// Something went very wrong, drop the peer
+			log.Debug("Propagated block verification failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
+			f.dropPeer(peer)
+			return
+		}
+		// Run the actual import and log any issues
+		if _, err := f.insertChain(types.Blocks{block}); err != nil {
+			log.Debug("Propagated block import failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
+			return
+		}
+		// If import succeeded, broadcast the block
+		propAnnounceOutTimer.UpdateSince(block.ReceivedAt)
+		go f.broadcastBlock(block, false)
+
+		// Invoke the testing hook if needed
+		if f.importedHook != nil {
+			f.importedHook(block)
+		}
+	}()
+}</code></pre>
+  <p>启动gorountine插入到本地：</p>
+  <p>1 先VerifyHeader，通过后广播block到若干节点</p>
+  <p>2 f.insertChain()就是写入到本地的leveldb</p>
+  <p>3 插入成功后，广播block hash到其他节点</p>
+  <p>有人要问了，为什么广播hash放在最后呢，要做到尽快广播到全网是不是放在1也可以：</p>
+  <p>1是广播整个区块，3是广播hash，只有等2插入到本地后，3广播出去后，别的节点来获取自己才有东西给别人，这也是3放在2后面的原因</p>
+  <p>不过其实也是可以放在第1步，只是这么做的话需要做另外的处理，不利于代码的统一性</p>
+  <h2>总结</h2>
+  <p>自此就分析完了节点收到blockhash后的处理，大致如下：</p>
+  <p>1 交给fetcher处理，先去拿header</p>
+  <p>2 等拿到header后，如果body为空，直接组织成block；否则接着拿body</p>
+  <p>3 拿到body后跟header组织成block，然后插入到本地的leveldb</p>
+  <p>中间有一些小细节：</p>
+  <p>1 获取header或者body的时候会等一段时间（400ms、100ms）等收到若干个节点广播的hash，</p>
+  <p>然后随机选一个去获取，这也是网络负载均衡的设计；代价就是要等一段时间才能同步完成一个区块</p>
+  <p>2 防Dos攻击：会记录同一个节点同时有多少hash在处理，如果大于给定的256就认为是节点在Dos攻击</p>
+  <h3>Fetcher和downloader的区别</h3>
+  <p>看完了fetcher和downloader的代码就知道了二者的区别：</p>
+  <p>1 downloader是用来当本地与其他节点相差太多的时候同步到最新的区块</p>
+  <p>2 fetcher是收到其他节点广播的新区块hashes后去获取这些给定的区块的</p>
+  <p><br></p>
+  <p><br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80595962,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80595962,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

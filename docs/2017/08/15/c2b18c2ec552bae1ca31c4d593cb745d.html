@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>fabric源码解析13——peer的BCCSP服务 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="fabric源码解析13——peer的BCCSP服务" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="fabric源码解析13——peer的BCCSP服务 加密的一般话题 加密涉及到了内容挺复杂的，是一门专业性很强的学科。笔者没有专门学过，在此只是略讲一些bccsp服务所涉及到的皮毛： RSA - 一种非对称的加密算法，用于加密。有几种族簇，如RSA1024，RSA2048等。 AES - 一种块加密算法，用于加密成块的大量数据。有几种族簇，如AES128，AES192等。 ECDSA - 一种椭圆曲线签名，用于签名。有几种族簇，如ECDSAP256，ECDSAP384等。 Hash - 哈希，有几种族簇，如SHA256，SHA3_256等。 HMAC - 密匙相关的哈希运算消息认证码。 x509 - 证书的一种，可参看文章12中对证书的解释。 PKCS#11 - 一套标准安全接口，可与安全硬件相关，以上的这些东西，可以找它来建立，读取，写入，修改，删除等操作进行管理。 fabric所用到的这些技术的常量名称在/fabric/bccsp/opts.go中开始的部分定义，如ECDSA支持ECDSAP256，ECDSAP384等几种类型。 BCCSP服务结构 BCCSP，是blockchain cryptographic service provider的缩写，个人译作区域链加密服务提供者，为fabric项目提供各种加密技术，签名技术，工具的性质很强，MSP服务模块中就使用到了BCCSP。这里需要说明的一点是，工具性强，也就说明了，如果不是想专门学这一领域，其实不用太在乎其实现的细节，只要用就行了。BCCSP服务的代码集中在/fabric/bccsp中，目录结构如下： mocks - 模拟代码文件夹，可以参看之帮助理解bccsp服务 signer - 实现的是crypto标准库的Signer接口，可参看文章12中MSP服务实现中带“专用签名笔”的身份signingidentity，该目录的签名接口是专用于向外界提供签名对象的功能的。 factory - bccsp服务工厂 pkcs11 - bccsp服务实现之一：HSM基础的bccsp（the hsm-based BCCSP implementation） sw - bccsp服务实现之二：软件基础的bccsp（the software-based implementation of the BCCSP） utils - bccsp服务工具函数 bccsp.go - 定义了BCCSP，Key接口，众多BCCSP接口所使用到的选项接口，如Key，KeyGenOpts，KeyDerivOpts等 keystore.go - 定义了key的管理存储接口，如果生成的key不是暂时的，则存储在该接口的实现对象中，如果是暂时性的，则不存储 XXXopts.go - XXX表示该目录下的各种值，bccsp服务实现所使用到的各种技术的选项实现 从以上可以看出bccsp服务有两种实现：pkcs11和sw。简单明了的解释的话（虽不太精准），就是pckcs11是硬件基础的加密服务实现，sw是软件基础的加密服务实现。这个硬件基础的实现以 https://github.com/miekg/pkcs11 这个库为基础，而HSM是Hardware Security Modules，即硬件安全模块的缩写。相对应的两种bccsp服务实现，这里有两种工厂，两种工厂为其他使用bccsp服务的模块提供了窗口函数（就是给其他模块提供窗口的函数，这些函数一般统一管理自己服务的功能模块，供外界调用，如后文所讲的InitFactories函数）。所有产生的bccsp实例存储在factory/factory.go中所定义的全局变量中。 bccsp中的接口和选项 接口 //在fabric/bccsp/bccsp.go中定义 type BCCSP interface { //根据key生成选项opts生成一个key //与key有关的选项opts选项要适合原始的key（与“证书是一级一级的认证”对看） KeyGen(opts KeyGenOpts) (k Key, err error) //根据key获取选项opts从k中重新获取一个key KeyDeriv(k Key, opts KeyDerivOpts) (dk Key, err error) //根据key导入选项opts从一个key原始的数据中导入一个key KeyImport(raw interface{}, opts KeyImportOpts) (k Key, err error) //根据SKI返回与该接口实例有联系的key GetKey(ski []byte) (k Key, err error) //根据哈希选项opts哈希一个消息msg，如果opts为空，则使用默认选项 Hash(msg []byte, opts HashOpts) (hash []byte, err error) //根据哈希选项opts获取hash.Hash实例，如果opts为空，则使用默认选项 GetHash(opts HashOpts) (h hash.Hash, err error) //根据签名者选项opts，使用k对digest进行签名，注意如果需要对一个特别大的消息的hash值 //进行签名，调用者则负责对该特别大的消息进行hash后将其作为digest传入 Sign(k Key, digest []byte, opts SignerOpts) (signature []byte, err error) //根据鉴定者选项opts，通过对比k和digest，鉴定签名 Verify(k Key, signature, digest []byte, opts SignerOpts) (valid bool, err error) //根据加密者选项opts，使用k加密plaintext Encrypt(k Key, plaintext []byte, opts EncrypterOpts) (ciphertext []byte, err error) //根据解密者选项opts，使用k对ciphertext进行解密 Decrypt(k Key, ciphertext []byte, opts DecrypterOpts) (plaintext []byte, err error) } 选项 bccsp文件夹中任何带opt字眼的文件，都是和选项有关的源码。关于对象的配套选项，我们在讲MSP服务的时候就见识过。根据一个选项的不同配置，对象主体可以得到不同的数据或进行不同的操作，这也是一种比较值得学习的语言上的组织技巧。尤其是在bccsp这种涉及的技术比较多，而每个对象自身又分为好多类的情况。在此以哈希选项HashOpts和key导入选项KeyImportOpts作为例子进行说明： //在/fabric/bccsp/bccsp.go中定义 //哈希选项接口 type HashOpts interface { Algorithm() string //获取hash算法字符串标识，如&quot;SHA256&quot;，&quot;SHA3_256&quot; } //在/fabric/bccsp/hashopts.go中定义 //哈希选项实现之一，SHA256选项 type SHA256Opts struct { } func (opts *SHA256Opts) Algorithm() string { return SHA256 } //哈希选项实现之二，SHA384选项 type SHA384Opts struct { } func (opts *SHA384Opts) Algorithm() string { return SHA384 } -------------------------------------------------- //在/fabric/bccsp/bccsp.go中定义 //key导入选项接口 type KeyImportOpts interface { Algorithm() string //返回key导入算法字符串标识 Ephemeral() bool //如果生成的key是短暂的（ephemeral），返回true，否则返回false } //在/fabric/bccsp/opts.go中定义 //key导入选项接口实现之一，ECDSA公匙的导入选项 type ECDSAPKIXPublicKeyImportOpts struct { Temporary bool } func (opts *ECDSAPKIXPublicKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPKIXPublicKeyImportOpts) Ephemeral() bool { return opts.Temporary } //key导入选项接口实现之二，ECDSA私匙的导入选项 type ECDSAPrivateKeyImportOpts struct { Temporary bool } func (opts *ECDSAPrivateKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPrivateKeyImportOpts) Ephemeral() bool { return opts.Temporary } //比较特殊的，比如签名选项接口SignerOpts //由于因为使用的标准库，因此使用到此选项时多赋值为nil，bccsp源码中未实现 SW实现方式 BCCSP的SoftWare（SW）实现形式是默认的形式，这点仅从/fabric/bccsp/factory/opts.go中工厂的默认选项DefaultOpts和核心配置文档中关于bccsp的配置就可以看出来。主要使用的包是标准库hash和crypto（包括其中的各种包，如aes，rsa，ecdsa，sha256，elliptic，x509等）。 目录结构： /fabric/bccsp/sw impl.go - bccsp的sw实现impl internals.go - 签名者、鉴定者、加密者、解密者接口定义 conf.go - bccsp的sw实现的配置定义 ———————————————————————– aes.go - aes类型的生成key函数、加密者/解密者实现 ecdsa.go - ecdsa类型的签名者、公匙/私匙鉴定者实现 rsa.go - rsa类型的签名者、公匙/私匙鉴定者实现 ———————————————————————– aeskey.go - aes类型的Key接口实现 ecdsakey.go - ecdsa类型的Key接口实现 rsakey.go - rsa类型的Key接口实现 ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现dummyKeyStore，当生成的key是短暂的，则说明这些key不会保存到文件中，而是保存到内存中，系统一关闭，这些key就消失了 fileks.go - file类型的KeyStore接口实现fileBasedKeyStore，当生成的key不是短暂的，则说明这些key在导入时，会存储在文件中，即便系统关闭，这些key也不会消失 BCCSP接口实现： //在/fabric/bccsp/sw/impl.go中定义 //SW bccsp的实例结构体 type impl struct { conf *config //bccsp实例的配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 encryptors map[reflect.Type]Encryptor //加密者映射 decryptors map[reflect.Type]Decryptor //解密者映射 signers map[reflect.Type]Signer //签名者映射，Key实现的类型作为映射的键 verifiers map[reflect.Type]Verifier //鉴定者映射，Key实现的类型作为映射的键 } //专用生成函数 func New(...) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, ...) { ... } ... 粗线条上看，由于impl对象和各种操作选项的存在，绝大部分接口的实现都是以switch-case为主干，根据选项的类型或配置，分情况完成功能，且每个分支的操作基本都很类似，如KeyGen。接下来一一介绍： KeyGen - 根据key生成选项不同，生成三种系列的key：ECDSA，AES，RSA。ECDSA使用库ecdsa的GenerateKey函数，AES使用自定义的GetRandomBytes函数（在aes.go中实现，包装了rand.Read），RSA使用库rsa的GenerateKey函数。每个系列又根据具体参数的不同生成不同“尺寸”的key，具体的细节略过。最后返回不同的Key实现对象，如ecdsaPrivateKey，aesPrivateKey等（分别定义在同目录中的XXXkey.go中）。这里要注意的是，当前版本中用于签名的key，只支持ECDSA系列的key，这是官方文档中所说的，但是从实现上看签名的支持不止一种，又但是，bccsp本质上无论实现多上中key，也只有被调用者决定使用哪一种。而MSP模块是bccsp的使用者之一，应该是在它这个地方只认ECDSA的key。 KeyDeriv - 根据key获取选项opts从k中重新获取一个key，这里的重新获取可以理解为把k中的内容重新打乱再生成一个key。处理两种key类型：ecdsaXXXKey（XXX代表Public和Private），aesPrivateKey。最后返回打乱后重新生成的两种类型的key：reRandomizedKey和hmacedKey。对于重新生成的key，如果选项中指定的不是暂时性的key，则会在ks中存储。 KeyImport - 从原始的数据raw中取出选项opts指定的key，如果不是临时性的，则在ks中存储，最后返回key。这里的原始，指的是[]byte或者含有key的数据（如证书数据里的key）。raw是一个空接口，也就是说可以接收任何形式的原始数据。为了得到key，对原始数据raw的转化或抽取，一部分使用了utils下的工具函数utils.Clone和utils.DERToPublicKey，如AES256，ECDSAPrivateKey等类型的key；一部分直接用go语言的断言raw.(*Key类型)，如ECDSAGoPublicKey，RSAGoPublicKey等类型的key。 Hash - 根据哈希选项opts对一个消息msg进行哈希，返回该msg的哈希值。如果opts为空，则使用默认选项。这个比较好理解，种类支持SHA2，SHA3哈希家族。 Sign - 根据签名者选项，使用k对digest进行签名，这里的签名者选项在当前版本里没什么用处，调用者都给的是nil。签名涉及到了Key接口和签名者Signer在SW bccsp中的实现。Key接口有三种实现：ecdsakey.go中的ecdsaPublicKey/ecdsaPrivateKey，rsakey.go中的rsaPublicKey/rsaPrivateKey，aeskey.go中的aesPrivateKey，这里签名（自然）使用的都是私匙。签名者接口Signer定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaSigner和rsa.go中的rsaSigner。参看SW bccsp专用生成函数New的signers赋值部分，可知用到了两种对应类型的Key和Signer：ecdsaPrivateKey - ecdsaSigner和rsaPrivateKey - rsaSigner。这里签名的实现是，从该bccsp实例的签名者集合成员signers获取类型为reflect.TypeOf(k)的签名者signer，然后直接调用signer的接口Sign，追溯，ecdsaSigner使用ecdsa库的Sign函数，rsaSigner使用rsa库PrivateKey结构体的Sign函数。 Verify - 根据鉴定者选项opts，通过对比k和digest，鉴定签名。鉴定涉及到了Key接口和鉴定者接口Verifier在SW bccsp中的实现。Key接口实现如上描述。鉴定者接口Verifier定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaPublicKeyKeyVerifier/ecdsaPrivateKeyVerifier和rsa.go中的rsaPublicKeyKeyVerifier/rsaPrivateKeyVerifier。参看SW bccsp专用生成函数New的verifiers赋值部分，可知所有鉴定者（与对应的Key接口实现）都有用到。这里鉴定的实现是，从该bccsp实例的鉴定者集合成员verifiers获取类型为reflect.TypeOf(k)的鉴定者verifier，然后直接调用verifier的接口Verify，追溯，ecdsaXXXKeyVerifier使用ecdsa库的Verify函数，rsaXXXKeyVerifier使用rsa库的VerifyPSS函数（这里XXX表示PublicKey或Private）。 Encrypt - 根据加密者选项opts，使用k**加密plaintext。加密涉及到了**Key接口和加密者接口Encryptor在SW bccsp中的实现。Key接口实现如上描述。加密者接口Encryptor定义在同目录下的internals.go中，在aes.go中实现（只能是aes，因为只有aes是用来加密的）：aescbcpkcs7Encryptor。参看SW bccsp专用生成函数New的encryptors赋值部分，只有aesPrivateKey - aescbcpkcs7Encryptor被使用。这里加密的实现是，从该bccsp实例的加密者集合成员encryptors获取类型为reflect.TypeOf(k)的加密者encryptor，然后直接调用encryptor的接口Encrypt，追溯，aescbcpkcs7Encryptor使用了aes库的加密流程进行加密。 Decrypt - 解密与加密类似，过程类似，也是只有aes配套实现，最终使用aes库解密流程进行解密。 GetXXX - GetXXX系列接口，获取实例对象中的数据，略。 在fabirc源码解析12——peer的MSP服务文中背书检验部分的第3、4点，涉及到了包含在msp中的bccsp对象成员，使用了bccsp对象的GetHashOpt、Hash、KeyImport、Verify等接口用以生成identities对象或identities自身一些接口实现。在此可以对看。 pkcs11实现方式 BCCSP的pkcs11实现形式主要使用到的库与sw实现如出一辙，但外加一个github.com/miekg/pkcs11库，最好参看其文档以熟悉pkcs11的简要操作。pkcs11（PKCS，Public-Key Cryptography Standards）是一套非常通用的接口标准，可以说这里是用pkcs11实现了bccsp的功能，也为fabric支持热插拔和个人安全硬件模块提供了服务。这点可以从bccsp的pkcs11的实现实例的专用生成函数New（参看下文）中所调用的loadLib函数可以看出来：loadLib加载了一个系统中的动态库，能加载系统的动态库，就可以和驱动、热插拔、连接电脑的字符设备联系在一起。比如将来，开发出了一款在区域链上类似于现在网上银行所用的U盾之类的个人身份或安全交易硬件模块或芯片，这些硬件模块或芯片只需要也遵循pkcs11，fabric即可对此进行支持和扩展。 对于pkcs11的所提供的接口，在此提供两个文档地址，读者可以稍作了解： https://www.ibm.com/developerworks/cn/security/s-pkcs/ ， http://docs.oracle.com/cd/E19253-01/819-7056/6n91eac56/index.html#chapter2-9 。这些文档与fabric和区域链无关，但是因为pkcs11是通用的接口，所以有一定参考价值。pkcs11库中的解释相对过于简单。 目录结构： /fabric/bccsp/pkcs11 impl.go - bccsp的pkcs11实现impl conf.go - 定义了bccsp服务的配置和PKCS11Opts、FileKeystoreOpts、DummyKeystoreOpts选项 pkcs11.go - 以pkcs11库为基础，包装各种pkcs11功能，实现了impl基于pkcs11的内调函数，和一些bccsp服务使用到的独立的内调函数 ———————————————————————– aes.go - 实现aes类型的生成key、加密、解密函数 ecdsa.go - 实现impl在ecdsa技术下的签名函数signECDSA和鉴定函数verifyECDSA ———————————————————————– aeskey.go - 实现aes类型的Key接口，只实现私匙aesPrivateKey ecdsakey.go - 实现ecdsa类型的Key接口，实现了公匙ecdsaPublicKey，私匙ecdsaPrivateKey rsakey.go - 实现了rsa类型的Key接口，实现了公匙rsaPublicKey，私匙rsaPrivateKey ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现DummyKeyStore fileks.go - file类型的KeyStore接口实现FileBasedKeyStore BCCSP接口实现： type impl struct { conf *config //配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 ctx *pkcs11.Ctx //标准库的pkcs11上下文 sessions chan pkcs11.SessionHandle //实质是uint，会话标识符频道，默认10个缓存 slot uint //安全硬件外设连接插槽标识号 lib string //加载库所在路径 noPrivImport bool //禁止导入私匙标识 softVerify bool //使用软件方式鉴定签名标识 } //专用生成函数 func New(opts PKCS11Opts, keyStore bccsp.KeyStore) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, err error) { ... } ... BCCSP的pkcs11实现的骨架在impl.go中与sw的实现基本一致，只是追溯到最终实现的语句时，sw实现是使用crypto库下的各个包进行签名，加密，密匙导入等，而pkcsll则用pkcs11包对数据进行了多一层的处理，使用pkcs11提供的上下文（pkcs11.Ctx）和会话（SessionHandle）之上对签名，密匙，加密等进行管理，这也是pkcs11.go文件的作用。两者最大的不同是一个面向软件，一个面向硬件，pkcs11自身又非常的冗杂，因此在此只讲pkcs11中与安全硬件模块建立连接的loadLib函数。 loadLib函数在pkcs11.go中定义，供专用生成函数New使用。为建立与安全硬件模块的通信，进行了如下步骤： 根据所给的系统动态库路径lib加载动态库（如openCryptoki的动态库），调用pkcs11.New(lib)建立pkcs11实例ctx。ctx相当于fabric与安全硬件模块通信的桥梁：bccsp&lt;–&gt;ctx&lt;–&gt;驱动lib&lt;–&gt;安全硬件模块，只要驱动lib是按照pkcs11标准开发。 ctx.Initialize()进行初始化。 从ctx.GetSlotList(true)返回的列表中获取由label指定的插槽标识slot（这里的槽可以简单的理解为电脑主机上供安全硬件模块插入的槽，如USB插口，可能不止一个，每一个在系统内核中都有名字和标识号）。 尝试10次调用ctx.OpenSession打开一个会话session（会话就是通过通信路径与安全硬件模块建立连接，可以简单的理解为pkcs11的chan）。 登陆会话ctx.Login。 返回ctx，slot，会话对象session，用于赋值给impl实例成员ctx，slot，把session发送到sessions里。 关于pkcs11，还有一点可说的，就是SoftHSM库，它是一个模拟硬件实现的pkcsll，对应到的系统动态库可参看impl.go中FindPKCS11Lib测试函数中所涉及的，如Linux下的libsofthsm2.so。现阶段是没有安全硬件模块可以配合测试的，所以只有使用SoftHSM模拟测试，将libsofthsm2.so导入pkcs11对象。 BCCSP工厂 对应两种bccsp实现，这里也有两种bccsp工厂：pkcs11factory.go和swfactory.go。fabric中某一模块一旦涉及工厂factory，则说明该模块基本就是由工厂提供“窗口函数”，供其他模块调用。这里以swfactory为例进行讲解。 目录结构： /fabric/bccsp/factory/ factory.go - 声明了默认bccsp实例defaultBCCSP，bccsp实例存储映射bccspMap等全局变量和这些变量的获取函数GetXXX，定义bccsp工厂接口。 nopkcs11.go/pkcs11.go - 定义了两种版本的工厂选项FactoryOpts，初始化工厂函数InitFactories和获取指定bccsp实例函数GetBCCSPFromOpts。nopkcs11是默认版本，可条件编译指定使用哪种版本（编译时加入nopkcs11或!nopkcs11选项）。两种版本的差异集中在是否使用pkcs11上。 opts.go - 定义了默认的工厂选项DefaultOpts。 pkcs11factory.go - pkcs11类型的bccsp工厂实现PKCS11Factory。 swfactory.go - sw类型的bccsp工厂实现SWFactory。还定义了sw版本的bccsp选项。 swfactory接口和实现： //在factory.go中定义 //接口 type BCCSPFactory interface { //返回工厂的名字 Name() string //返回符合工厂选项opts的bccsp实例 Get(opts *FactoryOpts) (bccsp.BCCSP, error) } //在swfactory.go中定义 //实现 type SWFactory struct{} func (f *SWFactory) Name() string { return SoftwareBasedFactoryName } func (f *SWFactory) Get(config *FactoryOpts) (bccsp.BCCSP, error) { ... } 实现的代码本身比较简单，Get最终是调用的sw的专用生成函数New来生成符合opts的bccsp实例。Name则是直接返回一个”SW”常量。 在每个chaincode例子中，如/fabric/examples/e2e_cli/examples/chaincode/go/chaincode_example02/chaincode_example02.go，都使用了chaincode垫片shim中的Start函数。不知道在fabirc源码解析7——peer的ChaincodeSupport服务文中是否说过，在此说一下，chaincode的“垫片”shim核心代码集中在/fabric/core/chaincode/shim中，该垫片所“承垫”的是与各个结点通信的任务，也即ChaincodeSupport服务。chaincode形成的通信的信息，通过shim分发到各个结点，然后shim负责从各个结点收集信息，汇总返回给chaincode，完成chaincode的功能。其中shim的Start函数就是用来启动一个chaincode，定义在/fabric/core/chaincode/shim/chaincode.go中。在Start的函数中，就调用了err := factory.InitFactories(&amp;factory.DefaultOpts)来初始化一个默认的bccsp工厂，在此可以知道，这里使用的默认工厂选项（参看opts.go），也就是使用的swfactory。 阅读更多" />
+<meta property="og:description" content="fabric源码解析13——peer的BCCSP服务 加密的一般话题 加密涉及到了内容挺复杂的，是一门专业性很强的学科。笔者没有专门学过，在此只是略讲一些bccsp服务所涉及到的皮毛： RSA - 一种非对称的加密算法，用于加密。有几种族簇，如RSA1024，RSA2048等。 AES - 一种块加密算法，用于加密成块的大量数据。有几种族簇，如AES128，AES192等。 ECDSA - 一种椭圆曲线签名，用于签名。有几种族簇，如ECDSAP256，ECDSAP384等。 Hash - 哈希，有几种族簇，如SHA256，SHA3_256等。 HMAC - 密匙相关的哈希运算消息认证码。 x509 - 证书的一种，可参看文章12中对证书的解释。 PKCS#11 - 一套标准安全接口，可与安全硬件相关，以上的这些东西，可以找它来建立，读取，写入，修改，删除等操作进行管理。 fabric所用到的这些技术的常量名称在/fabric/bccsp/opts.go中开始的部分定义，如ECDSA支持ECDSAP256，ECDSAP384等几种类型。 BCCSP服务结构 BCCSP，是blockchain cryptographic service provider的缩写，个人译作区域链加密服务提供者，为fabric项目提供各种加密技术，签名技术，工具的性质很强，MSP服务模块中就使用到了BCCSP。这里需要说明的一点是，工具性强，也就说明了，如果不是想专门学这一领域，其实不用太在乎其实现的细节，只要用就行了。BCCSP服务的代码集中在/fabric/bccsp中，目录结构如下： mocks - 模拟代码文件夹，可以参看之帮助理解bccsp服务 signer - 实现的是crypto标准库的Signer接口，可参看文章12中MSP服务实现中带“专用签名笔”的身份signingidentity，该目录的签名接口是专用于向外界提供签名对象的功能的。 factory - bccsp服务工厂 pkcs11 - bccsp服务实现之一：HSM基础的bccsp（the hsm-based BCCSP implementation） sw - bccsp服务实现之二：软件基础的bccsp（the software-based implementation of the BCCSP） utils - bccsp服务工具函数 bccsp.go - 定义了BCCSP，Key接口，众多BCCSP接口所使用到的选项接口，如Key，KeyGenOpts，KeyDerivOpts等 keystore.go - 定义了key的管理存储接口，如果生成的key不是暂时的，则存储在该接口的实现对象中，如果是暂时性的，则不存储 XXXopts.go - XXX表示该目录下的各种值，bccsp服务实现所使用到的各种技术的选项实现 从以上可以看出bccsp服务有两种实现：pkcs11和sw。简单明了的解释的话（虽不太精准），就是pckcs11是硬件基础的加密服务实现，sw是软件基础的加密服务实现。这个硬件基础的实现以 https://github.com/miekg/pkcs11 这个库为基础，而HSM是Hardware Security Modules，即硬件安全模块的缩写。相对应的两种bccsp服务实现，这里有两种工厂，两种工厂为其他使用bccsp服务的模块提供了窗口函数（就是给其他模块提供窗口的函数，这些函数一般统一管理自己服务的功能模块，供外界调用，如后文所讲的InitFactories函数）。所有产生的bccsp实例存储在factory/factory.go中所定义的全局变量中。 bccsp中的接口和选项 接口 //在fabric/bccsp/bccsp.go中定义 type BCCSP interface { //根据key生成选项opts生成一个key //与key有关的选项opts选项要适合原始的key（与“证书是一级一级的认证”对看） KeyGen(opts KeyGenOpts) (k Key, err error) //根据key获取选项opts从k中重新获取一个key KeyDeriv(k Key, opts KeyDerivOpts) (dk Key, err error) //根据key导入选项opts从一个key原始的数据中导入一个key KeyImport(raw interface{}, opts KeyImportOpts) (k Key, err error) //根据SKI返回与该接口实例有联系的key GetKey(ski []byte) (k Key, err error) //根据哈希选项opts哈希一个消息msg，如果opts为空，则使用默认选项 Hash(msg []byte, opts HashOpts) (hash []byte, err error) //根据哈希选项opts获取hash.Hash实例，如果opts为空，则使用默认选项 GetHash(opts HashOpts) (h hash.Hash, err error) //根据签名者选项opts，使用k对digest进行签名，注意如果需要对一个特别大的消息的hash值 //进行签名，调用者则负责对该特别大的消息进行hash后将其作为digest传入 Sign(k Key, digest []byte, opts SignerOpts) (signature []byte, err error) //根据鉴定者选项opts，通过对比k和digest，鉴定签名 Verify(k Key, signature, digest []byte, opts SignerOpts) (valid bool, err error) //根据加密者选项opts，使用k加密plaintext Encrypt(k Key, plaintext []byte, opts EncrypterOpts) (ciphertext []byte, err error) //根据解密者选项opts，使用k对ciphertext进行解密 Decrypt(k Key, ciphertext []byte, opts DecrypterOpts) (plaintext []byte, err error) } 选项 bccsp文件夹中任何带opt字眼的文件，都是和选项有关的源码。关于对象的配套选项，我们在讲MSP服务的时候就见识过。根据一个选项的不同配置，对象主体可以得到不同的数据或进行不同的操作，这也是一种比较值得学习的语言上的组织技巧。尤其是在bccsp这种涉及的技术比较多，而每个对象自身又分为好多类的情况。在此以哈希选项HashOpts和key导入选项KeyImportOpts作为例子进行说明： //在/fabric/bccsp/bccsp.go中定义 //哈希选项接口 type HashOpts interface { Algorithm() string //获取hash算法字符串标识，如&quot;SHA256&quot;，&quot;SHA3_256&quot; } //在/fabric/bccsp/hashopts.go中定义 //哈希选项实现之一，SHA256选项 type SHA256Opts struct { } func (opts *SHA256Opts) Algorithm() string { return SHA256 } //哈希选项实现之二，SHA384选项 type SHA384Opts struct { } func (opts *SHA384Opts) Algorithm() string { return SHA384 } -------------------------------------------------- //在/fabric/bccsp/bccsp.go中定义 //key导入选项接口 type KeyImportOpts interface { Algorithm() string //返回key导入算法字符串标识 Ephemeral() bool //如果生成的key是短暂的（ephemeral），返回true，否则返回false } //在/fabric/bccsp/opts.go中定义 //key导入选项接口实现之一，ECDSA公匙的导入选项 type ECDSAPKIXPublicKeyImportOpts struct { Temporary bool } func (opts *ECDSAPKIXPublicKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPKIXPublicKeyImportOpts) Ephemeral() bool { return opts.Temporary } //key导入选项接口实现之二，ECDSA私匙的导入选项 type ECDSAPrivateKeyImportOpts struct { Temporary bool } func (opts *ECDSAPrivateKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPrivateKeyImportOpts) Ephemeral() bool { return opts.Temporary } //比较特殊的，比如签名选项接口SignerOpts //由于因为使用的标准库，因此使用到此选项时多赋值为nil，bccsp源码中未实现 SW实现方式 BCCSP的SoftWare（SW）实现形式是默认的形式，这点仅从/fabric/bccsp/factory/opts.go中工厂的默认选项DefaultOpts和核心配置文档中关于bccsp的配置就可以看出来。主要使用的包是标准库hash和crypto（包括其中的各种包，如aes，rsa，ecdsa，sha256，elliptic，x509等）。 目录结构： /fabric/bccsp/sw impl.go - bccsp的sw实现impl internals.go - 签名者、鉴定者、加密者、解密者接口定义 conf.go - bccsp的sw实现的配置定义 ———————————————————————– aes.go - aes类型的生成key函数、加密者/解密者实现 ecdsa.go - ecdsa类型的签名者、公匙/私匙鉴定者实现 rsa.go - rsa类型的签名者、公匙/私匙鉴定者实现 ———————————————————————– aeskey.go - aes类型的Key接口实现 ecdsakey.go - ecdsa类型的Key接口实现 rsakey.go - rsa类型的Key接口实现 ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现dummyKeyStore，当生成的key是短暂的，则说明这些key不会保存到文件中，而是保存到内存中，系统一关闭，这些key就消失了 fileks.go - file类型的KeyStore接口实现fileBasedKeyStore，当生成的key不是短暂的，则说明这些key在导入时，会存储在文件中，即便系统关闭，这些key也不会消失 BCCSP接口实现： //在/fabric/bccsp/sw/impl.go中定义 //SW bccsp的实例结构体 type impl struct { conf *config //bccsp实例的配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 encryptors map[reflect.Type]Encryptor //加密者映射 decryptors map[reflect.Type]Decryptor //解密者映射 signers map[reflect.Type]Signer //签名者映射，Key实现的类型作为映射的键 verifiers map[reflect.Type]Verifier //鉴定者映射，Key实现的类型作为映射的键 } //专用生成函数 func New(...) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, ...) { ... } ... 粗线条上看，由于impl对象和各种操作选项的存在，绝大部分接口的实现都是以switch-case为主干，根据选项的类型或配置，分情况完成功能，且每个分支的操作基本都很类似，如KeyGen。接下来一一介绍： KeyGen - 根据key生成选项不同，生成三种系列的key：ECDSA，AES，RSA。ECDSA使用库ecdsa的GenerateKey函数，AES使用自定义的GetRandomBytes函数（在aes.go中实现，包装了rand.Read），RSA使用库rsa的GenerateKey函数。每个系列又根据具体参数的不同生成不同“尺寸”的key，具体的细节略过。最后返回不同的Key实现对象，如ecdsaPrivateKey，aesPrivateKey等（分别定义在同目录中的XXXkey.go中）。这里要注意的是，当前版本中用于签名的key，只支持ECDSA系列的key，这是官方文档中所说的，但是从实现上看签名的支持不止一种，又但是，bccsp本质上无论实现多上中key，也只有被调用者决定使用哪一种。而MSP模块是bccsp的使用者之一，应该是在它这个地方只认ECDSA的key。 KeyDeriv - 根据key获取选项opts从k中重新获取一个key，这里的重新获取可以理解为把k中的内容重新打乱再生成一个key。处理两种key类型：ecdsaXXXKey（XXX代表Public和Private），aesPrivateKey。最后返回打乱后重新生成的两种类型的key：reRandomizedKey和hmacedKey。对于重新生成的key，如果选项中指定的不是暂时性的key，则会在ks中存储。 KeyImport - 从原始的数据raw中取出选项opts指定的key，如果不是临时性的，则在ks中存储，最后返回key。这里的原始，指的是[]byte或者含有key的数据（如证书数据里的key）。raw是一个空接口，也就是说可以接收任何形式的原始数据。为了得到key，对原始数据raw的转化或抽取，一部分使用了utils下的工具函数utils.Clone和utils.DERToPublicKey，如AES256，ECDSAPrivateKey等类型的key；一部分直接用go语言的断言raw.(*Key类型)，如ECDSAGoPublicKey，RSAGoPublicKey等类型的key。 Hash - 根据哈希选项opts对一个消息msg进行哈希，返回该msg的哈希值。如果opts为空，则使用默认选项。这个比较好理解，种类支持SHA2，SHA3哈希家族。 Sign - 根据签名者选项，使用k对digest进行签名，这里的签名者选项在当前版本里没什么用处，调用者都给的是nil。签名涉及到了Key接口和签名者Signer在SW bccsp中的实现。Key接口有三种实现：ecdsakey.go中的ecdsaPublicKey/ecdsaPrivateKey，rsakey.go中的rsaPublicKey/rsaPrivateKey，aeskey.go中的aesPrivateKey，这里签名（自然）使用的都是私匙。签名者接口Signer定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaSigner和rsa.go中的rsaSigner。参看SW bccsp专用生成函数New的signers赋值部分，可知用到了两种对应类型的Key和Signer：ecdsaPrivateKey - ecdsaSigner和rsaPrivateKey - rsaSigner。这里签名的实现是，从该bccsp实例的签名者集合成员signers获取类型为reflect.TypeOf(k)的签名者signer，然后直接调用signer的接口Sign，追溯，ecdsaSigner使用ecdsa库的Sign函数，rsaSigner使用rsa库PrivateKey结构体的Sign函数。 Verify - 根据鉴定者选项opts，通过对比k和digest，鉴定签名。鉴定涉及到了Key接口和鉴定者接口Verifier在SW bccsp中的实现。Key接口实现如上描述。鉴定者接口Verifier定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaPublicKeyKeyVerifier/ecdsaPrivateKeyVerifier和rsa.go中的rsaPublicKeyKeyVerifier/rsaPrivateKeyVerifier。参看SW bccsp专用生成函数New的verifiers赋值部分，可知所有鉴定者（与对应的Key接口实现）都有用到。这里鉴定的实现是，从该bccsp实例的鉴定者集合成员verifiers获取类型为reflect.TypeOf(k)的鉴定者verifier，然后直接调用verifier的接口Verify，追溯，ecdsaXXXKeyVerifier使用ecdsa库的Verify函数，rsaXXXKeyVerifier使用rsa库的VerifyPSS函数（这里XXX表示PublicKey或Private）。 Encrypt - 根据加密者选项opts，使用k**加密plaintext。加密涉及到了**Key接口和加密者接口Encryptor在SW bccsp中的实现。Key接口实现如上描述。加密者接口Encryptor定义在同目录下的internals.go中，在aes.go中实现（只能是aes，因为只有aes是用来加密的）：aescbcpkcs7Encryptor。参看SW bccsp专用生成函数New的encryptors赋值部分，只有aesPrivateKey - aescbcpkcs7Encryptor被使用。这里加密的实现是，从该bccsp实例的加密者集合成员encryptors获取类型为reflect.TypeOf(k)的加密者encryptor，然后直接调用encryptor的接口Encrypt，追溯，aescbcpkcs7Encryptor使用了aes库的加密流程进行加密。 Decrypt - 解密与加密类似，过程类似，也是只有aes配套实现，最终使用aes库解密流程进行解密。 GetXXX - GetXXX系列接口，获取实例对象中的数据，略。 在fabirc源码解析12——peer的MSP服务文中背书检验部分的第3、4点，涉及到了包含在msp中的bccsp对象成员，使用了bccsp对象的GetHashOpt、Hash、KeyImport、Verify等接口用以生成identities对象或identities自身一些接口实现。在此可以对看。 pkcs11实现方式 BCCSP的pkcs11实现形式主要使用到的库与sw实现如出一辙，但外加一个github.com/miekg/pkcs11库，最好参看其文档以熟悉pkcs11的简要操作。pkcs11（PKCS，Public-Key Cryptography Standards）是一套非常通用的接口标准，可以说这里是用pkcs11实现了bccsp的功能，也为fabric支持热插拔和个人安全硬件模块提供了服务。这点可以从bccsp的pkcs11的实现实例的专用生成函数New（参看下文）中所调用的loadLib函数可以看出来：loadLib加载了一个系统中的动态库，能加载系统的动态库，就可以和驱动、热插拔、连接电脑的字符设备联系在一起。比如将来，开发出了一款在区域链上类似于现在网上银行所用的U盾之类的个人身份或安全交易硬件模块或芯片，这些硬件模块或芯片只需要也遵循pkcs11，fabric即可对此进行支持和扩展。 对于pkcs11的所提供的接口，在此提供两个文档地址，读者可以稍作了解： https://www.ibm.com/developerworks/cn/security/s-pkcs/ ， http://docs.oracle.com/cd/E19253-01/819-7056/6n91eac56/index.html#chapter2-9 。这些文档与fabric和区域链无关，但是因为pkcs11是通用的接口，所以有一定参考价值。pkcs11库中的解释相对过于简单。 目录结构： /fabric/bccsp/pkcs11 impl.go - bccsp的pkcs11实现impl conf.go - 定义了bccsp服务的配置和PKCS11Opts、FileKeystoreOpts、DummyKeystoreOpts选项 pkcs11.go - 以pkcs11库为基础，包装各种pkcs11功能，实现了impl基于pkcs11的内调函数，和一些bccsp服务使用到的独立的内调函数 ———————————————————————– aes.go - 实现aes类型的生成key、加密、解密函数 ecdsa.go - 实现impl在ecdsa技术下的签名函数signECDSA和鉴定函数verifyECDSA ———————————————————————– aeskey.go - 实现aes类型的Key接口，只实现私匙aesPrivateKey ecdsakey.go - 实现ecdsa类型的Key接口，实现了公匙ecdsaPublicKey，私匙ecdsaPrivateKey rsakey.go - 实现了rsa类型的Key接口，实现了公匙rsaPublicKey，私匙rsaPrivateKey ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现DummyKeyStore fileks.go - file类型的KeyStore接口实现FileBasedKeyStore BCCSP接口实现： type impl struct { conf *config //配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 ctx *pkcs11.Ctx //标准库的pkcs11上下文 sessions chan pkcs11.SessionHandle //实质是uint，会话标识符频道，默认10个缓存 slot uint //安全硬件外设连接插槽标识号 lib string //加载库所在路径 noPrivImport bool //禁止导入私匙标识 softVerify bool //使用软件方式鉴定签名标识 } //专用生成函数 func New(opts PKCS11Opts, keyStore bccsp.KeyStore) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, err error) { ... } ... BCCSP的pkcs11实现的骨架在impl.go中与sw的实现基本一致，只是追溯到最终实现的语句时，sw实现是使用crypto库下的各个包进行签名，加密，密匙导入等，而pkcsll则用pkcs11包对数据进行了多一层的处理，使用pkcs11提供的上下文（pkcs11.Ctx）和会话（SessionHandle）之上对签名，密匙，加密等进行管理，这也是pkcs11.go文件的作用。两者最大的不同是一个面向软件，一个面向硬件，pkcs11自身又非常的冗杂，因此在此只讲pkcs11中与安全硬件模块建立连接的loadLib函数。 loadLib函数在pkcs11.go中定义，供专用生成函数New使用。为建立与安全硬件模块的通信，进行了如下步骤： 根据所给的系统动态库路径lib加载动态库（如openCryptoki的动态库），调用pkcs11.New(lib)建立pkcs11实例ctx。ctx相当于fabric与安全硬件模块通信的桥梁：bccsp&lt;–&gt;ctx&lt;–&gt;驱动lib&lt;–&gt;安全硬件模块，只要驱动lib是按照pkcs11标准开发。 ctx.Initialize()进行初始化。 从ctx.GetSlotList(true)返回的列表中获取由label指定的插槽标识slot（这里的槽可以简单的理解为电脑主机上供安全硬件模块插入的槽，如USB插口，可能不止一个，每一个在系统内核中都有名字和标识号）。 尝试10次调用ctx.OpenSession打开一个会话session（会话就是通过通信路径与安全硬件模块建立连接，可以简单的理解为pkcs11的chan）。 登陆会话ctx.Login。 返回ctx，slot，会话对象session，用于赋值给impl实例成员ctx，slot，把session发送到sessions里。 关于pkcs11，还有一点可说的，就是SoftHSM库，它是一个模拟硬件实现的pkcsll，对应到的系统动态库可参看impl.go中FindPKCS11Lib测试函数中所涉及的，如Linux下的libsofthsm2.so。现阶段是没有安全硬件模块可以配合测试的，所以只有使用SoftHSM模拟测试，将libsofthsm2.so导入pkcs11对象。 BCCSP工厂 对应两种bccsp实现，这里也有两种bccsp工厂：pkcs11factory.go和swfactory.go。fabric中某一模块一旦涉及工厂factory，则说明该模块基本就是由工厂提供“窗口函数”，供其他模块调用。这里以swfactory为例进行讲解。 目录结构： /fabric/bccsp/factory/ factory.go - 声明了默认bccsp实例defaultBCCSP，bccsp实例存储映射bccspMap等全局变量和这些变量的获取函数GetXXX，定义bccsp工厂接口。 nopkcs11.go/pkcs11.go - 定义了两种版本的工厂选项FactoryOpts，初始化工厂函数InitFactories和获取指定bccsp实例函数GetBCCSPFromOpts。nopkcs11是默认版本，可条件编译指定使用哪种版本（编译时加入nopkcs11或!nopkcs11选项）。两种版本的差异集中在是否使用pkcs11上。 opts.go - 定义了默认的工厂选项DefaultOpts。 pkcs11factory.go - pkcs11类型的bccsp工厂实现PKCS11Factory。 swfactory.go - sw类型的bccsp工厂实现SWFactory。还定义了sw版本的bccsp选项。 swfactory接口和实现： //在factory.go中定义 //接口 type BCCSPFactory interface { //返回工厂的名字 Name() string //返回符合工厂选项opts的bccsp实例 Get(opts *FactoryOpts) (bccsp.BCCSP, error) } //在swfactory.go中定义 //实现 type SWFactory struct{} func (f *SWFactory) Name() string { return SoftwareBasedFactoryName } func (f *SWFactory) Get(config *FactoryOpts) (bccsp.BCCSP, error) { ... } 实现的代码本身比较简单，Get最终是调用的sw的专用生成函数New来生成符合opts的bccsp实例。Name则是直接返回一个”SW”常量。 在每个chaincode例子中，如/fabric/examples/e2e_cli/examples/chaincode/go/chaincode_example02/chaincode_example02.go，都使用了chaincode垫片shim中的Start函数。不知道在fabirc源码解析7——peer的ChaincodeSupport服务文中是否说过，在此说一下，chaincode的“垫片”shim核心代码集中在/fabric/core/chaincode/shim中，该垫片所“承垫”的是与各个结点通信的任务，也即ChaincodeSupport服务。chaincode形成的通信的信息，通过shim分发到各个结点，然后shim负责从各个结点收集信息，汇总返回给chaincode，完成chaincode的功能。其中shim的Start函数就是用来启动一个chaincode，定义在/fabric/core/chaincode/shim/chaincode.go中。在Start的函数中，就调用了err := factory.InitFactories(&amp;factory.DefaultOpts)来初始化一个默认的bccsp工厂，在此可以知道，这里使用的默认工厂选项（参看opts.go），也就是使用的swfactory。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/08/15/c2b18c2ec552bae1ca31c4d593cb745d.html" />
+<meta property="og:url" content="https://uzzz.org/2017/08/15/c2b18c2ec552bae1ca31c4d593cb745d.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-08-15T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"fabric源码解析13——peer的BCCSP服务 加密的一般话题 加密涉及到了内容挺复杂的，是一门专业性很强的学科。笔者没有专门学过，在此只是略讲一些bccsp服务所涉及到的皮毛： RSA - 一种非对称的加密算法，用于加密。有几种族簇，如RSA1024，RSA2048等。 AES - 一种块加密算法，用于加密成块的大量数据。有几种族簇，如AES128，AES192等。 ECDSA - 一种椭圆曲线签名，用于签名。有几种族簇，如ECDSAP256，ECDSAP384等。 Hash - 哈希，有几种族簇，如SHA256，SHA3_256等。 HMAC - 密匙相关的哈希运算消息认证码。 x509 - 证书的一种，可参看文章12中对证书的解释。 PKCS#11 - 一套标准安全接口，可与安全硬件相关，以上的这些东西，可以找它来建立，读取，写入，修改，删除等操作进行管理。 fabric所用到的这些技术的常量名称在/fabric/bccsp/opts.go中开始的部分定义，如ECDSA支持ECDSAP256，ECDSAP384等几种类型。 BCCSP服务结构 BCCSP，是blockchain cryptographic service provider的缩写，个人译作区域链加密服务提供者，为fabric项目提供各种加密技术，签名技术，工具的性质很强，MSP服务模块中就使用到了BCCSP。这里需要说明的一点是，工具性强，也就说明了，如果不是想专门学这一领域，其实不用太在乎其实现的细节，只要用就行了。BCCSP服务的代码集中在/fabric/bccsp中，目录结构如下： mocks - 模拟代码文件夹，可以参看之帮助理解bccsp服务 signer - 实现的是crypto标准库的Signer接口，可参看文章12中MSP服务实现中带“专用签名笔”的身份signingidentity，该目录的签名接口是专用于向外界提供签名对象的功能的。 factory - bccsp服务工厂 pkcs11 - bccsp服务实现之一：HSM基础的bccsp（the hsm-based BCCSP implementation） sw - bccsp服务实现之二：软件基础的bccsp（the software-based implementation of the BCCSP） utils - bccsp服务工具函数 bccsp.go - 定义了BCCSP，Key接口，众多BCCSP接口所使用到的选项接口，如Key，KeyGenOpts，KeyDerivOpts等 keystore.go - 定义了key的管理存储接口，如果生成的key不是暂时的，则存储在该接口的实现对象中，如果是暂时性的，则不存储 XXXopts.go - XXX表示该目录下的各种值，bccsp服务实现所使用到的各种技术的选项实现 从以上可以看出bccsp服务有两种实现：pkcs11和sw。简单明了的解释的话（虽不太精准），就是pckcs11是硬件基础的加密服务实现，sw是软件基础的加密服务实现。这个硬件基础的实现以 https://github.com/miekg/pkcs11 这个库为基础，而HSM是Hardware Security Modules，即硬件安全模块的缩写。相对应的两种bccsp服务实现，这里有两种工厂，两种工厂为其他使用bccsp服务的模块提供了窗口函数（就是给其他模块提供窗口的函数，这些函数一般统一管理自己服务的功能模块，供外界调用，如后文所讲的InitFactories函数）。所有产生的bccsp实例存储在factory/factory.go中所定义的全局变量中。 bccsp中的接口和选项 接口 //在fabric/bccsp/bccsp.go中定义 type BCCSP interface { //根据key生成选项opts生成一个key //与key有关的选项opts选项要适合原始的key（与“证书是一级一级的认证”对看） KeyGen(opts KeyGenOpts) (k Key, err error) //根据key获取选项opts从k中重新获取一个key KeyDeriv(k Key, opts KeyDerivOpts) (dk Key, err error) //根据key导入选项opts从一个key原始的数据中导入一个key KeyImport(raw interface{}, opts KeyImportOpts) (k Key, err error) //根据SKI返回与该接口实例有联系的key GetKey(ski []byte) (k Key, err error) //根据哈希选项opts哈希一个消息msg，如果opts为空，则使用默认选项 Hash(msg []byte, opts HashOpts) (hash []byte, err error) //根据哈希选项opts获取hash.Hash实例，如果opts为空，则使用默认选项 GetHash(opts HashOpts) (h hash.Hash, err error) //根据签名者选项opts，使用k对digest进行签名，注意如果需要对一个特别大的消息的hash值 //进行签名，调用者则负责对该特别大的消息进行hash后将其作为digest传入 Sign(k Key, digest []byte, opts SignerOpts) (signature []byte, err error) //根据鉴定者选项opts，通过对比k和digest，鉴定签名 Verify(k Key, signature, digest []byte, opts SignerOpts) (valid bool, err error) //根据加密者选项opts，使用k加密plaintext Encrypt(k Key, plaintext []byte, opts EncrypterOpts) (ciphertext []byte, err error) //根据解密者选项opts，使用k对ciphertext进行解密 Decrypt(k Key, ciphertext []byte, opts DecrypterOpts) (plaintext []byte, err error) } 选项 bccsp文件夹中任何带opt字眼的文件，都是和选项有关的源码。关于对象的配套选项，我们在讲MSP服务的时候就见识过。根据一个选项的不同配置，对象主体可以得到不同的数据或进行不同的操作，这也是一种比较值得学习的语言上的组织技巧。尤其是在bccsp这种涉及的技术比较多，而每个对象自身又分为好多类的情况。在此以哈希选项HashOpts和key导入选项KeyImportOpts作为例子进行说明： //在/fabric/bccsp/bccsp.go中定义 //哈希选项接口 type HashOpts interface { Algorithm() string //获取hash算法字符串标识，如&quot;SHA256&quot;，&quot;SHA3_256&quot; } //在/fabric/bccsp/hashopts.go中定义 //哈希选项实现之一，SHA256选项 type SHA256Opts struct { } func (opts *SHA256Opts) Algorithm() string { return SHA256 } //哈希选项实现之二，SHA384选项 type SHA384Opts struct { } func (opts *SHA384Opts) Algorithm() string { return SHA384 } -------------------------------------------------- //在/fabric/bccsp/bccsp.go中定义 //key导入选项接口 type KeyImportOpts interface { Algorithm() string //返回key导入算法字符串标识 Ephemeral() bool //如果生成的key是短暂的（ephemeral），返回true，否则返回false } //在/fabric/bccsp/opts.go中定义 //key导入选项接口实现之一，ECDSA公匙的导入选项 type ECDSAPKIXPublicKeyImportOpts struct { Temporary bool } func (opts *ECDSAPKIXPublicKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPKIXPublicKeyImportOpts) Ephemeral() bool { return opts.Temporary } //key导入选项接口实现之二，ECDSA私匙的导入选项 type ECDSAPrivateKeyImportOpts struct { Temporary bool } func (opts *ECDSAPrivateKeyImportOpts) Algorithm() string { return ECDSA } func (opts *ECDSAPrivateKeyImportOpts) Ephemeral() bool { return opts.Temporary } //比较特殊的，比如签名选项接口SignerOpts //由于因为使用的标准库，因此使用到此选项时多赋值为nil，bccsp源码中未实现 SW实现方式 BCCSP的SoftWare（SW）实现形式是默认的形式，这点仅从/fabric/bccsp/factory/opts.go中工厂的默认选项DefaultOpts和核心配置文档中关于bccsp的配置就可以看出来。主要使用的包是标准库hash和crypto（包括其中的各种包，如aes，rsa，ecdsa，sha256，elliptic，x509等）。 目录结构： /fabric/bccsp/sw impl.go - bccsp的sw实现impl internals.go - 签名者、鉴定者、加密者、解密者接口定义 conf.go - bccsp的sw实现的配置定义 ———————————————————————– aes.go - aes类型的生成key函数、加密者/解密者实现 ecdsa.go - ecdsa类型的签名者、公匙/私匙鉴定者实现 rsa.go - rsa类型的签名者、公匙/私匙鉴定者实现 ———————————————————————– aeskey.go - aes类型的Key接口实现 ecdsakey.go - ecdsa类型的Key接口实现 rsakey.go - rsa类型的Key接口实现 ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现dummyKeyStore，当生成的key是短暂的，则说明这些key不会保存到文件中，而是保存到内存中，系统一关闭，这些key就消失了 fileks.go - file类型的KeyStore接口实现fileBasedKeyStore，当生成的key不是短暂的，则说明这些key在导入时，会存储在文件中，即便系统关闭，这些key也不会消失 BCCSP接口实现： //在/fabric/bccsp/sw/impl.go中定义 //SW bccsp的实例结构体 type impl struct { conf *config //bccsp实例的配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 encryptors map[reflect.Type]Encryptor //加密者映射 decryptors map[reflect.Type]Decryptor //解密者映射 signers map[reflect.Type]Signer //签名者映射，Key实现的类型作为映射的键 verifiers map[reflect.Type]Verifier //鉴定者映射，Key实现的类型作为映射的键 } //专用生成函数 func New(...) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, ...) { ... } ... 粗线条上看，由于impl对象和各种操作选项的存在，绝大部分接口的实现都是以switch-case为主干，根据选项的类型或配置，分情况完成功能，且每个分支的操作基本都很类似，如KeyGen。接下来一一介绍： KeyGen - 根据key生成选项不同，生成三种系列的key：ECDSA，AES，RSA。ECDSA使用库ecdsa的GenerateKey函数，AES使用自定义的GetRandomBytes函数（在aes.go中实现，包装了rand.Read），RSA使用库rsa的GenerateKey函数。每个系列又根据具体参数的不同生成不同“尺寸”的key，具体的细节略过。最后返回不同的Key实现对象，如ecdsaPrivateKey，aesPrivateKey等（分别定义在同目录中的XXXkey.go中）。这里要注意的是，当前版本中用于签名的key，只支持ECDSA系列的key，这是官方文档中所说的，但是从实现上看签名的支持不止一种，又但是，bccsp本质上无论实现多上中key，也只有被调用者决定使用哪一种。而MSP模块是bccsp的使用者之一，应该是在它这个地方只认ECDSA的key。 KeyDeriv - 根据key获取选项opts从k中重新获取一个key，这里的重新获取可以理解为把k中的内容重新打乱再生成一个key。处理两种key类型：ecdsaXXXKey（XXX代表Public和Private），aesPrivateKey。最后返回打乱后重新生成的两种类型的key：reRandomizedKey和hmacedKey。对于重新生成的key，如果选项中指定的不是暂时性的key，则会在ks中存储。 KeyImport - 从原始的数据raw中取出选项opts指定的key，如果不是临时性的，则在ks中存储，最后返回key。这里的原始，指的是[]byte或者含有key的数据（如证书数据里的key）。raw是一个空接口，也就是说可以接收任何形式的原始数据。为了得到key，对原始数据raw的转化或抽取，一部分使用了utils下的工具函数utils.Clone和utils.DERToPublicKey，如AES256，ECDSAPrivateKey等类型的key；一部分直接用go语言的断言raw.(*Key类型)，如ECDSAGoPublicKey，RSAGoPublicKey等类型的key。 Hash - 根据哈希选项opts对一个消息msg进行哈希，返回该msg的哈希值。如果opts为空，则使用默认选项。这个比较好理解，种类支持SHA2，SHA3哈希家族。 Sign - 根据签名者选项，使用k对digest进行签名，这里的签名者选项在当前版本里没什么用处，调用者都给的是nil。签名涉及到了Key接口和签名者Signer在SW bccsp中的实现。Key接口有三种实现：ecdsakey.go中的ecdsaPublicKey/ecdsaPrivateKey，rsakey.go中的rsaPublicKey/rsaPrivateKey，aeskey.go中的aesPrivateKey，这里签名（自然）使用的都是私匙。签名者接口Signer定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaSigner和rsa.go中的rsaSigner。参看SW bccsp专用生成函数New的signers赋值部分，可知用到了两种对应类型的Key和Signer：ecdsaPrivateKey - ecdsaSigner和rsaPrivateKey - rsaSigner。这里签名的实现是，从该bccsp实例的签名者集合成员signers获取类型为reflect.TypeOf(k)的签名者signer，然后直接调用signer的接口Sign，追溯，ecdsaSigner使用ecdsa库的Sign函数，rsaSigner使用rsa库PrivateKey结构体的Sign函数。 Verify - 根据鉴定者选项opts，通过对比k和digest，鉴定签名。鉴定涉及到了Key接口和鉴定者接口Verifier在SW bccsp中的实现。Key接口实现如上描述。鉴定者接口Verifier定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaPublicKeyKeyVerifier/ecdsaPrivateKeyVerifier和rsa.go中的rsaPublicKeyKeyVerifier/rsaPrivateKeyVerifier。参看SW bccsp专用生成函数New的verifiers赋值部分，可知所有鉴定者（与对应的Key接口实现）都有用到。这里鉴定的实现是，从该bccsp实例的鉴定者集合成员verifiers获取类型为reflect.TypeOf(k)的鉴定者verifier，然后直接调用verifier的接口Verify，追溯，ecdsaXXXKeyVerifier使用ecdsa库的Verify函数，rsaXXXKeyVerifier使用rsa库的VerifyPSS函数（这里XXX表示PublicKey或Private）。 Encrypt - 根据加密者选项opts，使用k**加密plaintext。加密涉及到了**Key接口和加密者接口Encryptor在SW bccsp中的实现。Key接口实现如上描述。加密者接口Encryptor定义在同目录下的internals.go中，在aes.go中实现（只能是aes，因为只有aes是用来加密的）：aescbcpkcs7Encryptor。参看SW bccsp专用生成函数New的encryptors赋值部分，只有aesPrivateKey - aescbcpkcs7Encryptor被使用。这里加密的实现是，从该bccsp实例的加密者集合成员encryptors获取类型为reflect.TypeOf(k)的加密者encryptor，然后直接调用encryptor的接口Encrypt，追溯，aescbcpkcs7Encryptor使用了aes库的加密流程进行加密。 Decrypt - 解密与加密类似，过程类似，也是只有aes配套实现，最终使用aes库解密流程进行解密。 GetXXX - GetXXX系列接口，获取实例对象中的数据，略。 在fabirc源码解析12——peer的MSP服务文中背书检验部分的第3、4点，涉及到了包含在msp中的bccsp对象成员，使用了bccsp对象的GetHashOpt、Hash、KeyImport、Verify等接口用以生成identities对象或identities自身一些接口实现。在此可以对看。 pkcs11实现方式 BCCSP的pkcs11实现形式主要使用到的库与sw实现如出一辙，但外加一个github.com/miekg/pkcs11库，最好参看其文档以熟悉pkcs11的简要操作。pkcs11（PKCS，Public-Key Cryptography Standards）是一套非常通用的接口标准，可以说这里是用pkcs11实现了bccsp的功能，也为fabric支持热插拔和个人安全硬件模块提供了服务。这点可以从bccsp的pkcs11的实现实例的专用生成函数New（参看下文）中所调用的loadLib函数可以看出来：loadLib加载了一个系统中的动态库，能加载系统的动态库，就可以和驱动、热插拔、连接电脑的字符设备联系在一起。比如将来，开发出了一款在区域链上类似于现在网上银行所用的U盾之类的个人身份或安全交易硬件模块或芯片，这些硬件模块或芯片只需要也遵循pkcs11，fabric即可对此进行支持和扩展。 对于pkcs11的所提供的接口，在此提供两个文档地址，读者可以稍作了解： https://www.ibm.com/developerworks/cn/security/s-pkcs/ ， http://docs.oracle.com/cd/E19253-01/819-7056/6n91eac56/index.html#chapter2-9 。这些文档与fabric和区域链无关，但是因为pkcs11是通用的接口，所以有一定参考价值。pkcs11库中的解释相对过于简单。 目录结构： /fabric/bccsp/pkcs11 impl.go - bccsp的pkcs11实现impl conf.go - 定义了bccsp服务的配置和PKCS11Opts、FileKeystoreOpts、DummyKeystoreOpts选项 pkcs11.go - 以pkcs11库为基础，包装各种pkcs11功能，实现了impl基于pkcs11的内调函数，和一些bccsp服务使用到的独立的内调函数 ———————————————————————– aes.go - 实现aes类型的生成key、加密、解密函数 ecdsa.go - 实现impl在ecdsa技术下的签名函数signECDSA和鉴定函数verifyECDSA ———————————————————————– aeskey.go - 实现aes类型的Key接口，只实现私匙aesPrivateKey ecdsakey.go - 实现ecdsa类型的Key接口，实现了公匙ecdsaPublicKey，私匙ecdsaPrivateKey rsakey.go - 实现了rsa类型的Key接口，实现了公匙rsaPublicKey，私匙rsaPrivateKey ———————————————————————– dummyks.go - dummy类型的KeyStore接口实现DummyKeyStore fileks.go - file类型的KeyStore接口实现FileBasedKeyStore BCCSP接口实现： type impl struct { conf *config //配置 ks bccsp.KeyStore //key存储系统对象，存储和获取Key对象 ctx *pkcs11.Ctx //标准库的pkcs11上下文 sessions chan pkcs11.SessionHandle //实质是uint，会话标识符频道，默认10个缓存 slot uint //安全硬件外设连接插槽标识号 lib string //加载库所在路径 noPrivImport bool //禁止导入私匙标识 softVerify bool //使用软件方式鉴定签名标识 } //专用生成函数 func New(opts PKCS11Opts, keyStore bccsp.KeyStore) (bccsp.BCCSP, error) { ... } //接口实现 func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, err error) { ... } ... BCCSP的pkcs11实现的骨架在impl.go中与sw的实现基本一致，只是追溯到最终实现的语句时，sw实现是使用crypto库下的各个包进行签名，加密，密匙导入等，而pkcsll则用pkcs11包对数据进行了多一层的处理，使用pkcs11提供的上下文（pkcs11.Ctx）和会话（SessionHandle）之上对签名，密匙，加密等进行管理，这也是pkcs11.go文件的作用。两者最大的不同是一个面向软件，一个面向硬件，pkcs11自身又非常的冗杂，因此在此只讲pkcs11中与安全硬件模块建立连接的loadLib函数。 loadLib函数在pkcs11.go中定义，供专用生成函数New使用。为建立与安全硬件模块的通信，进行了如下步骤： 根据所给的系统动态库路径lib加载动态库（如openCryptoki的动态库），调用pkcs11.New(lib)建立pkcs11实例ctx。ctx相当于fabric与安全硬件模块通信的桥梁：bccsp&lt;–&gt;ctx&lt;–&gt;驱动lib&lt;–&gt;安全硬件模块，只要驱动lib是按照pkcs11标准开发。 ctx.Initialize()进行初始化。 从ctx.GetSlotList(true)返回的列表中获取由label指定的插槽标识slot（这里的槽可以简单的理解为电脑主机上供安全硬件模块插入的槽，如USB插口，可能不止一个，每一个在系统内核中都有名字和标识号）。 尝试10次调用ctx.OpenSession打开一个会话session（会话就是通过通信路径与安全硬件模块建立连接，可以简单的理解为pkcs11的chan）。 登陆会话ctx.Login。 返回ctx，slot，会话对象session，用于赋值给impl实例成员ctx，slot，把session发送到sessions里。 关于pkcs11，还有一点可说的，就是SoftHSM库，它是一个模拟硬件实现的pkcsll，对应到的系统动态库可参看impl.go中FindPKCS11Lib测试函数中所涉及的，如Linux下的libsofthsm2.so。现阶段是没有安全硬件模块可以配合测试的，所以只有使用SoftHSM模拟测试，将libsofthsm2.so导入pkcs11对象。 BCCSP工厂 对应两种bccsp实现，这里也有两种bccsp工厂：pkcs11factory.go和swfactory.go。fabric中某一模块一旦涉及工厂factory，则说明该模块基本就是由工厂提供“窗口函数”，供其他模块调用。这里以swfactory为例进行讲解。 目录结构： /fabric/bccsp/factory/ factory.go - 声明了默认bccsp实例defaultBCCSP，bccsp实例存储映射bccspMap等全局变量和这些变量的获取函数GetXXX，定义bccsp工厂接口。 nopkcs11.go/pkcs11.go - 定义了两种版本的工厂选项FactoryOpts，初始化工厂函数InitFactories和获取指定bccsp实例函数GetBCCSPFromOpts。nopkcs11是默认版本，可条件编译指定使用哪种版本（编译时加入nopkcs11或!nopkcs11选项）。两种版本的差异集中在是否使用pkcs11上。 opts.go - 定义了默认的工厂选项DefaultOpts。 pkcs11factory.go - pkcs11类型的bccsp工厂实现PKCS11Factory。 swfactory.go - sw类型的bccsp工厂实现SWFactory。还定义了sw版本的bccsp选项。 swfactory接口和实现： //在factory.go中定义 //接口 type BCCSPFactory interface { //返回工厂的名字 Name() string //返回符合工厂选项opts的bccsp实例 Get(opts *FactoryOpts) (bccsp.BCCSP, error) } //在swfactory.go中定义 //实现 type SWFactory struct{} func (f *SWFactory) Name() string { return SoftwareBasedFactoryName } func (f *SWFactory) Get(config *FactoryOpts) (bccsp.BCCSP, error) { ... } 实现的代码本身比较简单，Get最终是调用的sw的专用生成函数New来生成符合opts的bccsp实例。Name则是直接返回一个”SW”常量。 在每个chaincode例子中，如/fabric/examples/e2e_cli/examples/chaincode/go/chaincode_example02/chaincode_example02.go，都使用了chaincode垫片shim中的Start函数。不知道在fabirc源码解析7——peer的ChaincodeSupport服务文中是否说过，在此说一下，chaincode的“垫片”shim核心代码集中在/fabric/core/chaincode/shim中，该垫片所“承垫”的是与各个结点通信的任务，也即ChaincodeSupport服务。chaincode形成的通信的信息，通过shim分发到各个结点，然后shim负责从各个结点收集信息，汇总返回给chaincode，完成chaincode的功能。其中shim的Start函数就是用来启动一个chaincode，定义在/fabric/core/chaincode/shim/chaincode.go中。在Start的函数中，就调用了err := factory.InitFactories(&amp;factory.DefaultOpts)来初始化一个默认的bccsp工厂，在此可以知道，这里使用的默认工厂选项（参看opts.go），也就是使用的swfactory。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/08/15/c2b18c2ec552bae1ca31c4d593cb745d.html","headline":"fabric源码解析13——peer的BCCSP服务","dateModified":"2017-08-15T00:00:00+08:00","datePublished":"2017-08-15T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/08/15/c2b18c2ec552bae1ca31c4d593cb745d.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>fabric源码解析13——peer的BCCSP服务</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="fabric源码解析13peer的bccsp服务">fabric源码解析13——peer的BCCSP服务</h1> 
+  <h2 id="加密的一般话题">加密的一般话题</h2> 
+  <p>加密涉及到了内容挺复杂的，是一门专业性很强的学科。笔者没有专门学过，在此只是略讲一些bccsp服务所涉及到的皮毛：</p> 
+  <ul> 
+   <li>RSA - 一种非对称的加密算法，用于加密。有几种族簇，如RSA1024，RSA2048等。</li> 
+   <li>AES - 一种块加密算法，用于加密成块的大量数据。有几种族簇，如AES128，AES192等。</li> 
+   <li>ECDSA - 一种椭圆曲线签名，用于签名。有几种族簇，如ECDSAP256，ECDSAP384等。</li> 
+   <li>Hash - 哈希，有几种族簇，如SHA256，SHA3_256等。</li> 
+   <li>HMAC - 密匙相关的哈希运算消息认证码。</li> 
+   <li>x509 - 证书的一种，可参看文章12中对证书的解释。</li> 
+   <li>PKCS#11 - 一套标准安全接口，可与安全硬件相关，以上的这些东西，可以找它来建立，读取，写入，修改，删除等操作进行管理。</li> 
+  </ul> 
+  <p>fabric所用到的这些技术的常量名称在/fabric/bccsp/opts.go中开始的部分定义，如ECDSA支持ECDSAP256，ECDSAP384等几种类型。</p> 
+  <h2 id="bccsp服务结构">BCCSP服务结构</h2> 
+  <p><strong>BCCSP</strong>，是<strong>blockchain cryptographic service provider</strong>的缩写，个人译作<strong>区域链加密服务提供者</strong>，为fabric项目提供各种加密技术，签名技术，工具的性质很强，MSP服务模块中就使用到了BCCSP。这里需要说明的一点是，工具性强，也就说明了，如果不是想专门学这一领域，其实不用太在乎其实现的细节，只要用就行了。BCCSP服务的代码集中在<strong>/fabric/bccsp</strong>中，<strong>目录结构</strong>如下：</p> 
+  <ul> 
+   <li>mocks - 模拟代码文件夹，可以参看之帮助理解bccsp服务</li> 
+   <li><strong>signer</strong> - 实现的是crypto标准库的Signer接口，可参看文章12中MSP服务实现中带“专用签名笔”的身份signingidentity，该目录的签名接口是专用于向外界提供签名对象的功能的。</li> 
+   <li><strong>factory</strong> - bccsp服务工厂</li> 
+   <li><strong>pkcs11</strong> - <strong>bccsp服务实现之一</strong>：HSM基础的bccsp（the hsm-based BCCSP implementation）</li> 
+   <li><strong>sw</strong> - <strong>bccsp服务实现之二</strong>：软件基础的bccsp（the software-based implementation of the BCCSP）</li> 
+   <li>utils - bccsp服务工具函数</li> 
+   <li>bccsp.go - 定义了BCCSP，Key接口，众多BCCSP接口所使用到的<strong>选项</strong>接口，如Key，KeyGenOpts，KeyDerivOpts等</li> 
+   <li>keystore.go - 定义了key的管理存储接口，如果生成的key不是暂时的，则存储在该接口的实现对象中，如果是暂时性的，则不存储</li> 
+   <li>XXXopts.go - XXX表示该目录下的各种值，bccsp服务实现所使用到的各种技术的<strong>选项</strong>实现</li> 
+  </ul> 
+  <p>从以上可以看出bccsp服务有两种实现：<strong>pkcs11和sw</strong>。简单明了的解释的话（虽不太精准），就是pckcs11是硬件基础的加密服务实现，sw是软件基础的加密服务实现。这个硬件基础的实现以 <a href="https://github.com/miekg/pkcs11" rel="nofollow" target="_blank">https://github.com/miekg/pkcs11</a> 这个库为基础，而HSM是Hardware Security Modules，即硬件安全模块的缩写。相对应的两种bccsp服务实现，这里有两种工厂，两种工厂为其他使用bccsp服务的模块提供了窗口函数（就是给其他模块提供窗口的函数，这些函数一般统一管理自己服务的功能模块，供外界调用，如后文所讲的InitFactories函数）。所有产生的bccsp实例存储在factory/factory.go中所定义的全局变量中。</p> 
+  <h2 id="bccsp中的接口和选项">bccsp中的接口和选项</h2> 
+  <h4 id="接口">接口</h4> 
+  <pre class="prettyprint"><code class=" hljs axapta"><span class="hljs-comment">//在fabric/bccsp/bccsp.go中定义</span>
+type BCCSP <span class="hljs-class"><span class="hljs-keyword">interface</span> {</span>
+    <span class="hljs-comment">//根据key生成选项opts生成一个key</span>
+    <span class="hljs-comment">//与key有关的选项opts选项要适合原始的key（与“证书是一级一级的认证”对看）</span>
+    KeyGen(opts KeyGenOpts) (k Key, err error)
+    <span class="hljs-comment">//根据key获取选项opts从k中重新获取一个key</span>
+    KeyDeriv(k Key, opts KeyDerivOpts) (dk Key, err error)
+    <span class="hljs-comment">//根据key导入选项opts从一个key原始的数据中导入一个key</span>
+    KeyImport(raw <span class="hljs-class"><span class="hljs-keyword">interface</span>{</span>}, opts KeyImportOpts) (k Key, err error)
+    <span class="hljs-comment">//根据SKI返回与该接口实例有联系的key</span>
+    GetKey(ski []<span class="hljs-keyword">byte</span>) (k Key, err error)
+    <span class="hljs-comment">//根据哈希选项opts哈希一个消息msg，如果opts为空，则使用默认选项</span>
+    Hash(msg []<span class="hljs-keyword">byte</span>, opts HashOpts) (hash []<span class="hljs-keyword">byte</span>, err error)
+    <span class="hljs-comment">//根据哈希选项opts获取hash.Hash实例，如果opts为空，则使用默认选项</span>
+    GetHash(opts HashOpts) (h hash.Hash, err error)
+    <span class="hljs-comment">//根据签名者选项opts，使用k对digest进行签名，注意如果需要对一个特别大的消息的hash值</span>
+    <span class="hljs-comment">//进行签名，调用者则负责对该特别大的消息进行hash后将其作为digest传入</span>
+    Sign(k Key, digest []<span class="hljs-keyword">byte</span>, opts SignerOpts) (signature []<span class="hljs-keyword">byte</span>, err error)
+    <span class="hljs-comment">//根据鉴定者选项opts，通过对比k和digest，鉴定签名</span>
+    Verify(k Key, signature, digest []<span class="hljs-keyword">byte</span>, opts SignerOpts) (valid bool, err error)
+    <span class="hljs-comment">//根据加密者选项opts，使用k加密plaintext</span>
+    Encrypt(k Key, plaintext []<span class="hljs-keyword">byte</span>, opts EncrypterOpts) (ciphertext []<span class="hljs-keyword">byte</span>, err error)
+    <span class="hljs-comment">//根据解密者选项opts，使用k对ciphertext进行解密</span>
+    Decrypt(k Key, ciphertext []<span class="hljs-keyword">byte</span>, opts DecrypterOpts) (plaintext []<span class="hljs-keyword">byte</span>, err error)
+}</code></pre> 
+  <h4 id="选项">选项</h4> 
+  <p>bccsp文件夹中任何带opt字眼的文件，都是和选项有关的源码。关于对象的配套选项，我们在讲MSP服务的时候就见识过。<strong>根据一个选项的不同配置，对象主体可以得到不同的数据或进行不同的操作</strong>，这也是一种比较值得学习的<strong>语言上的组织技巧</strong>。尤其是在bccsp这种涉及的技术比较多，而每个对象自身又分为好多类的情况。在此以<strong>哈希选项HashOpts</strong>和<strong>key导入选项KeyImportOpts</strong>作为例子进行说明：</p> 
+  <pre class="prettyprint"><code class=" hljs go"><span class="hljs-comment">//在/fabric/bccsp/bccsp.go中定义</span>
+<span class="hljs-comment">//哈希选项接口</span>
+<span class="hljs-keyword">type</span> HashOpts <span class="hljs-keyword">interface</span> {
+    Algorithm() <span class="hljs-typename">string</span>  <span class="hljs-comment">//获取hash算法字符串标识，如"SHA256"，"SHA3_256"</span>
+}
+<span class="hljs-comment">//在/fabric/bccsp/hashopts.go中定义</span>
+<span class="hljs-comment">//哈希选项实现之一，SHA256选项</span>
+<span class="hljs-keyword">type</span> SHA256Opts <span class="hljs-keyword">struct</span> {
+}
+<span class="hljs-keyword">func</span> (opts *SHA256Opts) Algorithm() <span class="hljs-typename">string</span> {
+    <span class="hljs-keyword">return</span> SHA256
+}
+<span class="hljs-comment">//哈希选项实现之二，SHA384选项</span>
+<span class="hljs-keyword">type</span> SHA384Opts <span class="hljs-keyword">struct</span> {
+}
+<span class="hljs-keyword">func</span> (opts *SHA384Opts) Algorithm() <span class="hljs-typename">string</span> {
+    <span class="hljs-keyword">return</span> SHA384
+}
+--------------------------------------------------
+<span class="hljs-comment">//在/fabric/bccsp/bccsp.go中定义</span>
+<span class="hljs-comment">//key导入选项接口</span>
+<span class="hljs-keyword">type</span> KeyImportOpts <span class="hljs-keyword">interface</span> {
+    Algorithm() <span class="hljs-typename">string</span> <span class="hljs-comment">//返回key导入算法字符串标识</span>
+    Ephemeral() <span class="hljs-typename">bool</span>   <span class="hljs-comment">//如果生成的key是短暂的（ephemeral），返回true，否则返回false</span>
+}
+<span class="hljs-comment">//在/fabric/bccsp/opts.go中定义</span>
+<span class="hljs-comment">//key导入选项接口实现之一，ECDSA公匙的导入选项</span>
+<span class="hljs-keyword">type</span> ECDSAPKIXPublicKeyImportOpts <span class="hljs-keyword">struct</span> {
+    Temporary <span class="hljs-typename">bool</span>
+}
+<span class="hljs-keyword">func</span> (opts *ECDSAPKIXPublicKeyImportOpts) Algorithm() <span class="hljs-typename">string</span> {
+    <span class="hljs-keyword">return</span> ECDSA
+}
+<span class="hljs-keyword">func</span> (opts *ECDSAPKIXPublicKeyImportOpts) Ephemeral() <span class="hljs-typename">bool</span> {
+    <span class="hljs-keyword">return</span> opts.Temporary
+}
+<span class="hljs-comment">//key导入选项接口实现之二，ECDSA私匙的导入选项</span>
+<span class="hljs-keyword">type</span> ECDSAPrivateKeyImportOpts <span class="hljs-keyword">struct</span> {
+    Temporary <span class="hljs-typename">bool</span>
+}
+<span class="hljs-keyword">func</span> (opts *ECDSAPrivateKeyImportOpts) Algorithm() <span class="hljs-typename">string</span> {
+    <span class="hljs-keyword">return</span> ECDSA
+}
+<span class="hljs-keyword">func</span> (opts *ECDSAPrivateKeyImportOpts) Ephemeral() <span class="hljs-typename">bool</span> {
+    <span class="hljs-keyword">return</span> opts.Temporary
+}
+<span class="hljs-comment">//比较特殊的，比如签名选项接口SignerOpts</span>
+<span class="hljs-comment">//由于因为使用的标准库，因此使用到此选项时多赋值为nil，bccsp源码中未实现</span></code></pre> 
+  <h2 id="sw实现方式">SW实现方式</h2> 
+  <p>BCCSP的SoftWare（SW）实现形式是默认的形式，这点仅从/fabric/bccsp/factory/opts.go中工厂的默认选项DefaultOpts和核心配置文档中关于bccsp的配置就可以看出来。主要使用的包是标准库<strong>hash</strong>和<strong>crypto</strong>（包括其中的各种包，如<strong>aes</strong>，<strong>rsa</strong>，<strong>ecdsa</strong>，<strong>sha256</strong>，<strong>elliptic</strong>，<strong>x509</strong>等）。</p> 
+  <p><strong>目录结构</strong>：</p> 
+  <ul> 
+   <li>/fabric/bccsp/sw <br> 
+    <ul>
+     <li>impl.go - bccsp的sw实现<strong>impl</strong></li> 
+     <li>internals.go - 签名者、鉴定者、加密者、解密者接口定义</li> 
+     <li>conf.go - bccsp的sw实现的配置定义</li> 
+     <li>———————————————————————–</li> 
+     <li>aes.go - aes类型的生成key函数、加密者/解密者实现</li> 
+     <li>ecdsa.go - ecdsa类型的签名者、公匙/私匙鉴定者实现</li> 
+     <li>rsa.go - rsa类型的签名者、公匙/私匙鉴定者实现</li> 
+     <li>———————————————————————–</li> 
+     <li>aeskey.go - aes类型的Key接口实现</li> 
+     <li>ecdsakey.go - ecdsa类型的Key接口实现</li> 
+     <li>rsakey.go - rsa类型的Key接口实现</li> 
+     <li>———————————————————————–</li> 
+     <li>dummyks.go - dummy类型的KeyStore接口实现dummyKeyStore，当生成的key是短暂的，则说明这些key不会保存到文件中，而是保存到内存中，系统一关闭，这些key就消失了</li> 
+     <li>fileks.go - file类型的KeyStore接口实现fileBasedKeyStore，当生成的key不是短暂的，则说明这些key在导入时，会存储在文件中，即便系统关闭，这些key也不会消失</li>
+    </ul></li> 
+  </ul> 
+  <p><strong>BCCSP接口实现</strong>：</p> 
+  <pre class="prettyprint"><code class=" hljs r">//在/fabric/bccsp/sw/impl.go中定义
+//SW bccsp的实例结构体
+type impl struct {
+    conf *config                          //bccsp实例的配置
+    ks   bccsp.KeyStore                   //key存储系统对象，存储和获取Key对象
+    encryptors map[reflect.Type]Encryptor //加密者映射
+    decryptors map[reflect.Type]Decryptor //解密者映射
+    signers    map[reflect.Type]Signer    //签名者映射，Key实现的类型作为映射的键
+    verifiers  map[reflect.Type]Verifier  //鉴定者映射，Key实现的类型作为映射的键
+}
+//专用生成函数
+func New(<span class="hljs-keyword">...</span>) (bccsp.BCCSP, error) { <span class="hljs-keyword">...</span> }
+//接口实现
+func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, <span class="hljs-keyword">...</span>) { <span class="hljs-keyword">...</span> }
+<span class="hljs-keyword">...</span></code></pre> 
+  <p>粗线条上看，由于impl对象和各种操作选项的存在，绝大部分接口的实现都是以<strong>switch-case</strong>为主干，根据选项的类型或配置，分情况完成功能，且每个分支的操作基本都很类似，如KeyGen。接下来一一介绍：</p> 
+  <ol> 
+   <li><strong>KeyGen</strong> - 根据key生成选项不同，生成三种系列的key：<strong>ECDSA，AES，RSA</strong>。ECDSA使用库ecdsa的GenerateKey函数，AES使用自定义的GetRandomBytes函数（在aes.go中实现，包装了rand.Read），RSA使用库rsa的GenerateKey函数。每个系列又根据具体参数的不同生成不同“尺寸”的key，具体的细节略过。最后返回不同的Key实现对象，如ecdsaPrivateKey，aesPrivateKey等（分别定义在同目录中的XXXkey.go中）。这里要注意的是，当前版本中用于签名的key，只支持ECDSA系列的key，这是官方文档中所说的，但是从实现上看签名的支持不止一种，又但是，bccsp本质上无论实现多上中key，也只有被调用者决定使用哪一种。而MSP模块是bccsp的使用者之一，应该是在它这个地方只认ECDSA的key。</li> 
+   <li><strong>KeyDeriv</strong> - 根据key获取选项opts从k中重新获取一个key，这里的重新获取可以理解为把k中的内容重新打乱再生成一个key。处理两种key类型：<strong>ecdsaXXXKey（XXX代表Public和Private），aesPrivateKey</strong>。最后返回打乱后重新生成的两种类型的key：<strong>reRandomizedKey</strong>和<strong>hmacedKey</strong>。对于重新生成的key，如果选项中指定的不是暂时性的key，则会在ks中存储。</li> 
+   <li><strong>KeyImport</strong> - 从原始的数据raw中取出选项opts指定的key，如果不是临时性的，则在ks中存储，最后返回key。这里的原始，指的是[]byte或者含有key的数据（如证书数据里的key）。raw是一个空接口，也就是说可以接收任何形式的原始数据。为了得到key，对原始数据raw的转化或抽取，一部分使用了utils下的工具函数<code>utils.Clone</code>和<code>utils.DERToPublicKey</code>，如AES256，ECDSAPrivateKey等类型的key；一部分直接用go语言的断言<code>raw.(*Key类型)</code>，如ECDSAGoPublicKey，RSAGoPublicKey等类型的key。</li> 
+   <li><strong>Hash</strong> - 根据哈希选项opts对一个消息msg进行哈希，返回该msg的哈希值。如果opts为空，则使用默认选项。这个比较好理解，种类支持SHA2，SHA3哈希家族。</li> 
+   <li><strong>Sign</strong> - 根据签名者选项，使用k对digest进行<strong>签名</strong>，这里的签名者选项在当前版本里没什么用处，调用者都给的是nil。<strong>签名</strong>涉及到了<strong>Key接口</strong>和<strong>签名者Signer</strong>在SW bccsp中的实现。Key接口有三种实现：ecdsakey.go中的ecdsaPublicKey/ecdsaPrivateKey，rsakey.go中的rsaPublicKey/rsaPrivateKey，aeskey.go中的aesPrivateKey，这里签名（自然）使用的都是私匙。签名者接口Signer定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaSigner和rsa.go中的rsaSigner。参看SW bccsp专用生成函数<code>New</code>的signers赋值部分，可知用到了两种对应类型的Key和Signer：<strong>ecdsaPrivateKey - ecdsaSigner</strong>和<strong>rsaPrivateKey - rsaSigner</strong>。这里<strong>签名</strong>的实现是，从该bccsp实例的签名者集合成员signers获取类型为<code>reflect.TypeOf(k)</code>的签名者signer，然后直接调用signer的接口Sign，追溯，ecdsaSigner使用ecdsa库的Sign函数，rsaSigner使用rsa库PrivateKey结构体的Sign函数。</li> 
+   <li><strong>Verify</strong> - 根据鉴定者选项opts，通过对比k和digest，<strong>鉴定</strong>签名。<strong>鉴定</strong>涉及到了<strong>Key接口</strong>和<strong>鉴定者接口Verifier</strong>在SW bccsp中的实现。Key接口实现如上描述。鉴定者接口Verifier定义在同目录下的internals.go中，有两种类型的实现：ecdsa.go中的ecdsaPublicKeyKeyVerifier/ecdsaPrivateKeyVerifier和rsa.go中的rsaPublicKeyKeyVerifier/rsaPrivateKeyVerifier。参看SW bccsp专用生成函数<code>New</code>的verifiers赋值部分，可知所有鉴定者（与对应的Key接口实现）都有用到。这里<strong>鉴定</strong>的实现是，从该bccsp实例的鉴定者集合成员verifiers获取类型为<code>reflect.TypeOf(k)</code>的鉴定者verifier，然后直接调用verifier的接口Verify，追溯，ecdsaXXXKeyVerifier使用ecdsa库的Verify函数，rsaXXXKeyVerifier使用rsa库的VerifyPSS函数（这里XXX表示PublicKey或Private）。</li> 
+   <li><strong>Encrypt</strong> - 根据加密者选项opts，使用k**加密<strong>plaintext。</strong>加密<strong>涉及到了**Key接口</strong>和<strong>加密者接口Encryptor</strong>在SW bccsp中的实现。Key接口实现如上描述。加密者接口Encryptor定义在同目录下的internals.go中，在aes.go中实现（只能是aes，因为只有aes是用来加密的）：aescbcpkcs7Encryptor。参看SW bccsp专用生成函数<code>New</code>的encryptors赋值部分，只有<strong>aesPrivateKey - aescbcpkcs7Encryptor</strong>被使用。这里<strong>加密</strong>的实现是，从该bccsp实例的加密者集合成员encryptors获取类型为<code>reflect.TypeOf(k)</code>的加密者encryptor，然后直接调用encryptor的接口Encrypt，追溯，aescbcpkcs7Encryptor使用了aes库的加密流程进行加密。</li> 
+   <li><strong>Decrypt</strong> - <strong>解密</strong>与加密类似，过程类似，也是只有aes配套实现，最终使用aes库解密流程进行解密。</li> 
+   <li><strong>GetXXX</strong> - GetXXX系列接口，获取实例对象中的数据，略。</li> 
+  </ol> 
+  <p>在fabirc源码解析12——peer的MSP服务文中背书检验部分的第3、4点，涉及到了包含在msp中的bccsp对象成员，使用了bccsp对象的<code>GetHashOpt</code>、<code>Hash</code>、<code>KeyImport</code>、<code>Verify</code>等接口用以生成identities对象或identities自身一些接口实现。在此可以对看。</p> 
+  <h2 id="pkcs11实现方式">pkcs11实现方式</h2> 
+  <p>BCCSP的pkcs11实现形式主要使用到的库与sw实现如出一辙，但外加一个<strong>github.com/miekg/pkcs11</strong>库，最好参看其文档以熟悉pkcs11的简要操作。pkcs11（PKCS，Public-Key Cryptography Standards）是一套非常通用的接口标准，可以说这里是用pkcs11实现了bccsp的功能，也为fabric支持热插拔和个人安全硬件模块提供了服务。这点可以从bccsp的pkcs11的实现实例的专用生成函数<code>New</code>（参看下文）中所调用的<code>loadLib</code>函数可以看出来：<code>loadLib</code>加载了一个系统中的动态库，能加载系统的动态库，就可以和驱动、热插拔、连接电脑的字符设备联系在一起。比如将来，开发出了一款在区域链上类似于现在网上银行所用的U盾之类的个人身份或安全交易硬件模块或芯片，这些硬件模块或芯片只需要也遵循pkcs11，fabric即可对此进行支持和扩展。</p> 
+  <p>对于pkcs11的所提供的接口，在此提供两个文档地址，读者可以稍作了解： <a href="https://www.ibm.com/developerworks/cn/security/s-pkcs/" rel="nofollow" target="_blank">https://www.ibm.com/developerworks/cn/security/s-pkcs/</a> ， <a href="http://docs.oracle.com/cd/E19253-01/819-7056/6n91eac56/index.html#chapter2-9" rel="nofollow" target="_blank">http://docs.oracle.com/cd/E19253-01/819-7056/6n91eac56/index.html#chapter2-9</a> 。这些文档与fabric和区域链无关，但是因为pkcs11是通用的接口，所以有一定参考价值。pkcs11库中的解释相对过于简单。</p> 
+  <p><strong>目录结构</strong>：</p> 
+  <ul> 
+   <li>/fabric/bccsp/pkcs11 <br> 
+    <ul>
+     <li>impl.go - bccsp的pkcs11实现<strong>impl</strong></li> 
+     <li>conf.go - 定义了bccsp服务的配置和PKCS11Opts、FileKeystoreOpts、DummyKeystoreOpts选项</li> 
+     <li><strong>pkcs11.go</strong> - 以<strong>pkcs11库</strong>为基础，包装各种pkcs11功能，实现了impl基于pkcs11的内调函数，和一些bccsp服务使用到的独立的内调函数</li> 
+     <li>———————————————————————–</li> 
+     <li>aes.go - 实现aes类型的生成key、加密、解密函数</li> 
+     <li>ecdsa.go - 实现impl在ecdsa技术下的签名函数<code>signECDSA</code>和鉴定函数<code>verifyECDSA</code></li> 
+     <li>———————————————————————–</li> 
+     <li>aeskey.go - 实现aes类型的Key接口，只实现私匙aesPrivateKey</li> 
+     <li>ecdsakey.go - 实现ecdsa类型的Key接口，实现了公匙ecdsaPublicKey，私匙ecdsaPrivateKey</li> 
+     <li>rsakey.go - 实现了rsa类型的Key接口，实现了公匙rsaPublicKey，私匙rsaPrivateKey</li> 
+     <li>———————————————————————–</li> 
+     <li>dummyks.go - dummy类型的KeyStore接口实现DummyKeyStore</li> 
+     <li>fileks.go - file类型的KeyStore接口实现FileBasedKeyStore</li>
+    </ul></li> 
+  </ul> 
+  <p><strong>BCCSP接口实现</strong>：</p> 
+  <pre class="prettyprint"><code class=" hljs r">type impl struct {
+    conf *config                       //配置
+    ks   bccsp.KeyStore                //key存储系统对象，存储和获取Key对象
+    ctx      *pkcs11.Ctx               //标准库的pkcs11上下文
+    sessions chan pkcs11.SessionHandle //实质是uint，会话标识符频道，默认<span class="hljs-number">10</span>个缓存
+    slot     uint                      //安全硬件外设连接插槽标识号
+    lib          string                //加载库所在路径
+    noPrivImport bool                  //禁止导入私匙标识
+    softVerify   bool                  //使用软件方式鉴定签名标识
+}
+//专用生成函数
+func New(opts PKCS11Opts, keyStore bccsp.KeyStore) (bccsp.BCCSP, error) { <span class="hljs-keyword">...</span> }
+//接口实现
+func (csp *impl) KeyGen(opts bccsp.KeyGenOpts) (k bccsp.Key, err error) { <span class="hljs-keyword">...</span> }
+<span class="hljs-keyword">...</span></code></pre> 
+  <p>BCCSP的pkcs11实现的骨架在impl.go中与sw的实现基本一致，只是追溯到最终实现的语句时，sw实现是使用crypto库下的各个包进行签名，加密，密匙导入等，<strong>而pkcsll则用pkcs11包对数据进行了多一层的处理，使用pkcs11提供的上下文（pkcs11.Ctx）和会话（SessionHandle）之上对签名，密匙，加密等进行管理，这也是pkcs11.go文件的作用</strong>。两者最大的不同是一个面向软件，一个面向硬件，pkcs11自身又非常的冗杂，因此在此只讲pkcs11中与安全硬件模块建立连接的<strong>loadLib</strong>函数。</p> 
+  <p><strong>loadLib函数</strong>在pkcs11.go中定义，供专用生成函数<code>New</code>使用。为建立与安全硬件模块的通信，进行了如下步骤：</p> 
+  <ol> 
+   <li>根据所给的系统动态库路径lib加载动态库（如openCryptoki的动态库），调用<code>pkcs11.New(lib)</code>建立pkcs11实例ctx。ctx相当于fabric与安全硬件模块通信的桥梁：<strong>bccsp&lt;–&gt;ctx&lt;–&gt;驱动lib&lt;–&gt;安全硬件模块</strong>，只要驱动lib是按照pkcs11标准开发。</li> 
+   <li><code>ctx.Initialize()</code>进行初始化。</li> 
+   <li>从<code>ctx.GetSlotList(true)</code>返回的列表中获取由label指定的插槽标识slot（这里的槽可以简单的理解为电脑主机上供安全硬件模块插入的槽，如USB插口，可能不止一个，每一个在系统内核中都有名字和标识号）。</li> 
+   <li>尝试10次调用<code>ctx.OpenSession</code>打开一个会话session（会话就是通过通信路径与安全硬件模块建立连接，可以简单的理解为pkcs11的chan）。</li> 
+   <li>登陆会话<code>ctx.Login</code>。</li> 
+   <li>返回ctx，slot，会话对象session，用于赋值给impl实例成员ctx，slot，把session发送到sessions里。</li> 
+  </ol> 
+  <p>关于pkcs11，还有一点可说的，就是SoftHSM库，它是一个模拟硬件实现的pkcsll，对应到的系统动态库可参看impl.go中FindPKCS11Lib测试函数中所涉及的，如Linux下的libsofthsm2.so。现阶段是没有安全硬件模块可以配合测试的，所以只有使用SoftHSM模拟测试，将libsofthsm2.so导入pkcs11对象。</p> 
+  <h2 id="bccsp工厂">BCCSP工厂</h2> 
+  <p>对应两种bccsp实现，这里也有两种bccsp工厂：<strong>pkcs11factory.go</strong>和<strong>swfactory.go</strong>。fabric中某一模块一旦涉及工厂factory，则说明该模块基本就是由工厂提供“窗口函数”，供其他模块调用。这里以swfactory为例进行讲解。</p> 
+  <p><strong>目录结构</strong>：</p> 
+  <ul> 
+   <li>/fabric/bccsp/factory/ <br> 
+    <ul>
+     <li>factory.go - 声明了默认bccsp实例<strong>defaultBCCSP</strong>，bccsp实例存储映射<strong>bccspMap</strong>等全局变量和这些变量的获取函数<strong>GetXXX</strong>，定义bccsp工厂接口。 </li> 
+     <li>nopkcs11.go/pkcs11.go - 定义了两种版本的工厂选项<strong>FactoryOpts</strong>，初始化工厂函数InitFactories和获取指定bccsp实例函数GetBCCSPFromOpts。nopkcs11是默认版本，可条件编译指定使用哪种版本（编译时加入nopkcs11或!nopkcs11选项）。两种版本的差异集中在是否使用pkcs11上。</li> 
+     <li>opts.go - 定义了默认的工厂选项<strong>DefaultOpts</strong>。</li> 
+     <li>pkcs11factory.go - pkcs11类型的bccsp工厂实现<strong>PKCS11Factory</strong>。</li> 
+     <li>swfactory.go - sw类型的bccsp工厂实现<strong>SWFactory</strong>。还定义了sw版本的bccsp选项。</li>
+    </ul></li> 
+  </ul> 
+  <p><strong>swfactory接口和实现</strong>：</p> 
+  <pre class="prettyprint"><code class=" hljs go"><span class="hljs-comment">//在factory.go中定义</span>
+<span class="hljs-comment">//接口</span>
+<span class="hljs-keyword">type</span> BCCSPFactory <span class="hljs-keyword">interface</span> {
+
+    <span class="hljs-comment">//返回工厂的名字</span>
+    Name() <span class="hljs-typename">string</span>
+    <span class="hljs-comment">//返回符合工厂选项opts的bccsp实例</span>
+    Get(opts *FactoryOpts) (bccsp.BCCSP, error)
+}
+
+<span class="hljs-comment">//在swfactory.go中定义</span>
+<span class="hljs-comment">//实现</span>
+<span class="hljs-keyword">type</span> SWFactory <span class="hljs-keyword">struct</span>{}
+<span class="hljs-keyword">func</span> (f *SWFactory) Name() <span class="hljs-typename">string</span> {
+    <span class="hljs-keyword">return</span> SoftwareBasedFactoryName
+}
+<span class="hljs-keyword">func</span> (f *SWFactory) Get(config *FactoryOpts) (bccsp.BCCSP, error) { ... }</code></pre> 
+  <p>实现的代码本身比较简单，<code>Get</code>最终是调用的sw的专用生成函数<code>New</code>来生成符合opts的bccsp实例。<code>Name</code>则是直接返回一个”SW”常量。</p> 
+  <p>在每个chaincode例子中，如/fabric/examples/e2e_cli/examples/chaincode/go/chaincode_example02/chaincode_example02.go，都使用了chaincode垫片shim中的<code>Start</code>函数。不知道在fabirc源码解析7——peer的ChaincodeSupport服务文中是否说过，在此说一下，chaincode的“垫片”shim核心代码集中在/fabric/core/chaincode/shim中，该垫片所“承垫”的是与各个结点通信的任务，也即ChaincodeSupport服务。chaincode形成的通信的信息，通过shim分发到各个结点，然后shim负责从各个结点收集信息，汇总返回给chaincode，完成chaincode的功能。其中shim的<code>Start</code>函数就是用来启动一个chaincode，定义在/fabric/core/chaincode/shim/chaincode.go中。在<code>Start</code>的函数中，就调用了<code>err := factory.InitFactories(&amp;factory.DefaultOpts)</code>来初始化一个默认的bccsp工厂，在此可以知道，这里使用的默认工厂选项（参看opts.go），也就是使用的swfactory。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/idsuf698987/article/details/77200287,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/idsuf698987/article/details/77200287,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

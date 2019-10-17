@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>疑案追踪：Spring Boot内存泄露排查记 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="疑案追踪：Spring Boot内存泄露排查记" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="总第323篇 2019年 第001篇 在项目迁移到Spring Boot之后，发生内存使用量过高的问题。本文介绍了整个排查过程以及使用到的工具，也非常适用于其他堆外内存排查。 背景 为了更好地实现对项目的管理，我们将组内一个项目迁移到MDP框架（基于Spring Boot），随后我们就发现系统会频繁报出Swap区域使用量过高的异常。笔者被叫去帮忙查看原因，发现配置了4G堆内内存，但是实际使用的物理内存竟然高达7G，确实不正常。 JVM参数配置是： -XX:MetaspaceSize=256M&nbsp;-XX:MaxMetaspaceSize=256M&nbsp;-XX:+AlwaysPreTouch&nbsp;-XX:ReservedCodeCacheSize=128m&nbsp;-XX:InitialCodeCacheSize=128m,&nbsp;-Xss512k&nbsp;-Xmx4g&nbsp;-Xms4g,-XX:+UseG1GC&nbsp;-XX:G1HeapRegionSize=4M 实际使用的物理内存如下图所示： 排查过程 1. 使用Java层面的工具定位内存区域（堆内内存、Code区域或者使用unsafe.allocateMemory和DirectByteBuffer申请的堆外内存） 笔者在项目中添加-XX:NativeMemoryTracking=detailJVM参数重启项目，使用命令jcmd pid VM.native_memory detail查看到的内存分布如下： 发现命令显示的committed的内存小于物理内存，因为jcmd命令显示的内存包含堆内内存、Code区域、通过unsafe.allocateMemory和DirectByteBuffer申请的内存，但是不包含其他Native Code（C代码）申请的堆外内存。所以猜测是使用Native Code申请内存所导致的问题。 为了防止误判，笔者使用了pmap查看内存分布，发现大量64M地址；而这些地址空间不在jcmd命令所给出的地址空间里面，基本上可断定就是这些64M的内存所导致。 2. 使用系统层面的工具定位堆外内存 因为笔者已经基本上确定是Native Code所引起，而Java层面的工具不便于排查此类问题，只能使用系统层面的工具去定位问题。 首先，使用了gperftools去定位问题 gperftools的使用方法可以参考gperftools，gperftools的监控如下： 从上图可以看出：使用malloc申请的内存最高到3G之后就释放了，之后始终维持在700M-800M。笔者第一反应是：难道Native Code中没有使用malloc申请，直接使用mmap/brk申请的？（gperftools原理就使用动态链接的方式替换了操作系统默认的内存分配器（glibc）。） 然后，使用strace去追踪系统调用 因为使用gperftools没有追踪到这些内存，于是直接使用命令strace -f -e&quot;brk,mmap,munmap&quot; -p pid追踪向OS申请内存请求，但是并没有发现有可疑内存申请。strace监控如下图所示： 接着，使用GDB去dump可疑内存 因为使用strace没有追踪到可疑内存申请；于是想着看看内存中的情况。就是直接使用命令gdp -pid pid进入GDB之后，然后使用命令dump memory mem.bin startAddress endAddressdump内存，其中startAddress和endAddress可以从/proc/pid/smaps中查找。然后使用strings mem.bin查看dump的内容，如下： 从内容上来看，像是解压后的JAR包信息。读取JAR包信息应该是在项目启动的时候，那么在项目启动之后使用strace作用就不是很大了。所以应该在项目启动的时候使用strace，而不是启动完成之后。 再次，项目启动时使用strace去追踪系统调用 项目启动使用strace追踪系统调用，发现确实申请了很多64M的内存空间，截图如下： 使用该mmap申请的地址空间在pmap对应如下： 最后，使用jstack去查看对应的线程 因为strace命令中已经显示申请内存的线程ID。直接使用命令jstack pid去查看线程栈，找到对应的线程栈（注意10进制和16进制转换）如下： 这里基本上就可以看出问题来了：MCC（美团统一配置中心）使用了Reflections进行扫包，底层使用了Spring Boot去加载JAR。因为解压JAR使用Inflater类，需要用到堆外内存，然后使用Btrace去追踪这个类，栈如下： 然后查看使用MCC的地方，发现没有配置扫包路径，默认是扫描所有的包。于是修改代码，配置扫包路径，发布上线后内存问题解决。 3. 为什么堆外内存没有释放掉呢？ 虽然问题已经解决了，但是有几个疑问： 为什么使用旧的框架没有问题？ 为什么堆外内存没有释放？ 为什么内存大小都是64M，JAR大小不可能这么大，而且都是一样大？ 为什么gperftools最终显示使用的内存大小是700M左右，解压包真的没有使用malloc申请内存吗？ 带着疑问，笔者直接看了一下Spring Boot Loader那一块的源码。发现Spring Boot对Java JDK的InflaterInputStream进行了包装并且使用了Inflater，而Inflater本身用于解压JAR包的需要用到堆外内存。而包装之后的类ZipInflaterInputStream没有释放Inflater持有的堆外内存。于是笔者以为找到了原因，立马向Spring Boot社区反馈了这个Bug。但是反馈之后，笔者就发现Inflater这个对象本身实现了finalize方法，在这个方法中有调用释放堆外内存的逻辑。也就是说Spring Boot依赖于GC释放堆外内存。 笔者使用jmap查看堆内对象时，发现已经基本上没有Inflater这个对象了。于是就怀疑GC的时候，没有调用finalize。带着这样的怀疑，笔者把Inflater进行包装在Spring Boot Loader里面替换成自己包装的Inflater，在finalize进行打点监控，结果finalize方法确实被调用了。于是笔者又去看了Inflater对应的C代码，发现初始化的时候使用了malloc申请内存，end的时候也调用了free去释放内存。 此刻，笔者只能怀疑free的时候没有真正释放内存，便把Spring Boot包装的InflaterInputStream替换成Java JDK自带的，发现替换之后，内存问题也得以解决了。 这时，再返过来看gperftools的内存分布情况，发现使用Spring Boot时，内存使用一直在增加，突然某个点内存使用下降了好多（使用量直接由3G降为700M左右）。这个点应该就是GC引起的，内存应该释放了，但是在操作系统层面并没有看到内存变化，那是不是没有释放到操作系统，被内存分配器持有了呢？ 继续探究，发现系统默认的内存分配器（glibc 2.12版本）和使用gperftools内存地址分布差别很明显，2.5G地址使用smaps发现它是属于Native Stack。内存地址分布如下： 到此，基本上可以确定是内存分配器在捣鬼；搜索了一下glibc 64M，发现glibc从2.11开始对每个线程引入内存池（64位机器大小就是64M内存），原文如下： 按照文中所说去修改MALLOC_ARENA_MAX环境变量，发现没什么效果。查看tcmalloc（gperftools使用的内存分配器）也使用了内存池方式。 为了验证是内存池搞的鬼，笔者就简单写个不带内存池的内存分配器。使用命令gcc zjbmalloc.c -fPIC -shared -o zjbmalloc.so生成动态库，然后使用export LD_PRELOAD=zjbmalloc.so替换掉glibc的内存分配器。其中代码Demo如下： 通过在自定义分配器当中埋点可以发现其实程序启动之后应用实际申请的堆外内存始终在700M-800M之间，gperftools监控显示内存使用量也是在700M-800M左右。但是从操作系统角度来看进程占用的内存差别很大（这里只是监控堆外内存）。 笔者做了一下测试，使用不同分配器进行不同程度的扫包，占用的内存如下： 为什么自定义的malloc申请800M，最终占用的物理内存在1.7G呢？ 因为自定义内存分配器采用的是mmap分配内存，mmap分配内存需要按需向上取整到整数个页，所以存在着巨大的空间浪费。通过监控发现最终申请的页面数目在536k个左右，那实际上向系统申请的内存等于512k * 4k（pagesize） = 2G。 为什么这个数据大于1.7G呢？ 因为操作系统采取的是延迟分配的方式，通过mmap向系统申请内存的时候，系统仅仅返回内存地址并没有分配真实的物理内存。只有在真正使用的时候，系统产生一个缺页中断然后再分配实际的物理Page。 总结 整个内存分配的流程如上图所示。MCC扫包的默认配置是扫描所有的JAR包。在扫描包的时候，Spring Boot不会主动去释放堆外内存，导致在扫描阶段，堆外内存占用量一直持续飙升。当发生GC的时候，Spring Boot依赖于finalize机制去释放了堆外内存；但是glibc为了性能考虑，并没有真正把内存归返到操作系统，而是留下来放入内存池了，导致应用层以为发生了“内存泄漏”。所以修改MCC的配置路径为特定的JAR包，问题解决。笔者在发表这篇文章时，发现Spring Boot的最新版本（2.0.5.RELEASE）已经做了修改，在ZipInflaterInputStream主动释放了堆外内存不再依赖GC；所以Spring Boot升级到最新版本，这个问题也可以得到解决。 参考资料 GNU C Library (glibc) Native Memory Tracking Spring Boot gperftools Btrace 作者简介 纪兵，2015年加入美团，目前主要从事酒店C端相关的工作。 欢迎加入美团Java技术交流群，跟项目维护者零距离交流。进群方式：请加美美同学微信（微信号：MTDPtech02），回复：Spring Boot，美美会自动拉你进群。 ----------&nbsp; END&nbsp; ---------- 也许你还想看 Spring MVC注解故障追踪记 这个Spring高危漏洞，你修补了吗？ ReactiveCocoa中潜在的内存泄漏及解决方案" />
+<meta property="og:description" content="总第323篇 2019年 第001篇 在项目迁移到Spring Boot之后，发生内存使用量过高的问题。本文介绍了整个排查过程以及使用到的工具，也非常适用于其他堆外内存排查。 背景 为了更好地实现对项目的管理，我们将组内一个项目迁移到MDP框架（基于Spring Boot），随后我们就发现系统会频繁报出Swap区域使用量过高的异常。笔者被叫去帮忙查看原因，发现配置了4G堆内内存，但是实际使用的物理内存竟然高达7G，确实不正常。 JVM参数配置是： -XX:MetaspaceSize=256M&nbsp;-XX:MaxMetaspaceSize=256M&nbsp;-XX:+AlwaysPreTouch&nbsp;-XX:ReservedCodeCacheSize=128m&nbsp;-XX:InitialCodeCacheSize=128m,&nbsp;-Xss512k&nbsp;-Xmx4g&nbsp;-Xms4g,-XX:+UseG1GC&nbsp;-XX:G1HeapRegionSize=4M 实际使用的物理内存如下图所示： 排查过程 1. 使用Java层面的工具定位内存区域（堆内内存、Code区域或者使用unsafe.allocateMemory和DirectByteBuffer申请的堆外内存） 笔者在项目中添加-XX:NativeMemoryTracking=detailJVM参数重启项目，使用命令jcmd pid VM.native_memory detail查看到的内存分布如下： 发现命令显示的committed的内存小于物理内存，因为jcmd命令显示的内存包含堆内内存、Code区域、通过unsafe.allocateMemory和DirectByteBuffer申请的内存，但是不包含其他Native Code（C代码）申请的堆外内存。所以猜测是使用Native Code申请内存所导致的问题。 为了防止误判，笔者使用了pmap查看内存分布，发现大量64M地址；而这些地址空间不在jcmd命令所给出的地址空间里面，基本上可断定就是这些64M的内存所导致。 2. 使用系统层面的工具定位堆外内存 因为笔者已经基本上确定是Native Code所引起，而Java层面的工具不便于排查此类问题，只能使用系统层面的工具去定位问题。 首先，使用了gperftools去定位问题 gperftools的使用方法可以参考gperftools，gperftools的监控如下： 从上图可以看出：使用malloc申请的内存最高到3G之后就释放了，之后始终维持在700M-800M。笔者第一反应是：难道Native Code中没有使用malloc申请，直接使用mmap/brk申请的？（gperftools原理就使用动态链接的方式替换了操作系统默认的内存分配器（glibc）。） 然后，使用strace去追踪系统调用 因为使用gperftools没有追踪到这些内存，于是直接使用命令strace -f -e&quot;brk,mmap,munmap&quot; -p pid追踪向OS申请内存请求，但是并没有发现有可疑内存申请。strace监控如下图所示： 接着，使用GDB去dump可疑内存 因为使用strace没有追踪到可疑内存申请；于是想着看看内存中的情况。就是直接使用命令gdp -pid pid进入GDB之后，然后使用命令dump memory mem.bin startAddress endAddressdump内存，其中startAddress和endAddress可以从/proc/pid/smaps中查找。然后使用strings mem.bin查看dump的内容，如下： 从内容上来看，像是解压后的JAR包信息。读取JAR包信息应该是在项目启动的时候，那么在项目启动之后使用strace作用就不是很大了。所以应该在项目启动的时候使用strace，而不是启动完成之后。 再次，项目启动时使用strace去追踪系统调用 项目启动使用strace追踪系统调用，发现确实申请了很多64M的内存空间，截图如下： 使用该mmap申请的地址空间在pmap对应如下： 最后，使用jstack去查看对应的线程 因为strace命令中已经显示申请内存的线程ID。直接使用命令jstack pid去查看线程栈，找到对应的线程栈（注意10进制和16进制转换）如下： 这里基本上就可以看出问题来了：MCC（美团统一配置中心）使用了Reflections进行扫包，底层使用了Spring Boot去加载JAR。因为解压JAR使用Inflater类，需要用到堆外内存，然后使用Btrace去追踪这个类，栈如下： 然后查看使用MCC的地方，发现没有配置扫包路径，默认是扫描所有的包。于是修改代码，配置扫包路径，发布上线后内存问题解决。 3. 为什么堆外内存没有释放掉呢？ 虽然问题已经解决了，但是有几个疑问： 为什么使用旧的框架没有问题？ 为什么堆外内存没有释放？ 为什么内存大小都是64M，JAR大小不可能这么大，而且都是一样大？ 为什么gperftools最终显示使用的内存大小是700M左右，解压包真的没有使用malloc申请内存吗？ 带着疑问，笔者直接看了一下Spring Boot Loader那一块的源码。发现Spring Boot对Java JDK的InflaterInputStream进行了包装并且使用了Inflater，而Inflater本身用于解压JAR包的需要用到堆外内存。而包装之后的类ZipInflaterInputStream没有释放Inflater持有的堆外内存。于是笔者以为找到了原因，立马向Spring Boot社区反馈了这个Bug。但是反馈之后，笔者就发现Inflater这个对象本身实现了finalize方法，在这个方法中有调用释放堆外内存的逻辑。也就是说Spring Boot依赖于GC释放堆外内存。 笔者使用jmap查看堆内对象时，发现已经基本上没有Inflater这个对象了。于是就怀疑GC的时候，没有调用finalize。带着这样的怀疑，笔者把Inflater进行包装在Spring Boot Loader里面替换成自己包装的Inflater，在finalize进行打点监控，结果finalize方法确实被调用了。于是笔者又去看了Inflater对应的C代码，发现初始化的时候使用了malloc申请内存，end的时候也调用了free去释放内存。 此刻，笔者只能怀疑free的时候没有真正释放内存，便把Spring Boot包装的InflaterInputStream替换成Java JDK自带的，发现替换之后，内存问题也得以解决了。 这时，再返过来看gperftools的内存分布情况，发现使用Spring Boot时，内存使用一直在增加，突然某个点内存使用下降了好多（使用量直接由3G降为700M左右）。这个点应该就是GC引起的，内存应该释放了，但是在操作系统层面并没有看到内存变化，那是不是没有释放到操作系统，被内存分配器持有了呢？ 继续探究，发现系统默认的内存分配器（glibc 2.12版本）和使用gperftools内存地址分布差别很明显，2.5G地址使用smaps发现它是属于Native Stack。内存地址分布如下： 到此，基本上可以确定是内存分配器在捣鬼；搜索了一下glibc 64M，发现glibc从2.11开始对每个线程引入内存池（64位机器大小就是64M内存），原文如下： 按照文中所说去修改MALLOC_ARENA_MAX环境变量，发现没什么效果。查看tcmalloc（gperftools使用的内存分配器）也使用了内存池方式。 为了验证是内存池搞的鬼，笔者就简单写个不带内存池的内存分配器。使用命令gcc zjbmalloc.c -fPIC -shared -o zjbmalloc.so生成动态库，然后使用export LD_PRELOAD=zjbmalloc.so替换掉glibc的内存分配器。其中代码Demo如下： 通过在自定义分配器当中埋点可以发现其实程序启动之后应用实际申请的堆外内存始终在700M-800M之间，gperftools监控显示内存使用量也是在700M-800M左右。但是从操作系统角度来看进程占用的内存差别很大（这里只是监控堆外内存）。 笔者做了一下测试，使用不同分配器进行不同程度的扫包，占用的内存如下： 为什么自定义的malloc申请800M，最终占用的物理内存在1.7G呢？ 因为自定义内存分配器采用的是mmap分配内存，mmap分配内存需要按需向上取整到整数个页，所以存在着巨大的空间浪费。通过监控发现最终申请的页面数目在536k个左右，那实际上向系统申请的内存等于512k * 4k（pagesize） = 2G。 为什么这个数据大于1.7G呢？ 因为操作系统采取的是延迟分配的方式，通过mmap向系统申请内存的时候，系统仅仅返回内存地址并没有分配真实的物理内存。只有在真正使用的时候，系统产生一个缺页中断然后再分配实际的物理Page。 总结 整个内存分配的流程如上图所示。MCC扫包的默认配置是扫描所有的JAR包。在扫描包的时候，Spring Boot不会主动去释放堆外内存，导致在扫描阶段，堆外内存占用量一直持续飙升。当发生GC的时候，Spring Boot依赖于finalize机制去释放了堆外内存；但是glibc为了性能考虑，并没有真正把内存归返到操作系统，而是留下来放入内存池了，导致应用层以为发生了“内存泄漏”。所以修改MCC的配置路径为特定的JAR包，问题解决。笔者在发表这篇文章时，发现Spring Boot的最新版本（2.0.5.RELEASE）已经做了修改，在ZipInflaterInputStream主动释放了堆外内存不再依赖GC；所以Spring Boot升级到最新版本，这个问题也可以得到解决。 参考资料 GNU C Library (glibc) Native Memory Tracking Spring Boot gperftools Btrace 作者简介 纪兵，2015年加入美团，目前主要从事酒店C端相关的工作。 欢迎加入美团Java技术交流群，跟项目维护者零距离交流。进群方式：请加美美同学微信（微信号：MTDPtech02），回复：Spring Boot，美美会自动拉你进群。 ----------&nbsp; END&nbsp; ---------- 也许你还想看 Spring MVC注解故障追踪记 这个Spring高危漏洞，你修补了吗？ ReactiveCocoa中潜在的内存泄漏及解决方案" />
+<link rel="canonical" href="https://uzzz.org/2019/04/29/729147.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/29/729147.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-29T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"总第323篇 2019年 第001篇 在项目迁移到Spring Boot之后，发生内存使用量过高的问题。本文介绍了整个排查过程以及使用到的工具，也非常适用于其他堆外内存排查。 背景 为了更好地实现对项目的管理，我们将组内一个项目迁移到MDP框架（基于Spring Boot），随后我们就发现系统会频繁报出Swap区域使用量过高的异常。笔者被叫去帮忙查看原因，发现配置了4G堆内内存，但是实际使用的物理内存竟然高达7G，确实不正常。 JVM参数配置是： -XX:MetaspaceSize=256M&nbsp;-XX:MaxMetaspaceSize=256M&nbsp;-XX:+AlwaysPreTouch&nbsp;-XX:ReservedCodeCacheSize=128m&nbsp;-XX:InitialCodeCacheSize=128m,&nbsp;-Xss512k&nbsp;-Xmx4g&nbsp;-Xms4g,-XX:+UseG1GC&nbsp;-XX:G1HeapRegionSize=4M 实际使用的物理内存如下图所示： 排查过程 1. 使用Java层面的工具定位内存区域（堆内内存、Code区域或者使用unsafe.allocateMemory和DirectByteBuffer申请的堆外内存） 笔者在项目中添加-XX:NativeMemoryTracking=detailJVM参数重启项目，使用命令jcmd pid VM.native_memory detail查看到的内存分布如下： 发现命令显示的committed的内存小于物理内存，因为jcmd命令显示的内存包含堆内内存、Code区域、通过unsafe.allocateMemory和DirectByteBuffer申请的内存，但是不包含其他Native Code（C代码）申请的堆外内存。所以猜测是使用Native Code申请内存所导致的问题。 为了防止误判，笔者使用了pmap查看内存分布，发现大量64M地址；而这些地址空间不在jcmd命令所给出的地址空间里面，基本上可断定就是这些64M的内存所导致。 2. 使用系统层面的工具定位堆外内存 因为笔者已经基本上确定是Native Code所引起，而Java层面的工具不便于排查此类问题，只能使用系统层面的工具去定位问题。 首先，使用了gperftools去定位问题 gperftools的使用方法可以参考gperftools，gperftools的监控如下： 从上图可以看出：使用malloc申请的内存最高到3G之后就释放了，之后始终维持在700M-800M。笔者第一反应是：难道Native Code中没有使用malloc申请，直接使用mmap/brk申请的？（gperftools原理就使用动态链接的方式替换了操作系统默认的内存分配器（glibc）。） 然后，使用strace去追踪系统调用 因为使用gperftools没有追踪到这些内存，于是直接使用命令strace -f -e&quot;brk,mmap,munmap&quot; -p pid追踪向OS申请内存请求，但是并没有发现有可疑内存申请。strace监控如下图所示： 接着，使用GDB去dump可疑内存 因为使用strace没有追踪到可疑内存申请；于是想着看看内存中的情况。就是直接使用命令gdp -pid pid进入GDB之后，然后使用命令dump memory mem.bin startAddress endAddressdump内存，其中startAddress和endAddress可以从/proc/pid/smaps中查找。然后使用strings mem.bin查看dump的内容，如下： 从内容上来看，像是解压后的JAR包信息。读取JAR包信息应该是在项目启动的时候，那么在项目启动之后使用strace作用就不是很大了。所以应该在项目启动的时候使用strace，而不是启动完成之后。 再次，项目启动时使用strace去追踪系统调用 项目启动使用strace追踪系统调用，发现确实申请了很多64M的内存空间，截图如下： 使用该mmap申请的地址空间在pmap对应如下： 最后，使用jstack去查看对应的线程 因为strace命令中已经显示申请内存的线程ID。直接使用命令jstack pid去查看线程栈，找到对应的线程栈（注意10进制和16进制转换）如下： 这里基本上就可以看出问题来了：MCC（美团统一配置中心）使用了Reflections进行扫包，底层使用了Spring Boot去加载JAR。因为解压JAR使用Inflater类，需要用到堆外内存，然后使用Btrace去追踪这个类，栈如下： 然后查看使用MCC的地方，发现没有配置扫包路径，默认是扫描所有的包。于是修改代码，配置扫包路径，发布上线后内存问题解决。 3. 为什么堆外内存没有释放掉呢？ 虽然问题已经解决了，但是有几个疑问： 为什么使用旧的框架没有问题？ 为什么堆外内存没有释放？ 为什么内存大小都是64M，JAR大小不可能这么大，而且都是一样大？ 为什么gperftools最终显示使用的内存大小是700M左右，解压包真的没有使用malloc申请内存吗？ 带着疑问，笔者直接看了一下Spring Boot Loader那一块的源码。发现Spring Boot对Java JDK的InflaterInputStream进行了包装并且使用了Inflater，而Inflater本身用于解压JAR包的需要用到堆外内存。而包装之后的类ZipInflaterInputStream没有释放Inflater持有的堆外内存。于是笔者以为找到了原因，立马向Spring Boot社区反馈了这个Bug。但是反馈之后，笔者就发现Inflater这个对象本身实现了finalize方法，在这个方法中有调用释放堆外内存的逻辑。也就是说Spring Boot依赖于GC释放堆外内存。 笔者使用jmap查看堆内对象时，发现已经基本上没有Inflater这个对象了。于是就怀疑GC的时候，没有调用finalize。带着这样的怀疑，笔者把Inflater进行包装在Spring Boot Loader里面替换成自己包装的Inflater，在finalize进行打点监控，结果finalize方法确实被调用了。于是笔者又去看了Inflater对应的C代码，发现初始化的时候使用了malloc申请内存，end的时候也调用了free去释放内存。 此刻，笔者只能怀疑free的时候没有真正释放内存，便把Spring Boot包装的InflaterInputStream替换成Java JDK自带的，发现替换之后，内存问题也得以解决了。 这时，再返过来看gperftools的内存分布情况，发现使用Spring Boot时，内存使用一直在增加，突然某个点内存使用下降了好多（使用量直接由3G降为700M左右）。这个点应该就是GC引起的，内存应该释放了，但是在操作系统层面并没有看到内存变化，那是不是没有释放到操作系统，被内存分配器持有了呢？ 继续探究，发现系统默认的内存分配器（glibc 2.12版本）和使用gperftools内存地址分布差别很明显，2.5G地址使用smaps发现它是属于Native Stack。内存地址分布如下： 到此，基本上可以确定是内存分配器在捣鬼；搜索了一下glibc 64M，发现glibc从2.11开始对每个线程引入内存池（64位机器大小就是64M内存），原文如下： 按照文中所说去修改MALLOC_ARENA_MAX环境变量，发现没什么效果。查看tcmalloc（gperftools使用的内存分配器）也使用了内存池方式。 为了验证是内存池搞的鬼，笔者就简单写个不带内存池的内存分配器。使用命令gcc zjbmalloc.c -fPIC -shared -o zjbmalloc.so生成动态库，然后使用export LD_PRELOAD=zjbmalloc.so替换掉glibc的内存分配器。其中代码Demo如下： 通过在自定义分配器当中埋点可以发现其实程序启动之后应用实际申请的堆外内存始终在700M-800M之间，gperftools监控显示内存使用量也是在700M-800M左右。但是从操作系统角度来看进程占用的内存差别很大（这里只是监控堆外内存）。 笔者做了一下测试，使用不同分配器进行不同程度的扫包，占用的内存如下： 为什么自定义的malloc申请800M，最终占用的物理内存在1.7G呢？ 因为自定义内存分配器采用的是mmap分配内存，mmap分配内存需要按需向上取整到整数个页，所以存在着巨大的空间浪费。通过监控发现最终申请的页面数目在536k个左右，那实际上向系统申请的内存等于512k * 4k（pagesize） = 2G。 为什么这个数据大于1.7G呢？ 因为操作系统采取的是延迟分配的方式，通过mmap向系统申请内存的时候，系统仅仅返回内存地址并没有分配真实的物理内存。只有在真正使用的时候，系统产生一个缺页中断然后再分配实际的物理Page。 总结 整个内存分配的流程如上图所示。MCC扫包的默认配置是扫描所有的JAR包。在扫描包的时候，Spring Boot不会主动去释放堆外内存，导致在扫描阶段，堆外内存占用量一直持续飙升。当发生GC的时候，Spring Boot依赖于finalize机制去释放了堆外内存；但是glibc为了性能考虑，并没有真正把内存归返到操作系统，而是留下来放入内存池了，导致应用层以为发生了“内存泄漏”。所以修改MCC的配置路径为特定的JAR包，问题解决。笔者在发表这篇文章时，发现Spring Boot的最新版本（2.0.5.RELEASE）已经做了修改，在ZipInflaterInputStream主动释放了堆外内存不再依赖GC；所以Spring Boot升级到最新版本，这个问题也可以得到解决。 参考资料 GNU C Library (glibc) Native Memory Tracking Spring Boot gperftools Btrace 作者简介 纪兵，2015年加入美团，目前主要从事酒店C端相关的工作。 欢迎加入美团Java技术交流群，跟项目维护者零距离交流。进群方式：请加美美同学微信（微信号：MTDPtech02），回复：Spring Boot，美美会自动拉你进群。 ----------&nbsp; END&nbsp; ---------- 也许你还想看 Spring MVC注解故障追踪记 这个Spring高危漏洞，你修补了吗？ ReactiveCocoa中潜在的内存泄漏及解决方案","@type":"BlogPosting","url":"https://uzzz.org/2019/04/29/729147.html","headline":"疑案追踪：Spring Boot内存泄露排查记","dateModified":"2019-04-29T00:00:00+08:00","datePublished":"2019-04-29T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/29/729147.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>疑案追踪：Spring&nbsp;Boot内存泄露排查记</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;" data-mpa-powered-by="yiban.io"><img class="" data-copyright="0" data-ratio="0.10546875" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsV6LYkM3uK5TAnl8DxXwdR4zA3FUoOfW6b1icLsE77CELpkNLzriajHTdibqkqVFYoldIoffibgkOslZA/640?wx_fmt=png" data-type="png" data-w="1280" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsV6LYkM3uK5TAnl8DxXwdR4zA3FUoOfW6b1icLsE77CELpkNLzriajHTdibqkqVFYoldIoffibgkOslZA/640?wx_fmt=png"></p> 
+<p style="white-space: normal;text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><strong><span style="color: rgb(136, 136, 136);font-size: 12px;letter-spacing: 1px;">总第323篇</span></strong></p> 
+<p style="white-space: normal;text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><strong><span style="color: rgb(136, 136, 136);font-size: 12px;letter-spacing: 1px;">2019年 第001篇</span></strong></p> 
+<p style="white-space: normal;text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><strong><span style="color: rgb(136, 136, 136);font-size: 12px;letter-spacing: 1px;"><br></span></strong></p> 
+<section data-role="outer" label="Powered by 135editor.com" style="font-size:16px;font-family:微软雅黑;"> 
+ <section data-role="outer" label="Powered by 135editor.com"> 
+  <section class="_135editor" data-tools="135编辑器" data-id="127" style="border-width: 0px;border-style: none;border-color: initial;"> 
+   <section class="_135editor" data-tools="135编辑器" data-id="127" style="border-width: 0px;border-style: none;border-color: initial;"> 
+    <section style="margin: 60px 16px 16px;border-width: 1px;border-style: solid;border-color: rgb(235, 234, 225);text-align: center;border-radius: 8px;font-size: 18px;font-weight: inherit;text-decoration: inherit;"> 
+     <section style="margin-top: -3.3em;margin-right: 5px;margin-left: 5px;color: inherit;"> 
+      <section style="border-width: 2px;border-style: solid;border-color: rgb(235, 234, 225);width: 108px;clear: both;margin-right: auto;margin-left: auto;height: 108px;border-radius: 50%;box-shadow: rgb(201, 201, 201) 0px 2px 2px 2px;background-color: rgb(254, 254, 254);"> 
+       <img border="0" class="" data-ratio="1" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsVEo8rq9KLCpBpDjFMC8ybD4f2pE7xWdP9ezEA3nkuj5o3uuhazA18PviaVic81JrPR9JXySICia6Mww/640?wx_fmt=jpeg" data-type="jpeg" data-w="800" data-width="100%" height="auto" opacity="" style="border-radius: 50%;color: inherit;display: inline-block;" title="undefined" width="100%" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsVEo8rq9KLCpBpDjFMC8ybD4f2pE7xWdP9ezEA3nkuj5o3uuhazA18PviaVic81JrPR9JXySICia6Mww/640?wx_fmt=jpeg"> 
+      </section> 
+     </section> 
+     <section class="135brush" data-brushtype="text" data-style="text-align: left; font-size: 14px; color: inherit;" style="margin: 8px 15px;line-height: 1.4;color: inherit;"> 
+      <p style="text-align: left;"> <span style="font-size: 13px;color: rgb(136, 136, 136);">在项目迁移到Spring Boot之后，发生内存使用量过高的问题。本文介绍了整个排查过程以及使用到的工具，也非常适用于其他堆外内存排查。</span></p> 
+     </section> 
+    </section> 
+   </section> 
+  </section> 
+ </section> 
+</section> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><span style="color: rgb(136, 136, 136);"></span></p> 
+<h2 style="color: rgb(0, 0, 0);font-size: 18px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-bottom: 15px;margin-left: 0.5em;margin-right: 0.5em;"><span style="color: rgb(37, 183, 167);font-size: 20px;">背景</span></h2> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">为了更好地实现对项目的管理，我们将组内一个项目迁移到MDP框架（<span style="color: rgb(136, 136, 136);">基于Spring Boot</span>），随后我们就发现系统会频繁报出Swap区域使用量过高的异常。笔者被叫去帮忙查看原因，发现配置了4G堆内内存，但是实际使用的物理内存竟然高达7G，确实不正常。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="font-size: 15px;">JVM参数配置是：</span></p> 
+<section class="output_wrapper" style="font-size: 16px;color: rgb(62, 62, 62);line-height: 1.6;letter-spacing: 0px;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;margin-left: 0.5em;margin-right: 0.5em;"> 
+ <pre style="font-size: inherit;color: inherit;line-height: inherit;margin-top: 0px;margin-bottom: 0px;padding: 0px;"><code class="java language-java hljs" style="margin-right: 2px;margin-left: 2px;line-height: 18px;font-size: 14px;letter-spacing: 0px;font-family: Consolas, Inconsolata, Courier, monospace;border-radius: 0px;color: rgb(169, 183, 198);background: rgb(40, 43, 46);padding: 0.5em;display: block !important;overflow-wrap: normal !important;overflow: auto !important;">-XX:MetaspaceSize=<span class="hljs-number" style="font-size: inherit;line-height: inherit;color: rgb(174, 135, 250);overflow-wrap: inherit !important;word-break: inherit !important;">256</span>M&nbsp;<br>-XX:MaxMetaspaceSize=<span class="hljs-number" style="font-size: inherit;line-height: inherit;color: rgb(174, 135, 250);overflow-wrap: inherit !important;word-break: inherit !important;">256</span>M&nbsp;<br>-XX:+AlwaysPreTouch&nbsp;<br>-XX:ReservedCodeCacheSize=<span class="hljs-number" style="font-size: inherit;line-height: inherit;color: rgb(174, 135, 250);overflow-wrap: inherit !important;word-break: inherit !important;">128</span>m&nbsp;<br>-XX:InitialCodeCacheSize=<span class="hljs-number" style="font-size: inherit;line-height: inherit;color: rgb(174, 135, 250);overflow-wrap: inherit !important;word-break: inherit !important;">128</span>m,&nbsp;<br>-Xss512k&nbsp;-Xmx4g&nbsp;-Xms4g,-XX:+UseG1GC&nbsp;<br>-XX:G1HeapRegionSize=<span class="hljs-number" style="font-size: inherit;line-height: inherit;color: rgb(174, 135, 250);overflow-wrap: inherit !important;word-break: inherit !important;">4</span>M<br></code></pre> 
+</section> 
+<p style="margin: 15px 0.5em 10px;font-family: Arial, sans-serif;text-align: start;"><span style="font-size: 15px;">实际使用的物理内存如下图所示：</span></p> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: center;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;"><img class="mpa-image" data-ratio="0.31130434782608696" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6ibz7858GUxMKruU56aRAtziaYP6VNVNtXHRJZuLBQV8gybwYY0Eewexg/640?wx_fmt=png" data-type="png" data-w="1150" style="width: 483px;height: 150px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6ibz7858GUxMKruU56aRAtziaYP6VNVNtXHRJZuLBQV8gybwYY0Eewexg/640?wx_fmt=png"></p> 
+<h2 style="margin: 30px 0.5em 15px;color: rgb(0, 0, 0);font-size: 18px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: rgb(37, 183, 167);font-size: 20px;">排查过程</span></h2> 
+<h3 style="margin: 10px 0.5em 15px;color: rgb(0, 0, 0);font-weight: bold;line-height: 1.5;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">1. 使用Java层面的工具定位内存区域（<span style="color: rgb(136, 136, 136);">堆内内存、Code区域或者使用unsafe.allocateMemory和DirectByteBuffer申请的堆外内存</span>）</h3> 
+<section class="output_wrapper" style="font-size: 16px;color: rgb(62, 62, 62);line-height: 1.6;letter-spacing: 0px;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;"> 
+ <p style="font-size: inherit;color: inherit;line-height: inherit;margin: 1.5em 0.5em;"><span style="font-size: 15px;">笔者在项目中添加</span><code style="font-size: inherit;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">-XX:NativeMemoryTracking=detail</span></code><span style="font-size: 15px;">JVM参数重启项目，使用命令</span><code style="font-size: inherit;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">jcmd pid VM.native_memory detail</span></code><span style="font-size: 15px;">查看到的内存分布如下：</span></p> 
+</section> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: center;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;"><img class="mpa-image" data-ratio="1.0313531353135315" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6rLM2UR6sPxknA3RBOiaecibO99gnu7dZfRAd4m4s7wXxbjGNaTIK9eew/640?wx_fmt=png" data-type="png" data-w="1212" style="width: 433px;height: 447px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6rLM2UR6sPxknA3RBOiaecibO99gnu7dZfRAd4m4s7wXxbjGNaTIK9eew/640?wx_fmt=png"><br></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">发现命令显示的committed的内存小于物理内存，因为jcmd命令显示的内存包含堆内内存、Code区域、通过unsafe.allocateMemory和DirectByteBuffer申请的内存，但是不包含其他Native Code（<span style="color: rgb(136, 136, 136);">C代码</span>）申请的堆外内存。所以猜测是使用Native Code申请内存所导致的问题。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">为了防止误判，笔者使用了pmap查看内存分布，发现大量64M地址；而这些地址空间不在jcmd命令所给出的地址空间里面，基本上可断定就是这些64M的内存所导致。</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.9651376146788991" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6P5qwhy3PASxAafkl87eNbbkdQVJIJ6FFpiceESOE9bJ8RiayMGSdA6Cg/640?wx_fmt=png" data-type="png" data-w="1090" style="width: 416px;height: 401px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6P5qwhy3PASxAafkl87eNbbkdQVJIJ6FFpiceESOE9bJ8RiayMGSdA6Cg/640?wx_fmt=png"></p> 
+<h3 style="margin: 30px 0.5em 15px;color: rgb(0, 0, 0);font-weight: bold;line-height: 1.5;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">2. 使用系统层面的工具定位堆外内存</h3> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">因为笔者已经基本上确定是Native Code所引起，而Java层面的工具不便于排查此类问题，只能使用系统层面的工具去定位问题。</p> 
+<h4 style="margin: 20px 0.5em 15px;color: rgb(0, 0, 0);font-size: 14px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">首先，使用了gperftools去定位问题</h4> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">gperftools的使用方法可以参考<a href="https://github.com/gperftools/gperftools" style="color: rgb(53, 114, 176);" data-linktype="2">gperftools</a>，gperftools的监控如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.2710674157303371" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6TsEOKqVicDHCT0DgXRPVOamTT5BadyDroxiao1s8LAVCiabbMpWX6a3Lw/640?wx_fmt=png" data-type="png" data-w="1424" style="width: 462px;height: 125px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6TsEOKqVicDHCT0DgXRPVOamTT5BadyDroxiao1s8LAVCiabbMpWX6a3Lw/640?wx_fmt=png"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">从上图可以看出：使用malloc申请的内存最高到3G之后就释放了，之后始终维持在700M-800M。笔者第一反应是：难道Native Code中没有使用malloc申请，直接使用mmap/brk申请的？（<span style="color: rgb(136, 136, 136);">gperftools原理就使用动态链接的方式替换了操作系统默认的内存分配器（glibc）。</span>）</p> 
+<h4 style="margin: 20px 0.5em 15px;color: rgb(0, 0, 0);font-size: 14px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">然后，使用strace去追踪系统调用</h4> 
+<section class="output_wrapper" style="font-size: 16px;color: rgb(62, 62, 62);line-height: 1.6;letter-spacing: 0px;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;"> 
+ <p style="font-size: inherit;color: inherit;line-height: inherit;margin: 1.5em 0.5em;"><span style="font-size: 15px;">因为使用gperftools没有追踪到这些内存，于是直接使用命令</span><code style="font-size: inherit;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">strace -f -e"brk,mmap,munmap" -p pid</span></code><span style="font-size: 15px;">追踪向OS申请内存请求，但是并没有发现有可疑内存申请。strace监控如下图所示：</span></p> 
+</section> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.26796875" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ670mJT39SwWhDo0zm2HGX28DqnbfmoRSxWSeSCPZic24uJkb3h0CZsZQ/640?wx_fmt=jpeg" data-type="jpeg" data-w="1280" style="width: 466px;height: 125px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ670mJT39SwWhDo0zm2HGX28DqnbfmoRSxWSeSCPZic24uJkb3h0CZsZQ/640?wx_fmt=jpeg"></p> 
+<h4 style="margin: 20px 0.5em 15px;color: rgb(0, 0, 0);font-size: 14px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">接着，使用GDB去dump可疑内存</h4> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;font-size: 15px;">因为使用strace没有追踪到可疑内存申请；于是想着看看内存中的情况。就是直接使用命令</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">gdp -pid pid</span></code><span style="color: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;font-size: 15px;">进入GDB之后，然后使用命令</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">dump memory mem.bin startAddress endAddress</span></code><span style="color: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;font-size: 15px;">dump内存，其中startAddress和endAddress可以从/proc/pid/smaps中查找。然后使用</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);"><span style="font-size: 15px;">strings mem.bin</span></code><span style="color: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;font-size: 15px;">查看dump的内容，如下：</span><br></p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.30078125" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6OPfeu8lM7jUH1452Fvgbd36n3sY4E5xibhRv2wXPicu0x7gNUiauFRMDA/640?wx_fmt=jpeg" data-type="jpeg" data-w="1280" style="width: 490px;height: 147px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6OPfeu8lM7jUH1452Fvgbd36n3sY4E5xibhRv2wXPicu0x7gNUiauFRMDA/640?wx_fmt=jpeg"></p> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">从内容上来看，像是解压后的JAR包信息。读取JAR包信息应该是在项目启动的时候，那么在项目启动之后使用strace作用就不是很大了。所以应该在项目启动的时候使用strace，而不是启动完成之后。</p> 
+<h4 style="margin: 20px 0.5em 15px;color: rgb(0, 0, 0);font-size: 14px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">再次，项目启动时使用strace去追踪系统调用</h4> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">项目启动使用strace追踪系统调用，发现确实申请了很多64M的内存空间，截图如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.10786516853932585" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6Ctt9JGoXgLoQgicQiceguX7qUNPzTibleF9JhHBJictv7fBUjPa8xTICfg/640?wx_fmt=png" data-type="png" data-w="1780" style="" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6Ctt9JGoXgLoQgicQiceguX7qUNPzTibleF9JhHBJictv7fBUjPa8xTICfg/640?wx_fmt=png"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">使用该mmap申请的地址空间在pmap对应如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.6879432624113475" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6OHeT8nicBMB4icUpuovw2oJzshNoluVGS1iamLyQjNFFiaYsx9b45uG5QA/640?wx_fmt=png" data-type="png" data-w="846" style="width: 374px;height: 257px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6OHeT8nicBMB4icUpuovw2oJzshNoluVGS1iamLyQjNFFiaYsx9b45uG5QA/640?wx_fmt=png"></p> 
+<h4 style="margin: 20px 0.5em 15px;color: rgb(0, 0, 0);font-size: 14px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">最后，使用jstack去查看对应的线程</h4> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">因为strace命令中已经显示申请内存的线程ID。直接使用命令</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);">jstack pid</code><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">去查看线程栈，找到对应的线程栈（</span><span style="font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;color: rgb(136, 136, 136);">注意10进制和16进制转换</span><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">）如下：</span><br></p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.3668280871670702" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6ASPzlzrciarEG4f3BDcOlJ9Cic96vFR7dgtI2icHLo4UtaT6x5rQmAmbw/640?wx_fmt=png" data-type="png" data-w="1652" style="" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6ASPzlzrciarEG4f3BDcOlJ9Cic96vFR7dgtI2icHLo4UtaT6x5rQmAmbw/640?wx_fmt=png"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">这里基本上就可以看出问题来了：MCC（<span style="color: rgb(136, 136, 136);">美团统一配置中心</span>）使用了Reflections进行扫包，底层使用了Spring Boot去加载JAR。因为解压JAR使用Inflater类，需要用到堆外内存，然后使用Btrace去追踪这个类，栈如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.7085889570552147" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ67ibuiceezuD1CBj0bDKBIEo7mthJEibXKpickTrnYr26cvZtSuMMh0GYNQ/640?wx_fmt=png" data-type="png" data-w="1956" style="" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ67ibuiceezuD1CBj0bDKBIEo7mthJEibXKpickTrnYr26cvZtSuMMh0GYNQ/640?wx_fmt=png"></p> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">然后查看使用MCC的地方，发现没有配置扫包路径，默认是扫描所有的包。于是修改代码，配置扫包路径，发布上线后内存问题解决。</p> 
+<h3 style="margin: 30px 0.5em 15px;color: rgb(0, 0, 0);font-weight: bold;line-height: 1.5;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">3. 为什么堆外内存没有释放掉呢？</h3> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">虽然问题已经解决了，但是有几个疑问：</p> 
+<ul class=" list-paddingleft-2" style="list-style-type: disc;"> 
+ <li><p><span style="font-size: 14px;">为什么使用旧的框架没有问题？</span></p></li> 
+ <li><p><span style="font-size: 14px;">为什么堆外内存没有释放？</span></p></li> 
+ <li><p><span style="font-size: 14px;">为什么内存大小都是64M，JAR大小不可能这么大，而且都是一样大？</span></p></li> 
+ <li><p><span style="font-size: 14px;">为什么gperftools最终显示使用的内存大小是700M左右，解压包真的没有使用malloc申请内存吗？</span></p></li> 
+</ul> 
+<p style="font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin: 15px 0.5em;">带着疑问，笔者直接看了一下<a href="https://github.com/spring-projects/spring-boot/tree/master/spring-boot-project/spring-boot-tools/spring-boot-loader/src/main/java/org/springframework/boot/loader" style="color: rgb(53, 114, 176);" data-linktype="2">Spring Boot Loader</a>那一块的源码。发现Spring Boot对Java JDK的InflaterInputStream进行了包装并且使用了Inflater，而Inflater本身用于解压JAR包的需要用到堆外内存。而包装之后的类ZipInflaterInputStream没有释放Inflater持有的堆外内存。于是笔者以为找到了原因，立马向Spring Boot社区反馈了<a href="https://github.com/spring-projects/spring-boot/issues/13935" style="color: rgb(53, 114, 176);" data-linktype="2">这个Bug</a>。但是反馈之后，笔者就发现Inflater这个对象本身实现了finalize方法，在这个方法中有调用释放堆外内存的逻辑。也就是说Spring Boot依赖于GC释放堆外内存。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">笔者使用jmap查看堆内对象时，发现已经基本上没有Inflater这个对象了。于是就怀疑GC的时候，没有调用finalize。带着这样的怀疑，笔者把Inflater进行包装在Spring Boot Loader里面替换成自己包装的Inflater，在finalize进行打点监控，结果finalize方法确实被调用了。于是笔者又去看了Inflater对应的C代码，发现初始化的时候使用了malloc申请内存，end的时候也调用了free去释放内存。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">此刻，笔者只能怀疑free的时候没有真正释放内存，便把Spring Boot包装的InflaterInputStream替换成Java JDK自带的，发现替换之后，内存问题也得以解决了。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">这时，再返过来看gperftools的内存分布情况，发现使用Spring Boot时，内存使用一直在增加，突然某个点内存使用下降了好多（<span style="color: rgb(136, 136, 136);">使用量直接由3G降为700M左右</span>）。这个点应该就是GC引起的，内存应该释放了，但是在操作系统层面并没有看到内存变化，那是不是没有释放到操作系统，被内存分配器持有了呢？</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">继续探究，发现系统默认的内存分配器（<span style="color: rgb(136, 136, 136);">glibc 2.12版本</span>）和使用gperftools内存地址分布差别很明显，2.5G地址使用smaps发现它是属于Native Stack。内存地址分布如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.5923423423423423" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6C4NP7LsUTLcWqFotdcXFEG9M6dKfGNIrxTLaLZUXNAF6Qh47NSUmVg/640?wx_fmt=png" data-type="png" data-w="888" style="width: 412px;height: 244px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6C4NP7LsUTLcWqFotdcXFEG9M6dKfGNIrxTLaLZUXNAF6Qh47NSUmVg/640?wx_fmt=png"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">到此，基本上可以确定是内存分配器在捣鬼；搜索了一下glibc 64M，发现glibc从2.11开始对每个线程引入内存池（<span style="color: rgb(136, 136, 136);">64位机器大小就是64M内存</span>），原文如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.31171875" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ66dZ9TCzXuUGkGguGBmgcNrBaBDZpSRoibVoiaqkhIBstlf0w7M8az43g/640?wx_fmt=jpeg" data-type="jpeg" data-w="1280" style="width: 410px;height: 128px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ66dZ9TCzXuUGkGguGBmgcNrBaBDZpSRoibVoiaqkhIBstlf0w7M8az43g/640?wx_fmt=jpeg"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">按照文中所说去修改MALLOC_ARENA_MAX环境变量，发现没什么效果。查看tcmalloc（<span style="color: rgb(136, 136, 136);">gperftools使用的内存分配器</span>）也使用了内存池方式。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">为了验证是内存池搞的鬼，笔者就简单写个不带内存池的内存分配器。使用命令</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);">gcc zjbmalloc.c -fPIC -shared -o zjbmalloc.so</code><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">生成动态库，然后使用</span><code style="font-size: inherit;letter-spacing: 0px;text-align: justify;line-height: inherit;padding: 2px 4px;border-radius: 4px;margin-right: 2px;margin-left: 2px;color: rgb(233, 105, 0);background: rgb(248, 248, 248);">export LD_PRELOAD=zjbmalloc.so</code><span style="color: inherit;font-size: inherit;font-family: &quot;Helvetica Neue&quot;, Helvetica, &quot;Hiragino Sans GB&quot;, &quot;Microsoft YaHei&quot;, Arial, sans-serif;letter-spacing: 0px;text-align: justify;">替换掉glibc的内存分配器。其中代码Demo如下：</span><br></p> 
+<p style="text-align: center;"><img class="" data-copyright="0" data-ratio="1.4928774928774928" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsVEo8rq9KLCpBpDjFMC8ybDkOGKcKQncicI36TWaYf7ibicib9p0ia52yDhticd6CRViaXKjbFVyyZzyiaulA/640?wx_fmt=png" data-type="png" data-w="1404" style="" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsVEo8rq9KLCpBpDjFMC8ybDkOGKcKQncicI36TWaYf7ibicib9p0ia52yDhticd6CRViaXKjbFVyyZzyiaulA/640?wx_fmt=png"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">通过在自定义分配器当中埋点可以发现其实程序启动之后应用实际申请的堆外内存始终在700M-800M之间，gperftools监控显示内存使用量也是在700M-800M左右。但是从操作系统角度来看进程占用的内存差别很大（<span style="color: rgb(136, 136, 136);">这里只是监控堆外内存</span>）。</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">笔者做了一下测试，使用不同分配器进行不同程度的扫包，占用的内存如下：</p> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.3171875" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6xmHYvd1yjITtPcXul87wKap0sR8YPVJoUqHCX1ELcx4zZOAwVa2sicA/640?wx_fmt=jpeg" data-type="jpeg" data-w="1280" style="width: 404px;height: 128px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6xmHYvd1yjITtPcXul87wKap0sR8YPVJoUqHCX1ELcx4zZOAwVa2sicA/640?wx_fmt=jpeg"></p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">为什么自定义的malloc申请800M，最终占用的物理内存在1.7G呢？</p> 
+<p style="margin: 10px 0.5em 15px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;">因为自定义内存分配器采用的是mmap分配内存，mmap分配内存需要按需向上取整到整数个页，所以存在着巨大的空间浪费。通过监控发现最终申请的页面数目在536k个左右，那实际上向系统申请的内存等于512k * 4k（<span style="color: rgb(136, 136, 136);">pagesize</span>） = 2G。 为什么这个数据大于1.7G呢？</p> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">因为操作系统采取的是延迟分配的方式，通过mmap向系统申请内存的时候，系统仅仅返回内存地址并没有分配真实的物理内存。只有在真正使用的时候，系统产生一个缺页中断然后再分配实际的物理Page。</p> 
+<h2 style="margin: 30px 0.5em 15px;color: rgb(0, 0, 0);font-size: 18px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: rgb(37, 183, 167);font-size: 20px;">总结</span></h2> 
+<p style="text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.24453125" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6DXCjgnTHOXjNsuMbl6NkwvfbibtjcKOOLrnMz842F7U1o24fwfib5V8w/640?wx_fmt=jpeg" data-type="jpeg" data-w="1280" style="width: 376px;height: 92px;" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_jpg/hEx03cFgUsXHzHrF9KHAh2cTeAo38YQ6DXCjgnTHOXjNsuMbl6NkwvfbibtjcKOOLrnMz842F7U1o24fwfib5V8w/640?wx_fmt=jpeg"></p> 
+<p style="margin-left: 0.5em;margin-right: 0.5em;"><br></p> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">整个内存分配的流程如上图所示。MCC扫包的默认配置是扫描所有的JAR包。在扫描包的时候，Spring Boot不会主动去释放堆外内存，导致在扫描阶段，堆外内存占用量一直持续飙升。当发生GC的时候，Spring Boot依赖于finalize机制去释放了堆外内存；但是glibc为了性能考虑，并没有真正把内存归返到操作系统，而是留下来放入内存池了，导致应用层以为发生了“内存泄漏”。所以修改MCC的配置路径为特定的JAR包，问题解决。笔者在发表这篇文章时，发现Spring Boot的最新版本（<span style="color: rgb(136, 136, 136);">2.0.5.RELEASE</span>）已经做了修改，在ZipInflaterInputStream主动释放了堆外内存不再依赖GC；所以Spring Boot升级到最新版本，这个问题也可以得到解决。</p> 
+<h2 style="margin-top: 30px;color: rgb(0, 0, 0);font-size: 18px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;"><span style="color: rgb(37, 183, 167);">参考资料</span></h2> 
+<p style="margin-left: 0.5em;margin-right: 0.5em;"><br></p> 
+<ol style="margin-left: 0.5em;margin-right: 0.5em;" class=" list-paddingleft-2"> 
+ <li><p><a href="https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/6/html/6.0_release_notes/compiler" style="color: rgb(53, 114, 176);font-size: 12px;text-decoration: underline;" data-linktype="2"><span style="font-size: 12px;">GNU C Library (glibc)</span></a></p></li> 
+ <li><p><a href="https://docs.oracle.com/javase/8/docs/technotes/guides/troubleshoot/tooldescr007.html" style="color: rgb(53, 114, 176);font-size: 12px;text-decoration: underline;" data-linktype="2"><span style="font-size: 12px;">Native Memory Tracking</span></a></p></li> 
+ <li><p><a href="https://github.com/spring-projects/spring-boot" style="color: rgb(53, 114, 176);font-size: 12px;text-decoration: underline;" data-linktype="2"><span style="font-size: 12px;">Spring Boot</span></a></p></li> 
+ <li><p><a href="https://github.com/gperftools/gperftools" style="color: rgb(53, 114, 176);font-size: 12px;text-decoration: underline;" data-linktype="2"><span style="font-size: 12px;">gperftools</span></a></p></li> 
+ <li><p><a href="https://github.com/btraceio/btrace" style="color: rgb(53, 114, 176);font-size: 12px;text-decoration: underline;" data-linktype="2"><span style="font-size: 12px;">Btrace</span></a></p></li> 
+</ol> 
+<h2 style="margin: 30px 0.5em 15px;color: rgb(0, 0, 0);font-size: 18px;font-weight: bold;line-height: 1.25;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;"><span style="color: rgb(37, 183, 167);">作者简介</span></h2> 
+<p style="margin-top: 10px;font-size: 15px;font-family: Arial, sans-serif;text-align: start;white-space: pre-wrap;margin-left: 0.5em;margin-right: 0.5em;">纪兵，2015年加入美团，目前主要从事酒店C端相关的工作。</p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><br></p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><span style="letter-spacing: 0.544px;background-color: rgb(255, 255, 255);color: rgb(136, 136, 136);font-size: 15px;">欢迎加入</span><strong style="letter-spacing: 0.544px;white-space: normal;background-color: rgb(255, 255, 255);"><span style="font-size: 15px;color: rgb(0, 0, 0);">美团Java技术交流群</span></strong><span style="letter-spacing: 0.544px;background-color: rgb(255, 255, 255);color: rgb(136, 136, 136);font-size: 15px;">，跟项目维护者零距离交流。进群方式：请加美美同学微信（<strong>微信号：MTDPtech02</strong>），回复：</span><span style="letter-spacing: 0.544px;background-color: rgb(255, 255, 255);font-size: 15px;color: rgb(0, 0, 0);"><strong>Spring Boot</strong></span><span style="letter-spacing: 0.544px;background-color: rgb(255, 255, 255);color: rgb(136, 136, 136);font-size: 15px;">，美美会自动拉你进群。</span></p> 
+<p style="white-space: normal;text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><span style="font-size: 15px;color: rgb(136, 136, 136);">----------&nbsp; END&nbsp; ----------</span></p> 
+<p data-source-line="194" style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><br></p> 
+<p style="white-space: normal;margin-bottom: 15px;margin-left: 0.5em;margin-right: 0.5em;"><span style="font-size: 16px;"><strong><span style="color: rgb(49, 188, 173);">也许你还想看</span></strong></span></p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&amp;mid=2651745427&amp;idx=2&amp;sn=03325a115e69de12966b6bda538e57ca&amp;chksm=bd12b5de8a653cc8107f86b73f31f4351edfdf59a182f1ffe7c00affc185f5180d70f3d8a872&amp;scene=21#wechat_redirect" target="_blank" style="font-size: 14px;text-decoration: underline;" data-linktype="2"><span style="font-size: 14px;">Spring MVC注解故障追踪记</span></a></p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&amp;mid=2651746838&amp;idx=2&amp;sn=400648da53def8f5c942fe4934d2aaf8&amp;chksm=bd12ab5b8a65224d6c4496cdcd98994938d58b775b3de28c420be72e87b4d259d2186b3e8588&amp;scene=21#wechat_redirect" target="_blank" style="font-size: 14px;text-decoration: underline;" data-linktype="2"><span style="font-size: 14px;">这个Spring高危漏洞，你修补了吗？</span></a></p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5NjQ5MTI5OA==&amp;mid=2651745371&amp;idx=1&amp;sn=19822c54a57f840393353b093a3dbede&amp;scene=21#wechat_redirect" target="_blank" style="font-size: 14px;text-decoration: underline;" data-linktype="2"><span style="font-size: 14px;">ReactiveCocoa中潜在的内存泄漏及解决方案</span></a><br></p> 
+<p style="white-space: normal;margin-left: 0.5em;margin-right: 0.5em;"><br></p> 
+<p style="white-space: normal;text-align: center;margin-left: 0.5em;margin-right: 0.5em;"><img class="" data-copyright="0" data-ratio="0.44533333333333336" data-s="300,640" data-src="https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsV6LYkM3uK5TAnl8DxXwdR4YOAKWmYSpAtzV3P359bDG3cn3Vr4T6HMkvDSI8icUYsejmDnfa5CdpQ/640?wx_fmt=png" data-type="png" data-w="1875" src="https://uzshare.com/_p?https://mmbiz.qpic.cn/mmbiz_png/hEx03cFgUsV6LYkM3uK5TAnl8DxXwdR4YOAKWmYSpAtzV3P359bDG3cn3Vr4T6HMkvDSI8icUYsejmDnfa5CdpQ/640?wx_fmt=png"></p>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

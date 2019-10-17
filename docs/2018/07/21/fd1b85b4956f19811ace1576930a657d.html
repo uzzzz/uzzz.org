@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>eos源码赏析（九）：EOS智能合约入门之区块打包和广播机制 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="eos源码赏析（九）：EOS智能合约入门之区块打包和广播机制" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="首先感谢群里的大佬中山狼、linx、阿泥豆等各位给予的指导。 在上篇文章中我们写到了eos中区块产生的调用流程，其主要过程是从插件中的producer_pligin去产生区块，而实际产生区块的过程却是在chain中的controller.cpp中实现的。通过以前的文章我们知道，在eos区块的产生并不仅仅是单独产生的过程，它还需要进行区块打包、入库、广播、上链等过程，今天我们就来谈谈区块产生之后又进行了哪些操作。 C++Tips： 在文章的开始，我们先熟悉一下C++中的一些概念，有助于我们接下来的代码分析。下面的一些定义及示例均来自于https://zh.cppreference.com，仅做参考。当然从文字上理解有些枯燥且分类较多，但对于我们理解eos源码有很大的帮助。当然不感兴趣的可以直接跳过。 左值和右值的概念： &nbsp; &nbsp;在C++11中，左值和右值的区分可以从以下概念入手： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性 (identity) ：可以确定表达式是否与另一表达式指代同一实体，例如通过比较它们所标识的对象或函数的（直接或间接获得的）地址； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动：移动构造函数、移动赋值运算符或实现了移动语义的其他函数重载能够绑定于这个表达式。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且不可被移动的表达式被称作左值 (lvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且可被移动的表达式被称作亡值 (xvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且可被移动的表达式被称作纯右值 (prvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且不可被移动的表达式无法使用。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性的表达式被称作“泛左值表达式 (glvalue expressions) ”。左值和亡值都是泛左值表达式。简单的来说，能取地址的变量一定是左值，有名字的变量也一定是左值，右值引用也是左值。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图1 左值表达式包含的类型 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动的表达式被称作“右值表达式 (rvalue expressions) ”。纯右值和亡值都是右值表达式。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图2 右值表达式包含的类型 std::move:&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;std::move 用于指示对象 t 可以“被移动”，即允许从 t 到另一对象的有效率的资源传递。特别是， std::move 生成标识其参数 t 的亡值表达式。它准确地等价于到右值引用类型的 static_cast 。有时候我们希望把左值当作右值来使用，例如一个变量的值，不再使用了，希望把它的值转移出去，C++11中的std::move就为我们提供了将左值引用转为右值引用的方法。举个例子关于std::move的用法： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图3 std::move使用示例 std::forward:&nbsp; &nbsp; &nbsp;std::forward是有条件转换。只有在它的参数绑定到一个右值时，它才转换它的参数到一个右值。当参数绑定到左值时，转换后仍为左值。万能的函数包装器，可将带返回值、不带返回值、带参和不带参的函数委托万能的函数包装器执行。 完美转发： &nbsp; &nbsp;完美转发是指在函数模板中，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。 下面是使用std::forward实现完美转发的一个例子： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图4 std::forward实现完美转发示例 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上面两个例子的运行结果各位可以尝试着运行一下，有助于加深对以上概念的理解。 区块打包： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;介绍完了这些C++小知识，让我们回到正题，生成的区块是如何进行打包并广播出去的。我们在上篇文章中也提到区块产生之后的pending会送到push_transactions中，具体的push_transaction截图如下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图5 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们知道在start_block中产生的区块是未经多节点确认过的，因此这里传入的implicit是为true，即这个块或者说这次交易是未确认的状态，此处我们使用init_for_implicit_trx对该区块进行初始化。而后，将本次交易的回执信息如是否执行成功、CPU的使用情况、net的使用情况等写入到本次交易的回执trace-&gt;receipt中。这里需要注意区分trace、trx、trx_context之间的区别与联系。trx则是包含了本次区块产生的交易信息，trx_context则是将trx的信息写入到trx_context类中方便接下来的使用，而trace为trx_context中的一个变量类型为action_trace的值。接下来我们可以看到这三者的区别。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图6 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在图6的标注1中我们可以看到，本次交易的回执信息填充结束之后，调用fc::move_append将trx_context使用move的方式转化为右值引用，即move到区块的action中去。那么这个move_append又是实现了什么功能呢？ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图7 eos源码中move_append &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;move_append中同样使用了move，在目标容器为空的情况下讲trx_context中的内容全部放心去。当目标容器不为空的情况下，则从目标容器末端开始循环插入trx_context中的信息。而这个目标容器就是pending-&gt;_action，就将其打包到区块的_action中去，这个_action为包含有交易回执信息的区块信息。以上操作完成了区块的生产和区块打包的过程，接下来该做些什么呢？当然是把区块信息发布到网络上或者说广播出去，让节点们去验证该区块的存在。 在eos中是如何将区块信息广播出去的呢？我们可以在图6中看到，使用了emit将trx区块内容信息或者将trace区块跟踪信息广播出去。emit的具体实现如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图8 eos源码中emit的实现 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这就是我们上面所提到的std::forward的功能，在函数模板的情况下，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。这里trx和trace均为左值，因其可以赋值且可取址，而后通过完美转发将参数传递给了Signal。这样Signal中便存在着可以使用的右值。恰如emit( self.accepted_transaction, trx)和emit(self.applied_transaction, trace)。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;熟悉信号槽的人看到emit不免会想，这是不是就是信号槽机制？没错，这正是boost中的signal-slot的机制。信号会在某个特定情况或动作下被触发，槽是等同与接受并处理信号的函数。做过qt开发的人对信号槽机制并不会陌生，拿最简单的on_pushButton_clicked()函数来讲，当某一个特定事件发生时（clicked），一个信号被发送（emit），与信号相关联（connect）的槽（slot）则会响应信号并完成相应的处理。而在boost中也存在类似的机制，我们结合eos源码中关于区块广播来分析下信号槽的实现。在图4中我们知道，通过std::forward将左值trx或trace进行了完美转发变成了信号量Signal，通过跟踪可以找到这些Signal对应的slot，均存在于net_plugin中，如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图9 net_plugin启动是绑定信号和槽 和大多数信号槽机制一样在net_plugin启动的时候，会去绑定信号和槽之间的关系。通过cc可以获取当前链上的绝大多数信息，而后使用connect的方式绑定了以下信号量，在区块广播出去的过程中并不存在confirm因此通过代码跟踪或者日志打印，一个区块产生、打包、广播出去的过程中只包含了accepted_transaction、applied_transaction、irreversible_block、accepted_block_header、accepted_block，需要注意的是，这里的五个过程是有先后顺序的。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图10 eos中区块产生时的信号量 &nbsp;&nbsp;&nbsp;&nbsp;在on_ irreversible中广播区块的是否可逆信息 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图11&nbsp;on_ irreversible &nbsp;&nbsp;&nbsp;&nbsp;在commit_block中广播区块的相关信息。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图12&nbsp;commit_block &nbsp;&nbsp;&nbsp;&nbsp;最终在net_plugin里面接收到的消息如下打印： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图13 日志打印结果 &nbsp; &nbsp;区块的广播机制大致如此。当然，又远不如此，如accepted_block从哪里来，会不会是已经上链的区块呢？这些区块信息广播出去之后会做怎样或者怎样被操作呢，咱们下篇文章，关于eos区块上链机制再聊。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你对eos开发感兴趣,长按以下二维码,关注本公众号,一起学习eos开发. &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 微信公众号 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;有任何疑问或者指教请添加本人个人公众号,当然有对eos开发感兴趣或者金庸粉的也可以添加,备注eos开发或金庸,拉你进群一起交流 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 个人微信帐号 阅读更多" />
+<meta property="og:description" content="首先感谢群里的大佬中山狼、linx、阿泥豆等各位给予的指导。 在上篇文章中我们写到了eos中区块产生的调用流程，其主要过程是从插件中的producer_pligin去产生区块，而实际产生区块的过程却是在chain中的controller.cpp中实现的。通过以前的文章我们知道，在eos区块的产生并不仅仅是单独产生的过程，它还需要进行区块打包、入库、广播、上链等过程，今天我们就来谈谈区块产生之后又进行了哪些操作。 C++Tips： 在文章的开始，我们先熟悉一下C++中的一些概念，有助于我们接下来的代码分析。下面的一些定义及示例均来自于https://zh.cppreference.com，仅做参考。当然从文字上理解有些枯燥且分类较多，但对于我们理解eos源码有很大的帮助。当然不感兴趣的可以直接跳过。 左值和右值的概念： &nbsp; &nbsp;在C++11中，左值和右值的区分可以从以下概念入手： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性 (identity) ：可以确定表达式是否与另一表达式指代同一实体，例如通过比较它们所标识的对象或函数的（直接或间接获得的）地址； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动：移动构造函数、移动赋值运算符或实现了移动语义的其他函数重载能够绑定于这个表达式。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且不可被移动的表达式被称作左值 (lvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且可被移动的表达式被称作亡值 (xvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且可被移动的表达式被称作纯右值 (prvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且不可被移动的表达式无法使用。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性的表达式被称作“泛左值表达式 (glvalue expressions) ”。左值和亡值都是泛左值表达式。简单的来说，能取地址的变量一定是左值，有名字的变量也一定是左值，右值引用也是左值。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图1 左值表达式包含的类型 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动的表达式被称作“右值表达式 (rvalue expressions) ”。纯右值和亡值都是右值表达式。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图2 右值表达式包含的类型 std::move:&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;std::move 用于指示对象 t 可以“被移动”，即允许从 t 到另一对象的有效率的资源传递。特别是， std::move 生成标识其参数 t 的亡值表达式。它准确地等价于到右值引用类型的 static_cast 。有时候我们希望把左值当作右值来使用，例如一个变量的值，不再使用了，希望把它的值转移出去，C++11中的std::move就为我们提供了将左值引用转为右值引用的方法。举个例子关于std::move的用法： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图3 std::move使用示例 std::forward:&nbsp; &nbsp; &nbsp;std::forward是有条件转换。只有在它的参数绑定到一个右值时，它才转换它的参数到一个右值。当参数绑定到左值时，转换后仍为左值。万能的函数包装器，可将带返回值、不带返回值、带参和不带参的函数委托万能的函数包装器执行。 完美转发： &nbsp; &nbsp;完美转发是指在函数模板中，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。 下面是使用std::forward实现完美转发的一个例子： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图4 std::forward实现完美转发示例 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上面两个例子的运行结果各位可以尝试着运行一下，有助于加深对以上概念的理解。 区块打包： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;介绍完了这些C++小知识，让我们回到正题，生成的区块是如何进行打包并广播出去的。我们在上篇文章中也提到区块产生之后的pending会送到push_transactions中，具体的push_transaction截图如下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图5 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们知道在start_block中产生的区块是未经多节点确认过的，因此这里传入的implicit是为true，即这个块或者说这次交易是未确认的状态，此处我们使用init_for_implicit_trx对该区块进行初始化。而后，将本次交易的回执信息如是否执行成功、CPU的使用情况、net的使用情况等写入到本次交易的回执trace-&gt;receipt中。这里需要注意区分trace、trx、trx_context之间的区别与联系。trx则是包含了本次区块产生的交易信息，trx_context则是将trx的信息写入到trx_context类中方便接下来的使用，而trace为trx_context中的一个变量类型为action_trace的值。接下来我们可以看到这三者的区别。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图6 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在图6的标注1中我们可以看到，本次交易的回执信息填充结束之后，调用fc::move_append将trx_context使用move的方式转化为右值引用，即move到区块的action中去。那么这个move_append又是实现了什么功能呢？ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图7 eos源码中move_append &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;move_append中同样使用了move，在目标容器为空的情况下讲trx_context中的内容全部放心去。当目标容器不为空的情况下，则从目标容器末端开始循环插入trx_context中的信息。而这个目标容器就是pending-&gt;_action，就将其打包到区块的_action中去，这个_action为包含有交易回执信息的区块信息。以上操作完成了区块的生产和区块打包的过程，接下来该做些什么呢？当然是把区块信息发布到网络上或者说广播出去，让节点们去验证该区块的存在。 在eos中是如何将区块信息广播出去的呢？我们可以在图6中看到，使用了emit将trx区块内容信息或者将trace区块跟踪信息广播出去。emit的具体实现如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图8 eos源码中emit的实现 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这就是我们上面所提到的std::forward的功能，在函数模板的情况下，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。这里trx和trace均为左值，因其可以赋值且可取址，而后通过完美转发将参数传递给了Signal。这样Signal中便存在着可以使用的右值。恰如emit( self.accepted_transaction, trx)和emit(self.applied_transaction, trace)。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;熟悉信号槽的人看到emit不免会想，这是不是就是信号槽机制？没错，这正是boost中的signal-slot的机制。信号会在某个特定情况或动作下被触发，槽是等同与接受并处理信号的函数。做过qt开发的人对信号槽机制并不会陌生，拿最简单的on_pushButton_clicked()函数来讲，当某一个特定事件发生时（clicked），一个信号被发送（emit），与信号相关联（connect）的槽（slot）则会响应信号并完成相应的处理。而在boost中也存在类似的机制，我们结合eos源码中关于区块广播来分析下信号槽的实现。在图4中我们知道，通过std::forward将左值trx或trace进行了完美转发变成了信号量Signal，通过跟踪可以找到这些Signal对应的slot，均存在于net_plugin中，如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图9 net_plugin启动是绑定信号和槽 和大多数信号槽机制一样在net_plugin启动的时候，会去绑定信号和槽之间的关系。通过cc可以获取当前链上的绝大多数信息，而后使用connect的方式绑定了以下信号量，在区块广播出去的过程中并不存在confirm因此通过代码跟踪或者日志打印，一个区块产生、打包、广播出去的过程中只包含了accepted_transaction、applied_transaction、irreversible_block、accepted_block_header、accepted_block，需要注意的是，这里的五个过程是有先后顺序的。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图10 eos中区块产生时的信号量 &nbsp;&nbsp;&nbsp;&nbsp;在on_ irreversible中广播区块的是否可逆信息 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图11&nbsp;on_ irreversible &nbsp;&nbsp;&nbsp;&nbsp;在commit_block中广播区块的相关信息。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图12&nbsp;commit_block &nbsp;&nbsp;&nbsp;&nbsp;最终在net_plugin里面接收到的消息如下打印： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图13 日志打印结果 &nbsp; &nbsp;区块的广播机制大致如此。当然，又远不如此，如accepted_block从哪里来，会不会是已经上链的区块呢？这些区块信息广播出去之后会做怎样或者怎样被操作呢，咱们下篇文章，关于eos区块上链机制再聊。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你对eos开发感兴趣,长按以下二维码,关注本公众号,一起学习eos开发. &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 微信公众号 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;有任何疑问或者指教请添加本人个人公众号,当然有对eos开发感兴趣或者金庸粉的也可以添加,备注eos开发或金庸,拉你进群一起交流 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 个人微信帐号 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/21/fd1b85b4956f19811ace1576930a657d.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/21/fd1b85b4956f19811ace1576930a657d.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"首先感谢群里的大佬中山狼、linx、阿泥豆等各位给予的指导。 在上篇文章中我们写到了eos中区块产生的调用流程，其主要过程是从插件中的producer_pligin去产生区块，而实际产生区块的过程却是在chain中的controller.cpp中实现的。通过以前的文章我们知道，在eos区块的产生并不仅仅是单独产生的过程，它还需要进行区块打包、入库、广播、上链等过程，今天我们就来谈谈区块产生之后又进行了哪些操作。 C++Tips： 在文章的开始，我们先熟悉一下C++中的一些概念，有助于我们接下来的代码分析。下面的一些定义及示例均来自于https://zh.cppreference.com，仅做参考。当然从文字上理解有些枯燥且分类较多，但对于我们理解eos源码有很大的帮助。当然不感兴趣的可以直接跳过。 左值和右值的概念： &nbsp; &nbsp;在C++11中，左值和右值的区分可以从以下概念入手： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性 (identity) ：可以确定表达式是否与另一表达式指代同一实体，例如通过比较它们所标识的对象或函数的（直接或间接获得的）地址； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动：移动构造函数、移动赋值运算符或实现了移动语义的其他函数重载能够绑定于这个表达式。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且不可被移动的表达式被称作左值 (lvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且可被移动的表达式被称作亡值 (xvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且可被移动的表达式被称作纯右值 (prvalue) 表达式； &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且不可被移动的表达式无法使用。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性的表达式被称作“泛左值表达式 (glvalue expressions) ”。左值和亡值都是泛左值表达式。简单的来说，能取地址的变量一定是左值，有名字的变量也一定是左值，右值引用也是左值。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图1 左值表达式包含的类型 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动的表达式被称作“右值表达式 (rvalue expressions) ”。纯右值和亡值都是右值表达式。举例说明下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图2 右值表达式包含的类型 std::move:&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;std::move 用于指示对象 t 可以“被移动”，即允许从 t 到另一对象的有效率的资源传递。特别是， std::move 生成标识其参数 t 的亡值表达式。它准确地等价于到右值引用类型的 static_cast 。有时候我们希望把左值当作右值来使用，例如一个变量的值，不再使用了，希望把它的值转移出去，C++11中的std::move就为我们提供了将左值引用转为右值引用的方法。举个例子关于std::move的用法： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图3 std::move使用示例 std::forward:&nbsp; &nbsp; &nbsp;std::forward是有条件转换。只有在它的参数绑定到一个右值时，它才转换它的参数到一个右值。当参数绑定到左值时，转换后仍为左值。万能的函数包装器，可将带返回值、不带返回值、带参和不带参的函数委托万能的函数包装器执行。 完美转发： &nbsp; &nbsp;完美转发是指在函数模板中，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。 下面是使用std::forward实现完美转发的一个例子： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图4 std::forward实现完美转发示例 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上面两个例子的运行结果各位可以尝试着运行一下，有助于加深对以上概念的理解。 区块打包： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;介绍完了这些C++小知识，让我们回到正题，生成的区块是如何进行打包并广播出去的。我们在上篇文章中也提到区块产生之后的pending会送到push_transactions中，具体的push_transaction截图如下： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图5 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们知道在start_block中产生的区块是未经多节点确认过的，因此这里传入的implicit是为true，即这个块或者说这次交易是未确认的状态，此处我们使用init_for_implicit_trx对该区块进行初始化。而后，将本次交易的回执信息如是否执行成功、CPU的使用情况、net的使用情况等写入到本次交易的回执trace-&gt;receipt中。这里需要注意区分trace、trx、trx_context之间的区别与联系。trx则是包含了本次区块产生的交易信息，trx_context则是将trx的信息写入到trx_context类中方便接下来的使用，而trace为trx_context中的一个变量类型为action_trace的值。接下来我们可以看到这三者的区别。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图6 push_transaction源码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在图6的标注1中我们可以看到，本次交易的回执信息填充结束之后，调用fc::move_append将trx_context使用move的方式转化为右值引用，即move到区块的action中去。那么这个move_append又是实现了什么功能呢？ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图7 eos源码中move_append &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;move_append中同样使用了move，在目标容器为空的情况下讲trx_context中的内容全部放心去。当目标容器不为空的情况下，则从目标容器末端开始循环插入trx_context中的信息。而这个目标容器就是pending-&gt;_action，就将其打包到区块的_action中去，这个_action为包含有交易回执信息的区块信息。以上操作完成了区块的生产和区块打包的过程，接下来该做些什么呢？当然是把区块信息发布到网络上或者说广播出去，让节点们去验证该区块的存在。 在eos中是如何将区块信息广播出去的呢？我们可以在图6中看到，使用了emit将trx区块内容信息或者将trace区块跟踪信息广播出去。emit的具体实现如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图8 eos源码中emit的实现 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这就是我们上面所提到的std::forward的功能，在函数模板的情况下，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。这里trx和trace均为左值，因其可以赋值且可取址，而后通过完美转发将参数传递给了Signal。这样Signal中便存在着可以使用的右值。恰如emit( self.accepted_transaction, trx)和emit(self.applied_transaction, trace)。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;熟悉信号槽的人看到emit不免会想，这是不是就是信号槽机制？没错，这正是boost中的signal-slot的机制。信号会在某个特定情况或动作下被触发，槽是等同与接受并处理信号的函数。做过qt开发的人对信号槽机制并不会陌生，拿最简单的on_pushButton_clicked()函数来讲，当某一个特定事件发生时（clicked），一个信号被发送（emit），与信号相关联（connect）的槽（slot）则会响应信号并完成相应的处理。而在boost中也存在类似的机制，我们结合eos源码中关于区块广播来分析下信号槽的实现。在图4中我们知道，通过std::forward将左值trx或trace进行了完美转发变成了信号量Signal，通过跟踪可以找到这些Signal对应的slot，均存在于net_plugin中，如下图： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图9 net_plugin启动是绑定信号和槽 和大多数信号槽机制一样在net_plugin启动的时候，会去绑定信号和槽之间的关系。通过cc可以获取当前链上的绝大多数信息，而后使用connect的方式绑定了以下信号量，在区块广播出去的过程中并不存在confirm因此通过代码跟踪或者日志打印，一个区块产生、打包、广播出去的过程中只包含了accepted_transaction、applied_transaction、irreversible_block、accepted_block_header、accepted_block，需要注意的是，这里的五个过程是有先后顺序的。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图10 eos中区块产生时的信号量 &nbsp;&nbsp;&nbsp;&nbsp;在on_ irreversible中广播区块的是否可逆信息 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图11&nbsp;on_ irreversible &nbsp;&nbsp;&nbsp;&nbsp;在commit_block中广播区块的相关信息。 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图12&nbsp;commit_block &nbsp;&nbsp;&nbsp;&nbsp;最终在net_plugin里面接收到的消息如下打印： &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图13 日志打印结果 &nbsp; &nbsp;区块的广播机制大致如此。当然，又远不如此，如accepted_block从哪里来，会不会是已经上链的区块呢？这些区块信息广播出去之后会做怎样或者怎样被操作呢，咱们下篇文章，关于eos区块上链机制再聊。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你对eos开发感兴趣,长按以下二维码,关注本公众号,一起学习eos开发. &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 微信公众号 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;有任何疑问或者指教请添加本人个人公众号,当然有对eos开发感兴趣或者金庸粉的也可以添加,备注eos开发或金庸,拉你进群一起交流 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 个人微信帐号 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/21/fd1b85b4956f19811ace1576930a657d.html","headline":"eos源码赏析（九）：EOS智能合约入门之区块打包和广播机制","dateModified":"2018-07-21T00:00:00+08:00","datePublished":"2018-07-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/21/fd1b85b4956f19811ace1576930a657d.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>eos源码赏析（九）：EOS智能合约入门之区块打包和广播机制</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-7f5a1a725b.css"> 
+ <div class="htmledit_views"> 
+  <p>首先感谢群里的大佬中山狼、linx、阿泥豆等各位给予的指导。</p> 
+  <p>在上篇文章中我们写到了eos中区块产生的调用流程，其主要过程是从插件中的producer_pligin去产生区块，而实际产生区块的过程却是在chain中的controller.cpp中实现的。通过以前的文章我们知道，在eos区块的产生并不仅仅是单独产生的过程，它还需要进行区块打包、入库、广播、上链等过程，今天我们就来谈谈区块产生之后又进行了哪些操作。</p> 
+  <ol>
+   <li> <p><strong>C++</strong><strong>Tips：</strong></p> </li> 
+  </ol>
+  <p>在文章的开始，我们先熟悉一下C++中的一些概念，有助于我们接下来的代码分析。下面的一些定义及示例均来自于https://zh.cppreference.com，仅做参考。当然从文字上理解有些枯燥且分类较多，但对于我们理解eos源码有很大的帮助。当然不感兴趣的可以直接跳过。</p> 
+  <p><strong>左值和</strong><strong>右值的概念</strong>：</p> 
+  <p>&nbsp; &nbsp;在C++11中，左值和右值的区分可以从以下概念入手：</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性 (identity) ：可以确定表达式是否与另一表达式指代同一实体，例如通过比较它们所标识的对象或函数的（直接或间接获得的）地址；</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动：移动构造函数、移动赋值运算符或实现了移动语义的其他函数重载能够绑定于这个表达式。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且不可被移动的表达式被称作左值 (lvalue) 表达式；</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性且可被移动的表达式被称作亡值 (xvalue) 表达式；</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且可被移动的表达式被称作纯右值 (prvalue) 表达式；</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;不具有同一性且不可被移动的表达式无法使用。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;具有同一性的表达式被称作“泛左值表达式 (glvalue expressions) ”。左值和亡值都是泛左值表达式。简单的来说，能取地址的变量一定是左值，有名字的变量也一定是左值，右值引用也是左值。举例说明下：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194412177?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图1 左值表达式包含的类型</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可被移动的表达式被称作“右值表达式 (rvalue expressions) ”。纯右值和亡值都是右值表达式。举例说明下：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194428238?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图2 右值表达式包含的类型</p> 
+  <p><strong>s</strong><strong>td</strong><strong>::move</strong>:&nbsp;</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;std::move 用于指示对象 t 可以“被移动”，即允许从 t 到另一对象的有效率的资源传递。特别是， std::move 生成标识其参数 t 的亡值表达式。它准确地等价于到右值引用类型的 static_cast 。有时候我们希望把左值当作右值来使用，例如一个变量的值，不再使用了，希望把它的值转移出去，C++11中的std::move就为我们提供了将左值引用转为右值引用的方法。举个例子关于std::move的用法：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194535662?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p><img alt="" class="has" height="1" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194142593?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" width="1">&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图3 std::move使用示例</p> 
+  <p><strong>s</strong><strong>td</strong><strong>::forward:</strong>&nbsp;</p> 
+  <p>&nbsp; &nbsp;std::forward是有条件转换。只有在它的参数绑定到一个右值时，它才转换它的参数到一个右值。当参数绑定到左值时，转换后仍为左值。万能的函数包装器，可将带返回值、不带返回值、带参和不带参的函数委托万能的函数包装器执行。</p> 
+  <p><strong>完美转发</strong>：</p> 
+  <p>&nbsp; &nbsp;完美转发是指在函数模板中，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。</p> 
+  <p>下面是使用std::forward实现完美转发的一个例子：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194601351?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图4 std::forward实现完美转发示例</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;上面两个例子的运行结果各位可以尝试着运行一下，有助于加深对以上概念的理解。</p> 
+  <ol>
+   <li> <p><strong>区块打包：</strong></p> </li> 
+  </ol>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;介绍完了这些C++小知识，让我们回到正题，生成的区块是如何进行打包并广播出去的。我们在上篇文章中也提到区块产生之后的pending会送到push_transactions中，具体的push_transaction截图如下：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194625311?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图5 push_transaction源码</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;我们知道在start_block中产生的区块是未经多节点确认过的，因此这里传入的implicit是为true，即这个块或者说这次交易是未确认的状态，此处我们使用init_for_implicit_trx对该区块进行初始化。而后，将本次交易的回执信息如是否执行成功、CPU的使用情况、net的使用情况等写入到本次交易的回执trace-&gt;receipt中。这里需要注意区分trace、trx、trx_context之间的区别与联系。trx则是包含了本次区块产生的交易信息，trx_context则是将trx的信息写入到trx_context类中方便接下来的使用，而trace为trx_context中的一个变量类型为action_trace的值。接下来我们可以看到这三者的区别。</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194642610?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图6 push_transaction源码</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;在图6的标注1中我们可以看到，本次交易的回执信息填充结束之后，调用fc::move_append将trx_context使用move的方式转化为右值引用，即move到区块的action中去。那么这个move_append又是实现了什么功能呢？</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194706436?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图7 eos源码中move_append</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;move_append中同样使用了move，在目标容器为空的情况下讲trx_context中的内容全部放心去。当目标容器不为空的情况下，则从目标容器末端开始循环插入trx_context中的信息。而这个目标容器就是pending-&gt;_action，就将其打包到区块的_action中去，这个_action为包含有交易回执信息的区块信息。以上操作完成了区块的生产和区块打包的过程，接下来该做些什么呢？当然是把区块信息发布到网络上或者说广播出去，让节点们去验证该区块的存在。</p> 
+  <p>在eos中是如何将区块信息广播出去的呢？我们可以在图6中看到，使用了emit将trx区块内容信息或者将trace区块跟踪信息广播出去。emit的具体实现如下图：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194731620?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图8 eos源码中emit的实现</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;这就是我们上面所提到的std::forward的功能，在函数模板的情况下，完全依照模板的参数类型（即保持参数的左值、右值特征），将参数传递给函数模板中调用的另外一个函数。这里trx和trace均为左值，因其可以赋值且可取址，而后通过完美转发将参数传递给了Signal。这样Signal中便存在着可以使用的右值。恰如emit( self.accepted_transaction, trx)和emit(self.applied_transaction, trace)。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;熟悉信号槽的人看到emit不免会想，这是不是就是信号槽机制？没错，这正是boost中的signal-slot的机制。信号会在某个特定情况或动作下被触发，槽是等同与接受并处理信号的函数。做过qt开发的人对信号槽机制并不会陌生，拿最简单的on_pushButton_clicked()函数来讲，当某一个特定事件发生时（clicked），一个信号被发送（emit），与信号相关联（connect）的槽（slot）则会响应信号并完成相应的处理。而在boost中也存在类似的机制，我们结合eos源码中关于区块广播来分析下信号槽的实现。在图4中我们知道，通过std::forward将左值trx或trace进行了完美转发变成了信号量Signal，通过跟踪可以找到这些Signal对应的slot，均存在于net_plugin中，如下图：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194752162?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图9 net_plugin启动是绑定信号和槽</p> 
+  <p>和大多数信号槽机制一样在net_plugin启动的时候，会去绑定信号和槽之间的关系。通过cc可以获取当前链上的绝大多数信息，而后使用connect的方式绑定了以下信号量，在区块广播出去的过程中并不存在confirm因此通过代码跟踪或者日志打印，一个区块产生、打包、广播出去的过程中只包含了accepted_transaction、applied_transaction、irreversible_block、accepted_block_header、accepted_block，需要注意的是，这里的五个过程是有先后顺序的。</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194811259?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图10 eos中区块产生时的信号量</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;在on_ irreversible中广播区块的是否可逆信息</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194832120?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图11&nbsp;on_ irreversible</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;在commit_block中广播区块的相关信息。</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194859660?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 图12&nbsp;commit_block</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;最终在net_plugin里面接收到的消息如下打印：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194922108?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;图13 日志打印结果</p> 
+  <p>&nbsp; &nbsp;区块的广播机制大致如此。当然，又远不如此，如accepted_block从哪里来，会不会是已经上链的区块呢？这些区块信息广播出去之后会做怎样或者怎样被操作呢，咱们下篇文章，关于eos区块上链机制再聊。</p> 
+  <p><strong>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;如果你对eos开发感兴趣,长按以下二维码,关注本公众号,一起学习eos开发.</strong></p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180721194954516?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp;</p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 微信公众号</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;有任何疑问或者指教请添加本人个人公众号,当然有对eos开发感兴趣或者金庸粉的也可以添加,备注eos开发或金庸,拉你进群一起交流</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018072119502345?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp;</p> 
+  <p>&nbsp;</p> 
+  <p>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; 个人微信帐号</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhuxiangzhidi/article/details/81148323,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhuxiangzhidi/article/details/81148323,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

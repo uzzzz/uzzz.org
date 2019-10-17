@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Alabs丨浅谈DAG算法的实现 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Alabs丨浅谈DAG算法的实现" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="一.DAG的算法逻辑 假设有网络中有4个节点（A，B，C，D），每个节点都发送一笔交易，交易被包含在一个event里gossip到其他节点，一次gossip会把本节点的所知道的对方不知道的交易随机发送给其他节点，每个节点维护一个完整的图谱，通过投票算法，最后对每个event打一个时间戳，讲解具体逻辑前，我们先看一下event的数据结构： type Event struct { Transactions &nbsp; &nbsp;[][]byte &nbsp; &nbsp; &nbsp; &nbsp; //the payload selfParent &nbsp; &nbsp; &nbsp;string otherParent &nbsp; &nbsp; string Creator &nbsp; &nbsp; &nbsp; &nbsp; []byte &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //creator&#39;s public key Timestamp &nbsp; &nbsp; &nbsp; time.Time &nbsp; &nbsp; &nbsp; &nbsp;//creator&#39;s claimed timestamp of the event&#39;s creation roundReceived &nbsp; &nbsp; &nbsp;*int consensusTimestamp time.Time } Transactions字段是Event里包含的所有交易，selfParent和otherParent是该Event父Event的hash，包括了自己创建的父Event和其他节点创建的父Event，Creator是创建者的公钥，Timestamp是创建Event时的时间戳，roundRecevied是Event被第几层round里的famous witnesses 所共识的，consensusTimestamp是Event被共识时的时间戳。 接下来我们来看看具体的共识过程： &nbsp; 1.A，B，C，D在初始化时，各自创建一个rootEvent，然后B随机选择一个节点（假设选中的是D），然后B把自己所知道的D不知道的所有Events发送给D（这里只有B在一开始创建的rootEvent），D创建一个新的Event（该Event的selfParent为D的rootEvent，otherParent是B的rootEvent），然后D再随机把自己知道的Event（包括新创建的）全部发送给B，B再创建一个新的Event，这样B就知道了4个Event（自己创建的两个和D创建的两个），D知道3个Event（不包括B最后创建的）。 2.B再随机选择A，然后把自己知道的4个Event发送给A，A创建一个新的Event，这样一直增长下去，就形成了一个图谱结构。 3.famous witnesses的确定，首先有几个概念我们来看一下，see和strongly sees ， see就是说Event之间有祖孙关系，假设有Event （B2） 和Event （A3），假设B2是A3的祖先，A3是B2的子孙，那么就说A3可以看到B2， strongly sees是两个Event之间存在祖孙关系，并且这两个Event所有相连的所有路径中所过节点和超过2/3的节点，视为其中一个Event强看见另一个Event。 witness 是一个round中的第一个Event（rootEvent都是witness），round的确定方法是，一个Event可以强看见当前round里的2/3以上witness，那么该Event的round加一。 famous &nbsp;witness的确定机制是，下一层round里的witness对上一层可见的witness进行投票，再下一层round里的witness来计票，具体规则是，如果一个witness(A3)对上一层里的witness(B2)可见，那么投YES，当所有投票的witness(A3,B3,C3,D3)对被投票的witness(B2)投了YES，那么被投票的witness(B2)声明为famous，再下一层的 witness(B4)对参与投票的witness(A3,B3,C3,D3)如果是强可见的，那么计票为YES，那么该投票是有效的，当有效的票数超过2/3，那么被投票的witness(B2)选为famous witness。 4.当确定了famous witnesses，我们就可以为events找到一个consensusTimestamp和一个roundRecevied，规则是，当一个event（X）可以被下一层round里的所有famous witnesses看见，那么该event（X）的roundRecevied便是看见它所有famous witnesses所在的round值，该event（X）的consensusTimestamp确定规则是，找出所有famous witness的祖先event，并且是该event（X）的子孙的events，把这些events的时间戳排序，然后找中间的那个时间戳作为该event（X）的consensusTimestamp。 被打上consensusTimestamp的event便是形成共识的event，然后根据roundRecevied对event进行排序。 二.DAG的实现 &nbsp; 基本理论部分如上所述，接下来看一下工程上是如何实现以DAG算法为共识的项目，本项目主要实现了把dag形成共识后同一RoundReceived的交易映射到一个区块里，形成一个线性的区块链数据结构，使用了ethereum的账本结构。 上面类图，主要体现了DAG的核心类模块，crypto，网络通信等模块没有包含其中。 Event是DAG的基本数据结构，前面已经有介绍，Store负责数据的存储和管理，DAG类是DAG共识算法的核心，主要方法实现了可见与强可见的判断，划分round，决定famous witness，决定roundReceived，获取知道的Event，投票。 Core整个节点的核心逻辑，包含了插入Event，合并Event，运行共识等。 node模块，负责节点间的gossip，处理接收到的gossip请求并返回，负责ethereum与节点的proxy通信。 结合以上，我们看一下具体的业务流程，从一笔交易的发起，到交易入块的整个逻辑。 1.我们启动一个ethereum节点和一个DAG节点，它们之间是通过proxy进行连接。 2.ethereum调用proxy把交易传到DAG节点，DAG节点调用Core的AddTransctions把收到的交易加入到transactionpool里。 3.gossip心跳检测到需要发起gossip，便会创建一个新的event，把transactionpool的交易全部打包到event里，然后插入到Store里。 4.随机选取一个peer，发起gossip，从目标peer拉取自己不知道对方知道的event，并把自己知道的event传给对方。 5.拿到对方返回的event，调用Core的EventDiff来合并Event，并增加pedding区的Event，然后执行RunConsensus，来DivideRounds，调用DecideFame决定famous witnesses。 6.通过多次的gossip，famous witnesses被确定，然后调用FindOrder去决定 roundReceived和consensusTimestamp，然后排序。 7.调用handleNewConsensusEvents取出新共识过的event，并把里面的交易打包到一个块里，清空pedding区。 8.把区块返回到ethereum，ethereum执行区块里的交易，并把账本状态返回到DAG，DAG把账本状态入块，然后签名，再把签名广播到其他DAG节点，其他DAG节点收到签名，验证无误，与自己的签名合并入块，再把自己的签名广播。 &nbsp; 上图是我们通过4节点测试后取得的成功，我们可以看到其中一个块是包含了267581笔交易，用时大概是6秒左右，另一个块包含了835846笔交易，由此可见，在有限的节点测试环境中，达成一次共识需要的gossip次数是有限的，所以，增加单次网络IO（gossip）的数据负载（交易数量），产块时间间隔并没有受到严重影响，平均产块时间3-5秒。但是块中的交易数量得到了质的提高。 心得总结： 一：账本的一致性演化问题: 区块链的核心问题是解决公共网络环境下分布式账本的一致性演化问题，我们从两个问题去分析： 1.谁来记账。 2.非记账者如何验证记账者有没有说谎。 以成熟的比特币和以太坊为例，也就是pow共识算法，通过哈希算力来争夺记账权，以Merkle Tree 或者 Merkle Patricia tree 作为账本的基础数据结构，让“非记账者”快速验证记账者有没有说谎话，再加上惩罚机制的引入（算力的付出），让记账者从经济学的角度没有计坏账的动机，最终让比特币，以太坊成为数字货币领域，区块链技术的成功实践者。 我们知道以太坊的一个区块头中存在三个重要的数据，它们是Merkle树根节点的哈希，包括:状态树，交易树，收据树。在以太坊网络中，一个节点上的世界账本历史数据是经过哈希算力证明的，所以它是可信的，当一个矿工成功记了一批帐后（所谓的挖矿），它付出了算力，广播出去后，其他节点会根据本地的可信账本数据去验证矿工记得帐是否正确，核心的流程： Ａ.基于自己本地的账本(当然要努力保持本地账本是当前最长链，这里不做详细描述)，对块中得交易按顺序执行。然后改变本地世界账本状态，以及收据树等，形成新的世界状态数根哈希，和收据树根哈希。 B.比对本地新的世界状态和记账者给出的结果是否一致。即三个merkle根哈希值的比较。一致，那么便承认记账者没有说谎，本地账本和记账者的账本就会保持一致的演化下去。 这样随着网络中一个一个块得产生，全世界的每个账本都保持一致的演化下去。 二：我们的DAG主链（哈希图普）逻辑： DAG 共识与pow共识最大的区别在于，交易顺序的确定，以太坊中是单个矿工说了算，矿工可以根据自己的挖矿策略（交易手续费的高低）来决定一个块中包含那些交易，然后通过哈希算力争夺记账权。而哈希图谱中，如上文对哈希图谱算法的分析，hash graph 通过gossip协议在对一个round中的交易顺序达成一致，并形成一个块，简单来说这些交易顺序是通过协商确定的，一旦确定不可更改，这样，分布式中的每一个账本根据相同的交易顺序向下演化世界状态，最终可以保持账本的一致性。我们的具体流程： 1.哈希图谱共识模块，通过gossip协议对全网中一个round的交易排序问题达成共识，并形成中间状态的块，然后交给账本模块去验证，执行交易。使用交易树Merkel根哈希，保证已达成共识的交易顺序不被修改。 2.账本模块验证，执行完交易序列后，会生成新的世界状态树Merkel根（stateRoot），然后回复给哈希图普共识层。 3.哈希图谱共识层将块的交易树根，stateRoot, 广播出去，其他节点对刚才达成的交易序列共识作了相同的验证，执行。通过比较stateRoot可以得知演化结果是否一致，这样就可以相互收集签名确认，当一个块得到网络中多数节点签名确认后，块中交易即可认为达成最终共识。 &nbsp; 关于ALabs：ALabs是由Achain创始人崔萌发起并成立的区块链实验室，以打造高效的区块链网络为已任，主要进行尖端区块链技术研究，包括区块链底层技术、区块链扩展、区块链治理等，并提供区块链基础设施搭建、以及场景方案应用等服务。 阅读更多" />
+<meta property="og:description" content="一.DAG的算法逻辑 假设有网络中有4个节点（A，B，C，D），每个节点都发送一笔交易，交易被包含在一个event里gossip到其他节点，一次gossip会把本节点的所知道的对方不知道的交易随机发送给其他节点，每个节点维护一个完整的图谱，通过投票算法，最后对每个event打一个时间戳，讲解具体逻辑前，我们先看一下event的数据结构： type Event struct { Transactions &nbsp; &nbsp;[][]byte &nbsp; &nbsp; &nbsp; &nbsp; //the payload selfParent &nbsp; &nbsp; &nbsp;string otherParent &nbsp; &nbsp; string Creator &nbsp; &nbsp; &nbsp; &nbsp; []byte &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //creator&#39;s public key Timestamp &nbsp; &nbsp; &nbsp; time.Time &nbsp; &nbsp; &nbsp; &nbsp;//creator&#39;s claimed timestamp of the event&#39;s creation roundReceived &nbsp; &nbsp; &nbsp;*int consensusTimestamp time.Time } Transactions字段是Event里包含的所有交易，selfParent和otherParent是该Event父Event的hash，包括了自己创建的父Event和其他节点创建的父Event，Creator是创建者的公钥，Timestamp是创建Event时的时间戳，roundRecevied是Event被第几层round里的famous witnesses 所共识的，consensusTimestamp是Event被共识时的时间戳。 接下来我们来看看具体的共识过程： &nbsp; 1.A，B，C，D在初始化时，各自创建一个rootEvent，然后B随机选择一个节点（假设选中的是D），然后B把自己所知道的D不知道的所有Events发送给D（这里只有B在一开始创建的rootEvent），D创建一个新的Event（该Event的selfParent为D的rootEvent，otherParent是B的rootEvent），然后D再随机把自己知道的Event（包括新创建的）全部发送给B，B再创建一个新的Event，这样B就知道了4个Event（自己创建的两个和D创建的两个），D知道3个Event（不包括B最后创建的）。 2.B再随机选择A，然后把自己知道的4个Event发送给A，A创建一个新的Event，这样一直增长下去，就形成了一个图谱结构。 3.famous witnesses的确定，首先有几个概念我们来看一下，see和strongly sees ， see就是说Event之间有祖孙关系，假设有Event （B2） 和Event （A3），假设B2是A3的祖先，A3是B2的子孙，那么就说A3可以看到B2， strongly sees是两个Event之间存在祖孙关系，并且这两个Event所有相连的所有路径中所过节点和超过2/3的节点，视为其中一个Event强看见另一个Event。 witness 是一个round中的第一个Event（rootEvent都是witness），round的确定方法是，一个Event可以强看见当前round里的2/3以上witness，那么该Event的round加一。 famous &nbsp;witness的确定机制是，下一层round里的witness对上一层可见的witness进行投票，再下一层round里的witness来计票，具体规则是，如果一个witness(A3)对上一层里的witness(B2)可见，那么投YES，当所有投票的witness(A3,B3,C3,D3)对被投票的witness(B2)投了YES，那么被投票的witness(B2)声明为famous，再下一层的 witness(B4)对参与投票的witness(A3,B3,C3,D3)如果是强可见的，那么计票为YES，那么该投票是有效的，当有效的票数超过2/3，那么被投票的witness(B2)选为famous witness。 4.当确定了famous witnesses，我们就可以为events找到一个consensusTimestamp和一个roundRecevied，规则是，当一个event（X）可以被下一层round里的所有famous witnesses看见，那么该event（X）的roundRecevied便是看见它所有famous witnesses所在的round值，该event（X）的consensusTimestamp确定规则是，找出所有famous witness的祖先event，并且是该event（X）的子孙的events，把这些events的时间戳排序，然后找中间的那个时间戳作为该event（X）的consensusTimestamp。 被打上consensusTimestamp的event便是形成共识的event，然后根据roundRecevied对event进行排序。 二.DAG的实现 &nbsp; 基本理论部分如上所述，接下来看一下工程上是如何实现以DAG算法为共识的项目，本项目主要实现了把dag形成共识后同一RoundReceived的交易映射到一个区块里，形成一个线性的区块链数据结构，使用了ethereum的账本结构。 上面类图，主要体现了DAG的核心类模块，crypto，网络通信等模块没有包含其中。 Event是DAG的基本数据结构，前面已经有介绍，Store负责数据的存储和管理，DAG类是DAG共识算法的核心，主要方法实现了可见与强可见的判断，划分round，决定famous witness，决定roundReceived，获取知道的Event，投票。 Core整个节点的核心逻辑，包含了插入Event，合并Event，运行共识等。 node模块，负责节点间的gossip，处理接收到的gossip请求并返回，负责ethereum与节点的proxy通信。 结合以上，我们看一下具体的业务流程，从一笔交易的发起，到交易入块的整个逻辑。 1.我们启动一个ethereum节点和一个DAG节点，它们之间是通过proxy进行连接。 2.ethereum调用proxy把交易传到DAG节点，DAG节点调用Core的AddTransctions把收到的交易加入到transactionpool里。 3.gossip心跳检测到需要发起gossip，便会创建一个新的event，把transactionpool的交易全部打包到event里，然后插入到Store里。 4.随机选取一个peer，发起gossip，从目标peer拉取自己不知道对方知道的event，并把自己知道的event传给对方。 5.拿到对方返回的event，调用Core的EventDiff来合并Event，并增加pedding区的Event，然后执行RunConsensus，来DivideRounds，调用DecideFame决定famous witnesses。 6.通过多次的gossip，famous witnesses被确定，然后调用FindOrder去决定 roundReceived和consensusTimestamp，然后排序。 7.调用handleNewConsensusEvents取出新共识过的event，并把里面的交易打包到一个块里，清空pedding区。 8.把区块返回到ethereum，ethereum执行区块里的交易，并把账本状态返回到DAG，DAG把账本状态入块，然后签名，再把签名广播到其他DAG节点，其他DAG节点收到签名，验证无误，与自己的签名合并入块，再把自己的签名广播。 &nbsp; 上图是我们通过4节点测试后取得的成功，我们可以看到其中一个块是包含了267581笔交易，用时大概是6秒左右，另一个块包含了835846笔交易，由此可见，在有限的节点测试环境中，达成一次共识需要的gossip次数是有限的，所以，增加单次网络IO（gossip）的数据负载（交易数量），产块时间间隔并没有受到严重影响，平均产块时间3-5秒。但是块中的交易数量得到了质的提高。 心得总结： 一：账本的一致性演化问题: 区块链的核心问题是解决公共网络环境下分布式账本的一致性演化问题，我们从两个问题去分析： 1.谁来记账。 2.非记账者如何验证记账者有没有说谎。 以成熟的比特币和以太坊为例，也就是pow共识算法，通过哈希算力来争夺记账权，以Merkle Tree 或者 Merkle Patricia tree 作为账本的基础数据结构，让“非记账者”快速验证记账者有没有说谎话，再加上惩罚机制的引入（算力的付出），让记账者从经济学的角度没有计坏账的动机，最终让比特币，以太坊成为数字货币领域，区块链技术的成功实践者。 我们知道以太坊的一个区块头中存在三个重要的数据，它们是Merkle树根节点的哈希，包括:状态树，交易树，收据树。在以太坊网络中，一个节点上的世界账本历史数据是经过哈希算力证明的，所以它是可信的，当一个矿工成功记了一批帐后（所谓的挖矿），它付出了算力，广播出去后，其他节点会根据本地的可信账本数据去验证矿工记得帐是否正确，核心的流程： Ａ.基于自己本地的账本(当然要努力保持本地账本是当前最长链，这里不做详细描述)，对块中得交易按顺序执行。然后改变本地世界账本状态，以及收据树等，形成新的世界状态数根哈希，和收据树根哈希。 B.比对本地新的世界状态和记账者给出的结果是否一致。即三个merkle根哈希值的比较。一致，那么便承认记账者没有说谎，本地账本和记账者的账本就会保持一致的演化下去。 这样随着网络中一个一个块得产生，全世界的每个账本都保持一致的演化下去。 二：我们的DAG主链（哈希图普）逻辑： DAG 共识与pow共识最大的区别在于，交易顺序的确定，以太坊中是单个矿工说了算，矿工可以根据自己的挖矿策略（交易手续费的高低）来决定一个块中包含那些交易，然后通过哈希算力争夺记账权。而哈希图谱中，如上文对哈希图谱算法的分析，hash graph 通过gossip协议在对一个round中的交易顺序达成一致，并形成一个块，简单来说这些交易顺序是通过协商确定的，一旦确定不可更改，这样，分布式中的每一个账本根据相同的交易顺序向下演化世界状态，最终可以保持账本的一致性。我们的具体流程： 1.哈希图谱共识模块，通过gossip协议对全网中一个round的交易排序问题达成共识，并形成中间状态的块，然后交给账本模块去验证，执行交易。使用交易树Merkel根哈希，保证已达成共识的交易顺序不被修改。 2.账本模块验证，执行完交易序列后，会生成新的世界状态树Merkel根（stateRoot），然后回复给哈希图普共识层。 3.哈希图谱共识层将块的交易树根，stateRoot, 广播出去，其他节点对刚才达成的交易序列共识作了相同的验证，执行。通过比较stateRoot可以得知演化结果是否一致，这样就可以相互收集签名确认，当一个块得到网络中多数节点签名确认后，块中交易即可认为达成最终共识。 &nbsp; 关于ALabs：ALabs是由Achain创始人崔萌发起并成立的区块链实验室，以打造高效的区块链网络为已任，主要进行尖端区块链技术研究，包括区块链底层技术、区块链扩展、区块链治理等，并提供区块链基础设施搭建、以及场景方案应用等服务。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/25/aa401a6c1123ffc9c4ad6ffe348ce9d3.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/25/aa401a6c1123ffc9c4ad6ffe348ce9d3.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-25T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"一.DAG的算法逻辑 假设有网络中有4个节点（A，B，C，D），每个节点都发送一笔交易，交易被包含在一个event里gossip到其他节点，一次gossip会把本节点的所知道的对方不知道的交易随机发送给其他节点，每个节点维护一个完整的图谱，通过投票算法，最后对每个event打一个时间戳，讲解具体逻辑前，我们先看一下event的数据结构： type Event struct { Transactions &nbsp; &nbsp;[][]byte &nbsp; &nbsp; &nbsp; &nbsp; //the payload selfParent &nbsp; &nbsp; &nbsp;string otherParent &nbsp; &nbsp; string Creator &nbsp; &nbsp; &nbsp; &nbsp; []byte &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //creator&#39;s public key Timestamp &nbsp; &nbsp; &nbsp; time.Time &nbsp; &nbsp; &nbsp; &nbsp;//creator&#39;s claimed timestamp of the event&#39;s creation roundReceived &nbsp; &nbsp; &nbsp;*int consensusTimestamp time.Time } Transactions字段是Event里包含的所有交易，selfParent和otherParent是该Event父Event的hash，包括了自己创建的父Event和其他节点创建的父Event，Creator是创建者的公钥，Timestamp是创建Event时的时间戳，roundRecevied是Event被第几层round里的famous witnesses 所共识的，consensusTimestamp是Event被共识时的时间戳。 接下来我们来看看具体的共识过程： &nbsp; 1.A，B，C，D在初始化时，各自创建一个rootEvent，然后B随机选择一个节点（假设选中的是D），然后B把自己所知道的D不知道的所有Events发送给D（这里只有B在一开始创建的rootEvent），D创建一个新的Event（该Event的selfParent为D的rootEvent，otherParent是B的rootEvent），然后D再随机把自己知道的Event（包括新创建的）全部发送给B，B再创建一个新的Event，这样B就知道了4个Event（自己创建的两个和D创建的两个），D知道3个Event（不包括B最后创建的）。 2.B再随机选择A，然后把自己知道的4个Event发送给A，A创建一个新的Event，这样一直增长下去，就形成了一个图谱结构。 3.famous witnesses的确定，首先有几个概念我们来看一下，see和strongly sees ， see就是说Event之间有祖孙关系，假设有Event （B2） 和Event （A3），假设B2是A3的祖先，A3是B2的子孙，那么就说A3可以看到B2， strongly sees是两个Event之间存在祖孙关系，并且这两个Event所有相连的所有路径中所过节点和超过2/3的节点，视为其中一个Event强看见另一个Event。 witness 是一个round中的第一个Event（rootEvent都是witness），round的确定方法是，一个Event可以强看见当前round里的2/3以上witness，那么该Event的round加一。 famous &nbsp;witness的确定机制是，下一层round里的witness对上一层可见的witness进行投票，再下一层round里的witness来计票，具体规则是，如果一个witness(A3)对上一层里的witness(B2)可见，那么投YES，当所有投票的witness(A3,B3,C3,D3)对被投票的witness(B2)投了YES，那么被投票的witness(B2)声明为famous，再下一层的 witness(B4)对参与投票的witness(A3,B3,C3,D3)如果是强可见的，那么计票为YES，那么该投票是有效的，当有效的票数超过2/3，那么被投票的witness(B2)选为famous witness。 4.当确定了famous witnesses，我们就可以为events找到一个consensusTimestamp和一个roundRecevied，规则是，当一个event（X）可以被下一层round里的所有famous witnesses看见，那么该event（X）的roundRecevied便是看见它所有famous witnesses所在的round值，该event（X）的consensusTimestamp确定规则是，找出所有famous witness的祖先event，并且是该event（X）的子孙的events，把这些events的时间戳排序，然后找中间的那个时间戳作为该event（X）的consensusTimestamp。 被打上consensusTimestamp的event便是形成共识的event，然后根据roundRecevied对event进行排序。 二.DAG的实现 &nbsp; 基本理论部分如上所述，接下来看一下工程上是如何实现以DAG算法为共识的项目，本项目主要实现了把dag形成共识后同一RoundReceived的交易映射到一个区块里，形成一个线性的区块链数据结构，使用了ethereum的账本结构。 上面类图，主要体现了DAG的核心类模块，crypto，网络通信等模块没有包含其中。 Event是DAG的基本数据结构，前面已经有介绍，Store负责数据的存储和管理，DAG类是DAG共识算法的核心，主要方法实现了可见与强可见的判断，划分round，决定famous witness，决定roundReceived，获取知道的Event，投票。 Core整个节点的核心逻辑，包含了插入Event，合并Event，运行共识等。 node模块，负责节点间的gossip，处理接收到的gossip请求并返回，负责ethereum与节点的proxy通信。 结合以上，我们看一下具体的业务流程，从一笔交易的发起，到交易入块的整个逻辑。 1.我们启动一个ethereum节点和一个DAG节点，它们之间是通过proxy进行连接。 2.ethereum调用proxy把交易传到DAG节点，DAG节点调用Core的AddTransctions把收到的交易加入到transactionpool里。 3.gossip心跳检测到需要发起gossip，便会创建一个新的event，把transactionpool的交易全部打包到event里，然后插入到Store里。 4.随机选取一个peer，发起gossip，从目标peer拉取自己不知道对方知道的event，并把自己知道的event传给对方。 5.拿到对方返回的event，调用Core的EventDiff来合并Event，并增加pedding区的Event，然后执行RunConsensus，来DivideRounds，调用DecideFame决定famous witnesses。 6.通过多次的gossip，famous witnesses被确定，然后调用FindOrder去决定 roundReceived和consensusTimestamp，然后排序。 7.调用handleNewConsensusEvents取出新共识过的event，并把里面的交易打包到一个块里，清空pedding区。 8.把区块返回到ethereum，ethereum执行区块里的交易，并把账本状态返回到DAG，DAG把账本状态入块，然后签名，再把签名广播到其他DAG节点，其他DAG节点收到签名，验证无误，与自己的签名合并入块，再把自己的签名广播。 &nbsp; 上图是我们通过4节点测试后取得的成功，我们可以看到其中一个块是包含了267581笔交易，用时大概是6秒左右，另一个块包含了835846笔交易，由此可见，在有限的节点测试环境中，达成一次共识需要的gossip次数是有限的，所以，增加单次网络IO（gossip）的数据负载（交易数量），产块时间间隔并没有受到严重影响，平均产块时间3-5秒。但是块中的交易数量得到了质的提高。 心得总结： 一：账本的一致性演化问题: 区块链的核心问题是解决公共网络环境下分布式账本的一致性演化问题，我们从两个问题去分析： 1.谁来记账。 2.非记账者如何验证记账者有没有说谎。 以成熟的比特币和以太坊为例，也就是pow共识算法，通过哈希算力来争夺记账权，以Merkle Tree 或者 Merkle Patricia tree 作为账本的基础数据结构，让“非记账者”快速验证记账者有没有说谎话，再加上惩罚机制的引入（算力的付出），让记账者从经济学的角度没有计坏账的动机，最终让比特币，以太坊成为数字货币领域，区块链技术的成功实践者。 我们知道以太坊的一个区块头中存在三个重要的数据，它们是Merkle树根节点的哈希，包括:状态树，交易树，收据树。在以太坊网络中，一个节点上的世界账本历史数据是经过哈希算力证明的，所以它是可信的，当一个矿工成功记了一批帐后（所谓的挖矿），它付出了算力，广播出去后，其他节点会根据本地的可信账本数据去验证矿工记得帐是否正确，核心的流程： Ａ.基于自己本地的账本(当然要努力保持本地账本是当前最长链，这里不做详细描述)，对块中得交易按顺序执行。然后改变本地世界账本状态，以及收据树等，形成新的世界状态数根哈希，和收据树根哈希。 B.比对本地新的世界状态和记账者给出的结果是否一致。即三个merkle根哈希值的比较。一致，那么便承认记账者没有说谎，本地账本和记账者的账本就会保持一致的演化下去。 这样随着网络中一个一个块得产生，全世界的每个账本都保持一致的演化下去。 二：我们的DAG主链（哈希图普）逻辑： DAG 共识与pow共识最大的区别在于，交易顺序的确定，以太坊中是单个矿工说了算，矿工可以根据自己的挖矿策略（交易手续费的高低）来决定一个块中包含那些交易，然后通过哈希算力争夺记账权。而哈希图谱中，如上文对哈希图谱算法的分析，hash graph 通过gossip协议在对一个round中的交易顺序达成一致，并形成一个块，简单来说这些交易顺序是通过协商确定的，一旦确定不可更改，这样，分布式中的每一个账本根据相同的交易顺序向下演化世界状态，最终可以保持账本的一致性。我们的具体流程： 1.哈希图谱共识模块，通过gossip协议对全网中一个round的交易排序问题达成共识，并形成中间状态的块，然后交给账本模块去验证，执行交易。使用交易树Merkel根哈希，保证已达成共识的交易顺序不被修改。 2.账本模块验证，执行完交易序列后，会生成新的世界状态树Merkel根（stateRoot），然后回复给哈希图普共识层。 3.哈希图谱共识层将块的交易树根，stateRoot, 广播出去，其他节点对刚才达成的交易序列共识作了相同的验证，执行。通过比较stateRoot可以得知演化结果是否一致，这样就可以相互收集签名确认，当一个块得到网络中多数节点签名确认后，块中交易即可认为达成最终共识。 &nbsp; 关于ALabs：ALabs是由Achain创始人崔萌发起并成立的区块链实验室，以打造高效的区块链网络为已任，主要进行尖端区块链技术研究，包括区块链底层技术、区块链扩展、区块链治理等，并提供区块链基础设施搭建、以及场景方案应用等服务。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/25/aa401a6c1123ffc9c4ad6ffe348ce9d3.html","headline":"Alabs丨浅谈DAG算法的实现","dateModified":"2018-07-25T00:00:00+08:00","datePublished":"2018-07-25T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/25/aa401a6c1123ffc9c4ad6ffe348ce9d3.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Alabs丨浅谈DAG算法的实现</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h2><strong>一.DAG的算法逻辑</strong></h2> 
+  <p>假设有网络中有4个节点（A，B，C，D），每个节点都发送一笔交易，交易被包含在一个event里gossip到其他节点，一次gossip会把本节点的所知道的对方不知道的交易随机发送给其他节点，每个节点维护一个完整的图谱，通过投票算法，最后对每个event打一个时间戳，讲解具体逻辑前，我们先看一下event的数据结构：</p> 
+  <p>type Event struct {</p> 
+  <p>Transactions &nbsp; &nbsp;[][]byte &nbsp; &nbsp; &nbsp; &nbsp; //the payload</p> 
+  <p>selfParent &nbsp; &nbsp; &nbsp;string</p> 
+  <p>otherParent &nbsp; &nbsp; string</p> 
+  <p>Creator &nbsp; &nbsp; &nbsp; &nbsp; []byte &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //creator's public key</p> 
+  <p>Timestamp &nbsp; &nbsp; &nbsp; time.Time &nbsp; &nbsp; &nbsp; &nbsp;//creator's claimed timestamp of the event's creation</p> 
+  <p>roundReceived &nbsp; &nbsp; &nbsp;*int</p> 
+  <p>consensusTimestamp time.Time</p> 
+  <p>}</p> 
+  <p>Transactions字段是Event里包含的所有交易，selfParent和otherParent是该Event父Event的hash，包括了自己创建的父Event和其他节点创建的父Event，Creator是创建者的公钥，Timestamp是创建Event时的时间戳，roundRecevied是Event被第几层round里的famous witnesses 所共识的，consensusTimestamp是Event被共识时的时间戳。</p> 
+  <p><img alt="" class="has" src="https://mmbiz.qpic.cn/mmbiz_png/ibzgugvI9rXS49SIEVNo6VJ0picI6Yia1dEsLeMLMuzBQEhcJe6hcnlYlLJSia3WTzc6XbqeyvZdXWRlsaAV1JFOUw/640?wx_fmt=png&amp;tp=webp&amp;wxfrom=5&amp;wx_lazy=1"></p> 
+  <p><strong>接下来我们来看看具体的共识过程：</strong></p> 
+  <p>&nbsp;</p> 
+  <p>1.A，B，C，D在初始化时，各自创建一个rootEvent，然后B随机选择一个节点（假设选中的是D），然后B把自己所知道的D不知道的所有Events发送给D（这里只有B在一开始创建的rootEvent），D创建一个新的Event（该Event的selfParent为D的rootEvent，otherParent是B的rootEvent），然后D再随机把自己知道的Event（包括新创建的）全部发送给B，B再创建一个新的Event，这样B就知道了4个Event（自己创建的两个和D创建的两个），D知道3个Event（不包括B最后创建的）。</p> 
+  <p>2.B再随机选择A，然后把自己知道的4个Event发送给A，A创建一个新的Event，这样一直增长下去，就形成了一个图谱结构。</p> 
+  <p>3.famous witnesses的确定，首先有几个概念我们来看一下，see和strongly sees ，</p> 
+  <p>see就是说Event之间有祖孙关系，假设有Event （B2） 和Event （A3），假设B2是A3的祖先，A3是B2的子孙，那么就说A3可以看到B2，</p> 
+  <p>strongly sees是两个Event之间存在祖孙关系，并且这两个Event所有相连的所有路径中所过节点和超过2/3的节点，视为其中一个Event强看见另一个Event。</p> 
+  <p>witness 是一个round中的第一个Event（rootEvent都是witness），round的确定方法是，一个Event可以强看见当前round里的2/3以上witness，那么该Event的round加一。</p> 
+  <p>famous &nbsp;witness的确定机制是，下一层round里的witness对上一层可见的witness进行投票，再下一层round里的witness来计票，具体规则是，如果一个witness(A3)对上一层里的witness(B2)可见，那么投YES，当所有投票的witness(A3,B3,C3,D3)对被投票的witness(B2)投了YES，那么被投票的witness(B2)声明为famous，再下一层的</p> 
+  <p>witness(B4)对参与投票的witness(A3,B3,C3,D3)如果是强可见的，那么计票为YES，那么该投票是有效的，当有效的票数超过2/3，那么被投票的witness(B2)选为famous witness。</p> 
+  <p>4.当确定了famous witnesses，我们就可以为events找到一个consensusTimestamp和一个roundRecevied，规则是，当一个event（X）可以被下一层round里的所有famous witnesses看见，那么该event（X）的roundRecevied便是看见它所有famous witnesses所在的round值，该event（X）的consensusTimestamp确定规则是，找出所有famous witness的祖先event，并且是该event（X）的子孙的events，把这些events的时间戳排序，然后找中间的那个时间戳作为该event（X）的consensusTimestamp。</p> 
+  <p>被打上consensusTimestamp的event便是形成共识的event，然后根据roundRecevied对event进行排序。</p> 
+  <p><strong>二.DAG的实现</strong></p> 
+  <p>&nbsp;</p> 
+  <p>基本理论部分如上所述，接下来看一下工程上是如何实现以DAG算法为共识的项目，本项目主要实现了把dag形成共识后同一RoundReceived的交易映射到一个区块里，形成一个线性的区块链数据结构，使用了ethereum的账本结构。</p> 
+  <p><img alt="" class="has" src="https://mmbiz.qpic.cn/mmbiz_png/ibzgugvI9rXS49SIEVNo6VJ0picI6Yia1dERG28KLRfRXHw38iaTn4kia2aQ82k0XvenPGDCLBZm1MCNkKvgfshiaBhQ/640?wx_fmt=png&amp;tp=webp&amp;wxfrom=5&amp;wx_lazy=1"></p> 
+  <p>上面类图，主要体现了DAG的核心类模块，crypto，网络通信等模块没有包含其中。</p> 
+  <p>Event是DAG的基本数据结构，前面已经有介绍，Store负责数据的存储和管理，DAG类是DAG共识算法的核心，主要方法实现了可见与强可见的判断，划分round，决定famous witness，决定roundReceived，获取知道的Event，投票。</p> 
+  <p>Core整个节点的核心逻辑，包含了插入Event，合并Event，运行共识等。</p> 
+  <p>node模块，负责节点间的gossip，处理接收到的gossip请求并返回，负责ethereum与节点的proxy通信。</p> 
+  <p>结合以上，我们看一下具体的业务流程，从一笔交易的发起，到交易入块的整个逻辑。</p> 
+  <p>1.我们启动一个ethereum节点和一个DAG节点，它们之间是通过proxy进行连接。</p> 
+  <p>2.ethereum调用proxy把交易传到DAG节点，DAG节点调用Core的AddTransctions把收到的交易加入到transactionpool里。</p> 
+  <p>3.gossip心跳检测到需要发起gossip，便会创建一个新的event，把transactionpool的交易全部打包到event里，然后插入到Store里。</p> 
+  <p>4.随机选取一个peer，发起gossip，从目标peer拉取自己不知道对方知道的event，并把自己知道的event传给对方。</p> 
+  <p>5.拿到对方返回的event，调用Core的EventDiff来合并Event，并增加pedding区的Event，然后执行RunConsensus，来DivideRounds，调用DecideFame决定famous witnesses。</p> 
+  <p>6.通过多次的gossip，famous witnesses被确定，然后调用FindOrder去决定</p> 
+  <p>roundReceived和consensusTimestamp，然后排序。</p> 
+  <p>7.调用handleNewConsensusEvents取出新共识过的event，并把里面的交易打包到一个块里，清空pedding区。</p> 
+  <p>8.把区块返回到ethereum，ethereum执行区块里的交易，并把账本状态返回到DAG，DAG把账本状态入块，然后签名，再把签名广播到其他DAG节点，其他DAG节点收到签名，验证无误，与自己的签名合并入块，再把自己的签名广播。</p> 
+  <p><img alt="" class="has" src="https://mmbiz.qpic.cn/mmbiz_png/ibzgugvI9rXS49SIEVNo6VJ0picI6Yia1dErib16qeJ6x78RicWt5jyKBopbUJEB2CWVelCicWHR2b7zdadB25JU518A/640?wx_fmt=png&amp;tp=webp&amp;wxfrom=5&amp;wx_lazy=1"></p> 
+  <p>&nbsp;</p> 
+  <p>上图是我们通过4节点测试后取得的成功，我们可以看到其中一个块是包含了267581笔交易，用时大概是6秒左右，另一个块包含了835846笔交易，由此可见，在有限的节点测试环境中，达成一次共识需要的gossip次数是有限的，所以，增加单次网络IO（gossip）的数据负载（交易数量），产块时间间隔并没有受到严重影响，平均产块时间3-5秒。但是块中的交易数量得到了质的提高。</p> 
+  <p>心得总结：</p> 
+  <p>一：账本的一致性演化问题:</p> 
+  <p>区块链的核心问题是解决公共网络环境下分布式账本的一致性演化问题，我们从两个问题去分析：</p> 
+  <p>1.谁来记账。</p> 
+  <p>2.非记账者如何验证记账者有没有说谎。</p> 
+  <p>以成熟的比特币和以太坊为例，也就是pow共识算法，通过哈希算力来争夺记账权，以Merkle Tree 或者 Merkle Patricia tree 作为账本的基础数据结构，让“非记账者”快速验证记账者有没有说谎话，再加上惩罚机制的引入（算力的付出），让记账者从经济学的角度没有计坏账的动机，最终让比特币，以太坊成为数字货币领域，区块链技术的成功实践者。</p> 
+  <p>我们知道以太坊的一个区块头中存在三个重要的数据，它们是Merkle树根节点的哈希，包括:状态树，交易树，收据树。在以太坊网络中，一个节点上的世界账本历史数据是经过哈希算力证明的，所以它是可信的，当一个矿工成功记了一批帐后（所谓的挖矿），它付出了算力，广播出去后，其他节点会根据本地的可信账本数据去验证矿工记得帐是否正确，核心的流程：</p> 
+  <p>Ａ.基于自己本地的账本(当然要努力保持本地账本是当前最长链，这里不做详细描述)，对块中得交易按顺序执行。然后改变本地世界账本状态，以及收据树等，形成新的世界状态数根哈希，和收据树根哈希。</p> 
+  <p>B.比对本地新的世界状态和记账者给出的结果是否一致。即三个merkle根哈希值的比较。一致，那么便承认记账者没有说谎，本地账本和记账者的账本就会保持一致的演化下去。</p> 
+  <p>这样随着网络中一个一个块得产生，全世界的每个账本都保持一致的演化下去。</p> 
+  <p>二：我们的DAG主链（哈希图普）逻辑：</p> 
+  <p>DAG 共识与pow共识最大的区别在于，交易顺序的确定，以太坊中是单个矿工说了算，矿工可以根据自己的挖矿策略（交易手续费的高低）来决定一个块中包含那些交易，然后通过哈希算力争夺记账权。而哈希图谱中，如上文对哈希图谱算法的分析，hash graph 通过gossip协议在对一个round中的交易顺序达成一致，并形成一个块，简单来说这些交易顺序是通过协商确定的，一旦确定不可更改，这样，分布式中的每一个账本根据相同的交易顺序向下演化世界状态，最终可以保持账本的一致性。我们的具体流程：</p> 
+  <p>1.哈希图谱共识模块，通过gossip协议对全网中一个round的交易排序问题达成共识，并形成中间状态的块，然后交给账本模块去验证，执行交易。使用交易树Merkel根哈希，保证已达成共识的交易顺序不被修改。</p> 
+  <p>2.账本模块验证，执行完交易序列后，会生成新的世界状态树Merkel根（stateRoot），然后回复给哈希图普共识层。</p> 
+  <p>3.哈希图谱共识层将块的交易树根，stateRoot, 广播出去，其他节点对刚才达成的交易序列共识作了相同的验证，执行。通过比较stateRoot可以得知演化结果是否一致，这样就可以相互收集签名确认，当一个块得到网络中多数节点签名确认后，块中交易即可认为达成最终共识。</p> 
+  <p>&nbsp;</p> 
+  <p><strong>关于ALabs：ALabs是由Achain创始人崔萌发起并成立的区块链实验室，以打造高效的区块链网络为已任，主要进行尖端区块链技术研究，包括区块链底层技术、区块链扩展、区块链治理等，并提供区块链基础设施搭建、以及场景方案应用等服务。</strong></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_41902757/article/details/81203652,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_41902757/article/details/81203652,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

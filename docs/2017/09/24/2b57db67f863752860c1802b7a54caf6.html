@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>【区块链】以太坊源码学习 – EVM | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="【区块链】以太坊源码学习 – EVM" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊源码学习 – EVM 学习文档链接：here 一、虚拟机外 主要功能： 执行前将Transaction类型转化成Message，创建虚拟机(EVM)对象，计算一些Gas消耗，以及执行交易完毕后创建收据(Receipt)对象并返回 1.1 入口 和 返回值 文件：/core/state_processor.go --- Process() for i, tx := range block.Transactions() { statedb.Prepare(tx.Hash(), block.Hash(), i) receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) if err != nil { return nil, nil, nil, err } receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } //将block里面所有的tx逐个遍历执行，ApplyTransaction, 每次执行完返回一个收据(Receipt)对象 我们来看下Receipt结构体： type Receipt struct { // Consensus fields PostState []byte `json:&quot;root&quot;` Failed bool `json:&quot;failed&quot;` CumulativeGasUsed *big.Int `json:&quot;cumulativeGasUsed&quot; gencodec:&quot;required&quot;` Bloom Bloom `json:&quot;logsBloom&quot; gencodec:&quot;required&quot;` Logs []*Log `json:&quot;logs&quot; gencodec:&quot;required&quot;` // Implementation fields (don&#39;t reorder!) TxHash common.Hash `json:&quot;transactionHash&quot; gencodec:&quot;required&quot;` ContractAddress common.Address `json:&quot;contractAddress&quot;` GasUsed *big.Int `json:&quot;gasUsed&quot; gencodec:&quot;required&quot;` } 解释： Logs: Log类型的数组，其中每一个Log对象记录了Tx中一小步的操作。所以，每一个tx的执行结果，由一个Receipt对象来表示；更详细的内容，由一组Log对象来记录。这个Log数组很重要，比如在不同Ethereum节点(Node)的相互同步过程中，待同步区块的Log数组有助于验证同步中收到的block是否正确和完整，所以会被单独同步(传输)。 PostState: 保存了创建该Receipt对象时，整个Block内所有“帐户”的当时状态。Ethereum 里用stateObject来表示一个账户Account，这个账户可转帐(transfer value), 可执行tx, 它的唯一标示符是一个Address类型变量。 这个Receipt.PostState 就是当时所在Block里所有stateObject对象的RLP Hash值。 Bloom: Ethereum内部实现的一个256bit长Bloom Filter。 Bloom Filter概念定义可见wikipedia，它可用来快速验证一个新收到的对象是否处于一个已知的大量对象集合之中。这里Receipt的Bloom，被用以验证某个给定的Log是否处于Receipt已有的Log数组中。 1.2 封装EVM对象和Message对象 我们来看一下ApplyTransaction()： 文件：/core/state_processor.go --- ApplyTransaction() //=====Message对象===== msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, nil, err } //=====EVM对象===== context := NewEVMContext(msg, header, bc, author) vmenv := vm.NewEVM(context, statedb, config, cfg) //完成tx的执行 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) //创建一个收据Receipt对象，最后返回该Recetip对象，以及整个tx执行过程所消耗Gas数量。 ... 我们来看一下ApplyMessage() 文件：/core/state_transition.go --- ApplyMessage() //发现调用了TransitionDb() , _, gasUsed, failed, err := st.TransitionDb() 我们来看一下TransitionDb() 文件：/core/state_transition.go --- TransitionDb() //购买gas //计算tx固有gas //EVM执行 //计算本次执行交易的实际gas消耗 //偿退gas //奖励所属区块的挖掘者 二、 虚拟机内 包括执行转帐，和创建合约并执行合约的指令数组 2.1 EVM结构体 我们来看一下EVM的结构体： 文件：/core/vm/evm.go type EVM struct { Context --携带辅助信息：Transaction的信息(GasPrice, GasLimit)，Block的信息(Number, Difficulty)，以及转帐函数等 StateDB StateDB --为EVM提供statedb的相关操作 depth int chainConfig *params.ChainConfig chainRules params.Rules vmConfig Config interpreter *Interpreter --解释器，用来解释执行EVM中合约的指令 abort int32 } 2.2 完成转账 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 文件：/core/evm.go --Transfer() db.SubBalance(sender, amount) //转出账户减到一定金额以太币 db.AddBalance(recipient, amount) //转入账户增加一定金额以太币 //注意：转出和转入账户的操作不会立即生效，StateDB 并不是真正的数据库，只是一行为类似数据库的结构体它在内部以Trie的数据结构来管理各个基于地址的账户，可以理解成一个cache；当该账户的信息有变化时，变化先存储在Trie中。仅当整个Block要被插入到BlockChain时，StateDB 里缓存的所有账户的所有改动，才会被真正的提交到底层数据库。 2.3 合约的创建、赋值 我们先来看一下contract 结构体 文件：/core/vm/contract.go type Contract struct { CallerAddress common.Address caller ContractRef //转账转出方地址 self ContractRef //转入方地址 jumpdests destinations // result of JUMPDEST analysis. Code []byte //指令数组，其中每一个byte都对应于一个预定义的虚拟机指令 CodeHash common.Hash CodeAddr *common.Address Input []byte //数据数组，是指令所操作的数据集合 Gas uint64 value *big.Int Args []byte DelegateCall bool } 创建合约： call(),create() -- 二者均在StateProcessor的ApplyTransaction()被调用以执行单个交易，并且都有调用转帐函数完成转帐。 我们来看一下call() 文件：/core/vm/call.go var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } //转账 evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) //赋值Contract对象 contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) //调用run，执行该合约的指令 ret, err = run(evm, snapshot, contract, input) if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err 2.4 预编译合约 我们来看一下run(): 文件：/core/vm/run.go if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } return evm.interpreter.Run(snapshot, contract, input) 可见如果待执行的Contract对象恰好属于一组预编译的合约集合-此时以指令地址CodeAddr为匹配项-那么它可以直接运行；没有经过预编译的Contract，才会由Interpreter解释执行。这里的&quot;预编译&quot;，可理解为不需要编译(解释)指令(Code)。预编译的合约，其逻辑全部固定且已知，所以执行中不再需要Code，仅需Input即可。 在代码实现中，预编译合约只需实现两个方法Required()和Run()即可，这两方法仅需一个入参input。 2.5 解释器执行合约的指令 我们来看一下interpreter.go 可以看到一个Config结构体 文件：/core/vm/.interpreter.go type Config struct { Debug bool EnableJit bool ForceJit bool Tracer Tracer NoRecursion bool DisableGasMetering bool EnablePreimageRecording bool JumpTable [256]operation // } operation: 每个operation对象正对应一个已定义的虚拟机指令，它所含有的四个函数变量execute, gasCost, validateStack, memorySize 提供了这个虚拟机指令所代表的所有操作。每个指令长度1byte，Contract对象的成员变量Code类型为[]byte，就是这些虚拟机指令的任意集合。operation对象的函数操作，主要会用到Stack，Memory, IntPool 这几个自定义的数据结构。 然后我们看一下interpreter.run() 文件： 文件：/core/vm/.interpreter.go --run() 核心： 逐个byte遍历入参Contract对象的Code变量，将其解释为一个已知的operation，然后依次调用该operation对象的四个函数 operation在操作过程中，会需要几个数据结构： Stack，实现了标准容器 -栈的行为；Memory，一个字节数组，可表示线性排列的任意数据;还有一个intPool，提供对big.Int数据的存储和读取。 需要特别注意的是LOGn指令操作，它用来创建n个Log对象，这里n最大是4。还记得Log在何时被用到么？每个交易(Transaction,tx)执行完成后，会创建一个Receipt对象用来记录这个交易的执行结果。Receipt携带一个Log数组，用来记录tx操作过程中的所有变动细节，而这些Log，正是通过合适的LOGn指令-即合约指令数组(Contract.Code)中的单个byte，在其对应的operation里被创建出来的。每个新创建的Log对象被缓存在StateDB中的相对应的stateObject里，待需要时从StateDB中读取。 阅读更多" />
+<meta property="og:description" content="以太坊源码学习 – EVM 学习文档链接：here 一、虚拟机外 主要功能： 执行前将Transaction类型转化成Message，创建虚拟机(EVM)对象，计算一些Gas消耗，以及执行交易完毕后创建收据(Receipt)对象并返回 1.1 入口 和 返回值 文件：/core/state_processor.go --- Process() for i, tx := range block.Transactions() { statedb.Prepare(tx.Hash(), block.Hash(), i) receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) if err != nil { return nil, nil, nil, err } receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } //将block里面所有的tx逐个遍历执行，ApplyTransaction, 每次执行完返回一个收据(Receipt)对象 我们来看下Receipt结构体： type Receipt struct { // Consensus fields PostState []byte `json:&quot;root&quot;` Failed bool `json:&quot;failed&quot;` CumulativeGasUsed *big.Int `json:&quot;cumulativeGasUsed&quot; gencodec:&quot;required&quot;` Bloom Bloom `json:&quot;logsBloom&quot; gencodec:&quot;required&quot;` Logs []*Log `json:&quot;logs&quot; gencodec:&quot;required&quot;` // Implementation fields (don&#39;t reorder!) TxHash common.Hash `json:&quot;transactionHash&quot; gencodec:&quot;required&quot;` ContractAddress common.Address `json:&quot;contractAddress&quot;` GasUsed *big.Int `json:&quot;gasUsed&quot; gencodec:&quot;required&quot;` } 解释： Logs: Log类型的数组，其中每一个Log对象记录了Tx中一小步的操作。所以，每一个tx的执行结果，由一个Receipt对象来表示；更详细的内容，由一组Log对象来记录。这个Log数组很重要，比如在不同Ethereum节点(Node)的相互同步过程中，待同步区块的Log数组有助于验证同步中收到的block是否正确和完整，所以会被单独同步(传输)。 PostState: 保存了创建该Receipt对象时，整个Block内所有“帐户”的当时状态。Ethereum 里用stateObject来表示一个账户Account，这个账户可转帐(transfer value), 可执行tx, 它的唯一标示符是一个Address类型变量。 这个Receipt.PostState 就是当时所在Block里所有stateObject对象的RLP Hash值。 Bloom: Ethereum内部实现的一个256bit长Bloom Filter。 Bloom Filter概念定义可见wikipedia，它可用来快速验证一个新收到的对象是否处于一个已知的大量对象集合之中。这里Receipt的Bloom，被用以验证某个给定的Log是否处于Receipt已有的Log数组中。 1.2 封装EVM对象和Message对象 我们来看一下ApplyTransaction()： 文件：/core/state_processor.go --- ApplyTransaction() //=====Message对象===== msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, nil, err } //=====EVM对象===== context := NewEVMContext(msg, header, bc, author) vmenv := vm.NewEVM(context, statedb, config, cfg) //完成tx的执行 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) //创建一个收据Receipt对象，最后返回该Recetip对象，以及整个tx执行过程所消耗Gas数量。 ... 我们来看一下ApplyMessage() 文件：/core/state_transition.go --- ApplyMessage() //发现调用了TransitionDb() , _, gasUsed, failed, err := st.TransitionDb() 我们来看一下TransitionDb() 文件：/core/state_transition.go --- TransitionDb() //购买gas //计算tx固有gas //EVM执行 //计算本次执行交易的实际gas消耗 //偿退gas //奖励所属区块的挖掘者 二、 虚拟机内 包括执行转帐，和创建合约并执行合约的指令数组 2.1 EVM结构体 我们来看一下EVM的结构体： 文件：/core/vm/evm.go type EVM struct { Context --携带辅助信息：Transaction的信息(GasPrice, GasLimit)，Block的信息(Number, Difficulty)，以及转帐函数等 StateDB StateDB --为EVM提供statedb的相关操作 depth int chainConfig *params.ChainConfig chainRules params.Rules vmConfig Config interpreter *Interpreter --解释器，用来解释执行EVM中合约的指令 abort int32 } 2.2 完成转账 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 文件：/core/evm.go --Transfer() db.SubBalance(sender, amount) //转出账户减到一定金额以太币 db.AddBalance(recipient, amount) //转入账户增加一定金额以太币 //注意：转出和转入账户的操作不会立即生效，StateDB 并不是真正的数据库，只是一行为类似数据库的结构体它在内部以Trie的数据结构来管理各个基于地址的账户，可以理解成一个cache；当该账户的信息有变化时，变化先存储在Trie中。仅当整个Block要被插入到BlockChain时，StateDB 里缓存的所有账户的所有改动，才会被真正的提交到底层数据库。 2.3 合约的创建、赋值 我们先来看一下contract 结构体 文件：/core/vm/contract.go type Contract struct { CallerAddress common.Address caller ContractRef //转账转出方地址 self ContractRef //转入方地址 jumpdests destinations // result of JUMPDEST analysis. Code []byte //指令数组，其中每一个byte都对应于一个预定义的虚拟机指令 CodeHash common.Hash CodeAddr *common.Address Input []byte //数据数组，是指令所操作的数据集合 Gas uint64 value *big.Int Args []byte DelegateCall bool } 创建合约： call(),create() -- 二者均在StateProcessor的ApplyTransaction()被调用以执行单个交易，并且都有调用转帐函数完成转帐。 我们来看一下call() 文件：/core/vm/call.go var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } //转账 evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) //赋值Contract对象 contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) //调用run，执行该合约的指令 ret, err = run(evm, snapshot, contract, input) if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err 2.4 预编译合约 我们来看一下run(): 文件：/core/vm/run.go if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } return evm.interpreter.Run(snapshot, contract, input) 可见如果待执行的Contract对象恰好属于一组预编译的合约集合-此时以指令地址CodeAddr为匹配项-那么它可以直接运行；没有经过预编译的Contract，才会由Interpreter解释执行。这里的&quot;预编译&quot;，可理解为不需要编译(解释)指令(Code)。预编译的合约，其逻辑全部固定且已知，所以执行中不再需要Code，仅需Input即可。 在代码实现中，预编译合约只需实现两个方法Required()和Run()即可，这两方法仅需一个入参input。 2.5 解释器执行合约的指令 我们来看一下interpreter.go 可以看到一个Config结构体 文件：/core/vm/.interpreter.go type Config struct { Debug bool EnableJit bool ForceJit bool Tracer Tracer NoRecursion bool DisableGasMetering bool EnablePreimageRecording bool JumpTable [256]operation // } operation: 每个operation对象正对应一个已定义的虚拟机指令，它所含有的四个函数变量execute, gasCost, validateStack, memorySize 提供了这个虚拟机指令所代表的所有操作。每个指令长度1byte，Contract对象的成员变量Code类型为[]byte，就是这些虚拟机指令的任意集合。operation对象的函数操作，主要会用到Stack，Memory, IntPool 这几个自定义的数据结构。 然后我们看一下interpreter.run() 文件： 文件：/core/vm/.interpreter.go --run() 核心： 逐个byte遍历入参Contract对象的Code变量，将其解释为一个已知的operation，然后依次调用该operation对象的四个函数 operation在操作过程中，会需要几个数据结构： Stack，实现了标准容器 -栈的行为；Memory，一个字节数组，可表示线性排列的任意数据;还有一个intPool，提供对big.Int数据的存储和读取。 需要特别注意的是LOGn指令操作，它用来创建n个Log对象，这里n最大是4。还记得Log在何时被用到么？每个交易(Transaction,tx)执行完成后，会创建一个Receipt对象用来记录这个交易的执行结果。Receipt携带一个Log数组，用来记录tx操作过程中的所有变动细节，而这些Log，正是通过合适的LOGn指令-即合约指令数组(Contract.Code)中的单个byte，在其对应的operation里被创建出来的。每个新创建的Log对象被缓存在StateDB中的相对应的stateObject里，待需要时从StateDB中读取。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/09/24/2b57db67f863752860c1802b7a54caf6.html" />
+<meta property="og:url" content="https://uzzz.org/2017/09/24/2b57db67f863752860c1802b7a54caf6.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-09-24T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊源码学习 – EVM 学习文档链接：here 一、虚拟机外 主要功能： 执行前将Transaction类型转化成Message，创建虚拟机(EVM)对象，计算一些Gas消耗，以及执行交易完毕后创建收据(Receipt)对象并返回 1.1 入口 和 返回值 文件：/core/state_processor.go --- Process() for i, tx := range block.Transactions() { statedb.Prepare(tx.Hash(), block.Hash(), i) receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) if err != nil { return nil, nil, nil, err } receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } //将block里面所有的tx逐个遍历执行，ApplyTransaction, 每次执行完返回一个收据(Receipt)对象 我们来看下Receipt结构体： type Receipt struct { // Consensus fields PostState []byte `json:&quot;root&quot;` Failed bool `json:&quot;failed&quot;` CumulativeGasUsed *big.Int `json:&quot;cumulativeGasUsed&quot; gencodec:&quot;required&quot;` Bloom Bloom `json:&quot;logsBloom&quot; gencodec:&quot;required&quot;` Logs []*Log `json:&quot;logs&quot; gencodec:&quot;required&quot;` // Implementation fields (don&#39;t reorder!) TxHash common.Hash `json:&quot;transactionHash&quot; gencodec:&quot;required&quot;` ContractAddress common.Address `json:&quot;contractAddress&quot;` GasUsed *big.Int `json:&quot;gasUsed&quot; gencodec:&quot;required&quot;` } 解释： Logs: Log类型的数组，其中每一个Log对象记录了Tx中一小步的操作。所以，每一个tx的执行结果，由一个Receipt对象来表示；更详细的内容，由一组Log对象来记录。这个Log数组很重要，比如在不同Ethereum节点(Node)的相互同步过程中，待同步区块的Log数组有助于验证同步中收到的block是否正确和完整，所以会被单独同步(传输)。 PostState: 保存了创建该Receipt对象时，整个Block内所有“帐户”的当时状态。Ethereum 里用stateObject来表示一个账户Account，这个账户可转帐(transfer value), 可执行tx, 它的唯一标示符是一个Address类型变量。 这个Receipt.PostState 就是当时所在Block里所有stateObject对象的RLP Hash值。 Bloom: Ethereum内部实现的一个256bit长Bloom Filter。 Bloom Filter概念定义可见wikipedia，它可用来快速验证一个新收到的对象是否处于一个已知的大量对象集合之中。这里Receipt的Bloom，被用以验证某个给定的Log是否处于Receipt已有的Log数组中。 1.2 封装EVM对象和Message对象 我们来看一下ApplyTransaction()： 文件：/core/state_processor.go --- ApplyTransaction() //=====Message对象===== msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, nil, err } //=====EVM对象===== context := NewEVMContext(msg, header, bc, author) vmenv := vm.NewEVM(context, statedb, config, cfg) //完成tx的执行 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) //创建一个收据Receipt对象，最后返回该Recetip对象，以及整个tx执行过程所消耗Gas数量。 ... 我们来看一下ApplyMessage() 文件：/core/state_transition.go --- ApplyMessage() //发现调用了TransitionDb() , _, gasUsed, failed, err := st.TransitionDb() 我们来看一下TransitionDb() 文件：/core/state_transition.go --- TransitionDb() //购买gas //计算tx固有gas //EVM执行 //计算本次执行交易的实际gas消耗 //偿退gas //奖励所属区块的挖掘者 二、 虚拟机内 包括执行转帐，和创建合约并执行合约的指令数组 2.1 EVM结构体 我们来看一下EVM的结构体： 文件：/core/vm/evm.go type EVM struct { Context --携带辅助信息：Transaction的信息(GasPrice, GasLimit)，Block的信息(Number, Difficulty)，以及转帐函数等 StateDB StateDB --为EVM提供statedb的相关操作 depth int chainConfig *params.ChainConfig chainRules params.Rules vmConfig Config interpreter *Interpreter --解释器，用来解释执行EVM中合约的指令 abort int32 } 2.2 完成转账 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 文件：/core/evm.go --Transfer() db.SubBalance(sender, amount) //转出账户减到一定金额以太币 db.AddBalance(recipient, amount) //转入账户增加一定金额以太币 //注意：转出和转入账户的操作不会立即生效，StateDB 并不是真正的数据库，只是一行为类似数据库的结构体它在内部以Trie的数据结构来管理各个基于地址的账户，可以理解成一个cache；当该账户的信息有变化时，变化先存储在Trie中。仅当整个Block要被插入到BlockChain时，StateDB 里缓存的所有账户的所有改动，才会被真正的提交到底层数据库。 2.3 合约的创建、赋值 我们先来看一下contract 结构体 文件：/core/vm/contract.go type Contract struct { CallerAddress common.Address caller ContractRef //转账转出方地址 self ContractRef //转入方地址 jumpdests destinations // result of JUMPDEST analysis. Code []byte //指令数组，其中每一个byte都对应于一个预定义的虚拟机指令 CodeHash common.Hash CodeAddr *common.Address Input []byte //数据数组，是指令所操作的数据集合 Gas uint64 value *big.Int Args []byte DelegateCall bool } 创建合约： call(),create() -- 二者均在StateProcessor的ApplyTransaction()被调用以执行单个交易，并且都有调用转帐函数完成转帐。 我们来看一下call() 文件：/core/vm/call.go var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } //转账 evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) //赋值Contract对象 contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) //调用run，执行该合约的指令 ret, err = run(evm, snapshot, contract, input) if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err 2.4 预编译合约 我们来看一下run(): 文件：/core/vm/run.go if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } return evm.interpreter.Run(snapshot, contract, input) 可见如果待执行的Contract对象恰好属于一组预编译的合约集合-此时以指令地址CodeAddr为匹配项-那么它可以直接运行；没有经过预编译的Contract，才会由Interpreter解释执行。这里的&quot;预编译&quot;，可理解为不需要编译(解释)指令(Code)。预编译的合约，其逻辑全部固定且已知，所以执行中不再需要Code，仅需Input即可。 在代码实现中，预编译合约只需实现两个方法Required()和Run()即可，这两方法仅需一个入参input。 2.5 解释器执行合约的指令 我们来看一下interpreter.go 可以看到一个Config结构体 文件：/core/vm/.interpreter.go type Config struct { Debug bool EnableJit bool ForceJit bool Tracer Tracer NoRecursion bool DisableGasMetering bool EnablePreimageRecording bool JumpTable [256]operation // } operation: 每个operation对象正对应一个已定义的虚拟机指令，它所含有的四个函数变量execute, gasCost, validateStack, memorySize 提供了这个虚拟机指令所代表的所有操作。每个指令长度1byte，Contract对象的成员变量Code类型为[]byte，就是这些虚拟机指令的任意集合。operation对象的函数操作，主要会用到Stack，Memory, IntPool 这几个自定义的数据结构。 然后我们看一下interpreter.run() 文件： 文件：/core/vm/.interpreter.go --run() 核心： 逐个byte遍历入参Contract对象的Code变量，将其解释为一个已知的operation，然后依次调用该operation对象的四个函数 operation在操作过程中，会需要几个数据结构： Stack，实现了标准容器 -栈的行为；Memory，一个字节数组，可表示线性排列的任意数据;还有一个intPool，提供对big.Int数据的存储和读取。 需要特别注意的是LOGn指令操作，它用来创建n个Log对象，这里n最大是4。还记得Log在何时被用到么？每个交易(Transaction,tx)执行完成后，会创建一个Receipt对象用来记录这个交易的执行结果。Receipt携带一个Log数组，用来记录tx操作过程中的所有变动细节，而这些Log，正是通过合适的LOGn指令-即合约指令数组(Contract.Code)中的单个byte，在其对应的operation里被创建出来的。每个新创建的Log对象被缓存在StateDB中的相对应的stateObject里，待需要时从StateDB中读取。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/09/24/2b57db67f863752860c1802b7a54caf6.html","headline":"【区块链】以太坊源码学习 – EVM","dateModified":"2017-09-24T00:00:00+08:00","datePublished":"2017-09-24T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/09/24/2b57db67f863752860c1802b7a54caf6.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>【区块链】以太坊源码学习 -- EVM</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="以太坊源码学习-evm">以太坊源码学习 – EVM</h1> 
+  <hr> 
+  <p>学习文档链接：<a href="http://blog.csdn.net/teaspring/article/details/75389151" rel="nofollow">here</a></p> 
+  <h3 id="一虚拟机外">一、虚拟机外</h3> 
+  <p>主要功能：</p> 
+  <pre><code>执行前将Transaction类型转化成Message，创建虚拟机(EVM)对象，计算一些Gas消耗，以及执行交易完毕后创建收据(Receipt)对象并返回
+</code></pre> 
+  <h4 id="11-入口-和-返回值">1.1 入口 和 返回值</h4> 
+  <pre class="prettyprint"><code class=" hljs go">文件：/core/state_processor.<span class="hljs-keyword">go</span>  --- Process()
+
+<span class="hljs-keyword">for</span> i, tx := <span class="hljs-keyword">range</span> block.Transactions() {
+    statedb.Prepare(tx.Hash(), block.Hash(), i)
+    receipt, _, err := ApplyTransaction(p.config, p.bc, <span class="hljs-constant">nil</span>, gp, statedb, header, tx, totalUsedGas, cfg)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, <span class="hljs-constant">nil</span>, <span class="hljs-constant">nil</span>, err
+    }
+    receipts = <span class="hljs-built_in">append</span>(receipts, receipt)
+    allLogs = <span class="hljs-built_in">append</span>(allLogs, receipt.Logs...)
+}
+
+<span class="hljs-comment">//将block里面所有的tx逐个遍历执行，ApplyTransaction, 每次执行完返回一个收据(Receipt)对象</span></code></pre> 
+  <p>我们来看下Receipt结构体：</p> 
+  <pre><code>type Receipt struct {
+    // Consensus fields
+    PostState         []byte   `json:"root"`
+    Failed            bool     `json:"failed"`
+    CumulativeGasUsed *big.Int `json:"cumulativeGasUsed" gencodec:"required"`
+    Bloom             Bloom    `json:"logsBloom"         gencodec:"required"`
+    Logs              []*Log   `json:"logs"              gencodec:"required"`
+
+    // Implementation fields (don't reorder!)
+    TxHash          common.Hash    `json:"transactionHash" gencodec:"required"`
+    ContractAddress common.Address `json:"contractAddress"`
+    GasUsed         *big.Int       `json:"gasUsed" gencodec:"required"`
+}
+</code></pre> 
+  <p>解释：</p> 
+  <pre><code>Logs:  Log类型的数组，其中每一个Log对象记录了Tx中一小步的操作。所以，每一个tx的执行结果，由一个Receipt对象来表示；更详细的内容，由一组Log对象来记录。这个Log数组很重要，比如在不同Ethereum节点(Node)的相互同步过程中，待同步区块的Log数组有助于验证同步中收到的block是否正确和完整，所以会被单独同步(传输)。
+
+PostState:  保存了创建该Receipt对象时，整个Block内所有“帐户”的当时状态。Ethereum 里用stateObject来表示一个账户Account，这个账户可转帐(transfer value), 可执行tx, 它的唯一标示符是一个Address类型变量。 这个Receipt.PostState 就是当时所在Block里所有stateObject对象的RLP Hash值。
+
+Bloom: Ethereum内部实现的一个256bit长Bloom Filter。 Bloom Filter概念定义可见wikipedia，它可用来快速验证一个新收到的对象是否处于一个已知的大量对象集合之中。这里Receipt的Bloom，被用以验证某个给定的Log是否处于Receipt已有的Log数组中。
+</code></pre> 
+  <h4 id="12-封装evm对象和message对象">1.2 封装EVM对象和Message对象</h4> 
+  <p>我们来看一下ApplyTransaction()：</p> 
+  <pre class="prettyprint"><code class=" hljs r">文件：/core/state_processor.go  --- ApplyTransaction()
+
+//=====Message对象=====
+msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
+<span class="hljs-keyword">if</span> err != nil { <span class="hljs-keyword">return</span> nil, nil, err }
+
+//=====EVM对象=====
+context := NewEVMContext(msg, header, bc, author)
+vmenv := vm.NewEVM(context, statedb, config, cfg)
+
+//完成tx的执行
+_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
+
+//创建一个收据Receipt对象，最后返回该Recetip对象，以及整个tx执行过程所消耗Gas数量。
+<span class="hljs-keyword">...</span> </code></pre> 
+  <p>我们来看一下ApplyMessage()</p> 
+  <pre class="prettyprint"><code class=" hljs avrasm">文件：/core/state_transition<span class="hljs-preprocessor">.go</span>  --- ApplyMessage()
+
+//发现调用了TransitionDb()
+, _, gasUsed, failed, err := <span class="hljs-keyword">st</span><span class="hljs-preprocessor">.TransitionDb</span>()</code></pre> 
+  <p>我们来看一下TransitionDb()</p> 
+  <pre class="prettyprint"><code class=" hljs livecodeserver">文件：/core/state_transition.go  <span class="hljs-comment">--- TransitionDb()</span>
+<span class="hljs-comment"> //购买gas</span><span class="hljs-comment"> //计算tx固有gas</span><span class="hljs-comment"> //EVM执行</span><span class="hljs-comment"> //计算本次执行交易的实际gas消耗</span><span class="hljs-comment"> //偿退gas</span><span class="hljs-comment"> //奖励所属区块的挖掘者</span></code></pre> 
+  <p>二、 虚拟机内</p> 
+  <p>包括执行转帐，和创建合约并执行合约的指令数组</p> 
+  <h4 id="21-evm结构体">2.1 EVM结构体</h4> 
+  <p>我们来看一下EVM的结构体：</p> 
+  <pre class="prettyprint"><code class=" hljs haskell">文件：/core/vm/evm.go
+
+<span class="hljs-typedef"><span class="hljs-keyword">type</span> <span class="hljs-type">EVM</span> struct <span class="hljs-container">{ <span class="hljs-type">Context</span> <span class="hljs-comment">--携带辅助信息：Transaction的信息(GasPrice, GasLimit)，Block的信息(Number, Difficulty)，以及转帐函数等</span> <span class="hljs-type">StateDB</span> <span class="hljs-type">StateDB</span> <span class="hljs-comment">--为EVM提供statedb的相关操作</span> <span class="hljs-title">depth</span> <span class="hljs-title">int</span> <span class="hljs-title">chainConfig</span> *<span class="hljs-title">params</span>.<span class="hljs-type">ChainConfig</span> <span class="hljs-title">chainRules</span> <span class="hljs-title">params</span>.<span class="hljs-type">Rules</span> <span class="hljs-title">vmConfig</span> <span class="hljs-type">Config</span> <span class="hljs-title">interpreter</span> *<span class="hljs-type">Interpreter</span> <span class="hljs-comment">--解释器，用来解释执行EVM中合约的指令</span> <span class="hljs-title">abort</span> <span class="hljs-title">int32</span> }</span></span></code></pre> 
+  <h4 id="22-完成转账">2.2 完成转账</h4> 
+  <pre><code>交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。
+</code></pre> 
+  <pre class="prettyprint"><code class=" hljs livecodeserver">文件：/core/evm.go <span class="hljs-comment">--Transfer()</span>
+
+db.SubBalance(sender, amount) <span class="hljs-comment"> //转出账户减到一定金额以太币</span>
+db.AddBalance(recipient, amount)<span class="hljs-comment"> //转入账户增加一定金额以太币</span>
+<span class="hljs-comment"> //注意：转出和转入账户的操作不会立即生效，StateDB 并不是真正的数据库，只是一行为类似数据库的结构体它在内部以Trie的数据结构来管理各个基于地址的账户，可以理解成一个cache；当该账户的信息有变化时，变化先存储在Trie中。仅当整个Block要被插入到BlockChain时，StateDB 里缓存的所有账户的所有改动，才会被真正的提交到底层数据库。</span></code></pre> 
+  <h4 id="23-合约的创建赋值">2.3 合约的创建、赋值</h4> 
+  <p>我们先来看一下contract 结构体</p> 
+  <pre class="prettyprint"><code class=" hljs haskell">文件：/core/vm/contract.go  
+
+<span class="hljs-typedef"><span class="hljs-keyword">type</span> <span class="hljs-type">Contract</span> struct <span class="hljs-container">{ <span class="hljs-type">CallerAddress</span> <span class="hljs-title">common</span>.<span class="hljs-type">Address</span> <span class="hljs-title">caller</span> <span class="hljs-type">ContractRef</span> //转账转出方地址 <span class="hljs-title">self</span> <span class="hljs-type">ContractRef</span> //转入方地址 <span class="hljs-title">jumpdests</span> <span class="hljs-title">destinations</span> // <span class="hljs-title">result</span> <span class="hljs-title">of</span> <span class="hljs-type">JUMPDEST</span> <span class="hljs-title">analysis</span>. <span class="hljs-type">Code</span> []<span class="hljs-title">byte</span> //指令数组，其中每一个<span class="hljs-title">byte</span>都对应于一个预定义的虚拟机指令 <span class="hljs-type">CodeHash</span> <span class="hljs-title">common</span>.<span class="hljs-type">Hash</span> <span class="hljs-type">CodeAddr</span> *<span class="hljs-title">common</span>.<span class="hljs-type">Address</span> <span class="hljs-type">Input</span> []<span class="hljs-title">byte</span> //数据数组，是指令所操作的数据集合 <span class="hljs-type">Gas</span> <span class="hljs-title">uint64</span> <span class="hljs-title">value</span> *<span class="hljs-title">big</span>.<span class="hljs-type">Int</span> <span class="hljs-type">Args</span> []<span class="hljs-title">byte</span> <span class="hljs-type">DelegateCall</span> <span class="hljs-title">bool</span> }</span></span></code></pre> 
+  <pre><code>创建合约： call(),create() -- 二者均在StateProcessor的ApplyTransaction()被调用以执行单个交易，并且都有调用转帐函数完成转帐。
+</code></pre> 
+  <p>我们来看一下call()</p> 
+  <pre class="prettyprint"><code class=" hljs avrasm">文件：/core/vm/<span class="hljs-keyword">call</span><span class="hljs-preprocessor">.go</span>  
+
+var (
+    to = AccountRef(addr)
+    snapshot = evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.Snapshot</span>()
+)
+if !evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.Exist</span>(addr) {
+    precompiles := PrecompiledContractsHomestead
+    if evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsByzantium</span>(evm<span class="hljs-preprocessor">.BlockNumber</span>) {
+        precompiles = PrecompiledContractsByzantium
+    }
+    if precompiles[addr] == nil &amp;&amp; evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsEIP</span>158(evm<span class="hljs-preprocessor">.BlockNumber</span>) &amp;&amp; value<span class="hljs-preprocessor">.Sign</span>() == <span class="hljs-number">0</span> {
+        return nil, gas, nil
+    }
+    evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.CreateAccount</span>(addr)
+}
+
+//转账
+evm<span class="hljs-preprocessor">.Transfer</span>(evm<span class="hljs-preprocessor">.StateDB</span>, caller<span class="hljs-preprocessor">.Address</span>(), to<span class="hljs-preprocessor">.Address</span>(), value)
+
+//赋值Contract对象
+contract := NewContract(caller, to, value, gas)
+contract<span class="hljs-preprocessor">.SetCallCode</span>(&amp;addr, evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.GetCodeHash</span>(addr), evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.GetCode</span>(addr))
+
+//调用run，执行该合约的指令
+<span class="hljs-keyword">ret</span>, err = run(evm, snapshot, contract, input)
+
+if err != nil {
+    evm<span class="hljs-preprocessor">.StateDB</span><span class="hljs-preprocessor">.RevertToSnapshot</span>(snapshot)
+    if err != errExecutionReverted {
+        contract<span class="hljs-preprocessor">.UseGas</span>(contract<span class="hljs-preprocessor">.Gas</span>)
+    }
+}
+return <span class="hljs-keyword">ret</span>, contract<span class="hljs-preprocessor">.Gas</span>, err</code></pre> 
+  <h4 id="24-预编译合约">2.4 预编译合约</h4> 
+  <p>我们来看一下run(): </p> 
+  <pre class="prettyprint"><code class=" hljs avrasm">文件：/core/vm/run<span class="hljs-preprocessor">.go</span>  
+
+if contract<span class="hljs-preprocessor">.CodeAddr</span> != nil {
+    precompiles := PrecompiledContractsHomestead
+    if evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsByzantium</span>(evm<span class="hljs-preprocessor">.BlockNumber</span>) {
+        precompiles = PrecompiledContractsByzantium
+    }
+    if p := precompiles[*contract<span class="hljs-preprocessor">.CodeAddr</span>]<span class="hljs-comment">; p != nil {</span>
+        return RunPrecompiledContract(p, input, contract)
+    }
+}
+return evm<span class="hljs-preprocessor">.interpreter</span><span class="hljs-preprocessor">.Run</span>(snapshot, contract, input)</code></pre> 
+  <pre><code>可见如果待执行的Contract对象恰好属于一组预编译的合约集合-此时以指令地址CodeAddr为匹配项-那么它可以直接运行；没有经过预编译的Contract，才会由Interpreter解释执行。这里的"预编译"，可理解为不需要编译(解释)指令(Code)。预编译的合约，其逻辑全部固定且已知，所以执行中不再需要Code，仅需Input即可。
+
+在代码实现中，预编译合约只需实现两个方法Required()和Run()即可，这两方法仅需一个入参input。
+</code></pre> 
+  <h4 id="25-解释器执行合约的指令">2.5 解释器执行合约的指令</h4> 
+  <p>我们来看一下interpreter.go</p> 
+  <p>可以看到一个Config结构体</p> 
+  <pre class="prettyprint"><code class=" hljs haskell">文件：/core/vm/.interpreter.go
+
+<span class="hljs-typedef"><span class="hljs-keyword">type</span> <span class="hljs-type">Config</span> struct <span class="hljs-container">{ <span class="hljs-type">Debug</span> <span class="hljs-title">bool</span> <span class="hljs-type">EnableJit</span> <span class="hljs-title">bool</span> <span class="hljs-type">ForceJit</span> <span class="hljs-title">bool</span> <span class="hljs-type">Tracer</span> <span class="hljs-type">Tracer</span> <span class="hljs-type">NoRecursion</span> <span class="hljs-title">bool</span> <span class="hljs-type">DisableGasMetering</span> <span class="hljs-title">bool</span> <span class="hljs-type">EnablePreimageRecording</span> <span class="hljs-title">bool</span> <span class="hljs-type">JumpTable</span> [256]<span class="hljs-title">operation</span> // }</span></span></code></pre> 
+  <pre><code>operation: 每个operation对象正对应一个已定义的虚拟机指令，它所含有的四个函数变量execute, gasCost, validateStack, memorySize 提供了这个虚拟机指令所代表的所有操作。每个指令长度1byte，Contract对象的成员变量Code类型为[]byte，就是这些虚拟机指令的任意集合。operation对象的函数操作，主要会用到Stack，Memory, IntPool 这几个自定义的数据结构。
+</code></pre> 
+  <p>然后我们看一下interpreter.run()</p> 
+  <pre><code>文件： 文件：/core/vm/.interpreter.go --run()
+
+核心： 逐个byte遍历入参Contract对象的Code变量，将其解释为一个已知的operation，然后依次调用该operation对象的四个函数
+
+operation在操作过程中，会需要几个数据结构： Stack，实现了标准容器 -栈的行为；Memory，一个字节数组，可表示线性排列的任意数据;还有一个intPool，提供对big.Int数据的存储和读取。
+
+需要特别注意的是LOGn指令操作，它用来创建n个Log对象，这里n最大是4。还记得Log在何时被用到么？每个交易(Transaction,tx)执行完成后，会创建一个Receipt对象用来记录这个交易的执行结果。Receipt携带一个Log数组，用来记录tx操作过程中的所有变动细节，而这些Log，正是通过合适的LOGn指令-即合约指令数组(Contract.Code)中的单个byte，在其对应的operation里被创建出来的。每个新创建的Log对象被缓存在StateDB中的相对应的stateObject里，待需要时从StateDB中读取。
+</code></pre> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/loy_184548/article/details/78078518,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/loy_184548/article/details/78078518,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

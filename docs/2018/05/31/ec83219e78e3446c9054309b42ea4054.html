@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊之工作流程(同步完数据之后) | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊之工作流程(同步完数据之后)" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="这篇跟上一篇的区别是同步数据完成之后，以太坊的工作流程是怎样的 初始化 eth/handler.go func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 初始化Start的时候会新建4个goroutine： txBroadcastLoop:&nbsp; 当收到新的tx时，会将它发送到连接的Peer MinedBroadcastLoop：当挖出新的区块或者收到新的区块时，会将其发送到连接的Peer syncer：有新的Peer连接时，会新建goroutine从td最高的Peer同步区块信息 txsyncLoop：当监听到txsyncCh有数据时（新连接peer时会把自身的txpool写到这个channel），新建goroutine发送tx记录到连接的Peer 广播交易 订阅tx消息 上面Start（）的时候订阅了txCh消息 func (pool *TxPool) SubscribeTxPreEvent(ch chan&lt;- TxPreEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 当自身节点收到了客户端的交易或者收到其他节点发来的交易加到txpool中时，Send订阅消息：core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(TxPreEvent{tx}) }这样txBroadcastLoop中就读到了tx： func (self *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-self.txCh: self.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-self.txSub.Err(): return } } } 然后BroadCastTx就是发送TxMsg到所有连接的Peer，对端Peer收到Tx后加入自己的Txpool中 这样就达到交易扩散的目的 广播区块 上面Start（）的时候订阅了NewMinedBlockEvent pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) 这是event.TypeMux自带的功能 当打包新区块成功时，会Post这个event：miner/worker.go func (self *worker) wait() { for { mustCommitNewWork := true for result := range self.recv { atomic.AddInt32(&amp;self.atWork, -1) if result == nil { continue } block := result.Block work := result.Work // Update the block hash in all logs since it is now available and not when the // receipt/log of individual transactions were created. for _, r := range work.receipts { for _, l := range r.Logs { l.BlockHash = block.Hash() } } for _, log := range work.state.Logs() { log.BlockHash = block.Hash() } stat, err := self.chain.WriteBlockWithState(block, work.receipts, work.state) if err != nil { log.Error(&quot;Failed writing block to chain&quot;, &quot;err&quot;, err) continue } // check if canon block and write transactions if stat == core.CanonStatTy { // implicit by posting ChainHeadEvent mustCommitNewWork = false } // Broadcast the block and announce chain insertion event self.mux.Post(core.NewMinedBlockEvent{Block: block}) var ( events []interface{} logs = work.state.Logs() ) events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs}) if stat == core.CanonStatTy { events = append(events, core.ChainHeadEvent{Block: block}) } self.chain.PostChainEvents(events, logs) // Insert the block into the set of pending ones to wait for confirmations self.unconfirmed.Insert(block.NumberU64(), block.Hash()) if mustCommitNewWork { self.commitNewWork() } } } } 1 收到挖矿产生的block后WriteBlockWithState()写入本地leveldb 2 Post NewMinedBlockEvent func (self *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range self.minedBlockSub.Chan() { switch ev := obj.Data.(type) { case core.NewMinedBlockEvent: self.BroadcastBlock(ev.Block, true) // First propagate block to peers self.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } 这里收到新的区块后，调用BroadcastBlock广播区块，看代码是调用了两次，一次第二个参数为true，一次为fasle func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) { hash := block.Hash() peers := pm.peers.PeersWithoutBlock(hash) // If propagation is requested, send to a subset of the peer if propagate { // Calculate the TD of the block (it&#39;s not imported yet, so block.Td is not valid) var td *big.Int if parent := pm.blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil { td = new(big.Int).Add(block.Difficulty(), pm.blockchain.GetTd(block.ParentHash(), block.NumberU64()-1)) } else { log.Error(&quot;Propagating dangling block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) return } // Send the block to a subset of our peers transfer := peers[:int(math.Sqrt(float64(len(peers))))] for _, peer := range transfer { peer.SendNewBlock(block, td) } log.Trace(&quot;Propagated block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(transfer), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) return } // Otherwise if the block is indeed in out own chain, announce it if pm.blockchain.HasBlock(hash, block.NumberU64()) { for _, peer := range peers { peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()}) } log.Trace(&quot;Announced block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(peers), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) } } 第二个参数： true：从节点中找开平方根个节点广播整个区块 false：所有节点广播区块的hash；其他节点收到区块的hash，再发送消息获取区块 这么做的目的是减少本节点的瞬时网络负载，免得一次广播太多的block造成自己的网络拥堵 这样就实现了区块的扩散 阅读更多" />
+<meta property="og:description" content="这篇跟上一篇的区别是同步数据完成之后，以太坊的工作流程是怎样的 初始化 eth/handler.go func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 初始化Start的时候会新建4个goroutine： txBroadcastLoop:&nbsp; 当收到新的tx时，会将它发送到连接的Peer MinedBroadcastLoop：当挖出新的区块或者收到新的区块时，会将其发送到连接的Peer syncer：有新的Peer连接时，会新建goroutine从td最高的Peer同步区块信息 txsyncLoop：当监听到txsyncCh有数据时（新连接peer时会把自身的txpool写到这个channel），新建goroutine发送tx记录到连接的Peer 广播交易 订阅tx消息 上面Start（）的时候订阅了txCh消息 func (pool *TxPool) SubscribeTxPreEvent(ch chan&lt;- TxPreEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 当自身节点收到了客户端的交易或者收到其他节点发来的交易加到txpool中时，Send订阅消息：core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(TxPreEvent{tx}) }这样txBroadcastLoop中就读到了tx： func (self *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-self.txCh: self.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-self.txSub.Err(): return } } } 然后BroadCastTx就是发送TxMsg到所有连接的Peer，对端Peer收到Tx后加入自己的Txpool中 这样就达到交易扩散的目的 广播区块 上面Start（）的时候订阅了NewMinedBlockEvent pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) 这是event.TypeMux自带的功能 当打包新区块成功时，会Post这个event：miner/worker.go func (self *worker) wait() { for { mustCommitNewWork := true for result := range self.recv { atomic.AddInt32(&amp;self.atWork, -1) if result == nil { continue } block := result.Block work := result.Work // Update the block hash in all logs since it is now available and not when the // receipt/log of individual transactions were created. for _, r := range work.receipts { for _, l := range r.Logs { l.BlockHash = block.Hash() } } for _, log := range work.state.Logs() { log.BlockHash = block.Hash() } stat, err := self.chain.WriteBlockWithState(block, work.receipts, work.state) if err != nil { log.Error(&quot;Failed writing block to chain&quot;, &quot;err&quot;, err) continue } // check if canon block and write transactions if stat == core.CanonStatTy { // implicit by posting ChainHeadEvent mustCommitNewWork = false } // Broadcast the block and announce chain insertion event self.mux.Post(core.NewMinedBlockEvent{Block: block}) var ( events []interface{} logs = work.state.Logs() ) events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs}) if stat == core.CanonStatTy { events = append(events, core.ChainHeadEvent{Block: block}) } self.chain.PostChainEvents(events, logs) // Insert the block into the set of pending ones to wait for confirmations self.unconfirmed.Insert(block.NumberU64(), block.Hash()) if mustCommitNewWork { self.commitNewWork() } } } } 1 收到挖矿产生的block后WriteBlockWithState()写入本地leveldb 2 Post NewMinedBlockEvent func (self *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range self.minedBlockSub.Chan() { switch ev := obj.Data.(type) { case core.NewMinedBlockEvent: self.BroadcastBlock(ev.Block, true) // First propagate block to peers self.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } 这里收到新的区块后，调用BroadcastBlock广播区块，看代码是调用了两次，一次第二个参数为true，一次为fasle func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) { hash := block.Hash() peers := pm.peers.PeersWithoutBlock(hash) // If propagation is requested, send to a subset of the peer if propagate { // Calculate the TD of the block (it&#39;s not imported yet, so block.Td is not valid) var td *big.Int if parent := pm.blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil { td = new(big.Int).Add(block.Difficulty(), pm.blockchain.GetTd(block.ParentHash(), block.NumberU64()-1)) } else { log.Error(&quot;Propagating dangling block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) return } // Send the block to a subset of our peers transfer := peers[:int(math.Sqrt(float64(len(peers))))] for _, peer := range transfer { peer.SendNewBlock(block, td) } log.Trace(&quot;Propagated block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(transfer), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) return } // Otherwise if the block is indeed in out own chain, announce it if pm.blockchain.HasBlock(hash, block.NumberU64()) { for _, peer := range peers { peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()}) } log.Trace(&quot;Announced block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(peers), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) } } 第二个参数： true：从节点中找开平方根个节点广播整个区块 false：所有节点广播区块的hash；其他节点收到区块的hash，再发送消息获取区块 这么做的目的是减少本节点的瞬时网络负载，免得一次广播太多的block造成自己的网络拥堵 这样就实现了区块的扩散 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/31/ec83219e78e3446c9054309b42ea4054.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/31/ec83219e78e3446c9054309b42ea4054.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-31T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"这篇跟上一篇的区别是同步数据完成之后，以太坊的工作流程是怎样的 初始化 eth/handler.go func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 初始化Start的时候会新建4个goroutine： txBroadcastLoop:&nbsp; 当收到新的tx时，会将它发送到连接的Peer MinedBroadcastLoop：当挖出新的区块或者收到新的区块时，会将其发送到连接的Peer syncer：有新的Peer连接时，会新建goroutine从td最高的Peer同步区块信息 txsyncLoop：当监听到txsyncCh有数据时（新连接peer时会把自身的txpool写到这个channel），新建goroutine发送tx记录到连接的Peer 广播交易 订阅tx消息 上面Start（）的时候订阅了txCh消息 func (pool *TxPool) SubscribeTxPreEvent(ch chan&lt;- TxPreEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 当自身节点收到了客户端的交易或者收到其他节点发来的交易加到txpool中时，Send订阅消息：core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(TxPreEvent{tx}) }这样txBroadcastLoop中就读到了tx： func (self *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-self.txCh: self.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-self.txSub.Err(): return } } } 然后BroadCastTx就是发送TxMsg到所有连接的Peer，对端Peer收到Tx后加入自己的Txpool中 这样就达到交易扩散的目的 广播区块 上面Start（）的时候订阅了NewMinedBlockEvent pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) 这是event.TypeMux自带的功能 当打包新区块成功时，会Post这个event：miner/worker.go func (self *worker) wait() { for { mustCommitNewWork := true for result := range self.recv { atomic.AddInt32(&amp;self.atWork, -1) if result == nil { continue } block := result.Block work := result.Work // Update the block hash in all logs since it is now available and not when the // receipt/log of individual transactions were created. for _, r := range work.receipts { for _, l := range r.Logs { l.BlockHash = block.Hash() } } for _, log := range work.state.Logs() { log.BlockHash = block.Hash() } stat, err := self.chain.WriteBlockWithState(block, work.receipts, work.state) if err != nil { log.Error(&quot;Failed writing block to chain&quot;, &quot;err&quot;, err) continue } // check if canon block and write transactions if stat == core.CanonStatTy { // implicit by posting ChainHeadEvent mustCommitNewWork = false } // Broadcast the block and announce chain insertion event self.mux.Post(core.NewMinedBlockEvent{Block: block}) var ( events []interface{} logs = work.state.Logs() ) events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs}) if stat == core.CanonStatTy { events = append(events, core.ChainHeadEvent{Block: block}) } self.chain.PostChainEvents(events, logs) // Insert the block into the set of pending ones to wait for confirmations self.unconfirmed.Insert(block.NumberU64(), block.Hash()) if mustCommitNewWork { self.commitNewWork() } } } } 1 收到挖矿产生的block后WriteBlockWithState()写入本地leveldb 2 Post NewMinedBlockEvent func (self *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range self.minedBlockSub.Chan() { switch ev := obj.Data.(type) { case core.NewMinedBlockEvent: self.BroadcastBlock(ev.Block, true) // First propagate block to peers self.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } 这里收到新的区块后，调用BroadcastBlock广播区块，看代码是调用了两次，一次第二个参数为true，一次为fasle func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) { hash := block.Hash() peers := pm.peers.PeersWithoutBlock(hash) // If propagation is requested, send to a subset of the peer if propagate { // Calculate the TD of the block (it&#39;s not imported yet, so block.Td is not valid) var td *big.Int if parent := pm.blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil { td = new(big.Int).Add(block.Difficulty(), pm.blockchain.GetTd(block.ParentHash(), block.NumberU64()-1)) } else { log.Error(&quot;Propagating dangling block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, hash) return } // Send the block to a subset of our peers transfer := peers[:int(math.Sqrt(float64(len(peers))))] for _, peer := range transfer { peer.SendNewBlock(block, td) } log.Trace(&quot;Propagated block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(transfer), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) return } // Otherwise if the block is indeed in out own chain, announce it if pm.blockchain.HasBlock(hash, block.NumberU64()) { for _, peer := range peers { peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()}) } log.Trace(&quot;Announced block&quot;, &quot;hash&quot;, hash, &quot;recipients&quot;, len(peers), &quot;duration&quot;, common.PrettyDuration(time.Since(block.ReceivedAt))) } } 第二个参数： true：从节点中找开平方根个节点广播整个区块 false：所有节点广播区块的hash；其他节点收到区块的hash，再发送消息获取区块 这么做的目的是减少本节点的瞬时网络负载，免得一次广播太多的block造成自己的网络拥堵 这样就实现了区块的扩散 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/31/ec83219e78e3446c9054309b42ea4054.html","headline":"以太坊之工作流程(同步完数据之后)","dateModified":"2018-05-31T00:00:00+08:00","datePublished":"2018-05-31T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/31/ec83219e78e3446c9054309b42ea4054.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊之工作流程(同步完数据之后)</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>这篇跟上一篇的区别是同步数据完成之后，以太坊的工作流程是怎样的</p>
+  <h2>初始化</h2>
+  <p>eth/handler.go</p>
+  <pre><code class="language-html">func (pm *ProtocolManager) Start(maxPeers int) {
+	pm.maxPeers = maxPeers
+
+	// broadcast transactions
+	pm.txCh = make(chan core.TxPreEvent, txChanSize)
+	pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh)
+	go pm.txBroadcastLoop()
+
+	// broadcast mined blocks
+	pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{})
+	go pm.minedBroadcastLoop()
+
+	// start sync handlers
+	go pm.syncer()
+	go pm.txsyncLoop()
+}</code></pre>
+  <p>初始化Start的时候会新建4个goroutine：</p>
+  <p>txBroadcastLoop:&nbsp; 当收到新的tx时，会将它发送到连接的Peer</p>
+  <p>MinedBroadcastLoop：当挖出新的区块或者收到新的区块时，会将其发送到连接的Peer</p>
+  <p>syncer：有新的Peer连接时，会新建goroutine从td最高的Peer同步区块信息</p>
+  <p>txsyncLoop：当监听到txsyncCh有数据时（新连接peer时会把自身的txpool写到这个channel），新建goroutine发送tx记录到连接的Peer</p>
+  <h2>广播交易</h2>
+  <p>订阅tx消息</p>
+  <p>上面Start（）的时候订阅了txCh消息</p>
+  <pre><code class="language-html">func (pool *TxPool) SubscribeTxPreEvent(ch chan&lt;- TxPreEvent) event.Subscription {
+	return pool.scope.Track(pool.txFeed.Subscribe(ch))
+}</code></pre>
+  <p>当自身节点收到了客户端的交易或者收到其他节点发来的交易加到txpool中时，Send订阅消息：core/tx_pool.go</p>
+  <pre><code class="language-html">func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) {
+	// We've directly injected a replacement transaction, notify subsystems
+	go pool.txFeed.Send(TxPreEvent{tx})
+
+}</code></pre>这样txBroadcastLoop中就读到了tx：
+  <br>
+  <pre><code class="language-html">func (self *ProtocolManager) txBroadcastLoop() {
+	for {
+		select {
+		case event := &lt;-self.txCh:
+			self.BroadcastTx(event.Tx.Hash(), event.Tx)
+
+		// Err() channel will be closed when unsubscribing.
+		case &lt;-self.txSub.Err():
+			return
+		}
+	}
+}</code></pre>
+  <p>然后BroadCastTx就是发送TxMsg到所有连接的Peer，对端Peer收到Tx后加入自己的Txpool中</p>
+  <p>这样就达到交易扩散的目的</p>
+  <h2>广播区块</h2>
+  <p>上面Start（）的时候订阅了NewMinedBlockEvent</p>
+  <pre><code class="language-html">pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{})</code></pre>
+  <p>这是event.TypeMux自带的功能</p>
+  <p>当打包新区块成功时，会Post这个event：miner/worker.go</p>
+  <pre><code class="language-html">func (self *worker) wait() {
+	for {
+		mustCommitNewWork := true
+		for result := range self.recv {
+			atomic.AddInt32(&amp;self.atWork, -1)
+
+			if result == nil {
+				continue
+			}
+			block := result.Block
+			work := result.Work
+
+			// Update the block hash in all logs since it is now available and not when the
+			// receipt/log of individual transactions were created.
+			for _, r := range work.receipts {
+				for _, l := range r.Logs {
+					l.BlockHash = block.Hash()
+				}
+			}
+			for _, log := range work.state.Logs() {
+				log.BlockHash = block.Hash()
+			}
+			stat, err := self.chain.WriteBlockWithState(block, work.receipts, work.state)
+			if err != nil {
+				log.Error("Failed writing block to chain", "err", err)
+				continue
+			}
+			// check if canon block and write transactions
+			if stat == core.CanonStatTy {
+				// implicit by posting ChainHeadEvent
+				mustCommitNewWork = false
+			}
+			// Broadcast the block and announce chain insertion event
+			self.mux.Post(core.NewMinedBlockEvent{Block: block})
+			var (
+				events []interface{}
+				logs   = work.state.Logs()
+			)
+			events = append(events, core.ChainEvent{Block: block, Hash: block.Hash(), Logs: logs})
+			if stat == core.CanonStatTy {
+				events = append(events, core.ChainHeadEvent{Block: block})
+			}
+			self.chain.PostChainEvents(events, logs)
+
+			// Insert the block into the set of pending ones to wait for confirmations
+			self.unconfirmed.Insert(block.NumberU64(), block.Hash())
+
+			if mustCommitNewWork {
+				self.commitNewWork()
+			}
+		}
+	}
+}</code></pre>
+  <p>1 收到挖矿产生的block后WriteBlockWithState()写入本地leveldb</p>
+  <p>2 Post NewMinedBlockEvent</p>
+  <pre><code class="language-html">func (self *ProtocolManager) minedBroadcastLoop() {
+	// automatically stops if unsubscribe
+	for obj := range self.minedBlockSub.Chan() {
+		switch ev := obj.Data.(type) {
+		case core.NewMinedBlockEvent:
+			self.BroadcastBlock(ev.Block, true)  // First propagate block to peers
+			self.BroadcastBlock(ev.Block, false) // Only then announce to the rest
+		}
+	}
+}</code></pre>
+  <p>这里收到新的区块后，调用BroadcastBlock广播区块，看代码是调用了两次，一次第二个参数为true，一次为fasle</p>
+  <pre><code class="language-html">func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
+	hash := block.Hash()
+	peers := pm.peers.PeersWithoutBlock(hash)
+
+	// If propagation is requested, send to a subset of the peer
+	if propagate {
+		// Calculate the TD of the block (it's not imported yet, so block.Td is not valid)
+		var td *big.Int
+		if parent := pm.blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1); parent != nil {
+			td = new(big.Int).Add(block.Difficulty(), pm.blockchain.GetTd(block.ParentHash(), block.NumberU64()-1))
+		} else {
+			log.Error("Propagating dangling block", "number", block.Number(), "hash", hash)
+			return
+		}
+		// Send the block to a subset of our peers
+		transfer := peers[:int(math.Sqrt(float64(len(peers))))]
+		for _, peer := range transfer {
+			peer.SendNewBlock(block, td)
+		}
+		log.Trace("Propagated block", "hash", hash, "recipients", len(transfer), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+		return
+	}
+	// Otherwise if the block is indeed in out own chain, announce it
+	if pm.blockchain.HasBlock(hash, block.NumberU64()) {
+		for _, peer := range peers {
+			peer.SendNewBlockHashes([]common.Hash{hash}, []uint64{block.NumberU64()})
+		}
+		log.Trace("Announced block", "hash", hash, "recipients", len(peers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
+	}
+}</code></pre>
+  <p>第二个参数：</p>
+  <p>true：从节点中找开平方根个节点广播整个区块</p>
+  <p>false：所有节点广播区块的hash；其他节点收到区块的hash，再发送消息获取区块</p>
+  <p>这么做的目的是减少本节点的瞬时网络负载，免得一次广播太多的block造成自己的网络拥堵</p>
+  <p>这样就实现了区块的扩散</p>
+  <p><br></p>
+  <p><br></p>
+  <p><br><br></p>
+  <p><br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80529304,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80529304,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

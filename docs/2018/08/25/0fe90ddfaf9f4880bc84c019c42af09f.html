@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>golang重写区块链——0.3 数据库存储链和实现命令行交互 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="golang重写区块链——0.3 数据库存储链和实现命令行交互" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="&nbsp;&nbsp;&nbsp; 到为止我们已经实现了一条能够进行pow的区块链，距离实现一条正真意义上的区块链还有很长的路需要走。我们可能已经发现每当我们关闭程序后重新只能重新创建新的链，之前的数据都会不存在了。原因就是我们目前的链存储的数据都是在内存中，并没有被写入电脑的磁盘，所以会随着程序的退出被擦除。这一节我们就要解决这个问题，使用数据库来永久地保存我们创建的链。 &nbsp;&nbsp;&nbsp; 比特币使用的是一款简约而不简单的数据库LevelDB，这次我们不采用此数据库，而我们选择使用既简单又简约的BlotDB数据库。关于这款数据库的详细信息大家可以在网上去详细的了解，这里就不做详细的说明。简单的提一点的就是这款数据库中存储数据的方式是类似golang语言中的map结构，是使用键值对映射的方式来存储数据的，这些键值对被存储在一个叫bucket（桶）中。我们实例一个数据库就是实例一种bucket。比如如果需要查找一个值，我们首先要进入到装此值的桶是哪个，然后通过此值对应的key来查找。 &nbsp;&nbsp;&nbsp; 在进行数据库存储之前，我们需要了解我们存储到数据库的有哪些信息。我们需要用到两个bucket（桶）来装我们的链信息。第一个bucket是存放blocks：一条链中包含的所有块中的元数据信息，另一个bucket是存放chainstate：存储链的状态信息。目前我们还没有涉及到交易，所以我们现在只考虑blocks bucket。 最终我们会用到的键值对为： 32 字节的 block-hash -&gt; block 结构 l -&gt; 链中最后一个块的 hash &nbsp;&nbsp;&nbsp; 因为在数据库中存储的数据的变成[]byte，所以我们需要序列化和反序列化的操作，我们在block包里面实现这两个函数； //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } &nbsp;&nbsp;&nbsp; 下面就要实现数据库的内容了： 让我们从 NewBlockchain 函数开始。在之前的实现中，它会创建一个新的Blockchain 实例，并向其中加入创世块。而现在，我们希望它做的事情有： 打开一个数据库文件 检查文件里面是否已经存储了一个区块链 如果已经存储了一个区块链： 创建一个新的 Blockchain 实例 设置 Blockchain 实例的 tip 为数据库中存储的最后一个块的哈希 如果没有区块链： 创建创世块 存储到数据库 将创世块哈希保存为最后一个块的哈希 创建一个新的 Blockchain 实例，其 tip 指向创世块（tip 有尾部，尖端的意思，在这里 tip 存储的是最后一个块的哈希） 代码大概是这样： //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } &nbsp;&nbsp;&nbsp; 接下来我们想要更新的是 AddBlock 方法：现在向链中加入区块，就不是像之前向一个数组中加入一个元素那么简单了。从现在开始，我们会将区块存储在数据库里面： //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } &nbsp;&nbsp;&nbsp; 现在我们产生的区块都会保存在区块链数据库中，我们可以随时打开一条区块链加入新的区块。但是现在我们不能像以前一样通过for-range方式遍历区块链了。所以要打印出区块需要一个迭代器来帮助我们。通过区块链迭代器，我们能以区块能够进入区块链中的顺序进行打印。此外，因为我们不想将所有的块都加载到内存中（因为我们的区块链数据库可能很大！或者现在可以假装它可能很大），我们将会一个一个地读取它们。 //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } &nbsp;&nbsp;&nbsp;&nbsp; 为了方便我们在命令行界面操作我们的区块链，下面我们来实现CLI交互接口。首先创建一个CLI包，代码如下： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 注意：我之前没有写cli.validateArgs()这个函数来判断命令行输入参数的个数，然后就报错如下： &nbsp;报错提示：panic: runtime error: index out of range，原因是如果我们没有输入任何参数的话，os.Args[]这个切片里面只包含main.go这一个默认的参数，此时len(os.Args)=1，但是下面我们用到了os.Args[2:]，所以已经超出范围了，所以要报错。后面加上cli.validateArgs()函数来判断，就会有个提示我们要输入参数。 下面是main函数： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } 在main函数里面因为涉及到权限问题，结构体blockchain的db字段不能在外包访问，所以用工厂模式来调用字段db。 &nbsp; &nbsp;下面是这一章节完成后的整个代码： 1、block包： package block import ( &quot;encoding/gob&quot; &quot;bytes&quot; &quot;log&quot; ) //区块的结构体 type Block struct { Timestamp int64 Data []byte PrevBlockHash []byte Hash []byte Nonce int } //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } 2、blockchain包： package blockchain import ( &quot;github.com/boltdb/bolt&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;log&quot; ) /* 区块链实现 */ const dbFile = &quot;blockchain.db&quot; const blocksBucket = &quot;blocks&quot; const genesisCoinbaseData = &quot;The Times 03/Jan/2009 Chancellor on brink of second bailout for banks&quot; //区块链 type Blockchain struct { tip []byte db *bolt.DB } //工厂模式db func(bc *Blockchain) Db() *bolt.DB { return bc.db } //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } //创建创世区块 func GenesisBlock() *block.Block { return pow.NewBlock(&quot;创世区块&quot;,[]byte{}) } //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } 3、pow包： package pow import ( &quot;fmt&quot; &quot;crypto/sha256&quot; &quot;strconv&quot; &quot;bytes&quot; &quot;math/big&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;math&quot; &quot;time&quot; ) //在实际的比特币区块链中，加入一个区块是非常困难的事情，其中运用得到的就是工作量证明 //创建一个工作量证明的结构体 type ProofOfWork struct { block *block.Block //要证明的区块 target *big.Int //难度值 } //声明一个挖矿难度 const targetBits = 10 //实例化一个工作量证明 func NewProofOfWork(b *block.Block) *ProofOfWork { target := big.NewInt(1) target.Lsh(target,uint(256 - targetBits)) pow := &amp;ProofOfWork{b,target} return pow } //准备需要进行哈希的数据 func (pow *ProofOfWork) prepareData(nonce int) []byte { data := bytes.Join( [][]byte{ pow.block.PrevBlockHash, pow.block.Data, []byte(strconv.FormatInt(pow.block.Timestamp,10)), []byte(strconv.FormatInt(targetBits,10)), []byte(strconv.FormatInt(int64(nonce),10)), }, []byte{}, ) return data } //进行工作量证明,证明成功会返回随机数和区块哈希 func (pow *ProofOfWork) Run() (int,[]byte) { nonce := 0 var hash [32]byte var hashInt big.Int for nonce &lt; math.MaxInt64 { data := pow.prepareData(nonce) hash = sha256.Sum256(data) hashInt.SetBytes(hash[:]) //把哈希后的数据与难度值进行比较 if hashInt.Cmp(pow.target) == -1 { fmt.Printf(&quot;工作量证明成功 hash= %x nonce = %v\n&quot;,hash,nonce) break }else{ nonce ++ } } fmt.Println() return nonce,hash[:] } //实例化一个区块 func NewBlock(data string,prevBlockHash []byte) *block.Block { block := &amp;block.Block{time.Now().Unix(),[]byte(data),prevBlockHash,[]byte{},0} // block.SetHash() pow := NewProofOfWork(block) nonce,hash := pow.Run() block.Hash = hash block.Nonce = nonce return block } //其他节点验证nonce是否正确 func (pow *ProofOfWork) Validate() bool { var hashInt big.Int data := pow.prepareData(pow.block.Nonce) hash := sha256.Sum256(data) hashInt.SetBytes(hash[:]) isValid := hashInt.Cmp(pow.target) == -1 return isValid } 4、CLI包： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 5、main包： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } &nbsp; 注释：上面的代码中注解都是很详细的，运行都能通过，在VScode编辑器中编辑时其中有两处有警告的提示，主要原因是我编写的Block结构体字段和CLI结构体字段的首字母都是大写的，警告提示为：Disable go vet checks for “composite literal uses unkeyed fields”，解释为我所使用的这两个结构体中的都是无键字段，所以警告，这种警告可以忽略的，是go vet的一个提示，并不是错误。 —— 如果以上有什么错误或者疑问欢迎指正，可以加我的联系方式进行讨论：微信（18382255942）—— &nbsp; 阅读更多" />
+<meta property="og:description" content="&nbsp;&nbsp;&nbsp; 到为止我们已经实现了一条能够进行pow的区块链，距离实现一条正真意义上的区块链还有很长的路需要走。我们可能已经发现每当我们关闭程序后重新只能重新创建新的链，之前的数据都会不存在了。原因就是我们目前的链存储的数据都是在内存中，并没有被写入电脑的磁盘，所以会随着程序的退出被擦除。这一节我们就要解决这个问题，使用数据库来永久地保存我们创建的链。 &nbsp;&nbsp;&nbsp; 比特币使用的是一款简约而不简单的数据库LevelDB，这次我们不采用此数据库，而我们选择使用既简单又简约的BlotDB数据库。关于这款数据库的详细信息大家可以在网上去详细的了解，这里就不做详细的说明。简单的提一点的就是这款数据库中存储数据的方式是类似golang语言中的map结构，是使用键值对映射的方式来存储数据的，这些键值对被存储在一个叫bucket（桶）中。我们实例一个数据库就是实例一种bucket。比如如果需要查找一个值，我们首先要进入到装此值的桶是哪个，然后通过此值对应的key来查找。 &nbsp;&nbsp;&nbsp; 在进行数据库存储之前，我们需要了解我们存储到数据库的有哪些信息。我们需要用到两个bucket（桶）来装我们的链信息。第一个bucket是存放blocks：一条链中包含的所有块中的元数据信息，另一个bucket是存放chainstate：存储链的状态信息。目前我们还没有涉及到交易，所以我们现在只考虑blocks bucket。 最终我们会用到的键值对为： 32 字节的 block-hash -&gt; block 结构 l -&gt; 链中最后一个块的 hash &nbsp;&nbsp;&nbsp; 因为在数据库中存储的数据的变成[]byte，所以我们需要序列化和反序列化的操作，我们在block包里面实现这两个函数； //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } &nbsp;&nbsp;&nbsp; 下面就要实现数据库的内容了： 让我们从 NewBlockchain 函数开始。在之前的实现中，它会创建一个新的Blockchain 实例，并向其中加入创世块。而现在，我们希望它做的事情有： 打开一个数据库文件 检查文件里面是否已经存储了一个区块链 如果已经存储了一个区块链： 创建一个新的 Blockchain 实例 设置 Blockchain 实例的 tip 为数据库中存储的最后一个块的哈希 如果没有区块链： 创建创世块 存储到数据库 将创世块哈希保存为最后一个块的哈希 创建一个新的 Blockchain 实例，其 tip 指向创世块（tip 有尾部，尖端的意思，在这里 tip 存储的是最后一个块的哈希） 代码大概是这样： //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } &nbsp;&nbsp;&nbsp; 接下来我们想要更新的是 AddBlock 方法：现在向链中加入区块，就不是像之前向一个数组中加入一个元素那么简单了。从现在开始，我们会将区块存储在数据库里面： //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } &nbsp;&nbsp;&nbsp; 现在我们产生的区块都会保存在区块链数据库中，我们可以随时打开一条区块链加入新的区块。但是现在我们不能像以前一样通过for-range方式遍历区块链了。所以要打印出区块需要一个迭代器来帮助我们。通过区块链迭代器，我们能以区块能够进入区块链中的顺序进行打印。此外，因为我们不想将所有的块都加载到内存中（因为我们的区块链数据库可能很大！或者现在可以假装它可能很大），我们将会一个一个地读取它们。 //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } &nbsp;&nbsp;&nbsp;&nbsp; 为了方便我们在命令行界面操作我们的区块链，下面我们来实现CLI交互接口。首先创建一个CLI包，代码如下： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 注意：我之前没有写cli.validateArgs()这个函数来判断命令行输入参数的个数，然后就报错如下： &nbsp;报错提示：panic: runtime error: index out of range，原因是如果我们没有输入任何参数的话，os.Args[]这个切片里面只包含main.go这一个默认的参数，此时len(os.Args)=1，但是下面我们用到了os.Args[2:]，所以已经超出范围了，所以要报错。后面加上cli.validateArgs()函数来判断，就会有个提示我们要输入参数。 下面是main函数： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } 在main函数里面因为涉及到权限问题，结构体blockchain的db字段不能在外包访问，所以用工厂模式来调用字段db。 &nbsp; &nbsp;下面是这一章节完成后的整个代码： 1、block包： package block import ( &quot;encoding/gob&quot; &quot;bytes&quot; &quot;log&quot; ) //区块的结构体 type Block struct { Timestamp int64 Data []byte PrevBlockHash []byte Hash []byte Nonce int } //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } 2、blockchain包： package blockchain import ( &quot;github.com/boltdb/bolt&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;log&quot; ) /* 区块链实现 */ const dbFile = &quot;blockchain.db&quot; const blocksBucket = &quot;blocks&quot; const genesisCoinbaseData = &quot;The Times 03/Jan/2009 Chancellor on brink of second bailout for banks&quot; //区块链 type Blockchain struct { tip []byte db *bolt.DB } //工厂模式db func(bc *Blockchain) Db() *bolt.DB { return bc.db } //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } //创建创世区块 func GenesisBlock() *block.Block { return pow.NewBlock(&quot;创世区块&quot;,[]byte{}) } //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } 3、pow包： package pow import ( &quot;fmt&quot; &quot;crypto/sha256&quot; &quot;strconv&quot; &quot;bytes&quot; &quot;math/big&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;math&quot; &quot;time&quot; ) //在实际的比特币区块链中，加入一个区块是非常困难的事情，其中运用得到的就是工作量证明 //创建一个工作量证明的结构体 type ProofOfWork struct { block *block.Block //要证明的区块 target *big.Int //难度值 } //声明一个挖矿难度 const targetBits = 10 //实例化一个工作量证明 func NewProofOfWork(b *block.Block) *ProofOfWork { target := big.NewInt(1) target.Lsh(target,uint(256 - targetBits)) pow := &amp;ProofOfWork{b,target} return pow } //准备需要进行哈希的数据 func (pow *ProofOfWork) prepareData(nonce int) []byte { data := bytes.Join( [][]byte{ pow.block.PrevBlockHash, pow.block.Data, []byte(strconv.FormatInt(pow.block.Timestamp,10)), []byte(strconv.FormatInt(targetBits,10)), []byte(strconv.FormatInt(int64(nonce),10)), }, []byte{}, ) return data } //进行工作量证明,证明成功会返回随机数和区块哈希 func (pow *ProofOfWork) Run() (int,[]byte) { nonce := 0 var hash [32]byte var hashInt big.Int for nonce &lt; math.MaxInt64 { data := pow.prepareData(nonce) hash = sha256.Sum256(data) hashInt.SetBytes(hash[:]) //把哈希后的数据与难度值进行比较 if hashInt.Cmp(pow.target) == -1 { fmt.Printf(&quot;工作量证明成功 hash= %x nonce = %v\n&quot;,hash,nonce) break }else{ nonce ++ } } fmt.Println() return nonce,hash[:] } //实例化一个区块 func NewBlock(data string,prevBlockHash []byte) *block.Block { block := &amp;block.Block{time.Now().Unix(),[]byte(data),prevBlockHash,[]byte{},0} // block.SetHash() pow := NewProofOfWork(block) nonce,hash := pow.Run() block.Hash = hash block.Nonce = nonce return block } //其他节点验证nonce是否正确 func (pow *ProofOfWork) Validate() bool { var hashInt big.Int data := pow.prepareData(pow.block.Nonce) hash := sha256.Sum256(data) hashInt.SetBytes(hash[:]) isValid := hashInt.Cmp(pow.target) == -1 return isValid } 4、CLI包： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 5、main包： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } &nbsp; 注释：上面的代码中注解都是很详细的，运行都能通过，在VScode编辑器中编辑时其中有两处有警告的提示，主要原因是我编写的Block结构体字段和CLI结构体字段的首字母都是大写的，警告提示为：Disable go vet checks for “composite literal uses unkeyed fields”，解释为我所使用的这两个结构体中的都是无键字段，所以警告，这种警告可以忽略的，是go vet的一个提示，并不是错误。 —— 如果以上有什么错误或者疑问欢迎指正，可以加我的联系方式进行讨论：微信（18382255942）—— &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/25/0fe90ddfaf9f4880bc84c019c42af09f.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/25/0fe90ddfaf9f4880bc84c019c42af09f.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-25T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"&nbsp;&nbsp;&nbsp; 到为止我们已经实现了一条能够进行pow的区块链，距离实现一条正真意义上的区块链还有很长的路需要走。我们可能已经发现每当我们关闭程序后重新只能重新创建新的链，之前的数据都会不存在了。原因就是我们目前的链存储的数据都是在内存中，并没有被写入电脑的磁盘，所以会随着程序的退出被擦除。这一节我们就要解决这个问题，使用数据库来永久地保存我们创建的链。 &nbsp;&nbsp;&nbsp; 比特币使用的是一款简约而不简单的数据库LevelDB，这次我们不采用此数据库，而我们选择使用既简单又简约的BlotDB数据库。关于这款数据库的详细信息大家可以在网上去详细的了解，这里就不做详细的说明。简单的提一点的就是这款数据库中存储数据的方式是类似golang语言中的map结构，是使用键值对映射的方式来存储数据的，这些键值对被存储在一个叫bucket（桶）中。我们实例一个数据库就是实例一种bucket。比如如果需要查找一个值，我们首先要进入到装此值的桶是哪个，然后通过此值对应的key来查找。 &nbsp;&nbsp;&nbsp; 在进行数据库存储之前，我们需要了解我们存储到数据库的有哪些信息。我们需要用到两个bucket（桶）来装我们的链信息。第一个bucket是存放blocks：一条链中包含的所有块中的元数据信息，另一个bucket是存放chainstate：存储链的状态信息。目前我们还没有涉及到交易，所以我们现在只考虑blocks bucket。 最终我们会用到的键值对为： 32 字节的 block-hash -&gt; block 结构 l -&gt; 链中最后一个块的 hash &nbsp;&nbsp;&nbsp; 因为在数据库中存储的数据的变成[]byte，所以我们需要序列化和反序列化的操作，我们在block包里面实现这两个函数； //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } &nbsp;&nbsp;&nbsp; 下面就要实现数据库的内容了： 让我们从 NewBlockchain 函数开始。在之前的实现中，它会创建一个新的Blockchain 实例，并向其中加入创世块。而现在，我们希望它做的事情有： 打开一个数据库文件 检查文件里面是否已经存储了一个区块链 如果已经存储了一个区块链： 创建一个新的 Blockchain 实例 设置 Blockchain 实例的 tip 为数据库中存储的最后一个块的哈希 如果没有区块链： 创建创世块 存储到数据库 将创世块哈希保存为最后一个块的哈希 创建一个新的 Blockchain 实例，其 tip 指向创世块（tip 有尾部，尖端的意思，在这里 tip 存储的是最后一个块的哈希） 代码大概是这样： //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } &nbsp;&nbsp;&nbsp; 接下来我们想要更新的是 AddBlock 方法：现在向链中加入区块，就不是像之前向一个数组中加入一个元素那么简单了。从现在开始，我们会将区块存储在数据库里面： //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } &nbsp;&nbsp;&nbsp; 现在我们产生的区块都会保存在区块链数据库中，我们可以随时打开一条区块链加入新的区块。但是现在我们不能像以前一样通过for-range方式遍历区块链了。所以要打印出区块需要一个迭代器来帮助我们。通过区块链迭代器，我们能以区块能够进入区块链中的顺序进行打印。此外，因为我们不想将所有的块都加载到内存中（因为我们的区块链数据库可能很大！或者现在可以假装它可能很大），我们将会一个一个地读取它们。 //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } &nbsp;&nbsp;&nbsp;&nbsp; 为了方便我们在命令行界面操作我们的区块链，下面我们来实现CLI交互接口。首先创建一个CLI包，代码如下： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 注意：我之前没有写cli.validateArgs()这个函数来判断命令行输入参数的个数，然后就报错如下： &nbsp;报错提示：panic: runtime error: index out of range，原因是如果我们没有输入任何参数的话，os.Args[]这个切片里面只包含main.go这一个默认的参数，此时len(os.Args)=1，但是下面我们用到了os.Args[2:]，所以已经超出范围了，所以要报错。后面加上cli.validateArgs()函数来判断，就会有个提示我们要输入参数。 下面是main函数： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } 在main函数里面因为涉及到权限问题，结构体blockchain的db字段不能在外包访问，所以用工厂模式来调用字段db。 &nbsp; &nbsp;下面是这一章节完成后的整个代码： 1、block包： package block import ( &quot;encoding/gob&quot; &quot;bytes&quot; &quot;log&quot; ) //区块的结构体 type Block struct { Timestamp int64 Data []byte PrevBlockHash []byte Hash []byte Nonce int } //0.3 实现Block的序列化 func (b *Block) Serialize() []byte { //首先定义一个buffer存储序列化后的数据 var result bytes.Buffer //实例化一个序列化实例,结果保存到result中 encoder := gob.NewEncoder(&amp;result) //对区块进行实例化 err := encoder.Encode(b) if err != nil { log.Panic(err) } return result.Bytes() } //0.3 实现反序列化函数 func DeserializeBlock(d []byte) *Block { var block Block decoder := gob.NewDecoder(bytes.NewReader(d)) err := decoder.Decode(&amp;block) if err != nil { log.Panic(err) } return &amp;block } 2、blockchain包： package blockchain import ( &quot;github.com/boltdb/bolt&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;log&quot; ) /* 区块链实现 */ const dbFile = &quot;blockchain.db&quot; const blocksBucket = &quot;blocks&quot; const genesisCoinbaseData = &quot;The Times 03/Jan/2009 Chancellor on brink of second bailout for banks&quot; //区块链 type Blockchain struct { tip []byte db *bolt.DB } //工厂模式db func(bc *Blockchain) Db() *bolt.DB { return bc.db } //把区块添加进区块链 func (bc *Blockchain) AddBlock(data string) { var lastHash []byte //只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备 err := bc.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) lastHash = b.Get([]byte(&quot;l&quot;)) //通过键&quot;l&quot;拿到区块链顶端区块哈希 return nil }) if err != nil { log.Panic(err) } //prevBlock := bc.Blocks[len(bc.Blocks)-1] //求出新区块 newBlock := pow.NewBlock(data,lastHash) // bc.Blocks = append(bc.Blocks,newBlock) //把新区块加入到数据库区块链中 err = bc.db.Update(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) err := b.Put(newBlock.Hash,newBlock.Serialize()) if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),newBlock.Hash) bc.tip = newBlock.Hash return nil }) } //创建创世区块 func GenesisBlock() *block.Block { return pow.NewBlock(&quot;创世区块&quot;,[]byte{}) } //实例化一个区块链,默认存储了创世区块 func NewBlockchain() *Blockchain { //return &amp;Blockchain{[]*block.Block{GenesisBlock()}} var tip []byte //打开一个数据库文件，如果文件不存在则创建该名字的文件 db,err := bolt.Open(dbFile,0600,nil) if err != nil { log.Panic(err) } //读写操作数据库 err = db.Update(func(tx *bolt.Tx) error{ b := tx.Bucket([]byte(blocksBucket)) //查看名字为blocksBucket的Bucket是否存在 if b == nil { //不存在则从头 创建 genesis := GenesisBlock() //创建创世区块 b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶 if err != nil { log.Panic(err) } err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块 if err != nil { log.Panic(err) } err = b.Put([]byte(&quot;l&quot;),genesis.Hash) //&quot;l&quot;键对应区块链顶端区块的哈希 if err != nil { log.Panic(err) } tip = genesis.Hash //指向最后一个区块，这里也就是创世区块 } else { //如果存在blocksBucket桶，也就是存在区块链 //通过键&quot;l&quot;映射出顶端区块的Hash值 tip = b.Get([]byte(&quot;l&quot;)) } return nil }) bc := Blockchain{tip,db} //此时Blockchain结构体字段已经变成这样了 return &amp;bc } //分割线——————迭代器—————— type BlockchainIterator struct { currentHash []byte db *bolt.DB } //当需要遍历当前区块链时，创建一个此区块链的迭代器 func (bc *Blockchain) Iterator() *BlockchainIterator { bci := &amp;BlockchainIterator{bc.tip,bc.db} return bci } //迭代器的任务就是返回链中的下一个区块 func (i *BlockchainIterator) Next() *block.Block { var Block *block.Block //只读方式打开区块链数据库 err := i.db.View(func(tx *bolt.Tx) error { b := tx.Bucket([]byte(blocksBucket)) //获取数据库中当前区块哈希对应的被序列化后的区块 encodeBlock := b.Get(i.currentHash) //反序列化，获得区块 Block = block.DeserializeBlock(encodeBlock) return nil }) if err != nil { log.Panic(err) } //把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用 i.currentHash =Block.PrevBlockHash return Block } 3、pow包： package pow import ( &quot;fmt&quot; &quot;crypto/sha256&quot; &quot;strconv&quot; &quot;bytes&quot; &quot;math/big&quot; &quot;go_code/A_golang_blockchain/block&quot; &quot;math&quot; &quot;time&quot; ) //在实际的比特币区块链中，加入一个区块是非常困难的事情，其中运用得到的就是工作量证明 //创建一个工作量证明的结构体 type ProofOfWork struct { block *block.Block //要证明的区块 target *big.Int //难度值 } //声明一个挖矿难度 const targetBits = 10 //实例化一个工作量证明 func NewProofOfWork(b *block.Block) *ProofOfWork { target := big.NewInt(1) target.Lsh(target,uint(256 - targetBits)) pow := &amp;ProofOfWork{b,target} return pow } //准备需要进行哈希的数据 func (pow *ProofOfWork) prepareData(nonce int) []byte { data := bytes.Join( [][]byte{ pow.block.PrevBlockHash, pow.block.Data, []byte(strconv.FormatInt(pow.block.Timestamp,10)), []byte(strconv.FormatInt(targetBits,10)), []byte(strconv.FormatInt(int64(nonce),10)), }, []byte{}, ) return data } //进行工作量证明,证明成功会返回随机数和区块哈希 func (pow *ProofOfWork) Run() (int,[]byte) { nonce := 0 var hash [32]byte var hashInt big.Int for nonce &lt; math.MaxInt64 { data := pow.prepareData(nonce) hash = sha256.Sum256(data) hashInt.SetBytes(hash[:]) //把哈希后的数据与难度值进行比较 if hashInt.Cmp(pow.target) == -1 { fmt.Printf(&quot;工作量证明成功 hash= %x nonce = %v\\n&quot;,hash,nonce) break }else{ nonce ++ } } fmt.Println() return nonce,hash[:] } //实例化一个区块 func NewBlock(data string,prevBlockHash []byte) *block.Block { block := &amp;block.Block{time.Now().Unix(),[]byte(data),prevBlockHash,[]byte{},0} // block.SetHash() pow := NewProofOfWork(block) nonce,hash := pow.Run() block.Hash = hash block.Nonce = nonce return block } //其他节点验证nonce是否正确 func (pow *ProofOfWork) Validate() bool { var hashInt big.Int data := pow.prepareData(pow.block.Nonce) hash := sha256.Sum256(data) hashInt.SetBytes(hash[:]) isValid := hashInt.Cmp(pow.target) == -1 return isValid } 4、CLI包： package CLI import ( &quot;fmt&quot; &quot;os&quot; &quot;flag&quot; &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/pow&quot; &quot;strconv&quot; &quot;log&quot; ) //首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令 //创建一个CLI结构体 type CLI struct { BC *blockchain.Blockchain } //入口函数 func (cli *CLI) Run() { //判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息 cli.validateArgs() //实例化flag集合 addBlockCmd := flag.NewFlagSet(&quot;addblock&quot;,flag.ExitOnError) printChainCmd := flag.NewFlagSet(&quot;printchain&quot;,flag.ExitOnError) //注册一个flag标志符 addBlockData := addBlockCmd.String(&quot;data&quot;,&quot; &quot;,&quot;区块数据&quot;) switch os.Args[1] { //os.Args为一个保存输入命令的切片 case &quot;addblock&quot;: //解析出&quot;addblock&quot;后面的命令 err := addBlockCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } case &quot;printchain&quot;: err := printChainCmd.Parse(os.Args[2:]) if err != nil { log.Panic(err) } default : cli.printUsage() //提示用户怎么正确输入命令 os.Exit(1) } //进入被解析出的命令，进一步操作 if addBlockCmd.Parsed() { if *addBlockData == &quot; &quot; { addBlockCmd.Usage() //如果没有输入标志位data，则提醒用户怎么正确的输入 os.Exit(1) } //用户输入正确则进行加入区块的操作 cli.addBlock(*addBlockData) } if printChainCmd.Parsed() { //打印区块链操作 cli.printChain() } } //加入输入格式错误信息提示 func(cli *CLI) printUsage() { fmt.Println(&quot;Usage:&quot;) fmt.Println(&quot; addblock -data 区块信息&quot;) fmt.Println(&quot; printchain - Print all the blocks of the blockchain&quot;) } //判断命令行参数，如果没有输入参数则显示提示信息 func (cli *CLI) validateArgs() { if len(os.Args) &lt; 2 { cli.printUsage() os.Exit(1) } } //加入区块函数调用 func (cli *CLI) addBlock(data string) { cli.BC.AddBlock(data) fmt.Println(&quot;成功加入区块...&quot;) } //打印区块链函数调用 func (cli *CLI) printChain() { //这里需要用到迭代区块链的思想 //创建一个迭代器 bci := cli.BC.Iterator() for { block := bci.Next() //从顶端区块向前面的区块迭代 fmt.Printf(&quot;PrevHash:%x\\n&quot;,block.PrevBlockHash) fmt.Printf(&quot;Data:%s\\n&quot;,block.Data) fmt.Printf(&quot;Hash:%x\\n&quot;,block.Hash) //验证当前区块的pow pow := pow.NewProofOfWork(block) boolen := pow.Validate() fmt.Printf(&quot;POW is %s\\n&quot;,strconv.FormatBool(boolen)) fmt.Println() if len(block.PrevBlockHash) == 0 { break } } } 5、main包： package main import ( &quot;go_code/A_golang_blockchain/blockchain&quot; &quot;go_code/A_golang_blockchain/CLI&quot; ) func main() { //先创建一条区块链 bc := blockchain.NewBlockchain() //这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db //程序退出前关闭数据库 defer bc.Db().Close() cli := CLI.CLI{bc} cli.Run() // //加入区块到区块链中 // bc.AddBlock(&quot;区块01&quot;) // bc.AddBlock(&quot;区块02&quot;) //打印出区块链中各个区块的信息,并验证各个区块是否合格 // for _,b := range bc.Blocks { // fmt.Printf(&quot;时间戳：%v\\n&quot;,b.Timestamp) // fmt.Printf(&quot;Data：%s\\n&quot;,b.Data) // fmt.Printf(&quot;上一区块哈希：%x\\n&quot;,b.PrevBlockHash) // fmt.Printf(&quot;Hash：%x\\n&quot;,b.Hash) // fmt.Printf(&quot;Nonce：%v\\n&quot;,b.Nonce) // //验证当前区块的pow // pow := pow.NewProofOfWork(b) // boolen := pow.Validate() // fmt.Printf(&quot;POW is %s\\n&quot;,strconv.FormatBool(boolen)) // fmt.Println() // } } &nbsp; 注释：上面的代码中注解都是很详细的，运行都能通过，在VScode编辑器中编辑时其中有两处有警告的提示，主要原因是我编写的Block结构体字段和CLI结构体字段的首字母都是大写的，警告提示为：Disable go vet checks for “composite literal uses unkeyed fields”，解释为我所使用的这两个结构体中的都是无键字段，所以警告，这种警告可以忽略的，是go vet的一个提示，并不是错误。 —— 如果以上有什么错误或者疑问欢迎指正，可以加我的联系方式进行讨论：微信（18382255942）—— &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/25/0fe90ddfaf9f4880bc84c019c42af09f.html","headline":"golang重写区块链——0.3 数据库存储链和实现命令行交互","dateModified":"2018-08-25T00:00:00+08:00","datePublished":"2018-08-25T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/25/0fe90ddfaf9f4880bc84c019c42af09f.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>golang重写区块链——0.3 数据库存储链和实现命令行交互</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>&nbsp;&nbsp;&nbsp; 到为止我们已经实现了一条能够进行pow的区块链，距离实现一条正真意义上的区块链还有很长的路需要走。我们可能已经发现每当我们关闭程序后重新只能重新创建新的链，之前的数据都会不存在了。原因就是我们目前的链存储的数据都是在内存中，并没有被写入电脑的磁盘，所以会随着程序的退出被擦除。这一节我们就要解决这个问题，使用数据库来永久地保存我们创建的链。</p> 
+  <p>&nbsp;&nbsp;&nbsp; 比特币使用的是一款简约而不简单的数据库LevelDB，这次我们不采用此数据库，而我们选择使用既简单又简约的BlotDB数据库。关于这款数据库的详细信息大家可以在网上去详细的了解，这里就不做详细的说明。简单的提一点的就是这款数据库中存储数据的方式是类似golang语言中的map结构，是使用键值对映射的方式来存储数据的，这些键值对被存储在一个叫bucket（桶）中。我们实例一个数据库就是实例一种bucket。比如如果需要查找一个值，我们首先要进入到装此值的桶是哪个，然后通过此值对应的key来查找。</p> 
+  <p>&nbsp;&nbsp;&nbsp; 在进行数据库存储之前，我们需要了解我们存储到数据库的有哪些信息。我们需要用到两个bucket（桶）来装我们的链信息。第一个bucket是存放blocks：一条链中包含的所有块中的元数据信息，另一个bucket是存放chainstate：存储链的状态信息。目前我们还没有涉及到交易，所以我们现在只考虑blocks bucket。</p> 
+  <p>最终我们会用到的键值对为：</p> 
+  <ol>
+   <li>32 字节的 block-hash -&gt; block 结构</li> 
+   <li><code>l</code> -&gt; 链中最后一个块的 hash</li> 
+  </ol>
+  <p>&nbsp;&nbsp;&nbsp; 因为在数据库中存储的数据的变成[]byte，所以我们需要序列化和反序列化的操作，我们在block包里面实现这两个函数；</p> 
+  <pre class="has">
+<code class="language-Go">//0.3 实现Block的序列化
+func (b *Block) Serialize() []byte {
+	//首先定义一个buffer存储序列化后的数据
+	var result bytes.Buffer
+	//实例化一个序列化实例,结果保存到result中
+	encoder := gob.NewEncoder(&amp;result)
+	//对区块进行实例化
+	err := encoder.Encode(b)
+	if err != nil {
+		log.Panic(err)
+	}
+	return result.Bytes()
+}
+
+//0.3 实现反序列化函数
+func DeserializeBlock(d []byte) *Block {
+	var block Block
+	decoder := gob.NewDecoder(bytes.NewReader(d))
+	err := decoder.Decode(&amp;block)
+	if err != nil {
+		log.Panic(err)
+	}
+	return &amp;block
+}
+</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp; 下面就要实现数据库的内容了：</p> 
+  <p>让我们从 <code>NewBlockchain</code> 函数开始。在之前的实现中，它会创建一个新的<br><code>Blockchain</code> 实例，并向其中加入创世块。而现在，我们希望它做的事情有：</p> 
+  <ol>
+   <li>打开一个数据库文件</li> 
+   <li>检查文件里面是否已经存储了一个区块链</li> 
+   <li>如果已经存储了一个区块链： 
+    <ol>
+     <li>创建一个新的 <code>Blockchain</code> 实例</li> 
+     <li>设置 <code>Blockchain</code> 实例的 tip 为数据库中存储的最后一个块的哈希</li> 
+    </ol></li> 
+   <li>如果没有区块链： 
+    <ol>
+     <li>创建创世块</li> 
+     <li>存储到数据库</li> 
+     <li>将创世块哈希保存为最后一个块的哈希</li> 
+     <li>创建一个新的 <code>Blockchain</code> 实例，其 tip 指向创世块（tip 有尾部，尖端的意思，在这里 tip 存储的是最后一个块的哈希）</li> 
+    </ol></li> 
+  </ol>
+  <p>代码大概是这样：</p> 
+  <pre class="has">
+<code class="language-Go">//实例化一个区块链,默认存储了创世区块
+func NewBlockchain() *Blockchain {
+	//return &amp;Blockchain{[]*block.Block{GenesisBlock()}}
+	var tip []byte
+	//打开一个数据库文件，如果文件不存在则创建该名字的文件
+	db,err := bolt.Open(dbFile,0600,nil)
+	if err != nil {
+		log.Panic(err)
+	}
+	//读写操作数据库
+	err = db.Update(func(tx *bolt.Tx) error{
+		b := tx.Bucket([]byte(blocksBucket))
+		//查看名字为blocksBucket的Bucket是否存在
+		if b == nil {
+			//不存在则从头 创建
+			genesis := GenesisBlock()	//创建创世区块
+			b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶
+			if err != nil {
+				log.Panic(err)
+			}
+			err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块
+			if err != nil {
+				log.Panic(err)
+			}
+			err = b.Put([]byte("l"),genesis.Hash) //"l"键对应区块链顶端区块的哈希
+			if err != nil {
+				log.Panic(err)
+			}
+			tip = genesis.Hash //指向最后一个区块，这里也就是创世区块
+		} else {
+			//如果存在blocksBucket桶，也就是存在区块链
+			//通过键"l"映射出顶端区块的Hash值
+			tip = b.Get([]byte("l"))
+		}
+
+		return nil
+	})
+
+	bc := Blockchain{tip,db}  //此时Blockchain结构体字段已经变成这样了
+	return &amp;bc
+
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp; 接下来我们想要更新的是 <code>AddBlock</code> 方法：现在向链中加入区块，就不是像之前向一个数组中加入一个元素那么简单了。从现在开始，我们会将区块存储在数据库里面：</p> 
+  <pre class="has">
+<code class="language-Go">//把区块添加进区块链
+func (bc *Blockchain) AddBlock(data string) {
+	var lastHash []byte
+	//只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备
+	err := bc.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))	//通过键"l"拿到区块链顶端区块哈希
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	//prevBlock := bc.Blocks[len(bc.Blocks)-1]
+	//求出新区块
+	newBlock := pow.NewBlock(data,lastHash)
+	// bc.Blocks = append(bc.Blocks,newBlock)
+	//把新区块加入到数据库区块链中
+	err = bc.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		err := b.Put(newBlock.Hash,newBlock.Serialize())
+		if err != nil {
+			log.Panic(err)
+		}
+		err = b.Put([]byte("l"),newBlock.Hash)
+		bc.tip = newBlock.Hash
+
+		return nil
+	})
+}
+</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp; 现在我们产生的区块都会保存在区块链数据库中，我们可以随时打开一条区块链加入新的区块。但是现在我们不能像以前一样通过for-range方式遍历区块链了。所以要打印出区块需要一个迭代器来帮助我们。通过区块链迭代器，我们能以区块能够进入区块链中的顺序进行打印。此外，因为我们不想将所有的块都加载到内存中（因为我们的区块链数据库可能很大！或者现在可以假装它可能很大），我们将会一个一个地读取它们。</p> 
+  <pre class="has">
+<code class="language-Go">//分割线——————迭代器——————
+type BlockchainIterator struct {
+	currentHash 	[]byte
+	db 				*bolt.DB
+}
+//当需要遍历当前区块链时，创建一个此区块链的迭代器
+func (bc *Blockchain) Iterator() *BlockchainIterator {
+	bci := &amp;BlockchainIterator{bc.tip,bc.db}
+
+	return bci
+}
+
+//迭代器的任务就是返回链中的下一个区块
+func (i *BlockchainIterator) Next() *block.Block {
+	var Block *block.Block
+
+	//只读方式打开区块链数据库
+	err := i.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		//获取数据库中当前区块哈希对应的被序列化后的区块
+		encodeBlock := b.Get(i.currentHash)
+		//反序列化，获得区块
+		Block = block.DeserializeBlock(encodeBlock)
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	//把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用
+	i.currentHash =Block.PrevBlockHash
+
+	return Block
+
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp; 为了方便我们在命令行界面操作我们的区块链，下面我们来实现CLI交互接口。首先创建一个CLI包，代码如下：</p> 
+  <pre class="has">
+<code class="language-Go">package CLI
+
+import (
+	"fmt"
+	"os"
+	"flag"
+	"go_code/A_golang_blockchain/blockchain"
+	"go_code/A_golang_blockchain/pow"
+	"strconv"
+	"log"
+)
+//首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令
+
+//创建一个CLI结构体
+type CLI struct {
+	BC *blockchain.Blockchain
+}
+
+
+//入口函数
+func (cli *CLI) Run() {
+	//判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息
+	cli.validateArgs()
+	//实例化flag集合
+	addBlockCmd := flag.NewFlagSet("addblock",flag.ExitOnError)
+	printChainCmd := flag.NewFlagSet("printchain",flag.ExitOnError)
+
+	//注册一个flag标志符
+	addBlockData := addBlockCmd.String("data"," ","区块数据")
+
+	switch os.Args[1] {		//os.Args为一个保存输入命令的切片
+	case "addblock":
+		//解析出"addblock"后面的命令
+		err := addBlockCmd.Parse(os.Args[2:])
+		if err != nil {
+			log.Panic(err)
+		}
+	case "printchain":
+		err := printChainCmd.Parse(os.Args[2:])
+		if err != nil {
+			log.Panic(err)
+		}
+	default :
+		cli.printUsage()	//提示用户怎么正确输入命令
+		os.Exit(1)
+	}
+	
+	//进入被解析出的命令，进一步操作
+	if addBlockCmd.Parsed() {
+		if *addBlockData == " " {
+			addBlockCmd.Usage() 	//如果没有输入标志位data，则提醒用户怎么正确的输入
+			os.Exit(1)
+		}
+		//用户输入正确则进行加入区块的操作
+		cli.addBlock(*addBlockData)
+	}
+	if printChainCmd.Parsed() {
+		//打印区块链操作
+		cli.printChain()
+	}
+}
+
+//加入输入格式错误信息提示
+func(cli *CLI) printUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  addblock -data  区块信息")
+	fmt.Println("  printchain - Print all the blocks of the blockchain")
+}
+
+//判断命令行参数，如果没有输入参数则显示提示信息
+func (cli *CLI) validateArgs() {
+	if len(os.Args) &lt; 2 {
+		cli.printUsage()
+		os.Exit(1)
+	}
+}
+
+//加入区块函数调用
+func (cli *CLI) addBlock(data string) {
+	cli.BC.AddBlock(data)
+	fmt.Println("成功加入区块...")
+}
+
+//打印区块链函数调用
+func (cli *CLI) printChain() {
+	//这里需要用到迭代区块链的思想
+	//创建一个迭代器
+	bci := cli.BC.Iterator()
+
+	for {
+
+		block := bci.Next()	//从顶端区块向前面的区块迭代
+
+		fmt.Printf("PrevHash:%x\n",block.PrevBlockHash)
+		fmt.Printf("Data:%s\n",block.Data)
+		fmt.Printf("Hash:%x\n",block.Hash)
+		//验证当前区块的pow
+		pow := pow.NewProofOfWork(block)
+		boolen := pow.Validate()
+		fmt.Printf("POW is %s\n",strconv.FormatBool(boolen))
+		fmt.Println()
+		
+		if len(block.PrevBlockHash) == 0 {
+			break
+		}
+	}
+}</code></pre> 
+  <p>注意：我之前没有写cli.validateArgs()这个函数来判断命令行输入参数的个数，然后就报错如下：</p> 
+  <p><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180825205430578?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p5ajA4MTM=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p>&nbsp;报错提示：panic: runtime error: index out of range，原因是如果我们没有输入任何参数的话，os.Args[]这个切片里面只包含main.go这一个默认的参数，此时len(os.Args)=1，但是下面我们用到了os.Args[2:]，所以已经超出范围了，所以要报错。后面加上cli.validateArgs()函数来判断，就会有个提示我们要输入参数。</p> 
+  <p>下面是main函数：</p> 
+  <pre class="has">
+<code>package main
+
+import (
+	"go_code/A_golang_blockchain/blockchain"
+	"go_code/A_golang_blockchain/CLI"
+)
+
+func main() {
+	//先创建一条区块链
+	bc := blockchain.NewBlockchain()
+	//这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db
+	//程序退出前关闭数据库
+	defer bc.Db().Close()
+
+	cli := CLI.CLI{bc}
+	cli.Run()
+
+	// //加入区块到区块链中
+	// bc.AddBlock("区块01")
+	// bc.AddBlock("区块02")
+
+	//打印出区块链中各个区块的信息,并验证各个区块是否合格
+	// for _,b := range bc.Blocks {
+
+	// 	fmt.Printf("时间戳：%v\n",b.Timestamp)
+	// 	fmt.Printf("Data：%s\n",b.Data)
+	// 	fmt.Printf("上一区块哈希：%x\n",b.PrevBlockHash)
+	// 	fmt.Printf("Hash：%x\n",b.Hash)
+	// 	fmt.Printf("Nonce：%v\n",b.Nonce)
+	// 	//验证当前区块的pow
+	// 	pow := pow.NewProofOfWork(b)
+	// 	boolen := pow.Validate()
+	// 	fmt.Printf("POW is %s\n",strconv.FormatBool(boolen))
+	// 	fmt.Println()
+	// }
+
+}</code></pre> 
+  <p>在main函数里面因为涉及到权限问题，结构体blockchain的db字段不能在外包访问，所以用工厂模式来调用字段db。</p> 
+  <p>&nbsp;</p> 
+  <p>&nbsp;下面是这一章节完成后的整个代码：</p> 
+  <p>1、block包：</p> 
+  <pre class="has">
+<code class="language-Go">package block
+
+import (
+	"encoding/gob"
+	"bytes"
+	"log"
+
+)
+//区块的结构体
+type Block struct {
+	Timestamp		int64
+	Data			[]byte
+	PrevBlockHash	        []byte
+	Hash 			[]byte
+	Nonce			int
+}
+
+//0.3 实现Block的序列化
+func (b *Block) Serialize() []byte {
+	//首先定义一个buffer存储序列化后的数据
+	var result bytes.Buffer
+	//实例化一个序列化实例,结果保存到result中
+	encoder := gob.NewEncoder(&amp;result)
+	//对区块进行实例化
+	err := encoder.Encode(b)
+	if err != nil {
+		log.Panic(err)
+	}
+	return result.Bytes()
+}
+
+//0.3 实现反序列化函数
+func DeserializeBlock(d []byte) *Block {
+	var block Block
+	decoder := gob.NewDecoder(bytes.NewReader(d))
+	err := decoder.Decode(&amp;block)
+	if err != nil {
+		log.Panic(err)
+	}
+	return &amp;block
+}
+</code></pre> 
+  <p>2、blockchain包：</p> 
+  <pre class="has">
+<code class="language-Go">package blockchain
+
+import (
+	"github.com/boltdb/bolt"
+	"go_code/A_golang_blockchain/block"
+	"go_code/A_golang_blockchain/pow"
+	"log"
+)
+/*
+	区块链实现
+*/
+const dbFile = "blockchain.db"
+const blocksBucket = "blocks"
+const genesisCoinbaseData = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+//区块链
+type Blockchain struct {
+	tip		[]byte
+	db 		*bolt.DB
+}
+
+//工厂模式db
+func(bc *Blockchain) Db() *bolt.DB {
+	return bc.db
+}
+
+//把区块添加进区块链
+func (bc *Blockchain) AddBlock(data string) {
+	var lastHash []byte
+	//只读的方式浏览数据库，获取当前区块链顶端区块的哈希，为加入下一区块做准备
+	err := bc.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))	//通过键"l"拿到区块链顶端区块哈希
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	//prevBlock := bc.Blocks[len(bc.Blocks)-1]
+	//求出新区块
+	newBlock := pow.NewBlock(data,lastHash)
+	// bc.Blocks = append(bc.Blocks,newBlock)
+	//把新区块加入到数据库区块链中
+	err = bc.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		err := b.Put(newBlock.Hash,newBlock.Serialize())
+		if err != nil {
+			log.Panic(err)
+		}
+		err = b.Put([]byte("l"),newBlock.Hash)
+		bc.tip = newBlock.Hash
+
+		return nil
+	})
+}
+
+//创建创世区块
+func GenesisBlock() *block.Block {
+	return pow.NewBlock("创世区块",[]byte{})
+}
+//实例化一个区块链,默认存储了创世区块
+func NewBlockchain() *Blockchain {
+	//return &amp;Blockchain{[]*block.Block{GenesisBlock()}}
+	var tip []byte
+	//打开一个数据库文件，如果文件不存在则创建该名字的文件
+	db,err := bolt.Open(dbFile,0600,nil)
+	if err != nil {
+		log.Panic(err)
+	}
+	//读写操作数据库
+	err = db.Update(func(tx *bolt.Tx) error{
+		b := tx.Bucket([]byte(blocksBucket))
+		//查看名字为blocksBucket的Bucket是否存在
+		if b == nil {
+			//不存在则从头 创建
+			genesis := GenesisBlock()	//创建创世区块
+			b,err := tx.CreateBucket([]byte(blocksBucket)) //创建名为blocksBucket的桶
+			if err != nil {
+				log.Panic(err)
+			}
+			err = b.Put(genesis.Hash,genesis.Serialize()) //写入键值对，区块哈希对应序列化后的区块
+			if err != nil {
+				log.Panic(err)
+			}
+			err = b.Put([]byte("l"),genesis.Hash) //"l"键对应区块链顶端区块的哈希
+			if err != nil {
+				log.Panic(err)
+			}
+			tip = genesis.Hash //指向最后一个区块，这里也就是创世区块
+		} else {
+			//如果存在blocksBucket桶，也就是存在区块链
+			//通过键"l"映射出顶端区块的Hash值
+			tip = b.Get([]byte("l"))
+		}
+
+		return nil
+	})
+
+	bc := Blockchain{tip,db}  //此时Blockchain结构体字段已经变成这样了
+	return &amp;bc
+}
+
+//分割线——————迭代器——————
+type BlockchainIterator struct {
+	currentHash 	[]byte
+	db 				*bolt.DB
+}
+//当需要遍历当前区块链时，创建一个此区块链的迭代器
+func (bc *Blockchain) Iterator() *BlockchainIterator {
+	bci := &amp;BlockchainIterator{bc.tip,bc.db}
+
+	return bci
+}
+
+//迭代器的任务就是返回链中的下一个区块
+func (i *BlockchainIterator) Next() *block.Block {
+	var Block *block.Block
+
+	//只读方式打开区块链数据库
+	err := i.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		//获取数据库中当前区块哈希对应的被序列化后的区块
+		encodeBlock := b.Get(i.currentHash)
+		//反序列化，获得区块
+		Block = block.DeserializeBlock(encodeBlock)
+
+		return nil
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	//把迭代器中的当前区块哈希设置为上一区块的哈希，实现迭代的作用
+	i.currentHash =Block.PrevBlockHash
+
+	return Block
+
+}</code></pre> 
+  <p>3、pow包：</p> 
+  <pre class="has">
+<code class="language-Go">package pow
+
+import (
+	"fmt"
+	"crypto/sha256"
+	"strconv"
+	"bytes"
+	"math/big"
+	"go_code/A_golang_blockchain/block"
+	"math"
+	"time"
+)
+//在实际的比特币区块链中，加入一个区块是非常困难的事情，其中运用得到的就是工作量证明
+
+//创建一个工作量证明的结构体
+type ProofOfWork struct {
+	block *block.Block //要证明的区块
+	target *big.Int //难度值
+}
+//声明一个挖矿难度
+const targetBits = 10
+
+//实例化一个工作量证明
+func NewProofOfWork(b *block.Block) *ProofOfWork {
+	target :=  big.NewInt(1)
+	target.Lsh(target,uint(256 - targetBits))
+
+	pow := &amp;ProofOfWork{b,target}
+	return pow
+}
+
+//准备需要进行哈希的数据
+func (pow *ProofOfWork) prepareData(nonce int) []byte {
+	data := bytes.Join(
+		[][]byte{
+			pow.block.PrevBlockHash,
+			pow.block.Data,
+			[]byte(strconv.FormatInt(pow.block.Timestamp,10)),
+			[]byte(strconv.FormatInt(targetBits,10)),
+			[]byte(strconv.FormatInt(int64(nonce),10)),
+		},
+		[]byte{},
+	)
+	return data
+}
+
+//进行工作量证明,证明成功会返回随机数和区块哈希
+func (pow *ProofOfWork) Run() (int,[]byte) {
+	nonce := 0
+	var hash [32]byte
+	var hashInt big.Int
+	for nonce &lt; math.MaxInt64 {
+		data := pow.prepareData(nonce)
+		hash = sha256.Sum256(data)
+		hashInt.SetBytes(hash[:])
+
+		//把哈希后的数据与难度值进行比较
+		if hashInt.Cmp(pow.target) == -1 {
+			fmt.Printf("工作量证明成功 hash= %x  nonce = %v\n",hash,nonce)
+			break
+		}else{
+			nonce ++
+		}
+	}
+	fmt.Println()
+
+	return nonce,hash[:]
+}
+
+//实例化一个区块
+func NewBlock(data string,prevBlockHash []byte) *block.Block {
+	block := &amp;block.Block{time.Now().Unix(),[]byte(data),prevBlockHash,[]byte{},0}
+	// block.SetHash()
+
+	pow := NewProofOfWork(block)
+	nonce,hash := pow.Run()
+	block.Hash = hash
+	block.Nonce = nonce
+	return block
+}
+
+//其他节点验证nonce是否正确
+func (pow *ProofOfWork) Validate() bool {
+	var hashInt big.Int
+
+	data := pow.prepareData(pow.block.Nonce)
+	hash := sha256.Sum256(data)
+	hashInt.SetBytes(hash[:])
+
+	isValid := hashInt.Cmp(pow.target) == -1 
+	return isValid
+}
+</code></pre> 
+  <p>4、CLI包：</p> 
+  <pre class="has">
+<code class="language-Go">package CLI
+
+import (
+	"fmt"
+	"os"
+	"flag"
+	"go_code/A_golang_blockchain/blockchain"
+	"go_code/A_golang_blockchain/pow"
+	"strconv"
+	"log"
+)
+//首先我们想要拥有这些命令 1.加入区块命令 2.打印区块链命令
+
+//创建一个CLI结构体
+type CLI struct {
+	BC *blockchain.Blockchain
+}
+
+
+//入口函数
+func (cli *CLI) Run() {
+	//判断命令行输入参数的个数，如果没有输入任何参数则打印提示输入参数信息
+	cli.validateArgs()
+	//实例化flag集合
+	addBlockCmd := flag.NewFlagSet("addblock",flag.ExitOnError)
+	printChainCmd := flag.NewFlagSet("printchain",flag.ExitOnError)
+
+	//注册一个flag标志符
+	addBlockData := addBlockCmd.String("data"," ","区块数据")
+
+	switch os.Args[1] {		//os.Args为一个保存输入命令的切片
+	case "addblock":
+		//解析出"addblock"后面的命令
+		err := addBlockCmd.Parse(os.Args[2:])
+		if err != nil {
+			log.Panic(err)
+		}
+	case "printchain":
+		err := printChainCmd.Parse(os.Args[2:])
+		if err != nil {
+			log.Panic(err)
+		}
+	default :
+		cli.printUsage()	//提示用户怎么正确输入命令
+		os.Exit(1)
+	}
+	
+	//进入被解析出的命令，进一步操作
+	if addBlockCmd.Parsed() {
+		if *addBlockData == " " {
+			addBlockCmd.Usage() 	//如果没有输入标志位data，则提醒用户怎么正确的输入
+			os.Exit(1)
+		}
+		//用户输入正确则进行加入区块的操作
+		cli.addBlock(*addBlockData)
+	}
+	if printChainCmd.Parsed() {
+		//打印区块链操作
+		cli.printChain()
+	}
+}
+
+//加入输入格式错误信息提示
+func(cli *CLI) printUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  addblock -data  区块信息")
+	fmt.Println("  printchain - Print all the blocks of the blockchain")
+}
+
+//判断命令行参数，如果没有输入参数则显示提示信息
+func (cli *CLI) validateArgs() {
+	if len(os.Args) &lt; 2 {
+		cli.printUsage()
+		os.Exit(1)
+	}
+}
+
+//加入区块函数调用
+func (cli *CLI) addBlock(data string) {
+	cli.BC.AddBlock(data)
+	fmt.Println("成功加入区块...")
+}
+
+//打印区块链函数调用
+func (cli *CLI) printChain() {
+	//这里需要用到迭代区块链的思想
+	//创建一个迭代器
+	bci := cli.BC.Iterator()
+
+	for {
+
+		block := bci.Next()	//从顶端区块向前面的区块迭代
+
+		fmt.Printf("PrevHash:%x\n",block.PrevBlockHash)
+		fmt.Printf("Data:%s\n",block.Data)
+		fmt.Printf("Hash:%x\n",block.Hash)
+		//验证当前区块的pow
+		pow := pow.NewProofOfWork(block)
+		boolen := pow.Validate()
+		fmt.Printf("POW is %s\n",strconv.FormatBool(boolen))
+		fmt.Println()
+		
+		if len(block.PrevBlockHash) == 0 {
+			break
+		}
+	}
+}</code></pre> 
+  <p>5、main包：</p> 
+  <pre class="has">
+<code class="language-Go">package main
+
+import (
+	"go_code/A_golang_blockchain/blockchain"
+	"go_code/A_golang_blockchain/CLI"
+)
+
+func main() {
+	//先创建一条区块链
+	bc := blockchain.NewBlockchain()
+	//这里bc中的字段db由于是小写字母开头，所以我工厂模式了db,由函数Db()返回db
+	//程序退出前关闭数据库
+	defer bc.Db().Close()
+
+	cli := CLI.CLI{bc}
+	cli.Run()
+
+	// //加入区块到区块链中
+	// bc.AddBlock("区块01")
+	// bc.AddBlock("区块02")
+
+	//打印出区块链中各个区块的信息,并验证各个区块是否合格
+	// for _,b := range bc.Blocks {
+
+	// 	fmt.Printf("时间戳：%v\n",b.Timestamp)
+	// 	fmt.Printf("Data：%s\n",b.Data)
+	// 	fmt.Printf("上一区块哈希：%x\n",b.PrevBlockHash)
+	// 	fmt.Printf("Hash：%x\n",b.Hash)
+	// 	fmt.Printf("Nonce：%v\n",b.Nonce)
+	// 	//验证当前区块的pow
+	// 	pow := pow.NewProofOfWork(b)
+	// 	boolen := pow.Validate()
+	// 	fmt.Printf("POW is %s\n",strconv.FormatBool(boolen))
+	// 	fmt.Println()
+	// }
+
+}</code></pre> 
+  <p>&nbsp;</p> 
+  <p>注释：上面的代码中注解都是很详细的，运行都能通过，在VScode编辑器中编辑时其中有两处有警告的提示，主要原因是我编写的Block结构体字段和CLI结构体字段的首字母都是大写的，警告提示为：<a href="https://stackoverflow.com/questions/36273920/disable-go-vet-checks-for-composite-literal-uses-unkeyed-fields" rel="nofollow"><span style="color:#f33b45;">Disable go vet checks for “composite literal uses unkeyed fields”，</span><span style="color:#86ca5e;">解释为我所使用的这两个结构体中的都是无键字段，所以警告，这种警告可以忽略的，是go vet的一个提示，并不是错误。</span></a></p> 
+  <p><span style="color:#86ca5e;">—— 如果以上有什么错误或者疑问欢迎指正，可以加我的联系方式进行讨论：微信（18382255942）——</span></p> 
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zyj0813/article/details/82053261,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zyj0813/article/details/82053261,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

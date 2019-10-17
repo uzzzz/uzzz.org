@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>修改Go语言(golang)编译器源代码让它支持UTF-8 BOM | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="修改Go语言(golang)编译器源代码让它支持UTF-8 BOM" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="　　Go语言（golang）第一个正式版Go1发布了，但是这个新兴的编程语言还是非常不完善。这不，我（Liigo）又发现它的编译器竟然不支持编译带BOM的UTF-8编码的.go源文件。这就很奇怪，该语言明明要求源代码文件.go必须是UTF-8编码，但又不允许带UTF-8 BOM。要知道，这个世界上带BOM的文件太多了，很多文本编辑器/代码编辑器/IDE支持生成、甚至默认生成带有BOM的UTF-8文件。如果仅仅因为源代码文件多了BOM，编译器就不能编译这个文件，那也太低能了。 Go语言编译器(gc)不支持带有BOM的UTF-8源文件： Golang&#39;s compiler (gc) don&#39;t accept the .go files with UTF-8 BOM:&nbsp; E:\liigo\golang\src&gt;go run hello.go package : hello.go:1:1: illegal character U+FEFF E:\liigo\golang\src&gt;go run hello.go # command-line-arguments .\hello.go:9: illegal UTF-8 sequence ce d2 　　好在Go语言是开源项目，我(Liigo)来贡献代码，让它支持编译带UTF-8 BOM的.go源代码文件。经过分析后发现，Go语言编译器（gc）源代码中有两处地方涉及从磁盘文件中读取.go文件：一个是C语言写的词法分析器（src/cmd/gc/lex.c），一个是Go语言写的.go文件解析器（src/pkg/go/parser/interface.go）。解决思路也很简单，就是从磁盘读取文件内容后，判断前三个字节，与UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf）核对，如果一致则忽略这三个字节，从第四个字节算作文件的真正内容，然后再交给词法分析器和解析器处理，后面就一切正常了。 　　Go语言的词法分析器是用C语言手工编写的，其中用到了lib9/libbio库，是一个磁盘文件读写缓冲区，逐字节从该缓冲区读取数据时，它可以允许“反读取”最近的最多4个字节。就是说，它可以把吐出来的最后那个字节再吸回去。假设我刚刚读取了abcd是个字节，现在我“反读取”后两个字节，实际上就相当于我刚刚读取了ab还没有读取cd。利用它的这个“反读取”机制，恰恰可以很容易的忽略掉UTF-8文件最前面的BOM：首先读出前三个字节，如果这三个字节正好是UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf），那么直接把刚刚读出的三个字节扔掉就完事了，后面词法分析器处理时正好从BOM后面的字节开始读取；如果已经读出的三个字节不是UTF-8 BOM呢，需要“反读取”，即把他们再放回去，就当作我没有读取过它们。修改后的代码如下： // src/cmd/gc/lex.c : 319 // Try to read and ignore UTF-8 BOM 320 c1 = Bgetc(curio.bin); 321 c2 = Bgetc(curio.bin); 322 c3 = Bgetc(curio.bin); 323 if(c1 != 0xef || c2 != 0xbb || c3 != 0xbf) { 324 // If not UTF-8 BOM, restore the bytes. 325 // Bungetsize &gt; 3, so we can safely call Bungetc() 3 times. 326 Bungetc(curio.bin); 327 Bungetc(curio.bin); 328 Bungetc(curio.bin); 329 } 　　Go语言的源代码解析器(pkg/go/parser)是用Go语言自己编写的，其功能是解析.go源代码文件为语法树。Go语言官方提供的go build命令用pkg/go/parser分析处理编译前的库依赖项。go build命令（pkg/go/parser）是把.go文件整个读入内存后再解析的。我要做的工作就是，在pkg/go/parser开始正式解析前，把前面可能存在的UTF-8 BOM删除掉即可，这个工作仅仅涉及Go语言中byte slice的基本操作，是很轻量级的廉价操作。 // src/pkg/go/parser/interface.go : +// The data read from .go files maybe start with the UTF-8 BOM(byte order mark), +// we ignore the bytes here to make sure that the parser parses properly. +// +func ignoreUTF8BOM(data []byte) []byte { + if data == nil { + return nil + } + if len(data) &gt;= 3 &amp;&amp; data[0] == 0xef &amp;&amp; data[1] == 0xbb &amp;&amp; data[2] == 0xbf { + return data[3:] + } + return data +} + // If src != nil, readSource converts src to a []byte if possible; // otherwise it returns an error. If src == nil, readSource returns // the result of reading the file specified by filename. @@ -27,22 +40,23 @@ case string: return []byte(s), nil case []byte: - return s, nil + return ignoreUTF8BOM(s), nil case *bytes.Buffer: // is io.Reader, but src is already available in []byte form if s != nil { - return s.Bytes(), nil + return ignoreUTF8BOM(s.Bytes()), nil } case io.Reader: var buf bytes.Buffer if _, err := io.Copy(&amp;buf, s); err != nil { return nil, err } - return buf.Bytes(), nil + return ignoreUTF8BOM(buf.Bytes()), nil } return nil, errors.New(&quot;invalid source&quot;) } - return ioutil.ReadFile(filename) + fileData, err := ioutil.ReadFile(filename) + return ignoreUTF8BOM(fileData), err } 　　我把上面修改的代码提交到Go语言官方源码库，代码审查页面地址是: http://codereview.appspot.com/6036054/, 或&nbsp;http://codereview.appsp0t.com/6036054/。 　　但是Go语言的作者/官方开发者拒绝这一改进。Go开发组老大Rob Pike亲自回复给出拒绝的理由： Strictly speaking, a BOM is legal in UTF-8 but only as a marker for the type of the data stream, a magic number if you will. Since Go source code is required to be UTF-8, a BOM is never necessary and arguably erroneous. We&#39;ve come this far without accepting BOMS and I&#39;d like to keep it that way. 　　在我看来，这理由非常勉强，在逻辑上甚至都不成立。哦，既然规定了.go必须使用UTF-8编码，所以就一定不能加UTF-8 BOM了？加了BOM就拒不认可了？前面已经说过了，几乎所有文本编辑器都支持UTF-8 BOM，怎么到你这里就不合法了。一个很现实的例子是，Windows XP / Windows 7系统内置的“记事本”程序（notepad.exe）在保存UTF-8文件时是一定会自动添加UTF-8 BOM的。也就是说，你想用记事本保存的.go源代码是一定不能编译通过的。但就是这么严重的问题，Go作者们就是不当一回事；这么容易就可以改进的问题，他们就是拒绝改进。生生的为用户使用go语言又凭空制造一道阻力。要说是面临技术方案的妥协选择折中还可以理解，偏偏要在无关紧要的地方坚持己见、宁死不去考虑方便用户。我只能说他们是死脑筋。类似的情况我遇到也不止一次了，总结下来就是：技术大牛挂帅做产品害人害己；闭门造车的代价是死都不知道咋死的。（这样的总结也为我们做易语言产品敲响了警钟：绝对不能单纯以技术人员的心态做产品。） --------------------------------------------------------------------------------------------------- 2013-7-15 Liigo&nbsp;补记： 2013年5月13日发布的 golang 1.1 终于支持带UTF-8 BOM的源代码文件了： &quot;The Unicode byte order mark U+FEFF, encoded in UTF-8, is now permitted as the first character of a Go source file.&quot; http://golang.org/doc/go1.1#unicode 这一日，距离Go语言开发组老大Rob Pike当年拒绝UTF-8 BOM那番话发表（2012-4-17，内容见上文），已过去一年多，可能他已经忘记自己曾经说过什么。 而且他们对源代码的修改思路也是跟我一致的（都修改了lex.c同一处；我虽然没有直接修改scanner，但通过修改parser也间接达到了目的）： cc2bca9c03ef&nbsp;by Rob Pike, 2012-9-10:&nbsp;gc: initial BOM is legal 3d58333e8e2a&nbsp;by Russ Cox, 2012-10-7:&nbsp;cmd/gc: skip over reported BOMs 4245c8cdc599&nbsp;by&nbsp;Robert Griesemer, 2012-9-7:&nbsp;go/scanner: skip first character if it&#39;s a BOM 30444b809a9e&nbsp;by&nbsp;Robert Griesemer, 2013-4-12:&nbsp;go/scanner: reject BOMs that are not at the beginning 看到没！三个作者（包括两位老大）先后修改提交了至少4次，前后跨度7个月，才总算达到了我一次性修改提交源代码的效果。（本人当时初学Go语言不久，自我感觉技术很烂！我在易语言公司就技术水平而言也是垫底的。） --------------------------------------------------------------------------------------------------- 2014-3-18 Liigo&nbsp;补记： 历史总是惊人的相似，时隔两年之后，我（Liigo）又修改了Rust编程语言编译器的源代码，为其增加了支持UTF-8 BOM的功能。与Go语言官方开发组形成鲜明对比的是，Rust官方开发人员很爽快的采纳了我这个Pull Request#12976：libsyntax: librustdoc: ignore utf-8 BOM in .rs files。 --------------------------------------------------------------------------------------------------- 2015-2-5 Liigo 更新：稍作文字修正和润色。 阅读更多" />
+<meta property="og:description" content="　　Go语言（golang）第一个正式版Go1发布了，但是这个新兴的编程语言还是非常不完善。这不，我（Liigo）又发现它的编译器竟然不支持编译带BOM的UTF-8编码的.go源文件。这就很奇怪，该语言明明要求源代码文件.go必须是UTF-8编码，但又不允许带UTF-8 BOM。要知道，这个世界上带BOM的文件太多了，很多文本编辑器/代码编辑器/IDE支持生成、甚至默认生成带有BOM的UTF-8文件。如果仅仅因为源代码文件多了BOM，编译器就不能编译这个文件，那也太低能了。 Go语言编译器(gc)不支持带有BOM的UTF-8源文件： Golang&#39;s compiler (gc) don&#39;t accept the .go files with UTF-8 BOM:&nbsp; E:\liigo\golang\src&gt;go run hello.go package : hello.go:1:1: illegal character U+FEFF E:\liigo\golang\src&gt;go run hello.go # command-line-arguments .\hello.go:9: illegal UTF-8 sequence ce d2 　　好在Go语言是开源项目，我(Liigo)来贡献代码，让它支持编译带UTF-8 BOM的.go源代码文件。经过分析后发现，Go语言编译器（gc）源代码中有两处地方涉及从磁盘文件中读取.go文件：一个是C语言写的词法分析器（src/cmd/gc/lex.c），一个是Go语言写的.go文件解析器（src/pkg/go/parser/interface.go）。解决思路也很简单，就是从磁盘读取文件内容后，判断前三个字节，与UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf）核对，如果一致则忽略这三个字节，从第四个字节算作文件的真正内容，然后再交给词法分析器和解析器处理，后面就一切正常了。 　　Go语言的词法分析器是用C语言手工编写的，其中用到了lib9/libbio库，是一个磁盘文件读写缓冲区，逐字节从该缓冲区读取数据时，它可以允许“反读取”最近的最多4个字节。就是说，它可以把吐出来的最后那个字节再吸回去。假设我刚刚读取了abcd是个字节，现在我“反读取”后两个字节，实际上就相当于我刚刚读取了ab还没有读取cd。利用它的这个“反读取”机制，恰恰可以很容易的忽略掉UTF-8文件最前面的BOM：首先读出前三个字节，如果这三个字节正好是UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf），那么直接把刚刚读出的三个字节扔掉就完事了，后面词法分析器处理时正好从BOM后面的字节开始读取；如果已经读出的三个字节不是UTF-8 BOM呢，需要“反读取”，即把他们再放回去，就当作我没有读取过它们。修改后的代码如下： // src/cmd/gc/lex.c : 319 // Try to read and ignore UTF-8 BOM 320 c1 = Bgetc(curio.bin); 321 c2 = Bgetc(curio.bin); 322 c3 = Bgetc(curio.bin); 323 if(c1 != 0xef || c2 != 0xbb || c3 != 0xbf) { 324 // If not UTF-8 BOM, restore the bytes. 325 // Bungetsize &gt; 3, so we can safely call Bungetc() 3 times. 326 Bungetc(curio.bin); 327 Bungetc(curio.bin); 328 Bungetc(curio.bin); 329 } 　　Go语言的源代码解析器(pkg/go/parser)是用Go语言自己编写的，其功能是解析.go源代码文件为语法树。Go语言官方提供的go build命令用pkg/go/parser分析处理编译前的库依赖项。go build命令（pkg/go/parser）是把.go文件整个读入内存后再解析的。我要做的工作就是，在pkg/go/parser开始正式解析前，把前面可能存在的UTF-8 BOM删除掉即可，这个工作仅仅涉及Go语言中byte slice的基本操作，是很轻量级的廉价操作。 // src/pkg/go/parser/interface.go : +// The data read from .go files maybe start with the UTF-8 BOM(byte order mark), +// we ignore the bytes here to make sure that the parser parses properly. +// +func ignoreUTF8BOM(data []byte) []byte { + if data == nil { + return nil + } + if len(data) &gt;= 3 &amp;&amp; data[0] == 0xef &amp;&amp; data[1] == 0xbb &amp;&amp; data[2] == 0xbf { + return data[3:] + } + return data +} + // If src != nil, readSource converts src to a []byte if possible; // otherwise it returns an error. If src == nil, readSource returns // the result of reading the file specified by filename. @@ -27,22 +40,23 @@ case string: return []byte(s), nil case []byte: - return s, nil + return ignoreUTF8BOM(s), nil case *bytes.Buffer: // is io.Reader, but src is already available in []byte form if s != nil { - return s.Bytes(), nil + return ignoreUTF8BOM(s.Bytes()), nil } case io.Reader: var buf bytes.Buffer if _, err := io.Copy(&amp;buf, s); err != nil { return nil, err } - return buf.Bytes(), nil + return ignoreUTF8BOM(buf.Bytes()), nil } return nil, errors.New(&quot;invalid source&quot;) } - return ioutil.ReadFile(filename) + fileData, err := ioutil.ReadFile(filename) + return ignoreUTF8BOM(fileData), err } 　　我把上面修改的代码提交到Go语言官方源码库，代码审查页面地址是: http://codereview.appspot.com/6036054/, 或&nbsp;http://codereview.appsp0t.com/6036054/。 　　但是Go语言的作者/官方开发者拒绝这一改进。Go开发组老大Rob Pike亲自回复给出拒绝的理由： Strictly speaking, a BOM is legal in UTF-8 but only as a marker for the type of the data stream, a magic number if you will. Since Go source code is required to be UTF-8, a BOM is never necessary and arguably erroneous. We&#39;ve come this far without accepting BOMS and I&#39;d like to keep it that way. 　　在我看来，这理由非常勉强，在逻辑上甚至都不成立。哦，既然规定了.go必须使用UTF-8编码，所以就一定不能加UTF-8 BOM了？加了BOM就拒不认可了？前面已经说过了，几乎所有文本编辑器都支持UTF-8 BOM，怎么到你这里就不合法了。一个很现实的例子是，Windows XP / Windows 7系统内置的“记事本”程序（notepad.exe）在保存UTF-8文件时是一定会自动添加UTF-8 BOM的。也就是说，你想用记事本保存的.go源代码是一定不能编译通过的。但就是这么严重的问题，Go作者们就是不当一回事；这么容易就可以改进的问题，他们就是拒绝改进。生生的为用户使用go语言又凭空制造一道阻力。要说是面临技术方案的妥协选择折中还可以理解，偏偏要在无关紧要的地方坚持己见、宁死不去考虑方便用户。我只能说他们是死脑筋。类似的情况我遇到也不止一次了，总结下来就是：技术大牛挂帅做产品害人害己；闭门造车的代价是死都不知道咋死的。（这样的总结也为我们做易语言产品敲响了警钟：绝对不能单纯以技术人员的心态做产品。） --------------------------------------------------------------------------------------------------- 2013-7-15 Liigo&nbsp;补记： 2013年5月13日发布的 golang 1.1 终于支持带UTF-8 BOM的源代码文件了： &quot;The Unicode byte order mark U+FEFF, encoded in UTF-8, is now permitted as the first character of a Go source file.&quot; http://golang.org/doc/go1.1#unicode 这一日，距离Go语言开发组老大Rob Pike当年拒绝UTF-8 BOM那番话发表（2012-4-17，内容见上文），已过去一年多，可能他已经忘记自己曾经说过什么。 而且他们对源代码的修改思路也是跟我一致的（都修改了lex.c同一处；我虽然没有直接修改scanner，但通过修改parser也间接达到了目的）： cc2bca9c03ef&nbsp;by Rob Pike, 2012-9-10:&nbsp;gc: initial BOM is legal 3d58333e8e2a&nbsp;by Russ Cox, 2012-10-7:&nbsp;cmd/gc: skip over reported BOMs 4245c8cdc599&nbsp;by&nbsp;Robert Griesemer, 2012-9-7:&nbsp;go/scanner: skip first character if it&#39;s a BOM 30444b809a9e&nbsp;by&nbsp;Robert Griesemer, 2013-4-12:&nbsp;go/scanner: reject BOMs that are not at the beginning 看到没！三个作者（包括两位老大）先后修改提交了至少4次，前后跨度7个月，才总算达到了我一次性修改提交源代码的效果。（本人当时初学Go语言不久，自我感觉技术很烂！我在易语言公司就技术水平而言也是垫底的。） --------------------------------------------------------------------------------------------------- 2014-3-18 Liigo&nbsp;补记： 历史总是惊人的相似，时隔两年之后，我（Liigo）又修改了Rust编程语言编译器的源代码，为其增加了支持UTF-8 BOM的功能。与Go语言官方开发组形成鲜明对比的是，Rust官方开发人员很爽快的采纳了我这个Pull Request#12976：libsyntax: librustdoc: ignore utf-8 BOM in .rs files。 --------------------------------------------------------------------------------------------------- 2015-2-5 Liigo 更新：稍作文字修正和润色。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2012/04/16/f38e13358190b4619ce7d9318274c898.html" />
+<meta property="og:url" content="https://uzzz.org/2012/04/16/f38e13358190b4619ce7d9318274c898.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2012-04-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"　　Go语言（golang）第一个正式版Go1发布了，但是这个新兴的编程语言还是非常不完善。这不，我（Liigo）又发现它的编译器竟然不支持编译带BOM的UTF-8编码的.go源文件。这就很奇怪，该语言明明要求源代码文件.go必须是UTF-8编码，但又不允许带UTF-8 BOM。要知道，这个世界上带BOM的文件太多了，很多文本编辑器/代码编辑器/IDE支持生成、甚至默认生成带有BOM的UTF-8文件。如果仅仅因为源代码文件多了BOM，编译器就不能编译这个文件，那也太低能了。 Go语言编译器(gc)不支持带有BOM的UTF-8源文件： Golang&#39;s compiler (gc) don&#39;t accept the .go files with UTF-8 BOM:&nbsp; E:\\liigo\\golang\\src&gt;go run hello.go package : hello.go:1:1: illegal character U+FEFF E:\\liigo\\golang\\src&gt;go run hello.go # command-line-arguments .\\hello.go:9: illegal UTF-8 sequence ce d2 　　好在Go语言是开源项目，我(Liigo)来贡献代码，让它支持编译带UTF-8 BOM的.go源代码文件。经过分析后发现，Go语言编译器（gc）源代码中有两处地方涉及从磁盘文件中读取.go文件：一个是C语言写的词法分析器（src/cmd/gc/lex.c），一个是Go语言写的.go文件解析器（src/pkg/go/parser/interface.go）。解决思路也很简单，就是从磁盘读取文件内容后，判断前三个字节，与UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf）核对，如果一致则忽略这三个字节，从第四个字节算作文件的真正内容，然后再交给词法分析器和解析器处理，后面就一切正常了。 　　Go语言的词法分析器是用C语言手工编写的，其中用到了lib9/libbio库，是一个磁盘文件读写缓冲区，逐字节从该缓冲区读取数据时，它可以允许“反读取”最近的最多4个字节。就是说，它可以把吐出来的最后那个字节再吸回去。假设我刚刚读取了abcd是个字节，现在我“反读取”后两个字节，实际上就相当于我刚刚读取了ab还没有读取cd。利用它的这个“反读取”机制，恰恰可以很容易的忽略掉UTF-8文件最前面的BOM：首先读出前三个字节，如果这三个字节正好是UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf），那么直接把刚刚读出的三个字节扔掉就完事了，后面词法分析器处理时正好从BOM后面的字节开始读取；如果已经读出的三个字节不是UTF-8 BOM呢，需要“反读取”，即把他们再放回去，就当作我没有读取过它们。修改后的代码如下： // src/cmd/gc/lex.c : 319 // Try to read and ignore UTF-8 BOM 320 c1 = Bgetc(curio.bin); 321 c2 = Bgetc(curio.bin); 322 c3 = Bgetc(curio.bin); 323 if(c1 != 0xef || c2 != 0xbb || c3 != 0xbf) { 324 // If not UTF-8 BOM, restore the bytes. 325 // Bungetsize &gt; 3, so we can safely call Bungetc() 3 times. 326 Bungetc(curio.bin); 327 Bungetc(curio.bin); 328 Bungetc(curio.bin); 329 } 　　Go语言的源代码解析器(pkg/go/parser)是用Go语言自己编写的，其功能是解析.go源代码文件为语法树。Go语言官方提供的go build命令用pkg/go/parser分析处理编译前的库依赖项。go build命令（pkg/go/parser）是把.go文件整个读入内存后再解析的。我要做的工作就是，在pkg/go/parser开始正式解析前，把前面可能存在的UTF-8 BOM删除掉即可，这个工作仅仅涉及Go语言中byte slice的基本操作，是很轻量级的廉价操作。 // src/pkg/go/parser/interface.go : +// The data read from .go files maybe start with the UTF-8 BOM(byte order mark), +// we ignore the bytes here to make sure that the parser parses properly. +// +func ignoreUTF8BOM(data []byte) []byte { + if data == nil { + return nil + } + if len(data) &gt;= 3 &amp;&amp; data[0] == 0xef &amp;&amp; data[1] == 0xbb &amp;&amp; data[2] == 0xbf { + return data[3:] + } + return data +} + // If src != nil, readSource converts src to a []byte if possible; // otherwise it returns an error. If src == nil, readSource returns // the result of reading the file specified by filename. @@ -27,22 +40,23 @@ case string: return []byte(s), nil case []byte: - return s, nil + return ignoreUTF8BOM(s), nil case *bytes.Buffer: // is io.Reader, but src is already available in []byte form if s != nil { - return s.Bytes(), nil + return ignoreUTF8BOM(s.Bytes()), nil } case io.Reader: var buf bytes.Buffer if _, err := io.Copy(&amp;buf, s); err != nil { return nil, err } - return buf.Bytes(), nil + return ignoreUTF8BOM(buf.Bytes()), nil } return nil, errors.New(&quot;invalid source&quot;) } - return ioutil.ReadFile(filename) + fileData, err := ioutil.ReadFile(filename) + return ignoreUTF8BOM(fileData), err } 　　我把上面修改的代码提交到Go语言官方源码库，代码审查页面地址是: http://codereview.appspot.com/6036054/, 或&nbsp;http://codereview.appsp0t.com/6036054/。 　　但是Go语言的作者/官方开发者拒绝这一改进。Go开发组老大Rob Pike亲自回复给出拒绝的理由： Strictly speaking, a BOM is legal in UTF-8 but only as a marker for the type of the data stream, a magic number if you will. Since Go source code is required to be UTF-8, a BOM is never necessary and arguably erroneous. We&#39;ve come this far without accepting BOMS and I&#39;d like to keep it that way. 　　在我看来，这理由非常勉强，在逻辑上甚至都不成立。哦，既然规定了.go必须使用UTF-8编码，所以就一定不能加UTF-8 BOM了？加了BOM就拒不认可了？前面已经说过了，几乎所有文本编辑器都支持UTF-8 BOM，怎么到你这里就不合法了。一个很现实的例子是，Windows XP / Windows 7系统内置的“记事本”程序（notepad.exe）在保存UTF-8文件时是一定会自动添加UTF-8 BOM的。也就是说，你想用记事本保存的.go源代码是一定不能编译通过的。但就是这么严重的问题，Go作者们就是不当一回事；这么容易就可以改进的问题，他们就是拒绝改进。生生的为用户使用go语言又凭空制造一道阻力。要说是面临技术方案的妥协选择折中还可以理解，偏偏要在无关紧要的地方坚持己见、宁死不去考虑方便用户。我只能说他们是死脑筋。类似的情况我遇到也不止一次了，总结下来就是：技术大牛挂帅做产品害人害己；闭门造车的代价是死都不知道咋死的。（这样的总结也为我们做易语言产品敲响了警钟：绝对不能单纯以技术人员的心态做产品。） --------------------------------------------------------------------------------------------------- 2013-7-15 Liigo&nbsp;补记： 2013年5月13日发布的 golang 1.1 终于支持带UTF-8 BOM的源代码文件了： &quot;The Unicode byte order mark U+FEFF, encoded in UTF-8, is now permitted as the first character of a Go source file.&quot; http://golang.org/doc/go1.1#unicode 这一日，距离Go语言开发组老大Rob Pike当年拒绝UTF-8 BOM那番话发表（2012-4-17，内容见上文），已过去一年多，可能他已经忘记自己曾经说过什么。 而且他们对源代码的修改思路也是跟我一致的（都修改了lex.c同一处；我虽然没有直接修改scanner，但通过修改parser也间接达到了目的）： cc2bca9c03ef&nbsp;by Rob Pike, 2012-9-10:&nbsp;gc: initial BOM is legal 3d58333e8e2a&nbsp;by Russ Cox, 2012-10-7:&nbsp;cmd/gc: skip over reported BOMs 4245c8cdc599&nbsp;by&nbsp;Robert Griesemer, 2012-9-7:&nbsp;go/scanner: skip first character if it&#39;s a BOM 30444b809a9e&nbsp;by&nbsp;Robert Griesemer, 2013-4-12:&nbsp;go/scanner: reject BOMs that are not at the beginning 看到没！三个作者（包括两位老大）先后修改提交了至少4次，前后跨度7个月，才总算达到了我一次性修改提交源代码的效果。（本人当时初学Go语言不久，自我感觉技术很烂！我在易语言公司就技术水平而言也是垫底的。） --------------------------------------------------------------------------------------------------- 2014-3-18 Liigo&nbsp;补记： 历史总是惊人的相似，时隔两年之后，我（Liigo）又修改了Rust编程语言编译器的源代码，为其增加了支持UTF-8 BOM的功能。与Go语言官方开发组形成鲜明对比的是，Rust官方开发人员很爽快的采纳了我这个Pull Request#12976：libsyntax: librustdoc: ignore utf-8 BOM in .rs files。 --------------------------------------------------------------------------------------------------- 2015-2-5 Liigo 更新：稍作文字修正和润色。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2012/04/16/f38e13358190b4619ce7d9318274c898.html","headline":"修改Go语言(golang)编译器源代码让它支持UTF-8 BOM","dateModified":"2012-04-16T00:00:00+08:00","datePublished":"2012-04-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2012/04/16/f38e13358190b4619ce7d9318274c898.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>修改Go语言(golang)编译器源代码让它支持UTF-8 BOM</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>　　Go语言（golang）第一个正式版Go1发布了，但是这个新兴的编程语言还是非常不完善。这不，我（Liigo）又发现它的编译器竟然不支持编译带<a href="http://zh.wikipedia.org/zh-cn/%E4%BD%8D%E5%85%83%E7%B5%84%E9%A0%86%E5%BA%8F%E8%A8%98%E8%99%9F" rel="nofollow">BOM</a>的UTF-8编码的.go源文件。这就很奇怪，该语言明明要求源代码文件.go必须是UTF-8编码，但又不允许带UTF-8 BOM。要知道，这个世界上带BOM的文件太多了，很多文本编辑器/代码编辑器/IDE支持生成、甚至默认生成带有BOM的UTF-8文件。如果仅仅因为源代码文件多了BOM，编译器就不能编译这个文件，那也太低能了。</p> 
+  <p><strong>Go语言编译器(gc)不支持带有BOM的UTF-8源文件</strong>：<br> Golang's compiler (gc) don't accept the .go files with UTF-8 BOM:&nbsp;</p> 
+  <pre><code class="language-plain">E:\liigo\golang\src&gt;go run hello.go
+package :
+hello.go:1:1: illegal character U+FEFF
+
+E:\liigo\golang\src&gt;go run hello.go
+# command-line-arguments
+.\hello.go:9: illegal UTF-8 sequence
+ce d2</code></pre>
+  <br> 　　好在Go语言是开源项目，我(Liigo)来贡献代码，让它支持编译带UTF-8 BOM的.go源代码文件。经过分析后发现，Go语言编译器（gc）源代码中有两处地方涉及从磁盘文件中读取.go文件：一个是C语言写的词法分析器（src/cmd/gc/lex.c），一个是Go语言写的.go文件解析器（src/pkg/go/parser/interface.go）。解决思路也很简单，就是从磁盘读取文件内容后，判断前三个字节，与UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf）核对，如果一致则忽略这三个字节，从第四个字节算作文件的真正内容，然后再交给词法分析器和解析器处理，后面就一切正常了。 
+  <p></p> 
+  <p>　　Go语言的词法分析器是用C语言手工编写的，其中用到了lib9/libbio库，是一个磁盘文件读写缓冲区，逐字节从该缓冲区读取数据时，它可以允许“反读取”最近的最多4个字节。就是说，它可以把吐出来的最后那个字节再吸回去。假设我刚刚读取了abcd是个字节，现在我“反读取”后两个字节，实际上就相当于我刚刚读取了ab还没有读取cd。利用它的这个“反读取”机制，恰恰可以很容易的忽略掉UTF-8文件最前面的BOM：首先读出前三个字节，如果这三个字节正好是UTF-8 BOM的三个字节（0xef, 0xbb, 0xbf），那么直接把刚刚读出的三个字节扔掉就完事了，后面词法分析器处理时正好从BOM后面的字节开始读取；如果已经读出的三个字节不是UTF-8 BOM呢，需要“反读取”，即把他们再放回去，就当作我没有读取过它们。修改后的代码如下：</p> 
+  <p></p> 
+  <pre><code class="language-cpp">// src/cmd/gc/lex.c : </code></pre>
+  <pre><code class="language-cpp">  319                 // Try to read and ignore UTF-8 BOM
+  320                 c1 = Bgetc(curio.bin);
+  321                 c2 = Bgetc(curio.bin);
+  322                 c3 = Bgetc(curio.bin);
+  323                 if(c1 != 0xef || c2 != 0xbb || c3 != 0xbf) {
+  324                         // If not UTF-8 BOM, restore the bytes.
+  325                         // Bungetsize &gt; 3, so we can safely call Bungetc() 3 times.
+  326                         Bungetc(curio.bin);
+  327                         Bungetc(curio.bin);
+  328                         Bungetc(curio.bin);
+  329                 }</code></pre>
+  <br>
+  <p>　　Go语言的源代码解析器(pkg/go/parser)是用Go语言自己编写的，其功能是解析.go源代码文件为语法树。Go语言官方提供的go build命令用pkg/go/parser分析处理编译前的库依赖项。go build命令（pkg/go/parser）是把.go文件整个读入内存后再解析的。我要做的工作就是，在pkg/go/parser开始正式解析前，把前面可能存在的UTF-8 BOM删除掉即可，这个工作仅仅涉及Go语言中byte slice的基本操作，是很轻量级的廉价操作。</p> 
+  <p></p> 
+  <pre><code class="language-plain">// src/pkg/go/parser/interface.go : </code></pre>
+  <pre><code class="language-plain">+// The data read from .go files maybe start with the UTF-8 BOM(byte order mark),
++// we ignore the bytes here to make sure that the parser parses properly.
++//
++func ignoreUTF8BOM(data []byte) []byte {
++	if data == nil {
++		return nil
++	}
++	if len(data) &gt;= 3 &amp;&amp; data[0] == 0xef &amp;&amp; data[1] == 0xbb &amp;&amp; data[2] == 0xbf {
++		return data[3:]
++	}
++	return data
++}
++
+ // If src != nil, readSource converts src to a []byte if possible;
+ // otherwise it returns an error. If src == nil, readSource returns
+ // the result of reading the file specified by filename.
+@@ -27,22 +40,23 @@
+ 		case string:
+ 			return []byte(s), nil
+ 		case []byte:
+-			return s, nil
++			return ignoreUTF8BOM(s), nil
+ 		case *bytes.Buffer:
+ 			// is io.Reader, but src is already available in []byte form
+ 			if s != nil {
+-				return s.Bytes(), nil
++				return ignoreUTF8BOM(s.Bytes()), nil
+ 			}
+ 		case io.Reader:
+ 			var buf bytes.Buffer
+ 			if _, err := io.Copy(&amp;buf, s); err != nil {
+ 				return nil, err
+ 			}
+-			return buf.Bytes(), nil
++			return ignoreUTF8BOM(buf.Bytes()), nil
+ 		}
+ 		return nil, errors.New("invalid source")
+ 	}
+-	return ioutil.ReadFile(filename)
++	fileData, err := ioutil.ReadFile(filename)
++	return ignoreUTF8BOM(fileData), err
+ }</code></pre> 
+  <p><br></p> 
+  <p>　　我把上面修改的代码提交到Go语言官方源码库，代码审查页面地址是: <a href="http://codereview.appspot.com/6036054/" rel="nofollow"> http://codereview.appspot.com/6036054/</a>, 或&nbsp;<a href="http://codereview.appsp0t.com/6036054/" rel="nofollow">http://codereview.appsp0t.com/6036054/</a>。</p> 
+  <p>　　但是Go语言的作者/官方开发者拒绝这一改进。Go开发组老大Rob Pike亲自回复给出拒绝的理由：</p> 
+  <p></p> 
+  <pre><code class="language-plain">Strictly speaking, a BOM is legal in UTF-8 but only as a marker for
+the type of the data stream, a magic number if you will. Since Go
+source code is required to be UTF-8, a BOM is never necessary and
+arguably erroneous. We've come this far without accepting BOMS and I'd
+like to keep it that way.</code></pre> 
+  <p></p> 
+  <p>　　在我看来，这理由非常勉强，在逻辑上甚至都不成立。哦，既然规定了.go必须使用UTF-8编码，所以就一定不能加UTF-8 BOM了？加了BOM就拒不认可了？前面已经说过了，几乎所有文本编辑器都支持UTF-8 BOM，怎么到你这里就不合法了。一个很现实的例子是，Windows XP / Windows 7系统内置的“记事本”程序（notepad.exe）在保存UTF-8文件时是一定会自动添加UTF-8 BOM的。也就是说，你想用记事本保存的.go源代码是一定不能编译通过的。但就是这么严重的问题，Go作者们就是不当一回事；这么容易就可以改进的问题，他们就是拒绝改进。生生的为用户使用go语言又凭空制造一道阻力。要说是面临技术方案的妥协选择折中还可以理解，偏偏要在无关紧要的地方坚持己见、宁死不去考虑方便用户。我只能说他们是死脑筋。类似的情况我遇到也不止一次了，总结下来就是：<span style="color:rgb(255,0,0);"><strong>技术大牛挂帅做产品害人害己</strong></span>；闭门造车的代价是死都不知道咋死的。（这样的总结也为我们做易语言产品敲响了警钟：绝对不能单纯以技术人员的心态做产品。）</p> 
+  <p><br></p> 
+  <p>---------------------------------------------------------------------------------------------------</p> 
+  <p><br></p> 
+  <p><span style="background-color:rgb(255,255,255);"><strong>2013-7-15 <strong>Liigo&nbsp;</strong>补记</strong></span>：</p> 
+  <p><span style="color:#ff0000;"><strong>2013年5月13日发布的 golang 1.1 终于支持带UTF-8 BOM的源代码文件了</strong></span>：</p> 
+  <p></p> 
+  <pre><code class="language-plain">"The Unicode byte order mark U+FEFF, encoded in UTF-8, is now permitted as the first character of a Go source file."</code></pre>
+  <a href="http://golang.org/doc/go1.1#unicode" rel="nofollow">http://golang.org/doc/go1.1#unicode</a>
+  <br>
+  <p></p> 
+  <p>这一日，距离Go语言开发组老大Rob Pike当年拒绝UTF-8 BOM那番话发表（2012-4-17，内容见上文），已过去一年多，可能他已经忘记自己曾经说过什么。</p> 
+  <p>而且他们对源代码的修改思路也是跟我一致的（都修改了lex.c同一处；我虽然没有直接修改scanner，但通过修改parser也间接达到了目的）：</p> 
+  <p><span style="color:#000000;font-family:monospace;font-size:13px;"><a href="https://code.google.com/p/go/source/detail?r=cc2bca9c03efda8fafafc3ab2259623ce9e84fdf&amp;path=/src/cmd/gc/lex.c" rel="nofollow" style="font-family:monospace;font-size:13px;">cc2bca9c03ef</a>&nbsp;by Rob Pike, 2012-9-10:&nbsp;</span><span style="font-family:Monaco, 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', 'Lucida Console', monospace;font-size:14px;">gc: initial BOM is legal</span></p> 
+  <p><a href="https://code.google.com/p/go/source/detail?r=3d58333e8e2ae19fedf4bc3a412f77dbd037bf5c&amp;path=/src/cmd/gc/lex.c" rel="nofollow" style="font-family:monospace;font-size:13px;">3d58333e8e2a</a><span style="font-family:monospace;font-size:13px;">&nbsp;by Russ Cox, 2012-10-7:&nbsp;</span><span style="font-family:Monaco, 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', 'Lucida Console', monospace;font-size:14px;">cmd/gc: skip over reported BOMs</span></p> 
+  <p><span style="color:#000000;font-family:monospace;font-size:13px;"><span style="color:#000000;"><a href="https://code.google.com/p/go/source/detail?r=4245c8cdc5994455551cd2ef113a3b9b60b97f19&amp;path=/src/pkg/go/scanner/scanner.go" rel="nofollow" style="color:#800080;">4245c8cdc599</a>&nbsp;by&nbsp;<span style="font-family:arial, sans-serif;font-size:14px;">Robert Griesemer, 2012-9-7:&nbsp;</span></span></span><span style="font-family:Monaco, 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', 'Lucida Console', monospace;font-size:14px;">go/scanner: skip first character if it's a BOM</span></p> 
+  <p><span style="color:#000000;font-family:monospace;font-size:13px;"><span style="color:#000000;font-family:monospace;font-size:13px;"><a href="https://code.google.com/p/go/source/detail?r=30444b809a9e15ff76ca49afe155fac2b0e5e979&amp;path=/src/pkg/go/scanner/scanner.go" rel="nofollow" style="color:#800080;font-family:monospace;font-size:13px;">30444b809a9e</a>&nbsp;by&nbsp;<span style="font-family:arial, sans-serif;font-size:14px;">Robert Griesemer, 2013-4-12:&nbsp;<span style="font-family:Monaco, 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', 'Lucida Console', monospace;font-size:14px;">go/scanner: reject BOMs that are not at the beginning</span><br></span></span></span></p> 
+  <p><strong>看到没！三个作者（包括两位老大）先后修改提交了至少4次，前后跨度7个月，才总算达到了我一次性修改提交源代码的效果。（本人<span style="font-weight:bold;">当时</span>初学Go语言不久，自我感觉技术很烂！我在易语言公司就技术水平而言也是垫底的。）</strong></p> 
+  <p><br></p> 
+  <p></p> 
+  <p>---------------------------------------------------------------------------------------------------</p> 
+  <p><br></p> 
+  <p><strong>2014-3-18 Liigo&nbsp;补记</strong>：</p> 
+  <p><span style="color:#ff0000;"><strong>历史总是惊人的相似，时隔两年之后，我（Liigo）又修改了<a href="http://www.rust-lang.org/" rel="nofollow">Rust编程语言</a>编译器的源代码，为其增加了支持UTF-8 BOM的功能。与Go语言官方开发组形成鲜明对比的是，Rust官方开发人员很爽快的采纳了我这个Pull Request<a href="https://github.com/mozilla/rust/pull/12976" rel="nofollow">#12976</a>：libsyntax: librustdoc: ignore utf-8 BOM in .rs files。</strong></span></p> 
+  <br>
+  <p>---------------------------------------------------------------------------------------------------<br></p> 
+  <p><br></p> 
+  <p>2015-2-5 Liigo 更新：稍作文字修正和润色。</p> 
+  <p><br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liigo/article/details/7467309,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liigo/article/details/7467309,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

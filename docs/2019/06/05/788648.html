@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>PostgreSQL的clog—从事务回滚速度谈起 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="PostgreSQL的clog—从事务回滚速度谈起" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="如果是之前学习别的数据库的人，看PostgreSQL会感觉到有句话非常奇怪：“PostgreSQL的回滚是立即完成的，不会受到事务大小本身的影响”。 奇怪在哪里呢？比方我曾经遇到过一次MySQL的故障，一个开发给生产数据库导入数据，用的是Python脚本，但是，他没有注意一个事情，Python的MySQLdb默认情况下，是设置autocommit为0的，于是这哥们导数据（这里说的导入，不是普通那种load data，而是带有业务操作的SQL语句，所以需要脚本操作）脚本跑了一天之后，整个数据库的状况就变得极为糟糕了：他导入所用的，是一个业务的核心表，一堆业务操作都需要操作这个表，但随着这个导入动作跑了一天，占掉了大量的行锁（几百万行锁）之后，整个业务系统的对外服务都会处于一个无法求到锁的状况了（还掺和着MySQL间隙锁的坑坑洼洼），业务服务停摆，于是，作为DBA来说，最终的决策，只有杀掉这个”大”事务了。一个kill命令过去之后，我们当时俩DBA开始慢慢数—小蚂蚁慢慢爬——碰到—颗大豆芽——碰到两颗大豆芽—— 最终在将近三个小时的rollback之后，这个事务完成回滚，业务系统恢复。 所以看到PostgreSQL的这个描述之后，我第一时间的反应是，why？how？what？于是就有了这一篇文章，我从PG的事务可见性判断讲起，整理一下PG核心文件clog的机理与作用。 另注：从pg 10以后，clog改名为xact，主要原因，是很多人习惯性地使用*log删除日志文件，总是会不小心删除掉原先的xlog与clog文件，导致数据库不可用，所以分别改名为wal与xact，后文依然以clog为讨论单词，需要注意。&nbsp;clog简介 第一个问题，什么是clog？或者换个说法，PG到底有哪些日志，它们分别是干啥的？除了理所当前的各路文本记录（比方数据库的运行报错日志之类），PG的二进制类日志文件主要有两个，一个就是对应传统数据库理论的redo日志，理论上，所有数据的修改操作都会被记录到这个日志，在事务提交的时候确保操作都记录到磁盘中，这样讲即便发生宕机，数据库也能以不丢数据的形态重新复活。 但是，各个数据库在这个点上都有不同的实现，比方MySQL会有一个binlog用于跨存储引擎的主从同步，而在PG中，主从同步已经通过redo日志（PG术语为XLOG）同步的情况下，为了处理没有undo带来的一系列问题，其中可见性判断这个功能，就是交给clog日志文件解决的。 Clog中记录了每一个事务相关的xid（记得之前曾吐槽过这个玩意的大小问题带来的freeze问题）以及xid对应的事务的提交状态。提交状态包括以下一些：执行中，已提交，已中断，已提交的子事务。看到这里，就可以明白，只要事务提交的时候，设置状态为已提交，而事务回滚的时候，设置状态为已中断，就可以达到目的，的确避免了操作数百万行的事务突然要回滚时候的巨大代价。 但我看到这里的时候，就产生一个疑惑，这样的话，我查数据的时候，见到一行的xid之后，需要马上确认其可见性，就需要去查clog，这个查询频率势必极高而且随机性很大，这个问题该怎么解决呢？ #define&nbsp;CLOG_BITS_PER_XACT&nbsp;&nbsp;&nbsp;&nbsp;2 #define CLOG_XACTS_PER_BYTE 4 #define CLOG_XACTS_PER_PAGE （BLCKSZ * CLOG_XACTS_PER_BYTE） #define&nbsp;CLOG_XACT_BITMASK&nbsp;&nbsp;&nbsp;&nbsp;（（1&nbsp;&lt;&lt;&nbsp;CLOG_BITS_PER_XACT）&nbsp;-&nbsp;1） #define TransactionIdToPage（xid） （（xid） / （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToPgIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToByte（xid） （TransactionIdToPgIndex（xid） / CLOG_XACTS_PER_BYTE） #define TransactionIdToBIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_BYTE） PG代码给了一个非常精彩的回答。 还记得之前vacuum那个里面，我大力吐槽PG对32位xid的执着，但这个32位id果真一无是处吗？看到这里才明白，还留着这么一笔思路。 一个简单的算术，每个事务标记占据2个比特位（无符号0 1 2 3对应前面提到的事务状态），也就是说，每个字节可以保存4个事务，每当PG需要确定当前事务状态的时候，就直接根据当前事务id计算得到对应的clog页位置（除每页clog之后的整数商是页数字，而余数则是在页中的具体位置）。真是把文件当hash表用的典范啊。 在32位xid的情况下，假设xid限制是20亿，每个8K的clog页存储32k事务位的情况下，clog最大也才五百来MB，这部分交给操作系统的文件缓存足以保障访问效率了。 真是一个绝妙的主意不是么？如果不考虑64位xid的情况下，clog大小完全不可控的情况的话。 还是把话题集中在clog，下面我们来探讨的是，当事务提交或者回滚的时候，其内部的运作机理又是如何呢？ 以及，前文中可以看到的一个明显问题，pg这种操作的话，写入的行必然是一个”执行中事务状态”的行，这种行难道是每次查的时候，都得去找clog判断吗？如果频繁扫他几百万行，是不是会有问题？&nbsp;clog实现内部 前面提到，clog里面会记录的是xid对应的事务状态。在PG里面，xid是一个珍贵的资源（考虑到每20亿大限的成住空坏），因此并不是每个事务都会被分配到xid。 一般来说，只有一个事务进行了数据修改（比如insert，update，delete）之类的操作，才会被分配给一个xid。 当这个事务最终提交或者回滚的时候，其最终状态就会被记录入clog。 事务提交与回滚时候的clog操作 首先来说提交。 抛开其他各种过程，每次事务提交的时候，主要的调用路径是： CommitTransaction（提交事务时候调用）-&gt; RecordTransactionCommit（记录事务为已提交）-&gt; TransactionIdCommitTree（同步标记事务为提交）/TransactionIdAsyncCommitTree（异步标记事务为提交，调用下一步需要提供lsn）-&gt; TransactionIdSetTreeStatus（设置事务与子事务状态）-&gt; TransactionIdSetPageStatus（设置单数据页内事务状态）-&gt; TransactionIdSetPageStatusInternal（设置实际文件页）-&gt; TransactionIdSetStatusBit（设置比特位） 其中值得拿出来讲的，主要是TransactionIdSetTreeStatus这个方法。 这里涉及到一个概念，子事务。在PG这个地方，子事务的概念主要指：事务从开始到结束，期间可以savepoint，之后rollback到savepoint而不是事务起点，在实际情况中多有应用，因此这里父事务与子事务（比如事务最终提交，但期间有回滚的情况，或者事务期间多次save point）必须尽可能原子性的方式写入，否则事务可见性就会出现问题。 在代码注释里面，对这里的写入做了一个比较直观的例子：比如一个事务t，有子事务 t1，t2，t3，t4，其中t，t1被映射到clog页p1，t2和t3在p2，t4在页p3。那么写入的时候，顺序如下： 设置p2 的t2 t3为子提交，之后设置p3的t4位子提交 设置t1为子提交，之后设置t为已提交，之后设置t1为已提交 设置 t2 t3 为已提交，设置t4位已提交 对于回滚，实际上也是调用TransactionIdSetTreeStatus方法，只是上层函数是TransactionIdAbortTree，设置的标记是TRANSACTIONSTATUSABORTED，也就是记录事务为中断。语义上来说，对于事务中断，由于事务的原子性要求，中断的事务数据就是不可见的了，没啥问题。&nbsp;数据行事务可见性的判断与clog 众所周知的是，pg新增行都会对原先的行打一个删除标记，然后写在原先行的旁边，理所当然地，每个数据行都会记录一个事务标记（当然还有数据行对应的事务id），来确保可见性，避免看到事务层面已经rollback的事务。 首先，写入的当时，事务没有结束的时候，必然是”执行中”这个状态。当事务之后提交，或者回滚的时候，pg是必然不会回头改这个标记的，否则无论提交还是回滚，都是一个代价巨大的事情。 就前文所言，pg的事务可见性，是通过行的事务id，找到clog里面对应的标记位置，然后判断的，这里非常理所当然的一个事情是，这种判断，每一行做一次就足够了，判断清楚后，修改掉这个事务标记为已提交或者是中断事务，后续读取的时候，就不需要回查clog了。 PG当然就是这么干的。 也就是说，前一个事务所有修改的数据，它没有在提交或者回滚的当时改掉所有的修改标记，而是把烂摊子丢给后来的人。 而这里还藏着一个问题：你既然修改了行的标记，那理所当然地，行所在数据块的校验和就变了，校验和变了，那块是不是就必须得传到wal缓存走流程了？即便没有涉及数据的变更？而且考虑到从库查询的时候，查数据也可以直接走从库的clog流程，这个数据块是不是必须传给从库？ 那么，现在就有一个现成的面试问题了：PostgreSQL单纯的select执行，会不会产生WAL日志？ 事实上，这里的事务标记带来的校验和的问题，在PG里面的处理是比较特殊的。 PostgreSQL里面，当且仅当设置了walloghints或者初始化时候，initdb启用了checksum的情况下，才会在设置标记为的时候去写WAL日志。 而且这里还不是每次设置标记位都会写。 必须得是，前一次checkpoint之后，数据块第一次被修改就是sethintbit操作的情况下，才会写整个数据块到WAL。&nbsp;clog的一些衍生思考 实际上就清理过期数据，MySQL也是用delete+insert替代update，但在清理以及处理上，并没有搞到vacuum这么大代价，比如MySQL的purge线程的执行，一般很少需要特别关注，而PostgreSQL的vacuum虽然说是并行化，但是在单表内却是串行的，民间贡献的表内并行vacuum的补丁因为各种bug迟迟没有合并（目前来看PG12没戏了），这个事情为什么会这样呢？ 因为clog毕竟只是事务可见性的标记，而不是事务的修改关联。在传统的undo类实现中，修改的数据，以及关联的事务等，都在undo按照顺序存储，purge执行的之后，直接从undo就可以找到对应的需要处理的数据块直接处理。 但是对于PG来说，由于仅仅只有事务标记，vacuum必须扫描所有的数据文件的数据块来处理这个问题，虽然pg里面，vacuum和统计信息采集合二为一（统计信息采集是传统数据库最大的全库扫描行为了），但必然需要付出的全库扫描代价却一个都不会少。 因此vacuum对超大表非常慢，极端情况下在vacuum freezen时候导致全库不可用（freezen结束前不允许执行新事务），就是有极大可能的事情了。 为了解决超大表，传统建议是使用分区表，但PostgreSQL的官方实现里面，分区表一直不太稳定，并且支持不足，因此又不得不引入pathman这个外部组件来协调处理，导致运维复杂度的进一步上升，就成了理所当然的事情。 不过目前就PostgreSQL 12来说，已经在逐渐开放存储引擎层面的接口，而社区中实现的undo版本的存储引擎，虽然因为完成度问题没有在本次release中发布，但未来可期，相信vacuum这一类问题，在未来必然会得到更好的处理。往期精选 从Oracle到PostgreSQL：动态性能视图 vs 标准统计视图 从 Oracle 到 PostgreSQL ：从 Uptime 到数据库实例运行时间 作者：刘伟，云和恩墨软件开发部研究院研究员；前微博DBA，主要研究方向为开源数据库，分布式数据库，擅长自动化运维以及数据库内核研究。 编辑：尹文敏 公司简介&nbsp;&nbsp;|&nbsp;招聘&nbsp;|&nbsp;DTCC&nbsp;|&nbsp;数据技术嘉年华&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;入驻华为严选商城&nbsp;&nbsp; zCloud&nbsp;|&nbsp;SQM&nbsp;|&nbsp;Bethune Pro2&nbsp;|&nbsp;zData一体机&nbsp;|&nbsp;Mydata一体机&nbsp;|&nbsp;ZDBM 备份一体机 Oracle技术架构&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;数据库排行榜&nbsp;|&nbsp;DBASK问题集萃&nbsp;|&nbsp;技术通讯&nbsp; 升级迁移&nbsp;|&nbsp;性能优化&nbsp;|&nbsp;智能整合&nbsp;|&nbsp;安全保障&nbsp;|&nbsp;&nbsp;架构设计&nbsp;|&nbsp;SQL审核&nbsp;|&nbsp;分布式架构&nbsp;|&nbsp;高可用容灾&nbsp;|&nbsp;运维代维 云和恩墨大讲堂 |&nbsp;一个分享交流的地方 长按，识别二维码，加入万人交流社群 请备注：云和恩墨大讲堂" />
+<meta property="og:description" content="如果是之前学习别的数据库的人，看PostgreSQL会感觉到有句话非常奇怪：“PostgreSQL的回滚是立即完成的，不会受到事务大小本身的影响”。 奇怪在哪里呢？比方我曾经遇到过一次MySQL的故障，一个开发给生产数据库导入数据，用的是Python脚本，但是，他没有注意一个事情，Python的MySQLdb默认情况下，是设置autocommit为0的，于是这哥们导数据（这里说的导入，不是普通那种load data，而是带有业务操作的SQL语句，所以需要脚本操作）脚本跑了一天之后，整个数据库的状况就变得极为糟糕了：他导入所用的，是一个业务的核心表，一堆业务操作都需要操作这个表，但随着这个导入动作跑了一天，占掉了大量的行锁（几百万行锁）之后，整个业务系统的对外服务都会处于一个无法求到锁的状况了（还掺和着MySQL间隙锁的坑坑洼洼），业务服务停摆，于是，作为DBA来说，最终的决策，只有杀掉这个”大”事务了。一个kill命令过去之后，我们当时俩DBA开始慢慢数—小蚂蚁慢慢爬——碰到—颗大豆芽——碰到两颗大豆芽—— 最终在将近三个小时的rollback之后，这个事务完成回滚，业务系统恢复。 所以看到PostgreSQL的这个描述之后，我第一时间的反应是，why？how？what？于是就有了这一篇文章，我从PG的事务可见性判断讲起，整理一下PG核心文件clog的机理与作用。 另注：从pg 10以后，clog改名为xact，主要原因，是很多人习惯性地使用*log删除日志文件，总是会不小心删除掉原先的xlog与clog文件，导致数据库不可用，所以分别改名为wal与xact，后文依然以clog为讨论单词，需要注意。&nbsp;clog简介 第一个问题，什么是clog？或者换个说法，PG到底有哪些日志，它们分别是干啥的？除了理所当前的各路文本记录（比方数据库的运行报错日志之类），PG的二进制类日志文件主要有两个，一个就是对应传统数据库理论的redo日志，理论上，所有数据的修改操作都会被记录到这个日志，在事务提交的时候确保操作都记录到磁盘中，这样讲即便发生宕机，数据库也能以不丢数据的形态重新复活。 但是，各个数据库在这个点上都有不同的实现，比方MySQL会有一个binlog用于跨存储引擎的主从同步，而在PG中，主从同步已经通过redo日志（PG术语为XLOG）同步的情况下，为了处理没有undo带来的一系列问题，其中可见性判断这个功能，就是交给clog日志文件解决的。 Clog中记录了每一个事务相关的xid（记得之前曾吐槽过这个玩意的大小问题带来的freeze问题）以及xid对应的事务的提交状态。提交状态包括以下一些：执行中，已提交，已中断，已提交的子事务。看到这里，就可以明白，只要事务提交的时候，设置状态为已提交，而事务回滚的时候，设置状态为已中断，就可以达到目的，的确避免了操作数百万行的事务突然要回滚时候的巨大代价。 但我看到这里的时候，就产生一个疑惑，这样的话，我查数据的时候，见到一行的xid之后，需要马上确认其可见性，就需要去查clog，这个查询频率势必极高而且随机性很大，这个问题该怎么解决呢？ #define&nbsp;CLOG_BITS_PER_XACT&nbsp;&nbsp;&nbsp;&nbsp;2 #define CLOG_XACTS_PER_BYTE 4 #define CLOG_XACTS_PER_PAGE （BLCKSZ * CLOG_XACTS_PER_BYTE） #define&nbsp;CLOG_XACT_BITMASK&nbsp;&nbsp;&nbsp;&nbsp;（（1&nbsp;&lt;&lt;&nbsp;CLOG_BITS_PER_XACT）&nbsp;-&nbsp;1） #define TransactionIdToPage（xid） （（xid） / （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToPgIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToByte（xid） （TransactionIdToPgIndex（xid） / CLOG_XACTS_PER_BYTE） #define TransactionIdToBIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_BYTE） PG代码给了一个非常精彩的回答。 还记得之前vacuum那个里面，我大力吐槽PG对32位xid的执着，但这个32位id果真一无是处吗？看到这里才明白，还留着这么一笔思路。 一个简单的算术，每个事务标记占据2个比特位（无符号0 1 2 3对应前面提到的事务状态），也就是说，每个字节可以保存4个事务，每当PG需要确定当前事务状态的时候，就直接根据当前事务id计算得到对应的clog页位置（除每页clog之后的整数商是页数字，而余数则是在页中的具体位置）。真是把文件当hash表用的典范啊。 在32位xid的情况下，假设xid限制是20亿，每个8K的clog页存储32k事务位的情况下，clog最大也才五百来MB，这部分交给操作系统的文件缓存足以保障访问效率了。 真是一个绝妙的主意不是么？如果不考虑64位xid的情况下，clog大小完全不可控的情况的话。 还是把话题集中在clog，下面我们来探讨的是，当事务提交或者回滚的时候，其内部的运作机理又是如何呢？ 以及，前文中可以看到的一个明显问题，pg这种操作的话，写入的行必然是一个”执行中事务状态”的行，这种行难道是每次查的时候，都得去找clog判断吗？如果频繁扫他几百万行，是不是会有问题？&nbsp;clog实现内部 前面提到，clog里面会记录的是xid对应的事务状态。在PG里面，xid是一个珍贵的资源（考虑到每20亿大限的成住空坏），因此并不是每个事务都会被分配到xid。 一般来说，只有一个事务进行了数据修改（比如insert，update，delete）之类的操作，才会被分配给一个xid。 当这个事务最终提交或者回滚的时候，其最终状态就会被记录入clog。 事务提交与回滚时候的clog操作 首先来说提交。 抛开其他各种过程，每次事务提交的时候，主要的调用路径是： CommitTransaction（提交事务时候调用）-&gt; RecordTransactionCommit（记录事务为已提交）-&gt; TransactionIdCommitTree（同步标记事务为提交）/TransactionIdAsyncCommitTree（异步标记事务为提交，调用下一步需要提供lsn）-&gt; TransactionIdSetTreeStatus（设置事务与子事务状态）-&gt; TransactionIdSetPageStatus（设置单数据页内事务状态）-&gt; TransactionIdSetPageStatusInternal（设置实际文件页）-&gt; TransactionIdSetStatusBit（设置比特位） 其中值得拿出来讲的，主要是TransactionIdSetTreeStatus这个方法。 这里涉及到一个概念，子事务。在PG这个地方，子事务的概念主要指：事务从开始到结束，期间可以savepoint，之后rollback到savepoint而不是事务起点，在实际情况中多有应用，因此这里父事务与子事务（比如事务最终提交，但期间有回滚的情况，或者事务期间多次save point）必须尽可能原子性的方式写入，否则事务可见性就会出现问题。 在代码注释里面，对这里的写入做了一个比较直观的例子：比如一个事务t，有子事务 t1，t2，t3，t4，其中t，t1被映射到clog页p1，t2和t3在p2，t4在页p3。那么写入的时候，顺序如下： 设置p2 的t2 t3为子提交，之后设置p3的t4位子提交 设置t1为子提交，之后设置t为已提交，之后设置t1为已提交 设置 t2 t3 为已提交，设置t4位已提交 对于回滚，实际上也是调用TransactionIdSetTreeStatus方法，只是上层函数是TransactionIdAbortTree，设置的标记是TRANSACTIONSTATUSABORTED，也就是记录事务为中断。语义上来说，对于事务中断，由于事务的原子性要求，中断的事务数据就是不可见的了，没啥问题。&nbsp;数据行事务可见性的判断与clog 众所周知的是，pg新增行都会对原先的行打一个删除标记，然后写在原先行的旁边，理所当然地，每个数据行都会记录一个事务标记（当然还有数据行对应的事务id），来确保可见性，避免看到事务层面已经rollback的事务。 首先，写入的当时，事务没有结束的时候，必然是”执行中”这个状态。当事务之后提交，或者回滚的时候，pg是必然不会回头改这个标记的，否则无论提交还是回滚，都是一个代价巨大的事情。 就前文所言，pg的事务可见性，是通过行的事务id，找到clog里面对应的标记位置，然后判断的，这里非常理所当然的一个事情是，这种判断，每一行做一次就足够了，判断清楚后，修改掉这个事务标记为已提交或者是中断事务，后续读取的时候，就不需要回查clog了。 PG当然就是这么干的。 也就是说，前一个事务所有修改的数据，它没有在提交或者回滚的当时改掉所有的修改标记，而是把烂摊子丢给后来的人。 而这里还藏着一个问题：你既然修改了行的标记，那理所当然地，行所在数据块的校验和就变了，校验和变了，那块是不是就必须得传到wal缓存走流程了？即便没有涉及数据的变更？而且考虑到从库查询的时候，查数据也可以直接走从库的clog流程，这个数据块是不是必须传给从库？ 那么，现在就有一个现成的面试问题了：PostgreSQL单纯的select执行，会不会产生WAL日志？ 事实上，这里的事务标记带来的校验和的问题，在PG里面的处理是比较特殊的。 PostgreSQL里面，当且仅当设置了walloghints或者初始化时候，initdb启用了checksum的情况下，才会在设置标记为的时候去写WAL日志。 而且这里还不是每次设置标记位都会写。 必须得是，前一次checkpoint之后，数据块第一次被修改就是sethintbit操作的情况下，才会写整个数据块到WAL。&nbsp;clog的一些衍生思考 实际上就清理过期数据，MySQL也是用delete+insert替代update，但在清理以及处理上，并没有搞到vacuum这么大代价，比如MySQL的purge线程的执行，一般很少需要特别关注，而PostgreSQL的vacuum虽然说是并行化，但是在单表内却是串行的，民间贡献的表内并行vacuum的补丁因为各种bug迟迟没有合并（目前来看PG12没戏了），这个事情为什么会这样呢？ 因为clog毕竟只是事务可见性的标记，而不是事务的修改关联。在传统的undo类实现中，修改的数据，以及关联的事务等，都在undo按照顺序存储，purge执行的之后，直接从undo就可以找到对应的需要处理的数据块直接处理。 但是对于PG来说，由于仅仅只有事务标记，vacuum必须扫描所有的数据文件的数据块来处理这个问题，虽然pg里面，vacuum和统计信息采集合二为一（统计信息采集是传统数据库最大的全库扫描行为了），但必然需要付出的全库扫描代价却一个都不会少。 因此vacuum对超大表非常慢，极端情况下在vacuum freezen时候导致全库不可用（freezen结束前不允许执行新事务），就是有极大可能的事情了。 为了解决超大表，传统建议是使用分区表，但PostgreSQL的官方实现里面，分区表一直不太稳定，并且支持不足，因此又不得不引入pathman这个外部组件来协调处理，导致运维复杂度的进一步上升，就成了理所当然的事情。 不过目前就PostgreSQL 12来说，已经在逐渐开放存储引擎层面的接口，而社区中实现的undo版本的存储引擎，虽然因为完成度问题没有在本次release中发布，但未来可期，相信vacuum这一类问题，在未来必然会得到更好的处理。往期精选 从Oracle到PostgreSQL：动态性能视图 vs 标准统计视图 从 Oracle 到 PostgreSQL ：从 Uptime 到数据库实例运行时间 作者：刘伟，云和恩墨软件开发部研究院研究员；前微博DBA，主要研究方向为开源数据库，分布式数据库，擅长自动化运维以及数据库内核研究。 编辑：尹文敏 公司简介&nbsp;&nbsp;|&nbsp;招聘&nbsp;|&nbsp;DTCC&nbsp;|&nbsp;数据技术嘉年华&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;入驻华为严选商城&nbsp;&nbsp; zCloud&nbsp;|&nbsp;SQM&nbsp;|&nbsp;Bethune Pro2&nbsp;|&nbsp;zData一体机&nbsp;|&nbsp;Mydata一体机&nbsp;|&nbsp;ZDBM 备份一体机 Oracle技术架构&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;数据库排行榜&nbsp;|&nbsp;DBASK问题集萃&nbsp;|&nbsp;技术通讯&nbsp; 升级迁移&nbsp;|&nbsp;性能优化&nbsp;|&nbsp;智能整合&nbsp;|&nbsp;安全保障&nbsp;|&nbsp;&nbsp;架构设计&nbsp;|&nbsp;SQL审核&nbsp;|&nbsp;分布式架构&nbsp;|&nbsp;高可用容灾&nbsp;|&nbsp;运维代维 云和恩墨大讲堂 |&nbsp;一个分享交流的地方 长按，识别二维码，加入万人交流社群 请备注：云和恩墨大讲堂" />
+<link rel="canonical" href="https://uzzz.org/2019/06/05/788648.html" />
+<meta property="og:url" content="https://uzzz.org/2019/06/05/788648.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-06-05T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"如果是之前学习别的数据库的人，看PostgreSQL会感觉到有句话非常奇怪：“PostgreSQL的回滚是立即完成的，不会受到事务大小本身的影响”。 奇怪在哪里呢？比方我曾经遇到过一次MySQL的故障，一个开发给生产数据库导入数据，用的是Python脚本，但是，他没有注意一个事情，Python的MySQLdb默认情况下，是设置autocommit为0的，于是这哥们导数据（这里说的导入，不是普通那种load data，而是带有业务操作的SQL语句，所以需要脚本操作）脚本跑了一天之后，整个数据库的状况就变得极为糟糕了：他导入所用的，是一个业务的核心表，一堆业务操作都需要操作这个表，但随着这个导入动作跑了一天，占掉了大量的行锁（几百万行锁）之后，整个业务系统的对外服务都会处于一个无法求到锁的状况了（还掺和着MySQL间隙锁的坑坑洼洼），业务服务停摆，于是，作为DBA来说，最终的决策，只有杀掉这个”大”事务了。一个kill命令过去之后，我们当时俩DBA开始慢慢数—小蚂蚁慢慢爬——碰到—颗大豆芽——碰到两颗大豆芽—— 最终在将近三个小时的rollback之后，这个事务完成回滚，业务系统恢复。 所以看到PostgreSQL的这个描述之后，我第一时间的反应是，why？how？what？于是就有了这一篇文章，我从PG的事务可见性判断讲起，整理一下PG核心文件clog的机理与作用。 另注：从pg 10以后，clog改名为xact，主要原因，是很多人习惯性地使用*log删除日志文件，总是会不小心删除掉原先的xlog与clog文件，导致数据库不可用，所以分别改名为wal与xact，后文依然以clog为讨论单词，需要注意。&nbsp;clog简介 第一个问题，什么是clog？或者换个说法，PG到底有哪些日志，它们分别是干啥的？除了理所当前的各路文本记录（比方数据库的运行报错日志之类），PG的二进制类日志文件主要有两个，一个就是对应传统数据库理论的redo日志，理论上，所有数据的修改操作都会被记录到这个日志，在事务提交的时候确保操作都记录到磁盘中，这样讲即便发生宕机，数据库也能以不丢数据的形态重新复活。 但是，各个数据库在这个点上都有不同的实现，比方MySQL会有一个binlog用于跨存储引擎的主从同步，而在PG中，主从同步已经通过redo日志（PG术语为XLOG）同步的情况下，为了处理没有undo带来的一系列问题，其中可见性判断这个功能，就是交给clog日志文件解决的。 Clog中记录了每一个事务相关的xid（记得之前曾吐槽过这个玩意的大小问题带来的freeze问题）以及xid对应的事务的提交状态。提交状态包括以下一些：执行中，已提交，已中断，已提交的子事务。看到这里，就可以明白，只要事务提交的时候，设置状态为已提交，而事务回滚的时候，设置状态为已中断，就可以达到目的，的确避免了操作数百万行的事务突然要回滚时候的巨大代价。 但我看到这里的时候，就产生一个疑惑，这样的话，我查数据的时候，见到一行的xid之后，需要马上确认其可见性，就需要去查clog，这个查询频率势必极高而且随机性很大，这个问题该怎么解决呢？ #define&nbsp;CLOG_BITS_PER_XACT&nbsp;&nbsp;&nbsp;&nbsp;2 #define CLOG_XACTS_PER_BYTE 4 #define CLOG_XACTS_PER_PAGE （BLCKSZ * CLOG_XACTS_PER_BYTE） #define&nbsp;CLOG_XACT_BITMASK&nbsp;&nbsp;&nbsp;&nbsp;（（1&nbsp;&lt;&lt;&nbsp;CLOG_BITS_PER_XACT）&nbsp;-&nbsp;1） #define TransactionIdToPage（xid） （（xid） / （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToPgIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_PAGE） #define TransactionIdToByte（xid） （TransactionIdToPgIndex（xid） / CLOG_XACTS_PER_BYTE） #define TransactionIdToBIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_BYTE） PG代码给了一个非常精彩的回答。 还记得之前vacuum那个里面，我大力吐槽PG对32位xid的执着，但这个32位id果真一无是处吗？看到这里才明白，还留着这么一笔思路。 一个简单的算术，每个事务标记占据2个比特位（无符号0 1 2 3对应前面提到的事务状态），也就是说，每个字节可以保存4个事务，每当PG需要确定当前事务状态的时候，就直接根据当前事务id计算得到对应的clog页位置（除每页clog之后的整数商是页数字，而余数则是在页中的具体位置）。真是把文件当hash表用的典范啊。 在32位xid的情况下，假设xid限制是20亿，每个8K的clog页存储32k事务位的情况下，clog最大也才五百来MB，这部分交给操作系统的文件缓存足以保障访问效率了。 真是一个绝妙的主意不是么？如果不考虑64位xid的情况下，clog大小完全不可控的情况的话。 还是把话题集中在clog，下面我们来探讨的是，当事务提交或者回滚的时候，其内部的运作机理又是如何呢？ 以及，前文中可以看到的一个明显问题，pg这种操作的话，写入的行必然是一个”执行中事务状态”的行，这种行难道是每次查的时候，都得去找clog判断吗？如果频繁扫他几百万行，是不是会有问题？&nbsp;clog实现内部 前面提到，clog里面会记录的是xid对应的事务状态。在PG里面，xid是一个珍贵的资源（考虑到每20亿大限的成住空坏），因此并不是每个事务都会被分配到xid。 一般来说，只有一个事务进行了数据修改（比如insert，update，delete）之类的操作，才会被分配给一个xid。 当这个事务最终提交或者回滚的时候，其最终状态就会被记录入clog。 事务提交与回滚时候的clog操作 首先来说提交。 抛开其他各种过程，每次事务提交的时候，主要的调用路径是： CommitTransaction（提交事务时候调用）-&gt; RecordTransactionCommit（记录事务为已提交）-&gt; TransactionIdCommitTree（同步标记事务为提交）/TransactionIdAsyncCommitTree（异步标记事务为提交，调用下一步需要提供lsn）-&gt; TransactionIdSetTreeStatus（设置事务与子事务状态）-&gt; TransactionIdSetPageStatus（设置单数据页内事务状态）-&gt; TransactionIdSetPageStatusInternal（设置实际文件页）-&gt; TransactionIdSetStatusBit（设置比特位） 其中值得拿出来讲的，主要是TransactionIdSetTreeStatus这个方法。 这里涉及到一个概念，子事务。在PG这个地方，子事务的概念主要指：事务从开始到结束，期间可以savepoint，之后rollback到savepoint而不是事务起点，在实际情况中多有应用，因此这里父事务与子事务（比如事务最终提交，但期间有回滚的情况，或者事务期间多次save point）必须尽可能原子性的方式写入，否则事务可见性就会出现问题。 在代码注释里面，对这里的写入做了一个比较直观的例子：比如一个事务t，有子事务 t1，t2，t3，t4，其中t，t1被映射到clog页p1，t2和t3在p2，t4在页p3。那么写入的时候，顺序如下： 设置p2 的t2 t3为子提交，之后设置p3的t4位子提交 设置t1为子提交，之后设置t为已提交，之后设置t1为已提交 设置 t2 t3 为已提交，设置t4位已提交 对于回滚，实际上也是调用TransactionIdSetTreeStatus方法，只是上层函数是TransactionIdAbortTree，设置的标记是TRANSACTIONSTATUSABORTED，也就是记录事务为中断。语义上来说，对于事务中断，由于事务的原子性要求，中断的事务数据就是不可见的了，没啥问题。&nbsp;数据行事务可见性的判断与clog 众所周知的是，pg新增行都会对原先的行打一个删除标记，然后写在原先行的旁边，理所当然地，每个数据行都会记录一个事务标记（当然还有数据行对应的事务id），来确保可见性，避免看到事务层面已经rollback的事务。 首先，写入的当时，事务没有结束的时候，必然是”执行中”这个状态。当事务之后提交，或者回滚的时候，pg是必然不会回头改这个标记的，否则无论提交还是回滚，都是一个代价巨大的事情。 就前文所言，pg的事务可见性，是通过行的事务id，找到clog里面对应的标记位置，然后判断的，这里非常理所当然的一个事情是，这种判断，每一行做一次就足够了，判断清楚后，修改掉这个事务标记为已提交或者是中断事务，后续读取的时候，就不需要回查clog了。 PG当然就是这么干的。 也就是说，前一个事务所有修改的数据，它没有在提交或者回滚的当时改掉所有的修改标记，而是把烂摊子丢给后来的人。 而这里还藏着一个问题：你既然修改了行的标记，那理所当然地，行所在数据块的校验和就变了，校验和变了，那块是不是就必须得传到wal缓存走流程了？即便没有涉及数据的变更？而且考虑到从库查询的时候，查数据也可以直接走从库的clog流程，这个数据块是不是必须传给从库？ 那么，现在就有一个现成的面试问题了：PostgreSQL单纯的select执行，会不会产生WAL日志？ 事实上，这里的事务标记带来的校验和的问题，在PG里面的处理是比较特殊的。 PostgreSQL里面，当且仅当设置了walloghints或者初始化时候，initdb启用了checksum的情况下，才会在设置标记为的时候去写WAL日志。 而且这里还不是每次设置标记位都会写。 必须得是，前一次checkpoint之后，数据块第一次被修改就是sethintbit操作的情况下，才会写整个数据块到WAL。&nbsp;clog的一些衍生思考 实际上就清理过期数据，MySQL也是用delete+insert替代update，但在清理以及处理上，并没有搞到vacuum这么大代价，比如MySQL的purge线程的执行，一般很少需要特别关注，而PostgreSQL的vacuum虽然说是并行化，但是在单表内却是串行的，民间贡献的表内并行vacuum的补丁因为各种bug迟迟没有合并（目前来看PG12没戏了），这个事情为什么会这样呢？ 因为clog毕竟只是事务可见性的标记，而不是事务的修改关联。在传统的undo类实现中，修改的数据，以及关联的事务等，都在undo按照顺序存储，purge执行的之后，直接从undo就可以找到对应的需要处理的数据块直接处理。 但是对于PG来说，由于仅仅只有事务标记，vacuum必须扫描所有的数据文件的数据块来处理这个问题，虽然pg里面，vacuum和统计信息采集合二为一（统计信息采集是传统数据库最大的全库扫描行为了），但必然需要付出的全库扫描代价却一个都不会少。 因此vacuum对超大表非常慢，极端情况下在vacuum freezen时候导致全库不可用（freezen结束前不允许执行新事务），就是有极大可能的事情了。 为了解决超大表，传统建议是使用分区表，但PostgreSQL的官方实现里面，分区表一直不太稳定，并且支持不足，因此又不得不引入pathman这个外部组件来协调处理，导致运维复杂度的进一步上升，就成了理所当然的事情。 不过目前就PostgreSQL 12来说，已经在逐渐开放存储引擎层面的接口，而社区中实现的undo版本的存储引擎，虽然因为完成度问题没有在本次release中发布，但未来可期，相信vacuum这一类问题，在未来必然会得到更好的处理。往期精选 从Oracle到PostgreSQL：动态性能视图 vs 标准统计视图 从 Oracle 到 PostgreSQL ：从 Uptime 到数据库实例运行时间 作者：刘伟，云和恩墨软件开发部研究院研究员；前微博DBA，主要研究方向为开源数据库，分布式数据库，擅长自动化运维以及数据库内核研究。 编辑：尹文敏 公司简介&nbsp;&nbsp;|&nbsp;招聘&nbsp;|&nbsp;DTCC&nbsp;|&nbsp;数据技术嘉年华&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;入驻华为严选商城&nbsp;&nbsp; zCloud&nbsp;|&nbsp;SQM&nbsp;|&nbsp;Bethune Pro2&nbsp;|&nbsp;zData一体机&nbsp;|&nbsp;Mydata一体机&nbsp;|&nbsp;ZDBM 备份一体机 Oracle技术架构&nbsp;|&nbsp;免费课程&nbsp;|&nbsp;数据库排行榜&nbsp;|&nbsp;DBASK问题集萃&nbsp;|&nbsp;技术通讯&nbsp; 升级迁移&nbsp;|&nbsp;性能优化&nbsp;|&nbsp;智能整合&nbsp;|&nbsp;安全保障&nbsp;|&nbsp;&nbsp;架构设计&nbsp;|&nbsp;SQL审核&nbsp;|&nbsp;分布式架构&nbsp;|&nbsp;高可用容灾&nbsp;|&nbsp;运维代维 云和恩墨大讲堂 |&nbsp;一个分享交流的地方 长按，识别二维码，加入万人交流社群 请备注：云和恩墨大讲堂","@type":"BlogPosting","url":"https://uzzz.org/2019/06/05/788648.html","headline":"PostgreSQL的clog—从事务回滚速度谈起","dateModified":"2019-06-05T00:00:00+08:00","datePublished":"2019-06-05T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/06/05/788648.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>PostgreSQL的clog—从事务回滚速度谈起</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <div class="rich_media_content" id="js_content"> 
+   <p><span style="font-size:14px;">如果是之前学习别的数据库的人，看PostgreSQL会感觉到有句话非常奇怪：“PostgreSQL的回滚是立即完成的，不会受到事务大小本身的影响”。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">奇怪在哪里呢？比方我曾经遇到过一次MySQL的故障，一个开发给生产数据库导入数据，用的是Python脚本，但是，他没有注意一个事情，Python的MySQLdb默认情况下，是设置autocommit为0的，于是这哥们导数据（这里说的导入，不是普通那种load data，而是带有业务操作的SQL语句，所以需要脚本操作）脚本跑了一天之后，整个数据库的状况就变得极为糟糕了：他导入所用的，是一个业务的核心表，一堆业务操作都需要操作这个表，但随着这个导入动作跑了一天，占掉了大量的行锁（几百万行锁）之后，整个业务系统的对外服务都会处于一个无法求到锁的状况了（还掺和着MySQL间隙锁的坑坑洼洼），业务服务停摆，于是，作为DBA来说，最终的决策，只有杀掉这个”大”事务了。一个kill命令过去之后，我们当时俩DBA开始慢慢数—小蚂蚁慢慢爬——碰到—颗大豆芽——碰到两颗大豆芽——</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">最终在将近三个小时的rollback之后，这个事务完成回滚，业务系统恢复。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">所以看到PostgreSQL的这个描述之后，我第一时间的反应是，why？how？what？<br>于是就有了这一篇文章，我从PG的事务可见性判断讲起，整理一下PG核心文件clog的机理与作用。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><strong><span style="font-size:14px;">另注</span></strong><span style="font-size:14px;"><strong>：</strong>从pg 10以后，clog改名为xact，主要原因，是很多人习惯性地使用*log删除日志文件，总是会不小心删除掉原先的xlog与clog文件，导致数据库不可用，所以分别改名为wal与xact，后文依然以clog为讨论单词，需要注意。<br>&nbsp;<br></span><strong><span style="color:rgb(0,122,170);font-size:16px;">clog简介</span></strong></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p><br></p>
+   <p><span style="font-size:14px;">第一个问题，什么是clog？或者换个说法，PG到底有哪些日志，它们分别是干啥的？<br>除了理所当前的各路文本记录（比方数据库的运行报错日志之类），PG的二进制类日志文件主要有两个，一个就是对应传统数据库理论的redo日志，理论上，所有数据的修改操作都会被记录到这个日志，在事务提交的时候确保操作都记录到磁盘中，这样讲即便发生宕机，数据库也能以不丢数据的形态重新复活。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">但是，各个数据库在这个点上都有不同的实现，比方MySQL会有一个binlog用于跨存储引擎的主从同步，而在PG中，主从同步已经通过redo日志（PG术语为XLOG）同步的情况下，为了处理没有undo带来的一系列问题，其中可见性判断这个功能，就是交给clog日志文件解决的。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">Clog中记录了每一个事务相关的xid（记得之前曾吐槽过这个玩意的大小问题带来的freeze问题）以及xid对应的事务的提交状态。提交状态包括以下一些：执行中，已提交，已中断，已提交的子事务。看到这里，就可以明白，只要事务提交的时候，设置状态为已提交，而事务回滚的时候，设置状态为已中断，就可以达到目的，的确避免了操作数百万行的事务突然要回滚时候的巨大代价。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">但我看到这里的时候，就产生一个疑惑，这样的话，我查数据的时候，见到一行的xid之后，需要马上确认其可见性，就需要去查clog，这个查询频率势必极高而且随机性很大，这个问题该怎么解决呢？</span></p>
+   <p><span style="font-size:14px;"></span></p>
+   <pre class="code-snippet__fix code-snippet__js"></pre>
+   <pre><code>#define&nbsp;CLOG_BITS_PER_XACT&nbsp;&nbsp;&nbsp;&nbsp;2	
+#define CLOG_XACTS_PER_BYTE 4	
+#define CLOG_XACTS_PER_PAGE （BLCKSZ * CLOG_XACTS_PER_BYTE）	
+#define&nbsp;CLOG_XACT_BITMASK&nbsp;&nbsp;&nbsp;&nbsp;（（1&nbsp;&lt;&lt;&nbsp;CLOG_BITS_PER_XACT）&nbsp;-&nbsp;1）	
+#define TransactionIdToPage（xid）    （（xid） / （TransactionId） CLOG_XACTS_PER_PAGE）	
+#define TransactionIdToPgIndex（xid） （（xid） % （TransactionId） CLOG_XACTS_PER_PAGE）	
+#define TransactionIdToByte（xid）    （TransactionIdToPgIndex（xid） / CLOG_XACTS_PER_BYTE）	
+#define TransactionIdToBIndex（xid）    （（xid） % （TransactionId） CLOG_XACTS_PER_BYTE）</code></pre>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">PG代码给了一个非常精彩的回答。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">还记得之前vacuum那个里面，我大力吐槽PG对32位xid的执着，但这个32位id果真一无是处吗？看到这里才明白，还留着这么一笔思路。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">一个简单的算术，每个事务标记占据2个比特位（无符号0 1 2 3对应前面提到的事务状态），也就是说，每个字节可以保存4个事务，每当PG需要确定当前事务状态的时候，就直接根据当前事务id计算得到对应的clog页位置（除每页clog之后的整数商是页数字，而余数则是在页中的具体位置）。真是把文件当hash表用的典范啊。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">在32位xid的情况下，假设xid限制是20亿，每个8K的clog页存储32k事务位的情况下，clog最大也才五百来MB，这部分交给操作系统的文件缓存足以保障访问效率了。<br></span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">真是一个绝妙的主意不是么？如果不考虑64位xid的情况下，clog大小完全不可控的情况的话。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">还是把话题集中在clog，下面我们来探讨的是，当事务提交或者回滚的时候，其内部的运作机理又是如何呢？</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">以及，前文中可以看到的一个明显问题，pg这种操作的话，写入的行必然是一个”执行中事务状态”的行，这种行难道是每次查的时候，都得去找clog判断吗？如果频繁扫他几百万行，是不是会有问题？<br>&nbsp;<br></span><strong><span style="color:rgb(0,122,170);font-size:16px;">clog实现内部</span></strong><br></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p><br></p>
+   <p><span style="font-size:14px;">前面提到，clog里面会记录的是xid对应的事务状态。在PG里面，xid是一个珍贵的资源（考虑到每20亿大限的成住空坏），因此并不是每个事务都会被分配到xid。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">一般来说，只有一个事务进行了数据修改（比如insert，update，delete）之类的操作，才会被分配给一个xid。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">当这个事务最终提交或者回滚的时候，其最终状态就会被记录入clog。<br></span><strong><span style="color:rgb(0,122,170);font-size:16px;"><br></span></strong></p>
+   <p><strong><span style="color:rgb(0,122,170);font-size:16px;">事务提交与回滚时候的clog操作</span></strong></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p><br></p>
+   <p><span style="font-size:14px;"><strong>首先来说提交。</strong></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;">抛开其他各种过程，每次事务提交的时候，主要的调用路径是： CommitTransaction（提交事务时候调用）-&gt; RecordTransactionCommit（记录事务为已提交）-&gt; TransactionIdCommitTree（同步标记事务为提交）/TransactionIdAsyncCommitTree（异步标记事务为提交，调用下一步需要提供lsn）-&gt; TransactionIdSetTreeStatus（设置事务与子事务状态）-&gt; TransactionIdSetPageStatus（设置单数据页内事务状态）-&gt; TransactionIdSetPageStatusInternal（设置实际文件页）-&gt; TransactionIdSetStatusBit（设置比特位）</span></p>
+   <p style="text-align:left;"><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">其中值得拿出来讲的，主要是TransactionIdSetTreeStatus这个方法。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">这里涉及到一个概念，子事务。在PG这个地方，子事务的概念主要指：事务从开始到结束，期间可以savepoint，之后rollback到savepoint而不是事务起点，在实际情况中多有应用，因此这里父事务与子事务（比如事务最终提交，但期间有回滚的情况，或者事务期间多次save point）必须尽可能原子性的方式写入，否则事务可见性就会出现问题。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;">在代码注释里面，对这里的写入做了一个比较直观的例子：<br>比如一个事务t，有子事务 t1，t2，t3，t4，其中t，t1被映射到clog页p1，t2和t3在p2，t4在页p3。那么写入的时候，顺序如下：</span></p>
+   <ol style="list-style-type:decimal;" class="list-paddingleft-2">
+    <li><p style="text-align:left;"><span style="font-size:14px;">设置p2 的t2 t3为子提交，之后设置p3的t4位子提交</span></p></li>
+    <li><p style="text-align:left;"><span style="font-size:14px;">设置t1为子提交，之后设置t为已提交，之后设置t1为已提交</span></p></li>
+    <li><p style="text-align:left;"><span style="font-size:14px;">设置 t2 t3 为已提交，设置t4位已提交<br></span></p></li>
+   </ol>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;">对于回滚，实际上也是调用TransactionIdSetTreeStatus方法，只是上层函数是TransactionIdAbortTree，设置的标记是TRANSACTIONSTATUSABORTED，也就是记录事务为中断。语义上来说，对于事务中断，由于事务的原子性要求，中断的事务数据就是不可见的了，没啥问题。<br>&nbsp;<br></span><strong><span style="color:rgb(0,122,170);font-size:16px;">数据行事务可见性的判断与clog</span></strong><br></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p><br></p>
+   <p><span style="font-size:14px;">众所周知的是，pg新增行都会对原先的行打一个删除标记，然后写在原先行的旁边，理所当然地，每个数据行都会记录一个事务标记（当然还有数据行对应的事务id），来确保可见性，避免看到事务层面已经rollback的事务。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">首先，写入的当时，事务没有结束的时候，必然是”执行中”这个状态。当事务之后提交，或者回滚的时候，pg是必然不会回头改这个标记的，否则无论提交还是回滚，都是一个代价巨大的事情。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">就前文所言，pg的事务可见性，是通过行的事务id，找到clog里面对应的标记位置，然后判断的，这里非常理所当然的一个事情是，这种判断，每一行做一次就足够了，判断清楚后，修改掉这个事务标记为已提交或者是中断事务，后续读取的时候，就不需要回查clog了。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">PG当然就是这么干的。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">也就是说，前一个事务所有修改的数据，它没有在提交或者回滚的当时改掉所有的修改标记，而是把烂摊子丢给后来的人。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">而这里还藏着一个问题：你既然修改了行的标记，那理所当然地，行所在数据块的校验和就变了，校验和变了，那块是不是就必须得传到wal缓存走流程了？即便没有涉及数据的变更？而且考虑到从库查询的时候，查数据也可以直接走从库的clog流程，这个数据块是不是必须传给从库？</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">那么，现在就有一个现成的面试问题了：PostgreSQL单纯的select执行，会不会产生WAL日志？</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">事实上，这里的事务标记带来的校验和的问题，在PG里面的处理是比较特殊的。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">PostgreSQL里面，当且仅当设置了walloghints或者初始化时候，initdb启用了checksum的情况下，才会在设置标记为的时候去写WAL日志。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">而且这里还不是每次设置标记位都会写。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">必须得是，前一次checkpoint之后，数据块第一次被修改就是sethintbit操作的情况下，才会写整个数据块到WAL。<br>&nbsp;</span><br><strong><span style="color:rgb(0,122,170);font-size:16px;">clog的一些衍生思考</span></strong></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p><br></p>
+   <p><span style="font-size:14px;">实际上就清理过期数据，MySQL也是用delete+insert替代update，但在清理以及处理上，并没有搞到vacuum这么大代价，比如MySQL的purge线程的执行，一般很少需要特别关注，而PostgreSQL的vacuum虽然说是并行化，但是在单表内却是串行的，民间贡献的表内并行vacuum的补丁因为各种bug迟迟没有合并（目前来看PG12没戏了），这个事情为什么会这样呢？</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">因为clog毕竟只是事务可见性的标记，而不是事务的修改关联。在传统的undo类实现中，修改的数据，以及关联的事务等，都在undo按照顺序存储，purge执行的之后，直接从undo就可以找到对应的需要处理的数据块直接处理。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">但是对于PG来说，由于仅仅只有事务标记，vacuum必须扫描所有的数据文件的数据块来处理这个问题，虽然pg里面，vacuum和统计信息采集合二为一（统计信息采集是传统数据库最大的全库扫描行为了），但必然需要付出的全库扫描代价却一个都不会少。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;">因此vacuum对超大表非常慢，极端情况下在vacuum freezen时候导致全库不可用（freezen结束前不允许执行新事务），就是有极大可能的事情了。</span></p>
+   <p><span style="font-size:14px;"><br></span></p>
+   <p><span style="font-size:14px;">为了解决超大表，传统建议是使用分区表，但PostgreSQL的官方实现里面，分区表一直不太稳定，并且支持不足，因此又不得不引入pathman这个外部组件来协调处理，导致运维复杂度的进一步上升，就成了理所当然的事情。</span></p>
+   <p style="text-align:left;"><span style="font-size:14px;"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;">不过目前就PostgreSQL 12来说，已经在逐渐开放存储引擎层面的接口，而社区中实现的undo版本的存储引擎，虽然因为完成度问题没有在本次release中发布，但未来可期，相信vacuum这一类问题，在未来必然会得到更好的处理。<br><br></span><strong><span style="color:rgb(0,122,170);font-size:16px;">往期精选</span></strong></p>
+   <hr style="border-style:solid;border-width:1px 0 0;border-color:rgba(0,0,0,.1);">
+   <p style="text-align:left;"><br></p>
+   <p style="text-align:left;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281648&amp;idx=1&amp;sn=a9c921149295e8c030c1a5a4bb32f858&amp;chksm=be478ea6893007b0583bebebbbc0142ceb808c47f6ef27dfb7e6528a7d5e372f4d822a607d13&amp;scene=21#wechat_redirect" rel="nofollow" style="font-size:14px;text-decoration:underline;"><span style="font-size:14px;">从Oracle到PostgreSQL：动态性能视图 vs 标准统计视图</span></a></p>
+   <p style="text-align:left;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281632&amp;idx=1&amp;sn=f8b487c6cadf8d629a195cdf2c9ed8c7&amp;chksm=be478eb6893007a0a2c00c76682a818f2baaa73acadbc383bf518ef2045a51b14af5b6ba7e03&amp;scene=21#wechat_redirect" rel="nofollow" style="font-size:14px;text-decoration:underline;"><span style="font-size:14px;">从 Oracle 到 PostgreSQL ：从 Uptime 到数据库实例运行时间</span></a><br></p>
+   <p style="text-align:left;"><span style="font-size:14px;color:rgb(136,136,136);"><br></span></p>
+   <p style="text-align:left;"><span style="font-size:14px;color:rgb(136,136,136);">作者：刘伟，云和恩墨软件开发部研究院研究员；前微博DBA，主要研究方向为开源数据库，分布式数据库，擅长自动化运维以及数据库内核研究。</span></p>
+   <p style="text-align:left;"><span style="font-size:14px;color:rgb(136,136,136);">编辑：尹文敏</span></p>
+   <p style="clear:both;min-height:1em;color:rgb(51,51,51);font-family:'-apple-system-font', BlinkMacSystemFont, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', Arial, sans-serif;font-size:17px;font-style:normal;font-variant:normal;font-weight:normal;letter-spacing:.544000029563904px;line-height:27.2000007629395px;text-indent:0px;text-transform:none;word-spacing:0px;text-align:center;"><img class="rich_pages" style="width:677px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/bURPjgFpGMSutNs7JLp0SZkYeWFXxww9icB7fuLxMH4001LlVVk9H5vicFpSI6zbELwWTiabTIT7dsL6icmrQY6Hibg/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <p style="text-align:center;"><img class="rich_pages" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/bURPjgFpGMS0iaVHiat7rkz5drLFwxtbkQib2zpRpjiaJ9Ps7JMfV3iaA6nh4LR7ncicm2aEqnHySU3fw7g58cHcUc8A/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606539&amp;idx=1&amp;sn=134dafd5fb9ce3db71e76effd0d84397&amp;chksm=be95a0b589e229a375484ab05507d1c3af138956d41fdd3b12c383b4d0f6da98eae300d9a8da&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">公司简介</a><span style="font-size:12px;">&nbsp;&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606795&amp;idx=2&amp;sn=bb9544642faa52b4835718eb8479032e&amp;chksm=be95a7b589e22ea3f22adce976e4c0a3da68754c1132e79cb06ea1c97276863af36c5ab6bfde&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">招聘</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650605815&amp;idx=1&amp;sn=96f5e15c7d1f7e1ae1e314dbe02b43b2&amp;chksm=be95a38989e22a9fb5ac4329a1cf0beb14878f0b2e6fc8ea3ed7bb0daebbb601acd84bacd2ef&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;"><span style="font-size:12px;">DTCC</span></a><span style="font-size:12px;">&nbsp;|<span>&nbsp;</span></span><span style="font-size:12px;text-decoration:underline;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606300&amp;idx=1&amp;sn=2bed577bbd2785ed15ed6fa30d0bf5b8&amp;chksm=be95a1a289e228b4558498e0c28389e864858d1be334204365c10c2bbdc7ac1d68747cbca542&amp;scene=21#wechat_redirect" rel="nofollow">数据技术嘉年华</a></span><span style="font-size:12px;">&nbsp;|&nbsp;</span><span style="font-size:12px;text-decoration:underline;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281343&amp;idx=1&amp;sn=668e2c93f551141a416eb16f3eade76f&amp;chksm=be478d698930047f0fb674ef05a7cbaff4e5f3991d0e0b998f37c06ca1eafc44b6c30ecfb6c8&amp;scene=21#wechat_redirect" rel="nofollow">免费课程</a></span><span style="font-size:12px;">&nbsp;|&nbsp;</span><span style="font-size:12px;text-decoration:underline;"><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606949&amp;idx=1&amp;sn=f63ecdd4a5b21ef1104b4626ba29350b&amp;chksm=be95a61b89e22f0da76d3b7005cddf376405df2e91ff9fb9ebfc091b2de72d6901813f819332&amp;scene=21#wechat_redirect" rel="nofollow">入驻华为严选商城</a></span></p>&nbsp;&nbsp;
+   <img style="width:60px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/hUPnvEAd0LUUBAJOlz8CcqEOPa1ldXU3ibRAFVNDK5LeF9aC9xY7qztxG3VyROib1QrADiabUWPVlslTN2fdGDuPQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg">
+   <p style="text-align:left;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606558&amp;idx=1&amp;sn=d727f762e155ba9eebf0301a49b3815d&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">zCloud</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><span style="font-size:12px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606400&amp;idx=1&amp;sn=fda7dfd82768bbd8f890a0ab9250b9e6&amp;scene=21#wechat_redirect" rel="nofollow">SQM</a></span><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606558&amp;idx=2&amp;sn=06ca69294cebd30f5f710a322fb98b2c&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">Bethune Pro2</a>&nbsp;<span style="font-size:12px;">|&nbsp;</span><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606577&amp;idx=1&amp;sn=30025f8250b8c50663d3a591fe3de257&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">zData一体机</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606261&amp;idx=1&amp;sn=15ab8b32d85c885427c355f95026029d&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">Mydata一体机</a>&nbsp;|&nbsp;<a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606518&amp;idx=1&amp;sn=00f2f4a54a37cbc7d1e6fb517b529859&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">ZDBM 备份一体机</a></p>
+   <img style="width:52px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/hUPnvEAd0LUUBAJOlz8CcqEOPa1ldXU3mTOEfnaMaBWJPOOXcozJEKWtutDLicX9YMNhgzycyxNHUdqeuAjUyvA/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg">
+   <p><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281215&amp;idx=1&amp;sn=30d52b07763b6d7ba4cb15b79de29564&amp;chksm=be478ce9893005ff93809c1d88eda7066b98f560001b5b324be4a8e9ebc10bcafce2267c619d&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">Oracle技术架构</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281343&amp;idx=1&amp;sn=668e2c93f551141a416eb16f3eade76f&amp;chksm=be478d698930047f0fb674ef05a7cbaff4e5f3991d0e0b998f37c06ca1eafc44b6c30ecfb6c8&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">免费课程</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281350&amp;idx=1&amp;sn=26b13e3f181a5d6e831c021b7426e6c4&amp;chksm=be478d9089300486d05476098e1b3cfee5b2eb94365cf614e24d21d1eb58451e6ed16c601d00&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">数据库排行榜</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281239&amp;idx=2&amp;sn=e72ce90ab0bd2e8375b709644c7f8b54&amp;chksm=be478d01893004170db34db767a38b234606e9dd0eaca08a35c313fa474263bcf23871bebe46&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">DBASK问题集萃</a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650281286&amp;idx=1&amp;sn=48099b54f34f91687ccbf7afec9e7c65&amp;chksm=be478d50893004463678b48c0eb73f5741f06a6b1bea5502517f9801b0bde84e50c20502811d&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;font-size:12px;">技术通讯</a><span style="font-size:12px;">&nbsp;</span></p>
+   <img style="width:60px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/hUPnvEAd0LUUBAJOlz8CcqEOPa1ldXU30DVZ9aCJfsArKCAhqbDR3AT9icAzDHeWPvRl8R6NnskotytVDGuiaXuQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg">
+   <p><span style="font-size:12px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650605932&amp;idx=1&amp;sn=429bc42915a11a929d8e8d98fa94d627&amp;scene=21#wechat_redirect" rel="nofollow">升级迁移</a></span><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606850&amp;idx=1&amp;sn=cc081d93c4a267fcc3b1a99792ec22c9&amp;chksm=be95a67c89e22f6a113affd2d918d82f8139b638ec9a4b5201d0ee030033fd969a49a3b2f4f3&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;"><span style="font-size:12px;">性能优化</span></a><span style="font-size:12px;">&nbsp;|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650605700&amp;idx=1&amp;sn=051812f07add697e78e3f3e7a82564e5&amp;chksm=be95a3fa89e22aecb2c4bdb22b303a77e5c4b19e8ff6de2c62624e1161b8ebd4396b28940ddc&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;"><span style="font-size:12px;">智能整合</span></a><span style="font-size:12px;text-decoration:underline;">&nbsp;</span><span style="font-size:12px;">|&nbsp;</span><a href="http://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650603337&amp;idx=2&amp;sn=1aa0d1664bb04d8f9dd9c22e60887ba2&amp;scene=21#wechat_redirect" rel="nofollow" style="text-decoration:underline;"><span style="font-size:12px;">安全保障</span></a><span style="font-size:12px;">&nbsp;|&nbsp;<span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;">&nbsp;</span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650605243&amp;idx=1&amp;sn=83d34ae3e3b33ad55dad215665556dde&amp;scene=21#wechat_redirect" rel="nofollow">架构设计</a></span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;">&nbsp;|&nbsp;</span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=401725923&amp;idx=1&amp;sn=b5c396e5563e0836c9fd40a481ac42db&amp;scene=21#wechat_redirect" rel="nofollow">SQL审核</a></span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;">&nbsp;|&nbsp;</span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MDAxOTk2MQ==&amp;mid=2650274082&amp;idx=2&amp;sn=729a68af1b7f0266683da44cfd227e32&amp;scene=21#wechat_redirect" rel="nofollow">分布式架构</a></span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;">&nbsp;|&nbsp;</span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650606414&amp;idx=1&amp;sn=e952cc631c64da59b204ed513425eea0&amp;scene=21#wechat_redirect" rel="nofollow">高可用容灾</a></span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;">&nbsp;|&nbsp;</span><span style="font-family:'微软雅黑';font-size:12px;letter-spacing:1px;line-height:26.25px;text-decoration:underline;"><a href="https://mp.weixin.qq.com/s?__biz=MjM5MzExMTU2OQ==&amp;mid=2650603030&amp;idx=1&amp;sn=726b20fde867db768585fe605cbc5fe2&amp;scene=21#wechat_redirect" rel="nofollow">运维代维</a></span></span><br></p>
+   <p><strong><span style="font-size:16px;color:rgb(141,203,191);">云和恩墨大讲堂 |&nbsp;</span></strong><span style="font-size:16px;color:rgb(141,203,191);">一个分享交流的地方</span></p>
+   <p style="min-height:1em;"><span style="font-size:14px;color:rgb(141,203,191);">长按，识别二维码，加入<strong>万人</strong>交流社群</span></p>
+   <p style="min-height:1em;"><br></p>
+   <strong><img style="border-width:1px;border-style:dashed;border-color:rgb(168,164,171);" border="0" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/bURPjgFpGMSLia51VIoGv8GNktatN3DiamicGBJkEXibzoGaI0WFTwcD5MT8kzcUlaL1zUEXhewkEHIhRKRTLDq3mw/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></strong>
+   <p style="color:rgb(35,21,10);font-size:medium;min-height:1em;"><span style="font-size:12px;"><strong><span style="color:rgb(141,203,191);">请备注：云和恩墨大讲堂</span></strong></span></p>
+  </div> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

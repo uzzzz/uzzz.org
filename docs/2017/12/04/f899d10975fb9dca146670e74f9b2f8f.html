@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Ceph学习——客户端读写操作分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Ceph学习——客户端读写操作分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="客户端读写操作分析 本节设计到了Librados以及Osdc等操作，相关类如 RadosClient、Objecter、IoCtxImpl等介绍见上一节： Ceph学习——Librados与Osdc实现源码解析 1）调用rados_create()创建一个RadosClient对象。 2） 调用rados_config_read()读取配置文件。 3）调用rados_connect()函数，最终他会调用RadosClient::connect()来完成初始化 4）调用rados_ioctx_create()，它最终调用RadosClient::create_ioctx()穿件pool相关的IoCtxImpl类。 5）调用 rados_write 函数 想该pool中写入对象。调用了IoCtxImpl::write()。 写操作消息封装 int librados::IoCtxImpl::write(const object_t&amp; oid, bufferlist&amp; bl, size_t len, uint64_t off) { if (len &gt; UINT_MAX/2) return -E2BIG; ::ObjectOperation op;//创建ObjectOperation对象 prepare_assert_ops(&amp;op);//封装相关写操作 bufferlist mybl; mybl.substr_of(bl, 0, len); op.write(off, mybl); return operate(oid, &amp;op, NULL);//调用operate处理 } write中调用operate int librados::IoCtxImpl::operate(const object_t&amp; oid, ::ObjectOperation *o, ceph::real_time *pmtime, int flags) { ceph::real_time ut = (pmtime ? *pmtime : ceph::real_clock::now()); /* can&#39;t write to a snapshot */ if (snap_seq != CEPH_NOSNAP) return -EROFS; if (!o-&gt;size()) return 0; Mutex mylock(&quot;IoCtxImpl::operate::mylock&quot;); Cond cond; bool done; int r; version_t ver; Context *oncommit = new C_SafeCond(&amp;mylock, &amp;cond, &amp;done, &amp;r); int op = o-&gt;ops[0].op.op; ldout(client-&gt;cct, 10) &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; oid=&quot; &lt;&lt; oid &lt;&lt; &quot; nspace=&quot; &lt;&lt; oloc.nspace &lt;&lt; dendl; //调用objecter-&gt;prepare_mutate_op把ObjectOperation封装为Op类型 Objecter::Op *objecter_op = objecter-&gt;prepare_mutate_op(oid, oloc, *o, snapc, ut, flags, oncommit, &amp;ver); objecter-&gt;op_submit(objecter_op);//发送消息 mylock.Lock(); while (!done) cond.Wait(mylock); mylock.Unlock(); ldout(client-&gt;cct, 10) &lt;&lt; &quot;Objecter returned from &quot; &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; r=&quot; &lt;&lt; r &lt;&lt; dendl; set_sync_op_version(ver); return r; } 发送消息 op_submit 该函数将封装好的Op操作通过网络发送出去。在op_submit中调用了_op_submit_with_budget用来处理Throttle相关的流量信息以及超时处理，最后该函数调用 _op_submit用来完成关键地址寻址和发送工作。 函数 oid Objecter::op_submit(Op *op, ceph_tid_t *ptid, int *ctx_budget) { shunique_lock rl(rwlock, ceph::acquire_shared); ceph_tid_t tid = 0; if (!ptid) ptid = &amp;tid; op-&gt;trace.event(&quot;op submit&quot;); _op_submit_with_budget(op, rl, ptid, ctx_budget);//调用_op_submit_with_budget } void Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid, int *ctx_budget) { assert(initialized); assert(op-&gt;ops.size() == op-&gt;out_bl.size()); assert(op-&gt;ops.size() == op-&gt;out_rval.size()); assert(op-&gt;ops.size() == op-&gt;out_handler.size()); // throttle. before we look at any state, because // _take_op_budget() may drop our lock while it blocks. if (!op-&gt;ctx_budgeted || (ctx_budget &amp;&amp; (*ctx_budget == -1))) { int op_budget = _take_op_budget(op, sul); // take and pass out the budget for the first OP // in the context session if (ctx_budget &amp;&amp; (*ctx_budget == -1)) { *ctx_budget = op_budget; } } if (osd_timeout &gt; timespan(0)) { if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; auto tid = op-&gt;tid; op-&gt;ontimeout = timer.add_event(osd_timeout, [this, tid]() { op_cancel(tid, -ETIMEDOUT); }); } _op_submit(op, sul, ptid); } void Objecter::_op_submit(Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid) { // rwlock is locked ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; op &quot; &lt;&lt; op &lt;&lt; dendl; // pick target assert(op-&gt;session == NULL); OSDSession *s = NULL; //调用_calc_target 来计算目标OSD bool check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; // Try to get a session, including a retry if we need to take write lock //调用函数 _get_session 获取目标OSD的连接，如果返回-EAGAIN，就升级为写锁，重新获取 int r = _get_session(op-&gt;target.osd, &amp;s, sul); if (r == -EAGAIN || (check_for_latest_map &amp;&amp; sul.owns_lock_shared())) { epoch_t orig_epoch = osdmap-&gt;get_epoch(); sul.unlock(); if (cct-&gt;_conf-&gt;objecter_debug_inject_relock_delay) { sleep(1); } sul.lock(); if (orig_epoch != osdmap-&gt;get_epoch()) { // map changed; recalculate mapping ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; relock raced with osdmap, recalc target&quot; &lt;&lt; dendl; //调用_calc_target 来计算目标OSD check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; if (s) { put_session(s); s = NULL; r = -EAGAIN; } } } if (r == -EAGAIN) { assert(s == NULL); r = _get_session(op-&gt;target.osd, &amp;s, sul); } assert(r == 0); assert(s); // may be homeless _send_op_account(op); // send? assert(op-&gt;target.flags &amp; (CEPH_OSD_FLAG_READ|CEPH_OSD_FLAG_WRITE)); if (osdmap_full_try) { op-&gt;target.flags |= CEPH_OSD_FLAG_FULL_TRY; } bool need_send = false; //判断当前状态，如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息，调用函数_send_op发送消息 if (osdmap-&gt;get_epoch() &lt; epoch_barrier) { ldout(cct, 10) &lt;&lt; &quot; barrier, paused &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_WRITE) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSEWR)) { ldout(cct, 10) &lt;&lt; &quot; paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_READ) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSERD)) { ldout(cct, 10) &lt;&lt; &quot; paused read &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (op-&gt;respects_full() &amp;&amp; (_osdmap_full_flag() || _osdmap_pool_full(op-&gt;target.base_oloc.pool))) { ldout(cct, 0) &lt;&lt; &quot; FULL, paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (!s-&gt;is_homeless()) { need_send = true; } else { _maybe_request_map(); } //如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息 MOSDOp *m = NULL; if (need_send) { m = _prepare_osd_op(op); } OSDSession::unique_lock sl(s-&gt;lock); if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; ldout(cct, 10) &lt;&lt; &quot;_op_submit oid &quot; &lt;&lt; op-&gt;target.base_oid &lt;&lt; &quot; &#39;&quot; &lt;&lt; op-&gt;target.base_oloc &lt;&lt; &quot;&#39; &#39;&quot; &lt;&lt; op-&gt;target.target_oloc &lt;&lt; &quot;&#39; &quot; &lt;&lt; op-&gt;ops &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; &quot; osd.&quot; &lt;&lt; (!s-&gt;is_homeless() ? s-&gt;osd : -1) &lt;&lt; dendl; _session_op_assign(s, op); //如果可以发送请求就调用，调用函数_send_op发送消息 if (need_send) { _send_op(op, m); } // Last chance to touch Op here, after giving up session lock it can // be freed at any time by response handler. ceph_tid_t tid = op-&gt;tid; if (check_for_latest_map) { _send_op_map_check(op); } if (ptid) *ptid = tid; op = NULL; sl.unlock(); put_session(s); ldout(cct, 5) &lt;&lt; num_in_flight &lt;&lt; &quot; in flight&quot; &lt;&lt; dendl; } 对象寻址 _calc_target int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change) { .... .... .... const pg_pool_t *pi = osdmap-&gt;get_pg_pool(t-&gt;base_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; base pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; bool force_resend = false; if (osdmap-&gt;get_epoch() == pi-&gt;last_force_op_resend) { if (t-&gt;last_force_resend &lt; pi-&gt;last_force_op_resend) { t-&gt;last_force_resend = pi-&gt;last_force_op_resend; force_resend = true; } else if (t-&gt;last_force_resend == 0) { force_resend = true; } } // apply tiering t-&gt;target_oid = t-&gt;base_oid; t-&gt;target_oloc = t-&gt;base_oloc; if ((t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) { if (is_read &amp;&amp; pi-&gt;has_read_tier()) t-&gt;target_oloc.pool = pi-&gt;read_tier; if (is_write &amp;&amp; pi-&gt;has_write_tier()) t-&gt;target_oloc.pool = pi-&gt;write_tier; pi = osdmap-&gt;get_pg_pool(t-&gt;target_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } pg_t pgid; if (t-&gt;precalc_pgid) { assert(t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY); assert(t-&gt;base_oid.name.empty()); // make sure this is a pg op assert(t-&gt;base_oloc.pool == (int64_t)t-&gt;base_pgid.pool()); pgid = t-&gt;base_pgid; } else { //!!!!!!!!!!!!!!!!获取目标对象所在的PG！！！！！！！！！！！！！！！！！！！！！！！！！！！ int ret = osdmap-&gt;object_locator_to_pg(t-&gt;target_oid, t-&gt;target_oloc, pgid); if (ret == -ENOENT) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } ldout(cct,20) &lt;&lt; __func__ &lt;&lt; &quot; target &quot; &lt;&lt; t-&gt;target_oid &lt;&lt; &quot; &quot; &lt;&lt; t-&gt;target_oloc &lt;&lt; &quot; -&gt; pgid &quot; &lt;&lt; pgid &lt;&lt; dendl; ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; target pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; t-&gt;pool_ever_existed = true; int size = pi-&gt;size; int min_size = pi-&gt;min_size; unsigned pg_num = pi-&gt;get_pg_num(); int up_primary, acting_primary; vector&lt;int&gt; up, acting; //！！！！！！！！！！！！！！！通过CRUSH算法，获取该PG对应的OSD列表！！！！！！！！！！！！！！！！！ osdmap-&gt;pg_to_up_acting_osds(pgid, &amp;up, &amp;up_primary, &amp;acting, &amp;acting_primary); bool sort_bitwise = osdmap-&gt;test_flag(CEPH_OSDMAP_SORTBITWISE); bool recovery_deletes = osdmap-&gt;test_flag(CEPH_OSDMAP_RECOVERY_DELETES); unsigned prev_seed = ceph_stable_mod(pgid.ps(), t-&gt;pg_num, t-&gt;pg_num_mask); pg_t prev_pgid(prev_seed, pgid.pool()); .... .... .... return RECALC_OP_TARGET_NO_ACTION; } 阅读更多" />
+<meta property="og:description" content="客户端读写操作分析 本节设计到了Librados以及Osdc等操作，相关类如 RadosClient、Objecter、IoCtxImpl等介绍见上一节： Ceph学习——Librados与Osdc实现源码解析 1）调用rados_create()创建一个RadosClient对象。 2） 调用rados_config_read()读取配置文件。 3）调用rados_connect()函数，最终他会调用RadosClient::connect()来完成初始化 4）调用rados_ioctx_create()，它最终调用RadosClient::create_ioctx()穿件pool相关的IoCtxImpl类。 5）调用 rados_write 函数 想该pool中写入对象。调用了IoCtxImpl::write()。 写操作消息封装 int librados::IoCtxImpl::write(const object_t&amp; oid, bufferlist&amp; bl, size_t len, uint64_t off) { if (len &gt; UINT_MAX/2) return -E2BIG; ::ObjectOperation op;//创建ObjectOperation对象 prepare_assert_ops(&amp;op);//封装相关写操作 bufferlist mybl; mybl.substr_of(bl, 0, len); op.write(off, mybl); return operate(oid, &amp;op, NULL);//调用operate处理 } write中调用operate int librados::IoCtxImpl::operate(const object_t&amp; oid, ::ObjectOperation *o, ceph::real_time *pmtime, int flags) { ceph::real_time ut = (pmtime ? *pmtime : ceph::real_clock::now()); /* can&#39;t write to a snapshot */ if (snap_seq != CEPH_NOSNAP) return -EROFS; if (!o-&gt;size()) return 0; Mutex mylock(&quot;IoCtxImpl::operate::mylock&quot;); Cond cond; bool done; int r; version_t ver; Context *oncommit = new C_SafeCond(&amp;mylock, &amp;cond, &amp;done, &amp;r); int op = o-&gt;ops[0].op.op; ldout(client-&gt;cct, 10) &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; oid=&quot; &lt;&lt; oid &lt;&lt; &quot; nspace=&quot; &lt;&lt; oloc.nspace &lt;&lt; dendl; //调用objecter-&gt;prepare_mutate_op把ObjectOperation封装为Op类型 Objecter::Op *objecter_op = objecter-&gt;prepare_mutate_op(oid, oloc, *o, snapc, ut, flags, oncommit, &amp;ver); objecter-&gt;op_submit(objecter_op);//发送消息 mylock.Lock(); while (!done) cond.Wait(mylock); mylock.Unlock(); ldout(client-&gt;cct, 10) &lt;&lt; &quot;Objecter returned from &quot; &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; r=&quot; &lt;&lt; r &lt;&lt; dendl; set_sync_op_version(ver); return r; } 发送消息 op_submit 该函数将封装好的Op操作通过网络发送出去。在op_submit中调用了_op_submit_with_budget用来处理Throttle相关的流量信息以及超时处理，最后该函数调用 _op_submit用来完成关键地址寻址和发送工作。 函数 oid Objecter::op_submit(Op *op, ceph_tid_t *ptid, int *ctx_budget) { shunique_lock rl(rwlock, ceph::acquire_shared); ceph_tid_t tid = 0; if (!ptid) ptid = &amp;tid; op-&gt;trace.event(&quot;op submit&quot;); _op_submit_with_budget(op, rl, ptid, ctx_budget);//调用_op_submit_with_budget } void Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid, int *ctx_budget) { assert(initialized); assert(op-&gt;ops.size() == op-&gt;out_bl.size()); assert(op-&gt;ops.size() == op-&gt;out_rval.size()); assert(op-&gt;ops.size() == op-&gt;out_handler.size()); // throttle. before we look at any state, because // _take_op_budget() may drop our lock while it blocks. if (!op-&gt;ctx_budgeted || (ctx_budget &amp;&amp; (*ctx_budget == -1))) { int op_budget = _take_op_budget(op, sul); // take and pass out the budget for the first OP // in the context session if (ctx_budget &amp;&amp; (*ctx_budget == -1)) { *ctx_budget = op_budget; } } if (osd_timeout &gt; timespan(0)) { if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; auto tid = op-&gt;tid; op-&gt;ontimeout = timer.add_event(osd_timeout, [this, tid]() { op_cancel(tid, -ETIMEDOUT); }); } _op_submit(op, sul, ptid); } void Objecter::_op_submit(Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid) { // rwlock is locked ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; op &quot; &lt;&lt; op &lt;&lt; dendl; // pick target assert(op-&gt;session == NULL); OSDSession *s = NULL; //调用_calc_target 来计算目标OSD bool check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; // Try to get a session, including a retry if we need to take write lock //调用函数 _get_session 获取目标OSD的连接，如果返回-EAGAIN，就升级为写锁，重新获取 int r = _get_session(op-&gt;target.osd, &amp;s, sul); if (r == -EAGAIN || (check_for_latest_map &amp;&amp; sul.owns_lock_shared())) { epoch_t orig_epoch = osdmap-&gt;get_epoch(); sul.unlock(); if (cct-&gt;_conf-&gt;objecter_debug_inject_relock_delay) { sleep(1); } sul.lock(); if (orig_epoch != osdmap-&gt;get_epoch()) { // map changed; recalculate mapping ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; relock raced with osdmap, recalc target&quot; &lt;&lt; dendl; //调用_calc_target 来计算目标OSD check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; if (s) { put_session(s); s = NULL; r = -EAGAIN; } } } if (r == -EAGAIN) { assert(s == NULL); r = _get_session(op-&gt;target.osd, &amp;s, sul); } assert(r == 0); assert(s); // may be homeless _send_op_account(op); // send? assert(op-&gt;target.flags &amp; (CEPH_OSD_FLAG_READ|CEPH_OSD_FLAG_WRITE)); if (osdmap_full_try) { op-&gt;target.flags |= CEPH_OSD_FLAG_FULL_TRY; } bool need_send = false; //判断当前状态，如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息，调用函数_send_op发送消息 if (osdmap-&gt;get_epoch() &lt; epoch_barrier) { ldout(cct, 10) &lt;&lt; &quot; barrier, paused &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_WRITE) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSEWR)) { ldout(cct, 10) &lt;&lt; &quot; paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_READ) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSERD)) { ldout(cct, 10) &lt;&lt; &quot; paused read &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (op-&gt;respects_full() &amp;&amp; (_osdmap_full_flag() || _osdmap_pool_full(op-&gt;target.base_oloc.pool))) { ldout(cct, 0) &lt;&lt; &quot; FULL, paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (!s-&gt;is_homeless()) { need_send = true; } else { _maybe_request_map(); } //如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息 MOSDOp *m = NULL; if (need_send) { m = _prepare_osd_op(op); } OSDSession::unique_lock sl(s-&gt;lock); if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; ldout(cct, 10) &lt;&lt; &quot;_op_submit oid &quot; &lt;&lt; op-&gt;target.base_oid &lt;&lt; &quot; &#39;&quot; &lt;&lt; op-&gt;target.base_oloc &lt;&lt; &quot;&#39; &#39;&quot; &lt;&lt; op-&gt;target.target_oloc &lt;&lt; &quot;&#39; &quot; &lt;&lt; op-&gt;ops &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; &quot; osd.&quot; &lt;&lt; (!s-&gt;is_homeless() ? s-&gt;osd : -1) &lt;&lt; dendl; _session_op_assign(s, op); //如果可以发送请求就调用，调用函数_send_op发送消息 if (need_send) { _send_op(op, m); } // Last chance to touch Op here, after giving up session lock it can // be freed at any time by response handler. ceph_tid_t tid = op-&gt;tid; if (check_for_latest_map) { _send_op_map_check(op); } if (ptid) *ptid = tid; op = NULL; sl.unlock(); put_session(s); ldout(cct, 5) &lt;&lt; num_in_flight &lt;&lt; &quot; in flight&quot; &lt;&lt; dendl; } 对象寻址 _calc_target int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change) { .... .... .... const pg_pool_t *pi = osdmap-&gt;get_pg_pool(t-&gt;base_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; base pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; bool force_resend = false; if (osdmap-&gt;get_epoch() == pi-&gt;last_force_op_resend) { if (t-&gt;last_force_resend &lt; pi-&gt;last_force_op_resend) { t-&gt;last_force_resend = pi-&gt;last_force_op_resend; force_resend = true; } else if (t-&gt;last_force_resend == 0) { force_resend = true; } } // apply tiering t-&gt;target_oid = t-&gt;base_oid; t-&gt;target_oloc = t-&gt;base_oloc; if ((t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) { if (is_read &amp;&amp; pi-&gt;has_read_tier()) t-&gt;target_oloc.pool = pi-&gt;read_tier; if (is_write &amp;&amp; pi-&gt;has_write_tier()) t-&gt;target_oloc.pool = pi-&gt;write_tier; pi = osdmap-&gt;get_pg_pool(t-&gt;target_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } pg_t pgid; if (t-&gt;precalc_pgid) { assert(t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY); assert(t-&gt;base_oid.name.empty()); // make sure this is a pg op assert(t-&gt;base_oloc.pool == (int64_t)t-&gt;base_pgid.pool()); pgid = t-&gt;base_pgid; } else { //!!!!!!!!!!!!!!!!获取目标对象所在的PG！！！！！！！！！！！！！！！！！！！！！！！！！！！ int ret = osdmap-&gt;object_locator_to_pg(t-&gt;target_oid, t-&gt;target_oloc, pgid); if (ret == -ENOENT) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } ldout(cct,20) &lt;&lt; __func__ &lt;&lt; &quot; target &quot; &lt;&lt; t-&gt;target_oid &lt;&lt; &quot; &quot; &lt;&lt; t-&gt;target_oloc &lt;&lt; &quot; -&gt; pgid &quot; &lt;&lt; pgid &lt;&lt; dendl; ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; target pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; t-&gt;pool_ever_existed = true; int size = pi-&gt;size; int min_size = pi-&gt;min_size; unsigned pg_num = pi-&gt;get_pg_num(); int up_primary, acting_primary; vector&lt;int&gt; up, acting; //！！！！！！！！！！！！！！！通过CRUSH算法，获取该PG对应的OSD列表！！！！！！！！！！！！！！！！！ osdmap-&gt;pg_to_up_acting_osds(pgid, &amp;up, &amp;up_primary, &amp;acting, &amp;acting_primary); bool sort_bitwise = osdmap-&gt;test_flag(CEPH_OSDMAP_SORTBITWISE); bool recovery_deletes = osdmap-&gt;test_flag(CEPH_OSDMAP_RECOVERY_DELETES); unsigned prev_seed = ceph_stable_mod(pgid.ps(), t-&gt;pg_num, t-&gt;pg_num_mask); pg_t prev_pgid(prev_seed, pgid.pool()); .... .... .... return RECALC_OP_TARGET_NO_ACTION; } 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/12/04/f899d10975fb9dca146670e74f9b2f8f.html" />
+<meta property="og:url" content="https://uzzz.org/2017/12/04/f899d10975fb9dca146670e74f9b2f8f.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-12-04T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"客户端读写操作分析 本节设计到了Librados以及Osdc等操作，相关类如 RadosClient、Objecter、IoCtxImpl等介绍见上一节： Ceph学习——Librados与Osdc实现源码解析 1）调用rados_create()创建一个RadosClient对象。 2） 调用rados_config_read()读取配置文件。 3）调用rados_connect()函数，最终他会调用RadosClient::connect()来完成初始化 4）调用rados_ioctx_create()，它最终调用RadosClient::create_ioctx()穿件pool相关的IoCtxImpl类。 5）调用 rados_write 函数 想该pool中写入对象。调用了IoCtxImpl::write()。 写操作消息封装 int librados::IoCtxImpl::write(const object_t&amp; oid, bufferlist&amp; bl, size_t len, uint64_t off) { if (len &gt; UINT_MAX/2) return -E2BIG; ::ObjectOperation op;//创建ObjectOperation对象 prepare_assert_ops(&amp;op);//封装相关写操作 bufferlist mybl; mybl.substr_of(bl, 0, len); op.write(off, mybl); return operate(oid, &amp;op, NULL);//调用operate处理 } write中调用operate int librados::IoCtxImpl::operate(const object_t&amp; oid, ::ObjectOperation *o, ceph::real_time *pmtime, int flags) { ceph::real_time ut = (pmtime ? *pmtime : ceph::real_clock::now()); /* can&#39;t write to a snapshot */ if (snap_seq != CEPH_NOSNAP) return -EROFS; if (!o-&gt;size()) return 0; Mutex mylock(&quot;IoCtxImpl::operate::mylock&quot;); Cond cond; bool done; int r; version_t ver; Context *oncommit = new C_SafeCond(&amp;mylock, &amp;cond, &amp;done, &amp;r); int op = o-&gt;ops[0].op.op; ldout(client-&gt;cct, 10) &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; oid=&quot; &lt;&lt; oid &lt;&lt; &quot; nspace=&quot; &lt;&lt; oloc.nspace &lt;&lt; dendl; //调用objecter-&gt;prepare_mutate_op把ObjectOperation封装为Op类型 Objecter::Op *objecter_op = objecter-&gt;prepare_mutate_op(oid, oloc, *o, snapc, ut, flags, oncommit, &amp;ver); objecter-&gt;op_submit(objecter_op);//发送消息 mylock.Lock(); while (!done) cond.Wait(mylock); mylock.Unlock(); ldout(client-&gt;cct, 10) &lt;&lt; &quot;Objecter returned from &quot; &lt;&lt; ceph_osd_op_name(op) &lt;&lt; &quot; r=&quot; &lt;&lt; r &lt;&lt; dendl; set_sync_op_version(ver); return r; } 发送消息 op_submit 该函数将封装好的Op操作通过网络发送出去。在op_submit中调用了_op_submit_with_budget用来处理Throttle相关的流量信息以及超时处理，最后该函数调用 _op_submit用来完成关键地址寻址和发送工作。 函数 oid Objecter::op_submit(Op *op, ceph_tid_t *ptid, int *ctx_budget) { shunique_lock rl(rwlock, ceph::acquire_shared); ceph_tid_t tid = 0; if (!ptid) ptid = &amp;tid; op-&gt;trace.event(&quot;op submit&quot;); _op_submit_with_budget(op, rl, ptid, ctx_budget);//调用_op_submit_with_budget } void Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid, int *ctx_budget) { assert(initialized); assert(op-&gt;ops.size() == op-&gt;out_bl.size()); assert(op-&gt;ops.size() == op-&gt;out_rval.size()); assert(op-&gt;ops.size() == op-&gt;out_handler.size()); // throttle. before we look at any state, because // _take_op_budget() may drop our lock while it blocks. if (!op-&gt;ctx_budgeted || (ctx_budget &amp;&amp; (*ctx_budget == -1))) { int op_budget = _take_op_budget(op, sul); // take and pass out the budget for the first OP // in the context session if (ctx_budget &amp;&amp; (*ctx_budget == -1)) { *ctx_budget = op_budget; } } if (osd_timeout &gt; timespan(0)) { if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; auto tid = op-&gt;tid; op-&gt;ontimeout = timer.add_event(osd_timeout, [this, tid]() { op_cancel(tid, -ETIMEDOUT); }); } _op_submit(op, sul, ptid); } void Objecter::_op_submit(Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid) { // rwlock is locked ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; op &quot; &lt;&lt; op &lt;&lt; dendl; // pick target assert(op-&gt;session == NULL); OSDSession *s = NULL; //调用_calc_target 来计算目标OSD bool check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; // Try to get a session, including a retry if we need to take write lock //调用函数 _get_session 获取目标OSD的连接，如果返回-EAGAIN，就升级为写锁，重新获取 int r = _get_session(op-&gt;target.osd, &amp;s, sul); if (r == -EAGAIN || (check_for_latest_map &amp;&amp; sul.owns_lock_shared())) { epoch_t orig_epoch = osdmap-&gt;get_epoch(); sul.unlock(); if (cct-&gt;_conf-&gt;objecter_debug_inject_relock_delay) { sleep(1); } sul.lock(); if (orig_epoch != osdmap-&gt;get_epoch()) { // map changed; recalculate mapping ldout(cct, 10) &lt;&lt; __func__ &lt;&lt; &quot; relock raced with osdmap, recalc target&quot; &lt;&lt; dendl; //调用_calc_target 来计算目标OSD check_for_latest_map = _calc_target(&amp;op-&gt;target, nullptr) == RECALC_OP_TARGET_POOL_DNE; if (s) { put_session(s); s = NULL; r = -EAGAIN; } } } if (r == -EAGAIN) { assert(s == NULL); r = _get_session(op-&gt;target.osd, &amp;s, sul); } assert(r == 0); assert(s); // may be homeless _send_op_account(op); // send? assert(op-&gt;target.flags &amp; (CEPH_OSD_FLAG_READ|CEPH_OSD_FLAG_WRITE)); if (osdmap_full_try) { op-&gt;target.flags |= CEPH_OSD_FLAG_FULL_TRY; } bool need_send = false; //判断当前状态，如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息，调用函数_send_op发送消息 if (osdmap-&gt;get_epoch() &lt; epoch_barrier) { ldout(cct, 10) &lt;&lt; &quot; barrier, paused &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_WRITE) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSEWR)) { ldout(cct, 10) &lt;&lt; &quot; paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_READ) &amp;&amp; osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSERD)) { ldout(cct, 10) &lt;&lt; &quot; paused read &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (op-&gt;respects_full() &amp;&amp; (_osdmap_full_flag() || _osdmap_pool_full(op-&gt;target.base_oloc.pool))) { ldout(cct, 0) &lt;&lt; &quot; FULL, paused modify &quot; &lt;&lt; op &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; dendl; op-&gt;target.paused = true; _maybe_request_map(); } else if (!s-&gt;is_homeless()) { need_send = true; } else { _maybe_request_map(); } //如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息 MOSDOp *m = NULL; if (need_send) { m = _prepare_osd_op(op); } OSDSession::unique_lock sl(s-&gt;lock); if (op-&gt;tid == 0) op-&gt;tid = ++last_tid; ldout(cct, 10) &lt;&lt; &quot;_op_submit oid &quot; &lt;&lt; op-&gt;target.base_oid &lt;&lt; &quot; &#39;&quot; &lt;&lt; op-&gt;target.base_oloc &lt;&lt; &quot;&#39; &#39;&quot; &lt;&lt; op-&gt;target.target_oloc &lt;&lt; &quot;&#39; &quot; &lt;&lt; op-&gt;ops &lt;&lt; &quot; tid &quot; &lt;&lt; op-&gt;tid &lt;&lt; &quot; osd.&quot; &lt;&lt; (!s-&gt;is_homeless() ? s-&gt;osd : -1) &lt;&lt; dendl; _session_op_assign(s, op); //如果可以发送请求就调用，调用函数_send_op发送消息 if (need_send) { _send_op(op, m); } // Last chance to touch Op here, after giving up session lock it can // be freed at any time by response handler. ceph_tid_t tid = op-&gt;tid; if (check_for_latest_map) { _send_op_map_check(op); } if (ptid) *ptid = tid; op = NULL; sl.unlock(); put_session(s); ldout(cct, 5) &lt;&lt; num_in_flight &lt;&lt; &quot; in flight&quot; &lt;&lt; dendl; } 对象寻址 _calc_target int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change) { .... .... .... const pg_pool_t *pi = osdmap-&gt;get_pg_pool(t-&gt;base_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; base pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; bool force_resend = false; if (osdmap-&gt;get_epoch() == pi-&gt;last_force_op_resend) { if (t-&gt;last_force_resend &lt; pi-&gt;last_force_op_resend) { t-&gt;last_force_resend = pi-&gt;last_force_op_resend; force_resend = true; } else if (t-&gt;last_force_resend == 0) { force_resend = true; } } // apply tiering t-&gt;target_oid = t-&gt;base_oid; t-&gt;target_oloc = t-&gt;base_oloc; if ((t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) { if (is_read &amp;&amp; pi-&gt;has_read_tier()) t-&gt;target_oloc.pool = pi-&gt;read_tier; if (is_write &amp;&amp; pi-&gt;has_write_tier()) t-&gt;target_oloc.pool = pi-&gt;write_tier; pi = osdmap-&gt;get_pg_pool(t-&gt;target_oloc.pool); if (!pi) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } pg_t pgid; if (t-&gt;precalc_pgid) { assert(t-&gt;flags &amp; CEPH_OSD_FLAG_IGNORE_OVERLAY); assert(t-&gt;base_oid.name.empty()); // make sure this is a pg op assert(t-&gt;base_oloc.pool == (int64_t)t-&gt;base_pgid.pool()); pgid = t-&gt;base_pgid; } else { //!!!!!!!!!!!!!!!!获取目标对象所在的PG！！！！！！！！！！！！！！！！！！！！！！！！！！！ int ret = osdmap-&gt;object_locator_to_pg(t-&gt;target_oid, t-&gt;target_oloc, pgid); if (ret == -ENOENT) { t-&gt;osd = -1; return RECALC_OP_TARGET_POOL_DNE; } } ldout(cct,20) &lt;&lt; __func__ &lt;&lt; &quot; target &quot; &lt;&lt; t-&gt;target_oid &lt;&lt; &quot; &quot; &lt;&lt; t-&gt;target_oloc &lt;&lt; &quot; -&gt; pgid &quot; &lt;&lt; pgid &lt;&lt; dendl; ldout(cct,30) &lt;&lt; __func__ &lt;&lt; &quot; target pi &quot; &lt;&lt; pi &lt;&lt; &quot; pg_num &quot; &lt;&lt; pi-&gt;get_pg_num() &lt;&lt; dendl; t-&gt;pool_ever_existed = true; int size = pi-&gt;size; int min_size = pi-&gt;min_size; unsigned pg_num = pi-&gt;get_pg_num(); int up_primary, acting_primary; vector&lt;int&gt; up, acting; //！！！！！！！！！！！！！！！通过CRUSH算法，获取该PG对应的OSD列表！！！！！！！！！！！！！！！！！ osdmap-&gt;pg_to_up_acting_osds(pgid, &amp;up, &amp;up_primary, &amp;acting, &amp;acting_primary); bool sort_bitwise = osdmap-&gt;test_flag(CEPH_OSDMAP_SORTBITWISE); bool recovery_deletes = osdmap-&gt;test_flag(CEPH_OSDMAP_RECOVERY_DELETES); unsigned prev_seed = ceph_stable_mod(pgid.ps(), t-&gt;pg_num, t-&gt;pg_num_mask); pg_t prev_pgid(prev_seed, pgid.pool()); .... .... .... return RECALC_OP_TARGET_NO_ACTION; } 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/12/04/f899d10975fb9dca146670e74f9b2f8f.html","headline":"Ceph学习——客户端读写操作分析","dateModified":"2017-12-04T00:00:00+08:00","datePublished":"2017-12-04T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/12/04/f899d10975fb9dca146670e74f9b2f8f.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Ceph学习——客户端读写操作分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="客户端读写操作分析">客户端读写操作分析</h1> 
+  <p>本节设计到了Librados以及Osdc等操作，相关类如 RadosClient、Objecter、IoCtxImpl等介绍见上一节： <br> <a href="http://blog.csdn.net/csnd_pan/article/details/78707756" rel="nofollow">Ceph学习——Librados与Osdc实现源码解析</a></p> 
+  <p></p>
+  <div align="center"> 
+   <br> 
+   <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20171204184140743?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvQ1NORF9QQU4=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/SouthEast" alt="这里写图片描述" title="">
+  </div>
+  <p></p> 
+  <p>1）调用rados_create()创建一个RadosClient对象。 <br> 2） 调用rados_config_read()读取配置文件。 <br> 3）调用rados_connect()函数，最终他会调用RadosClient::connect()来完成初始化 <br> 4）调用rados_ioctx_create()，它最终调用RadosClient::create_ioctx()穿件pool相关的IoCtxImpl类。 <br> 5）调用 rados_write 函数 想该pool中写入对象。调用了IoCtxImpl::write()。</p> 
+  <p></p>
+  <div align="center"> 
+   <br> 
+   <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20171204181430089?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvQ1NORF9QQU4=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/SouthEast" alt="这里写图片描述" title="">
+  </div>
+  <p></p> 
+  <h2 id="写操作消息封装">写操作消息封装</h2> 
+  <pre class="prettyprint"><code class="language-c hljs "><span class="hljs-keyword">int</span> librados::IoCtxImpl::write(<span class="hljs-keyword">const</span> object_t&amp; oid, bufferlist&amp; bl,
+                               size_t len, uint64_t off)
+{
+  <span class="hljs-keyword">if</span> (len &gt; UINT_MAX/<span class="hljs-number">2</span>)
+    <span class="hljs-keyword">return</span> -E2BIG;
+  ::ObjectOperation op;<span class="hljs-comment">//创建ObjectOperation对象</span>
+  prepare_assert_ops(&amp;op);<span class="hljs-comment">//封装相关写操作</span>
+  bufferlist mybl;
+  mybl.substr_of(bl, <span class="hljs-number">0</span>, len);
+  op.write(off, mybl);
+  <span class="hljs-keyword">return</span> operate(oid, &amp;op, NULL);<span class="hljs-comment">//调用operate处理</span>
+}</code></pre> 
+  <p>write中调用operate</p> 
+  <pre class="prettyprint"><code class="language-c hljs "><span class="hljs-keyword">int</span> librados::IoCtxImpl::operate(<span class="hljs-keyword">const</span> object_t&amp; oid, ::ObjectOperation *o,
+                                 ceph::real_time *pmtime, <span class="hljs-keyword">int</span> flags)
+{
+  ceph::real_time ut = (pmtime ? *pmtime :
+    ceph::real_clock::now());
+
+  <span class="hljs-comment">/* can't write to a snapshot */</span>
+  <span class="hljs-keyword">if</span> (snap_seq != CEPH_NOSNAP)
+    <span class="hljs-keyword">return</span> -EROFS;
+
+  <span class="hljs-keyword">if</span> (!o-&gt;size())
+    <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;
+
+  Mutex mylock(<span class="hljs-string">"IoCtxImpl::operate::mylock"</span>);
+  Cond cond;
+  <span class="hljs-keyword">bool</span> done;
+  <span class="hljs-keyword">int</span> r;
+  version_t ver;
+
+  Context *oncommit = <span class="hljs-keyword">new</span> C_SafeCond(&amp;mylock, &amp;cond, &amp;done, &amp;r);
+
+  <span class="hljs-keyword">int</span> op = o-&gt;ops[<span class="hljs-number">0</span>].op.op;
+  ldout(client-&gt;cct, <span class="hljs-number">10</span>) &lt;&lt; ceph_osd_op_name(op) &lt;&lt; <span class="hljs-string">" oid="</span> &lt;&lt; oid
+                         &lt;&lt; <span class="hljs-string">" nspace="</span> &lt;&lt; oloc.nspace &lt;&lt; dendl;
+  <span class="hljs-comment">//调用objecter-&gt;prepare_mutate_op把ObjectOperation封装为Op类型</span>
+  Objecter::Op *objecter_op = objecter-&gt;prepare_mutate_op(oid, oloc,
+                                                          *o, snapc, ut, flags,
+                                                          oncommit, &amp;ver);
+  objecter-&gt;op_submit(objecter_op);<span class="hljs-comment">//发送消息</span>
+
+  mylock.Lock();
+  <span class="hljs-keyword">while</span> (!done)
+    cond.Wait(mylock);
+  mylock.Unlock();
+  ldout(client-&gt;cct, <span class="hljs-number">10</span>) &lt;&lt; <span class="hljs-string">"Objecter returned from "</span>
+        &lt;&lt; ceph_osd_op_name(op) &lt;&lt; <span class="hljs-string">" r="</span> &lt;&lt; r &lt;&lt; dendl;
+
+  set_sync_op_version(ver);
+
+  <span class="hljs-keyword">return</span> r;
+}</code></pre> 
+  <h2 id="发送消息-opsubmit">发送消息 op_submit</h2> 
+  <p>该函数将封装好的Op操作通过网络发送出去。在op_submit中调用了_op_submit_with_budget用来处理Throttle相关的流量信息以及超时处理，最后该函数调用 _op_submit用来完成关键地址寻址和发送工作。 <br> 函数</p> 
+  <pre class="prettyprint"><code class="language-c hljs ">oid Objecter::op_submit(Op *op, ceph_tid_t *ptid, <span class="hljs-keyword">int</span> *ctx_budget)
+{
+  shunique_lock rl(rwlock, ceph::acquire_shared);
+  ceph_tid_t tid = <span class="hljs-number">0</span>;
+  <span class="hljs-keyword">if</span> (!ptid)
+    ptid = &amp;tid;
+  op-&gt;trace.event(<span class="hljs-string">"op submit"</span>);
+  _op_submit_with_budget(op, rl, ptid, ctx_budget);<span class="hljs-comment">//调用_op_submit_with_budget</span>
+}
+
+<span class="hljs-keyword">void</span> Op *op, shunique_lock&amp; sul,
+                                      ceph_tid_t *ptid,
+                                      <span class="hljs-keyword">int</span> *ctx_budget)
+{
+  assert(initialized);
+
+  assert(op-&gt;ops.size() == op-&gt;out_bl.size());
+  assert(op-&gt;ops.size() == op-&gt;out_rval.size());
+  assert(op-&gt;ops.size() == op-&gt;out_handler.size());
+
+  <span class="hljs-comment">// throttle. before we look at any state, because</span>
+  <span class="hljs-comment">// _take_op_budget() may drop our lock while it blocks.</span>
+  <span class="hljs-keyword">if</span> (!op-&gt;ctx_budgeted || (ctx_budget &amp;&amp; (*ctx_budget == -<span class="hljs-number">1</span>))) {
+    <span class="hljs-keyword">int</span> op_budget = _take_op_budget(op, sul);
+    <span class="hljs-comment">// take and pass out the budget for the first OP</span>
+    <span class="hljs-comment">// in the context session</span>
+    <span class="hljs-keyword">if</span> (ctx_budget &amp;&amp; (*ctx_budget == -<span class="hljs-number">1</span>)) {
+      *ctx_budget = op_budget;
+    }
+  }
+
+  <span class="hljs-keyword">if</span> (osd_timeout &gt; timespan(<span class="hljs-number">0</span>)) {
+    <span class="hljs-keyword">if</span> (op-&gt;tid == <span class="hljs-number">0</span>)
+      op-&gt;tid = ++last_tid;
+    <span class="hljs-keyword">auto</span> tid = op-&gt;tid;
+    op-&gt;ontimeout = timer.add_event(osd_timeout,
+                                    [<span class="hljs-keyword">this</span>, tid]() {
+                                      op_cancel(tid, -ETIMEDOUT); });
+  }
+
+  _op_submit(op, sul, ptid);
+}
+
+
+<span class="hljs-keyword">void</span> Objecter::_op_submit(Op *op, shunique_lock&amp; sul, ceph_tid_t *ptid)
+{
+  <span class="hljs-comment">// rwlock is locked</span>
+
+  ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; __func__ &lt;&lt; <span class="hljs-string">" op "</span> &lt;&lt; op &lt;&lt; dendl;
+
+  <span class="hljs-comment">// pick target</span>
+  assert(op-&gt;session == NULL);
+  OSDSession *s = NULL;
+  <span class="hljs-comment">//调用_calc_target 来计算目标OSD</span>
+  <span class="hljs-keyword">bool</span> check_for_latest_map = _calc_target(&amp;op-&gt;target, <span class="hljs-keyword">nullptr</span>)
+    == RECALC_OP_TARGET_POOL_DNE;
+
+  <span class="hljs-comment">// Try to get a session, including a retry if we need to take write lock</span>
+  <span class="hljs-comment">//调用函数 _get_session 获取目标OSD的连接，如果返回-EAGAIN，就升级为写锁，重新获取</span>
+  <span class="hljs-keyword">int</span> r = _get_session(op-&gt;target.osd, &amp;s, sul);
+  <span class="hljs-keyword">if</span> (r == -EAGAIN ||
+      (check_for_latest_map &amp;&amp; sul.owns_lock_shared())) {
+    epoch_t orig_epoch = osdmap-&gt;get_epoch();
+    sul.unlock();
+    <span class="hljs-keyword">if</span> (cct-&gt;_conf-&gt;objecter_debug_inject_relock_delay) {
+      sleep(<span class="hljs-number">1</span>);
+    }
+    sul.lock();
+    <span class="hljs-keyword">if</span> (orig_epoch != osdmap-&gt;get_epoch()) {
+      <span class="hljs-comment">// map changed; recalculate mapping</span>
+      ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; __func__ &lt;&lt; <span class="hljs-string">" relock raced with osdmap, recalc target"</span>
+                     &lt;&lt; dendl;
+                     <span class="hljs-comment">//调用_calc_target 来计算目标OSD</span>
+      check_for_latest_map = _calc_target(&amp;op-&gt;target, <span class="hljs-keyword">nullptr</span>)
+        == RECALC_OP_TARGET_POOL_DNE;
+      <span class="hljs-keyword">if</span> (s) {
+        put_session(s);
+        s = NULL;
+        r = -EAGAIN;
+      }
+    }
+  }
+  <span class="hljs-keyword">if</span> (r == -EAGAIN) {
+    assert(s == NULL);
+    r = _get_session(op-&gt;target.osd, &amp;s, sul);
+  }
+  assert(r == <span class="hljs-number">0</span>);
+  assert(s);  <span class="hljs-comment">// may be homeless</span>
+
+  _send_op_account(op);
+
+  <span class="hljs-comment">// send?</span>
+
+  assert(op-&gt;target.flags &amp; (CEPH_OSD_FLAG_READ|CEPH_OSD_FLAG_WRITE));
+
+  <span class="hljs-keyword">if</span> (osdmap_full_try) {
+    op-&gt;target.flags |= CEPH_OSD_FLAG_FULL_TRY;
+  }
+
+  <span class="hljs-keyword">bool</span> need_send = <span class="hljs-keyword">false</span>;
+  <span class="hljs-comment">//判断当前状态，如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息，调用函数_send_op发送消息</span>
+  <span class="hljs-keyword">if</span> (osdmap-&gt;get_epoch() &lt; epoch_barrier) {
+    ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; <span class="hljs-string">" barrier, paused "</span> &lt;&lt; op &lt;&lt; <span class="hljs-string">" tid "</span> &lt;&lt; op-&gt;tid
+                   &lt;&lt; dendl;
+    op-&gt;target.paused = <span class="hljs-keyword">true</span>;
+    _maybe_request_map();
+  } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_WRITE) &amp;&amp;
+             osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSEWR)) {
+    ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; <span class="hljs-string">" paused modify "</span> &lt;&lt; op &lt;&lt; <span class="hljs-string">" tid "</span> &lt;&lt; op-&gt;tid
+                   &lt;&lt; dendl;
+    op-&gt;target.paused = <span class="hljs-keyword">true</span>;
+    _maybe_request_map();
+  } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> ((op-&gt;target.flags &amp; CEPH_OSD_FLAG_READ) &amp;&amp;
+             osdmap-&gt;test_flag(CEPH_OSDMAP_PAUSERD)) {
+    ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; <span class="hljs-string">" paused read "</span> &lt;&lt; op &lt;&lt; <span class="hljs-string">" tid "</span> &lt;&lt; op-&gt;tid
+                   &lt;&lt; dendl;
+    op-&gt;target.paused = <span class="hljs-keyword">true</span>;
+    _maybe_request_map();
+  } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (op-&gt;respects_full() &amp;&amp;
+             (_osdmap_full_flag() ||
+              _osdmap_pool_full(op-&gt;target.base_oloc.pool))) {
+    ldout(cct, <span class="hljs-number">0</span>) &lt;&lt; <span class="hljs-string">" FULL, paused modify "</span> &lt;&lt; op &lt;&lt; <span class="hljs-string">" tid "</span>
+                  &lt;&lt; op-&gt;tid &lt;&lt; dendl;
+    op-&gt;target.paused = <span class="hljs-keyword">true</span>;
+    _maybe_request_map();
+  } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (!s-&gt;is_homeless()) {
+    need_send = <span class="hljs-keyword">true</span>;
+  } <span class="hljs-keyword">else</span> {
+    _maybe_request_map();
+  }
+  <span class="hljs-comment">//如果可以发送请求就调用 函数_prepare_osd_op 准备请求消息</span>
+  MOSDOp *m = NULL;
+  <span class="hljs-keyword">if</span> (need_send) {
+    m = _prepare_osd_op(op);
+  }
+
+  OSDSession::unique_lock sl(s-&gt;lock);
+  <span class="hljs-keyword">if</span> (op-&gt;tid == <span class="hljs-number">0</span>)
+    op-&gt;tid = ++last_tid;
+
+  ldout(cct, <span class="hljs-number">10</span>) &lt;&lt; <span class="hljs-string">"_op_submit oid "</span> &lt;&lt; op-&gt;target.base_oid
+                 &lt;&lt; <span class="hljs-string">" '"</span> &lt;&lt; op-&gt;target.base_oloc &lt;&lt; <span class="hljs-string">"' '"</span>
+                 &lt;&lt; op-&gt;target.target_oloc &lt;&lt; <span class="hljs-string">"' "</span> &lt;&lt; op-&gt;ops &lt;&lt; <span class="hljs-string">" tid "</span>
+                 &lt;&lt; op-&gt;tid &lt;&lt; <span class="hljs-string">" osd."</span> &lt;&lt; (!s-&gt;is_homeless() ? s-&gt;osd : -<span class="hljs-number">1</span>)
+                 &lt;&lt; dendl;
+
+  _session_op_assign(s, op);
+  <span class="hljs-comment">//如果可以发送请求就调用，调用函数_send_op发送消息</span>
+  <span class="hljs-keyword">if</span> (need_send) {
+    _send_op(op, m);
+  }
+
+  <span class="hljs-comment">// Last chance to touch Op here, after giving up session lock it can</span>
+  <span class="hljs-comment">// be freed at any time by response handler.</span>
+  ceph_tid_t tid = op-&gt;tid;
+  <span class="hljs-keyword">if</span> (check_for_latest_map) {
+    _send_op_map_check(op);
+  }
+  <span class="hljs-keyword">if</span> (ptid)
+    *ptid = tid;
+  op = NULL;
+
+  sl.unlock();
+  put_session(s);
+
+  ldout(cct, <span class="hljs-number">5</span>) &lt;&lt; num_in_flight &lt;&lt; <span class="hljs-string">" in flight"</span> &lt;&lt; dendl;
+}</code></pre> 
+  <h2 id="对象寻址-calctarget">对象寻址 _calc_target</h2> 
+  <pre class="prettyprint"><code class=" hljs lasso">int Objecter<span class="hljs-tag">::_calc_target</span>(op_target_t <span class="hljs-subst">*</span>t, Connection <span class="hljs-subst">*</span>con, bool any_change)
+{
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+  const pg_pool_t <span class="hljs-subst">*</span>pi <span class="hljs-subst">=</span> osdmap<span class="hljs-subst">-&gt;</span>get_pg_pool(t<span class="hljs-subst">-&gt;</span>base_oloc<span class="hljs-built_in">.</span>pool);
+  <span class="hljs-keyword">if</span> (<span class="hljs-subst">!</span>pi) {
+    t<span class="hljs-subst">-&gt;</span>osd <span class="hljs-subst">=</span> <span class="hljs-subst">-</span><span class="hljs-number">1</span>;
+    <span class="hljs-keyword">return</span> RECALC_OP_TARGET_POOL_DNE;
+  }
+  ldout(cct,<span class="hljs-number">30</span>) <span class="hljs-subst">&lt;&lt;</span> __func__ <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" base pi "</span> <span class="hljs-subst">&lt;&lt;</span> pi
+                <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" pg_num "</span> <span class="hljs-subst">&lt;&lt;</span> pi<span class="hljs-subst">-&gt;</span>get_pg_num() <span class="hljs-subst">&lt;&lt;</span> dendl;
+
+  bool force_resend <span class="hljs-subst">=</span> <span class="hljs-literal">false</span>;
+  <span class="hljs-keyword">if</span> (osdmap<span class="hljs-subst">-&gt;</span>get_epoch() <span class="hljs-subst">==</span> pi<span class="hljs-subst">-&gt;</span>last_force_op_resend) {
+    <span class="hljs-keyword">if</span> (t<span class="hljs-subst">-&gt;</span>last_force_resend <span class="hljs-subst">&lt;</span> pi<span class="hljs-subst">-&gt;</span>last_force_op_resend) {
+      t<span class="hljs-subst">-&gt;</span>last_force_resend <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>last_force_op_resend;
+      force_resend <span class="hljs-subst">=</span> <span class="hljs-literal">true</span>;
+    } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (t<span class="hljs-subst">-&gt;</span>last_force_resend <span class="hljs-subst">==</span> <span class="hljs-number">0</span>) {
+      force_resend <span class="hljs-subst">=</span> <span class="hljs-literal">true</span>;
+    }
+  }
+
+  <span class="hljs-comment">// apply tiering</span>
+  t<span class="hljs-subst">-&gt;</span>target_oid <span class="hljs-subst">=</span> t<span class="hljs-subst">-&gt;</span>base_oid;
+  t<span class="hljs-subst">-&gt;</span>target_oloc <span class="hljs-subst">=</span> t<span class="hljs-subst">-&gt;</span>base_oloc;
+  <span class="hljs-keyword">if</span> ((t<span class="hljs-subst">-&gt;</span>flags <span class="hljs-subst">&amp;</span> CEPH_OSD_FLAG_IGNORE_OVERLAY) <span class="hljs-subst">==</span> <span class="hljs-number">0</span>) {
+    <span class="hljs-keyword">if</span> (is_read <span class="hljs-subst">&amp;&amp;</span> pi<span class="hljs-subst">-&gt;</span>has_read_tier())
+      t<span class="hljs-subst">-&gt;</span>target_oloc<span class="hljs-built_in">.</span>pool <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>read_tier;
+    <span class="hljs-keyword">if</span> (is_write <span class="hljs-subst">&amp;&amp;</span> pi<span class="hljs-subst">-&gt;</span>has_write_tier())
+      t<span class="hljs-subst">-&gt;</span>target_oloc<span class="hljs-built_in">.</span>pool <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>write_tier;
+    pi <span class="hljs-subst">=</span> osdmap<span class="hljs-subst">-&gt;</span>get_pg_pool(t<span class="hljs-subst">-&gt;</span>target_oloc<span class="hljs-built_in">.</span>pool);
+    <span class="hljs-keyword">if</span> (<span class="hljs-subst">!</span>pi) {
+      t<span class="hljs-subst">-&gt;</span>osd <span class="hljs-subst">=</span> <span class="hljs-subst">-</span><span class="hljs-number">1</span>;
+      <span class="hljs-keyword">return</span> RECALC_OP_TARGET_POOL_DNE;
+    }
+  }
+
+  pg_t pgid;
+  <span class="hljs-keyword">if</span> (t<span class="hljs-subst">-&gt;</span>precalc_pgid) {
+    assert(t<span class="hljs-subst">-&gt;</span>flags <span class="hljs-subst">&amp;</span> CEPH_OSD_FLAG_IGNORE_OVERLAY);
+    assert(t<span class="hljs-subst">-&gt;</span>base_oid<span class="hljs-built_in">.</span>name<span class="hljs-built_in">.</span>empty()); <span class="hljs-comment">// make sure this is a pg op</span>
+    assert(t<span class="hljs-subst">-&gt;</span>base_oloc<span class="hljs-built_in">.</span>pool <span class="hljs-subst">==</span> (int64_t)t<span class="hljs-subst">-&gt;</span>base_pgid<span class="hljs-built_in">.</span>pool());
+    pgid <span class="hljs-subst">=</span> t<span class="hljs-subst">-&gt;</span>base_pgid;
+  } <span class="hljs-keyword">else</span> {
+  <span class="hljs-comment">//!!!!!!!!!!!!!!!!获取目标对象所在的PG！！！！！！！！！！！！！！！！！！！！！！！！！！！</span>
+    int ret <span class="hljs-subst">=</span> osdmap<span class="hljs-subst">-&gt;</span>object_locator_to_pg(t<span class="hljs-subst">-&gt;</span>target_oid, t<span class="hljs-subst">-&gt;</span>target_oloc,
+                                           pgid);
+    <span class="hljs-keyword">if</span> (ret <span class="hljs-subst">==</span> <span class="hljs-attribute">-ENOENT</span>) {
+      t<span class="hljs-subst">-&gt;</span>osd <span class="hljs-subst">=</span> <span class="hljs-subst">-</span><span class="hljs-number">1</span>;
+      <span class="hljs-keyword">return</span> RECALC_OP_TARGET_POOL_DNE;
+    }
+  }
+  ldout(cct,<span class="hljs-number">20</span>) <span class="hljs-subst">&lt;&lt;</span> __func__ <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" target "</span> <span class="hljs-subst">&lt;&lt;</span> t<span class="hljs-subst">-&gt;</span>target_oid <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" "</span>
+                <span class="hljs-subst">&lt;&lt;</span> t<span class="hljs-subst">-&gt;</span>target_oloc <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" -&gt; pgid "</span> <span class="hljs-subst">&lt;&lt;</span> pgid <span class="hljs-subst">&lt;&lt;</span> dendl;
+  ldout(cct,<span class="hljs-number">30</span>) <span class="hljs-subst">&lt;&lt;</span> __func__ <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" target pi "</span> <span class="hljs-subst">&lt;&lt;</span> pi
+                <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">" pg_num "</span> <span class="hljs-subst">&lt;&lt;</span> pi<span class="hljs-subst">-&gt;</span>get_pg_num() <span class="hljs-subst">&lt;&lt;</span> dendl;
+  t<span class="hljs-subst">-&gt;</span>pool_ever_existed <span class="hljs-subst">=</span> <span class="hljs-literal">true</span>;
+
+  int size <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>size;
+  int min_size <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>min_size;
+  unsigned pg_num <span class="hljs-subst">=</span> pi<span class="hljs-subst">-&gt;</span>get_pg_num();
+  int up_primary, acting_primary;
+  vector<span class="hljs-subst">&lt;</span>int<span class="hljs-subst">&gt;</span> up, acting;
+  <span class="hljs-comment">//！！！！！！！！！！！！！！！通过CRUSH算法，获取该PG对应的OSD列表！！！！！！！！！！！！！！！！！</span>
+  osdmap<span class="hljs-subst">-&gt;</span>pg_to_up_acting_osds(pgid, <span class="hljs-subst">&amp;</span>up, <span class="hljs-subst">&amp;</span>up_primary,
+                               <span class="hljs-subst">&amp;</span>acting, <span class="hljs-subst">&amp;</span>acting_primary);
+  bool sort_bitwise <span class="hljs-subst">=</span> osdmap<span class="hljs-subst">-&gt;</span>test_flag(CEPH_OSDMAP_SORTBITWISE);
+  bool recovery_deletes <span class="hljs-subst">=</span> osdmap<span class="hljs-subst">-&gt;</span>test_flag(CEPH_OSDMAP_RECOVERY_DELETES);
+  unsigned prev_seed <span class="hljs-subst">=</span> ceph_stable_mod(pgid<span class="hljs-built_in">.</span>ps(), t<span class="hljs-subst">-&gt;</span>pg_num, t<span class="hljs-subst">-&gt;</span>pg_num_mask);
+  pg_t prev_pgid(prev_seed, pgid<span class="hljs-built_in">.</span>pool());
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+  <span class="hljs-attribute">...</span><span class="hljs-built_in">.</span>
+
+  <span class="hljs-keyword">return</span> RECALC_OP_TARGET_NO_ACTION;
+}</code></pre> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/CSND_PAN/article/details/78712495,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/CSND_PAN/article/details/78712495,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

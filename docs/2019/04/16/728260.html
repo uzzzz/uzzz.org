@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Spark WordCount执行流程以及相关源码 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Spark WordCount执行流程以及相关源码" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="RDD是一个抽象类，操作RDD就像操作本地集合一样，降低编程难度。RDD不存真正要计算的数据，而是记录了RDD的转换关系（调用了什么方法，传入什么函数）。RDD的算子分为两类，一类是Transformation（lazy），一类是Action（触发任务执行） RDD的map方法，是Executor中执行时，是一条一条的将数据拿出来处理。 创建方式： 1、通过外部存储的诗句进行创建 sc.textFile(&quot;path&quot;) 2、将Driver的scala集合通过并行化变成RDD。 sc.parallelize(List(x,x,x,x,x)) 3、调用已存在的RDD进行转换得到新的RDD。（转换的特点：1.生成新的RDD 2.Lazy） 分区取决哪些因素? 1、如果是driver端的scala集合并行化转换成RDD，没指定分区，则rdd分区按app分配中指定的核数 2、如从hdfs读创建RDD，并且设置最小分区数量是1，那么rdd分区数即使输入切片的数据。若没设置，spark调用textFile时默认传入2，分区会大于等于切片数量。 RDD五大特点：&nbsp; &nbsp;* &nbsp;- A list of partitions &nbsp;（一系列分区，分区有编号，有顺序的） &nbsp;* &nbsp;- A function for computing each split &nbsp;（每一个切片都会有一个函数作业在上面用于对数据进行处理） &nbsp;* &nbsp;- A list of dependencies on other RDDs &nbsp;（RDD和RDD之间存在依赖关系） &nbsp;* &nbsp;- Optionally, a Partitioner for key-value RDDs (e.g. to say that the RDD is hash-partitioned) &nbsp;&nbsp;&nbsp; &nbsp;（可选，key value类型的RDD才有RDD[(K,V)]）如果是kv类型的RDD，会一个分区器，默认是hash-partitioned &nbsp;* &nbsp;- Optionally, a list of preferred locations to compute each split on (e.g. block locations for &nbsp;* &nbsp; &nbsp;an HDFS file) &nbsp;&nbsp;&nbsp; &nbsp;（可以，如果是从HDFS中读取数据，会得到数据的最优位置（向Namenode请求元数据）） abstract class RDD[T: ClassTag]( &nbsp; &nbsp;@transient private var _sc: SparkContext, &nbsp; &nbsp;@transient private var deps: Seq[Dependency[_]] ) extends Serializable with Logging { &nbsp;//该方法只会被调用一次。由子类实现，返回这个RDD的所有partition。 protected def getPartitions: Array[Partition] //该方法只会被调用一次。计算该RDD和父RDD的依赖关系 protected def getDependencies: Seq[Dependency[_]] = deps // 对分区进行计算，返回一个可遍历的结果 def compute(split: Partition, context: TaskContext): Iterator[T] //可选的，指定优先位置，输入参数是split分片，输出结果是一组优先的节点位置 protected def getPreferredLocations(split: Partition): Seq[String] = Nil //可选的，分区的方法，针对第4点，类似于mapreduce当中的Paritioner接口，控制key分到哪个reduce @transient val partitioner: Option[Partitioner] = None } 注：图片均来自网络 。 &nbsp;当进行textFile时，调用了hadoopFile。 &nbsp;/** &nbsp; * Read a text file from HDFS, a local file system (available on all nodes), or any &nbsp; * Hadoop-supported file system URI, and return it as an RDD of Strings. &nbsp; */ &nbsp;def textFile( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[String] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;hadoopFile(path, classOf[TextInputFormat], classOf[LongWritable], classOf[Text], &nbsp; &nbsp; &nbsp;minPartitions).map(pair =&gt; pair._2.toString) } 在HadoopFile中我们可以看到new了hadoopRDD，即返回了一个hadoopRDD。 def hadoopFile[K, V]( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;inputFormatClass: Class[_ &lt;: InputFormat[K, V]], &nbsp; &nbsp; &nbsp;keyClass: Class[K], &nbsp; &nbsp; &nbsp;valueClass: Class[V], &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[(K, V)] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;// A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it. &nbsp; &nbsp;val confBroadcast = broadcast(new SerializableConfiguration(hadoopConfiguration)) &nbsp; &nbsp;val setInputPathsFunc = (jobConf: JobConf) =&gt; FileInputFormat.setInputPaths(jobConf, path) &nbsp; &nbsp;new HadoopRDD( &nbsp; &nbsp; &nbsp;this, &nbsp; &nbsp; &nbsp;confBroadcast, &nbsp; &nbsp; &nbsp;Some(setInputPathsFunc), &nbsp; &nbsp; &nbsp;inputFormatClass, &nbsp; &nbsp; &nbsp;keyClass, &nbsp; &nbsp; &nbsp;valueClass, &nbsp; &nbsp; &nbsp;minPartitions).setName(path) } 在hadoopRDD源码中，主要有getPartitions方法，compute方法 override def getPartitions: Array[Partition] = { &nbsp;val jobConf = getJobConf() &nbsp;// add the credentials here as this can be called before SparkContext initialized &nbsp;SparkHadoopUtil.get.addCredentials(jobConf) &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp;if (inputFormat.isInstanceOf[Configurable]) { &nbsp; &nbsp;inputFormat.asInstanceOf[Configurable].setConf(jobConf) } &nbsp;// 创建切片 &nbsp;val inputSplits = inputFormat.getSplits(jobConf, minPartitions) &nbsp;val array = new Array[Partition](inputSplits.size) &nbsp;// 根据切片创建分区Array并返回 &nbsp;for (i &lt;- 0 until inputSplits.size) { &nbsp; &nbsp;array(i) = new HadoopPartition(id, i, inputSplits(i)) } &nbsp;array } override def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)] = { &nbsp; &nbsp;val iter = new NextIterator[(K, V)] { &nbsp;// 将theSplit转为HadoopPartition &nbsp; &nbsp; &nbsp;val split = theSplit.asInstanceOf[HadoopPartition] &nbsp; &nbsp; &nbsp;logInfo(&quot;Input split: &quot; + split.inputSplit) &nbsp; &nbsp; &nbsp;val jobConf = getJobConf() ​ &nbsp; &nbsp; &nbsp;val inputMetrics = context.taskMetrics.getInputMetricsForReadMethod(DataReadMethod.Hadoop) ​ &nbsp; &nbsp; &nbsp;// 找到一个函数，该函数将返回该线程读取的文件系统字节。 &nbsp; &nbsp; &nbsp;// 创建RecordReader，因为RecordReader的构造函数可能读取一些字节 &nbsp; &nbsp; &nbsp;val bytesReadCallback = inputMetrics.bytesReadCallback.orElse { &nbsp; &nbsp; &nbsp; &nbsp;split.inputSplit.value match { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _: FileSplit | _: CombineFileSplit =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;SparkHadoopUtil.get.getFSBytesReadOnThreadCallback() &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _ =&gt; None &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp;inputMetrics.setBytesReadCallback(bytesReadCallback) ​ &nbsp; &nbsp; &nbsp;var reader: RecordReader[K, V] = null &nbsp; &nbsp; &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp; &nbsp; &nbsp;HadoopRDD.addLocalConfiguration(new SimpleDateFormat(&quot;yyyyMMddHHmm&quot;).format(createTime), &nbsp; &nbsp; &nbsp; &nbsp;context.stageId, theSplit.index, context.attemptNumber, jobConf) &nbsp; &nbsp; &nbsp;reader = inputFormat.getRecordReader(split.inputSplit.value, jobConf, Reporter.NULL) ​ &nbsp; &nbsp; &nbsp;// 注册一个任务完成回调，以关闭输入流。 &nbsp; &nbsp; &nbsp;context.addTaskCompletionListener{ context =&gt; closeIfNeeded() } &nbsp; &nbsp; &nbsp;val key: K = reader.createKey() &nbsp; &nbsp; &nbsp;val value: V = reader.createValue() ​ &nbsp; &nbsp; &nbsp;override def getNext(): (K, V) = { &nbsp; &nbsp; &nbsp; &nbsp;try { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = !reader.next(key, value) &nbsp; &nbsp; &nbsp; } catch { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case eof: EOFException =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = true &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; &nbsp;if (!finished) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;inputMetrics.incRecordsRead(1) &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; (key, value) &nbsp; &nbsp; } &nbsp; } &nbsp;" />
+<meta property="og:description" content="RDD是一个抽象类，操作RDD就像操作本地集合一样，降低编程难度。RDD不存真正要计算的数据，而是记录了RDD的转换关系（调用了什么方法，传入什么函数）。RDD的算子分为两类，一类是Transformation（lazy），一类是Action（触发任务执行） RDD的map方法，是Executor中执行时，是一条一条的将数据拿出来处理。 创建方式： 1、通过外部存储的诗句进行创建 sc.textFile(&quot;path&quot;) 2、将Driver的scala集合通过并行化变成RDD。 sc.parallelize(List(x,x,x,x,x)) 3、调用已存在的RDD进行转换得到新的RDD。（转换的特点：1.生成新的RDD 2.Lazy） 分区取决哪些因素? 1、如果是driver端的scala集合并行化转换成RDD，没指定分区，则rdd分区按app分配中指定的核数 2、如从hdfs读创建RDD，并且设置最小分区数量是1，那么rdd分区数即使输入切片的数据。若没设置，spark调用textFile时默认传入2，分区会大于等于切片数量。 RDD五大特点：&nbsp; &nbsp;* &nbsp;- A list of partitions &nbsp;（一系列分区，分区有编号，有顺序的） &nbsp;* &nbsp;- A function for computing each split &nbsp;（每一个切片都会有一个函数作业在上面用于对数据进行处理） &nbsp;* &nbsp;- A list of dependencies on other RDDs &nbsp;（RDD和RDD之间存在依赖关系） &nbsp;* &nbsp;- Optionally, a Partitioner for key-value RDDs (e.g. to say that the RDD is hash-partitioned) &nbsp;&nbsp;&nbsp; &nbsp;（可选，key value类型的RDD才有RDD[(K,V)]）如果是kv类型的RDD，会一个分区器，默认是hash-partitioned &nbsp;* &nbsp;- Optionally, a list of preferred locations to compute each split on (e.g. block locations for &nbsp;* &nbsp; &nbsp;an HDFS file) &nbsp;&nbsp;&nbsp; &nbsp;（可以，如果是从HDFS中读取数据，会得到数据的最优位置（向Namenode请求元数据）） abstract class RDD[T: ClassTag]( &nbsp; &nbsp;@transient private var _sc: SparkContext, &nbsp; &nbsp;@transient private var deps: Seq[Dependency[_]] ) extends Serializable with Logging { &nbsp;//该方法只会被调用一次。由子类实现，返回这个RDD的所有partition。 protected def getPartitions: Array[Partition] //该方法只会被调用一次。计算该RDD和父RDD的依赖关系 protected def getDependencies: Seq[Dependency[_]] = deps // 对分区进行计算，返回一个可遍历的结果 def compute(split: Partition, context: TaskContext): Iterator[T] //可选的，指定优先位置，输入参数是split分片，输出结果是一组优先的节点位置 protected def getPreferredLocations(split: Partition): Seq[String] = Nil //可选的，分区的方法，针对第4点，类似于mapreduce当中的Paritioner接口，控制key分到哪个reduce @transient val partitioner: Option[Partitioner] = None } 注：图片均来自网络 。 &nbsp;当进行textFile时，调用了hadoopFile。 &nbsp;/** &nbsp; * Read a text file from HDFS, a local file system (available on all nodes), or any &nbsp; * Hadoop-supported file system URI, and return it as an RDD of Strings. &nbsp; */ &nbsp;def textFile( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[String] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;hadoopFile(path, classOf[TextInputFormat], classOf[LongWritable], classOf[Text], &nbsp; &nbsp; &nbsp;minPartitions).map(pair =&gt; pair._2.toString) } 在HadoopFile中我们可以看到new了hadoopRDD，即返回了一个hadoopRDD。 def hadoopFile[K, V]( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;inputFormatClass: Class[_ &lt;: InputFormat[K, V]], &nbsp; &nbsp; &nbsp;keyClass: Class[K], &nbsp; &nbsp; &nbsp;valueClass: Class[V], &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[(K, V)] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;// A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it. &nbsp; &nbsp;val confBroadcast = broadcast(new SerializableConfiguration(hadoopConfiguration)) &nbsp; &nbsp;val setInputPathsFunc = (jobConf: JobConf) =&gt; FileInputFormat.setInputPaths(jobConf, path) &nbsp; &nbsp;new HadoopRDD( &nbsp; &nbsp; &nbsp;this, &nbsp; &nbsp; &nbsp;confBroadcast, &nbsp; &nbsp; &nbsp;Some(setInputPathsFunc), &nbsp; &nbsp; &nbsp;inputFormatClass, &nbsp; &nbsp; &nbsp;keyClass, &nbsp; &nbsp; &nbsp;valueClass, &nbsp; &nbsp; &nbsp;minPartitions).setName(path) } 在hadoopRDD源码中，主要有getPartitions方法，compute方法 override def getPartitions: Array[Partition] = { &nbsp;val jobConf = getJobConf() &nbsp;// add the credentials here as this can be called before SparkContext initialized &nbsp;SparkHadoopUtil.get.addCredentials(jobConf) &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp;if (inputFormat.isInstanceOf[Configurable]) { &nbsp; &nbsp;inputFormat.asInstanceOf[Configurable].setConf(jobConf) } &nbsp;// 创建切片 &nbsp;val inputSplits = inputFormat.getSplits(jobConf, minPartitions) &nbsp;val array = new Array[Partition](inputSplits.size) &nbsp;// 根据切片创建分区Array并返回 &nbsp;for (i &lt;- 0 until inputSplits.size) { &nbsp; &nbsp;array(i) = new HadoopPartition(id, i, inputSplits(i)) } &nbsp;array } override def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)] = { &nbsp; &nbsp;val iter = new NextIterator[(K, V)] { &nbsp;// 将theSplit转为HadoopPartition &nbsp; &nbsp; &nbsp;val split = theSplit.asInstanceOf[HadoopPartition] &nbsp; &nbsp; &nbsp;logInfo(&quot;Input split: &quot; + split.inputSplit) &nbsp; &nbsp; &nbsp;val jobConf = getJobConf() ​ &nbsp; &nbsp; &nbsp;val inputMetrics = context.taskMetrics.getInputMetricsForReadMethod(DataReadMethod.Hadoop) ​ &nbsp; &nbsp; &nbsp;// 找到一个函数，该函数将返回该线程读取的文件系统字节。 &nbsp; &nbsp; &nbsp;// 创建RecordReader，因为RecordReader的构造函数可能读取一些字节 &nbsp; &nbsp; &nbsp;val bytesReadCallback = inputMetrics.bytesReadCallback.orElse { &nbsp; &nbsp; &nbsp; &nbsp;split.inputSplit.value match { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _: FileSplit | _: CombineFileSplit =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;SparkHadoopUtil.get.getFSBytesReadOnThreadCallback() &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _ =&gt; None &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp;inputMetrics.setBytesReadCallback(bytesReadCallback) ​ &nbsp; &nbsp; &nbsp;var reader: RecordReader[K, V] = null &nbsp; &nbsp; &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp; &nbsp; &nbsp;HadoopRDD.addLocalConfiguration(new SimpleDateFormat(&quot;yyyyMMddHHmm&quot;).format(createTime), &nbsp; &nbsp; &nbsp; &nbsp;context.stageId, theSplit.index, context.attemptNumber, jobConf) &nbsp; &nbsp; &nbsp;reader = inputFormat.getRecordReader(split.inputSplit.value, jobConf, Reporter.NULL) ​ &nbsp; &nbsp; &nbsp;// 注册一个任务完成回调，以关闭输入流。 &nbsp; &nbsp; &nbsp;context.addTaskCompletionListener{ context =&gt; closeIfNeeded() } &nbsp; &nbsp; &nbsp;val key: K = reader.createKey() &nbsp; &nbsp; &nbsp;val value: V = reader.createValue() ​ &nbsp; &nbsp; &nbsp;override def getNext(): (K, V) = { &nbsp; &nbsp; &nbsp; &nbsp;try { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = !reader.next(key, value) &nbsp; &nbsp; &nbsp; } catch { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case eof: EOFException =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = true &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; &nbsp;if (!finished) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;inputMetrics.incRecordsRead(1) &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; (key, value) &nbsp; &nbsp; } &nbsp; } &nbsp;" />
+<link rel="canonical" href="https://uzzz.org/2019/04/16/728260.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/16/728260.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"RDD是一个抽象类，操作RDD就像操作本地集合一样，降低编程难度。RDD不存真正要计算的数据，而是记录了RDD的转换关系（调用了什么方法，传入什么函数）。RDD的算子分为两类，一类是Transformation（lazy），一类是Action（触发任务执行） RDD的map方法，是Executor中执行时，是一条一条的将数据拿出来处理。 创建方式： 1、通过外部存储的诗句进行创建 sc.textFile(&quot;path&quot;) 2、将Driver的scala集合通过并行化变成RDD。 sc.parallelize(List(x,x,x,x,x)) 3、调用已存在的RDD进行转换得到新的RDD。（转换的特点：1.生成新的RDD 2.Lazy） 分区取决哪些因素? 1、如果是driver端的scala集合并行化转换成RDD，没指定分区，则rdd分区按app分配中指定的核数 2、如从hdfs读创建RDD，并且设置最小分区数量是1，那么rdd分区数即使输入切片的数据。若没设置，spark调用textFile时默认传入2，分区会大于等于切片数量。 RDD五大特点：&nbsp; &nbsp;* &nbsp;- A list of partitions &nbsp;（一系列分区，分区有编号，有顺序的） &nbsp;* &nbsp;- A function for computing each split &nbsp;（每一个切片都会有一个函数作业在上面用于对数据进行处理） &nbsp;* &nbsp;- A list of dependencies on other RDDs &nbsp;（RDD和RDD之间存在依赖关系） &nbsp;* &nbsp;- Optionally, a Partitioner for key-value RDDs (e.g. to say that the RDD is hash-partitioned) &nbsp;&nbsp;&nbsp; &nbsp;（可选，key value类型的RDD才有RDD[(K,V)]）如果是kv类型的RDD，会一个分区器，默认是hash-partitioned &nbsp;* &nbsp;- Optionally, a list of preferred locations to compute each split on (e.g. block locations for &nbsp;* &nbsp; &nbsp;an HDFS file) &nbsp;&nbsp;&nbsp; &nbsp;（可以，如果是从HDFS中读取数据，会得到数据的最优位置（向Namenode请求元数据）） abstract class RDD[T: ClassTag]( &nbsp; &nbsp;@transient private var _sc: SparkContext, &nbsp; &nbsp;@transient private var deps: Seq[Dependency[_]] ) extends Serializable with Logging { &nbsp;//该方法只会被调用一次。由子类实现，返回这个RDD的所有partition。 protected def getPartitions: Array[Partition] //该方法只会被调用一次。计算该RDD和父RDD的依赖关系 protected def getDependencies: Seq[Dependency[_]] = deps // 对分区进行计算，返回一个可遍历的结果 def compute(split: Partition, context: TaskContext): Iterator[T] //可选的，指定优先位置，输入参数是split分片，输出结果是一组优先的节点位置 protected def getPreferredLocations(split: Partition): Seq[String] = Nil //可选的，分区的方法，针对第4点，类似于mapreduce当中的Paritioner接口，控制key分到哪个reduce @transient val partitioner: Option[Partitioner] = None } 注：图片均来自网络 。 &nbsp;当进行textFile时，调用了hadoopFile。 &nbsp;/** &nbsp; * Read a text file from HDFS, a local file system (available on all nodes), or any &nbsp; * Hadoop-supported file system URI, and return it as an RDD of Strings. &nbsp; */ &nbsp;def textFile( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[String] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;hadoopFile(path, classOf[TextInputFormat], classOf[LongWritable], classOf[Text], &nbsp; &nbsp; &nbsp;minPartitions).map(pair =&gt; pair._2.toString) } 在HadoopFile中我们可以看到new了hadoopRDD，即返回了一个hadoopRDD。 def hadoopFile[K, V]( &nbsp; &nbsp; &nbsp;path: String, &nbsp; &nbsp; &nbsp;inputFormatClass: Class[_ &lt;: InputFormat[K, V]], &nbsp; &nbsp; &nbsp;keyClass: Class[K], &nbsp; &nbsp; &nbsp;valueClass: Class[V], &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[(K, V)] = withScope { &nbsp; &nbsp;assertNotStopped() &nbsp; &nbsp;// A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it. &nbsp; &nbsp;val confBroadcast = broadcast(new SerializableConfiguration(hadoopConfiguration)) &nbsp; &nbsp;val setInputPathsFunc = (jobConf: JobConf) =&gt; FileInputFormat.setInputPaths(jobConf, path) &nbsp; &nbsp;new HadoopRDD( &nbsp; &nbsp; &nbsp;this, &nbsp; &nbsp; &nbsp;confBroadcast, &nbsp; &nbsp; &nbsp;Some(setInputPathsFunc), &nbsp; &nbsp; &nbsp;inputFormatClass, &nbsp; &nbsp; &nbsp;keyClass, &nbsp; &nbsp; &nbsp;valueClass, &nbsp; &nbsp; &nbsp;minPartitions).setName(path) } 在hadoopRDD源码中，主要有getPartitions方法，compute方法 override def getPartitions: Array[Partition] = { &nbsp;val jobConf = getJobConf() &nbsp;// add the credentials here as this can be called before SparkContext initialized &nbsp;SparkHadoopUtil.get.addCredentials(jobConf) &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp;if (inputFormat.isInstanceOf[Configurable]) { &nbsp; &nbsp;inputFormat.asInstanceOf[Configurable].setConf(jobConf) } &nbsp;// 创建切片 &nbsp;val inputSplits = inputFormat.getSplits(jobConf, minPartitions) &nbsp;val array = new Array[Partition](inputSplits.size) &nbsp;// 根据切片创建分区Array并返回 &nbsp;for (i &lt;- 0 until inputSplits.size) { &nbsp; &nbsp;array(i) = new HadoopPartition(id, i, inputSplits(i)) } &nbsp;array } override def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)] = { &nbsp; &nbsp;val iter = new NextIterator[(K, V)] { &nbsp;// 将theSplit转为HadoopPartition &nbsp; &nbsp; &nbsp;val split = theSplit.asInstanceOf[HadoopPartition] &nbsp; &nbsp; &nbsp;logInfo(&quot;Input split: &quot; + split.inputSplit) &nbsp; &nbsp; &nbsp;val jobConf = getJobConf() ​ &nbsp; &nbsp; &nbsp;val inputMetrics = context.taskMetrics.getInputMetricsForReadMethod(DataReadMethod.Hadoop) ​ &nbsp; &nbsp; &nbsp;// 找到一个函数，该函数将返回该线程读取的文件系统字节。 &nbsp; &nbsp; &nbsp;// 创建RecordReader，因为RecordReader的构造函数可能读取一些字节 &nbsp; &nbsp; &nbsp;val bytesReadCallback = inputMetrics.bytesReadCallback.orElse { &nbsp; &nbsp; &nbsp; &nbsp;split.inputSplit.value match { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _: FileSplit | _: CombineFileSplit =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;SparkHadoopUtil.get.getFSBytesReadOnThreadCallback() &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _ =&gt; None &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp;inputMetrics.setBytesReadCallback(bytesReadCallback) ​ &nbsp; &nbsp; &nbsp;var reader: RecordReader[K, V] = null &nbsp; &nbsp; &nbsp;val inputFormat = getInputFormat(jobConf) &nbsp; &nbsp; &nbsp;HadoopRDD.addLocalConfiguration(new SimpleDateFormat(&quot;yyyyMMddHHmm&quot;).format(createTime), &nbsp; &nbsp; &nbsp; &nbsp;context.stageId, theSplit.index, context.attemptNumber, jobConf) &nbsp; &nbsp; &nbsp;reader = inputFormat.getRecordReader(split.inputSplit.value, jobConf, Reporter.NULL) ​ &nbsp; &nbsp; &nbsp;// 注册一个任务完成回调，以关闭输入流。 &nbsp; &nbsp; &nbsp;context.addTaskCompletionListener{ context =&gt; closeIfNeeded() } &nbsp; &nbsp; &nbsp;val key: K = reader.createKey() &nbsp; &nbsp; &nbsp;val value: V = reader.createValue() ​ &nbsp; &nbsp; &nbsp;override def getNext(): (K, V) = { &nbsp; &nbsp; &nbsp; &nbsp;try { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = !reader.next(key, value) &nbsp; &nbsp; &nbsp; } catch { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case eof: EOFException =&gt; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = true &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; &nbsp;if (!finished) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;inputMetrics.incRecordsRead(1) &nbsp; &nbsp; &nbsp; } &nbsp; &nbsp; &nbsp; (key, value) &nbsp; &nbsp; } &nbsp; } &nbsp;","@type":"BlogPosting","url":"https://uzzz.org/2019/04/16/728260.html","headline":"Spark WordCount执行流程以及相关源码","dateModified":"2019-04-16T00:00:00+08:00","datePublished":"2019-04-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/16/728260.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Spark WordCount执行流程以及相关源码</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <p>RDD是一个抽象类，操作RDD就像操作本地集合一样，降低编程难度。RDD不存真正要计算的数据，而是记录了RDD的转换关系（调用了什么方法，传入什么函数）。RDD的算子分为两类，一类是Transformation（lazy），一类是Action（触发任务执行）</p> 
+  <p>RDD的map方法，是Executor中执行时，是一条一条的将数据拿出来处理。</p> 
+  <p>创建方式：</p> 
+  <p>1、通过外部存储的诗句进行创建 sc.textFile("path")</p> 
+  <p>2、将Driver的scala集合通过并行化变成RDD。 sc.parallelize(List(x,x,x,x,x))</p> 
+  <p>3、调用已存在的RDD进行转换得到新的RDD。（<span style="color:#f33b45;">转换的特点：1.生成新的RDD 2.Lazy</span>）</p> 
+  <p>分区取决哪些因素?</p> 
+  <p>1、如果是driver端的scala集合并行化转换成RDD，没指定分区，则rdd分区按app分配中指定的核数</p> 
+  <p>2、如从hdfs读创建RDD，并且设置最小分区数量是1，那么rdd分区数即使输入切片的数据。若没设置，spark调用textFile时默认传入2，分区会大于等于切片数量。</p> 
+  <p>RDD五大特点：&nbsp;</p> 
+  <p>&nbsp;* &nbsp;- A list of partitions &nbsp;（一系列分区，分区有编号，有顺序的）<br> &nbsp;* &nbsp;- A function for computing each split &nbsp;（每一个切片都会有一个函数作业在上面用于对数据进行处理）<br> &nbsp;* &nbsp;- A list of dependencies on other RDDs &nbsp;（RDD和RDD之间存在依赖关系）<br> &nbsp;* &nbsp;- Optionally, a Partitioner for key-value RDDs (e.g. to say that the RDD is hash-partitioned)<br> &nbsp;&nbsp;&nbsp; &nbsp;（可选，key value类型的RDD才有RDD[(K,V)]）如果是kv类型的RDD，会一个分区器，默认是hash-partitioned<br> &nbsp;* &nbsp;- Optionally, a list of preferred locations to compute each split on (e.g. block locations for<br> &nbsp;* &nbsp; &nbsp;an HDFS file)<br> &nbsp;&nbsp;&nbsp; &nbsp;（可以，如果是从HDFS中读取数据，会得到数据的最优位置（向Namenode请求元数据））</p> 
+  <pre class="has">
+<code class="language-java">abstract class RDD[T: ClassTag](
+ &nbsp; &nbsp;@transient private var _sc: SparkContext,
+ &nbsp; &nbsp;@transient private var deps: Seq[Dependency[_]]
+) extends Serializable with Logging {
+ &nbsp;//该方法只会被调用一次。由子类实现，返回这个RDD的所有partition。
+ protected def getPartitions: Array[Partition]
+ //该方法只会被调用一次。计算该RDD和父RDD的依赖关系
+ protected def getDependencies: Seq[Dependency[_]] = deps
+ // 对分区进行计算，返回一个可遍历的结果
+ def compute(split: Partition, context: TaskContext): Iterator[T]
+ //可选的，指定优先位置，输入参数是split分片，输出结果是一组优先的节点位置
+ protected def getPreferredLocations(split: Partition): Seq[String] = Nil
+ //可选的，分区的方法，针对第4点，类似于mapreduce当中的Paritioner接口，控制key分到哪个reduce
+ @transient val partitioner: Option[Partitioner] = None
+}
+</code></pre> 
+  <p>注：图片均来自网络 。</p> 
+  <p><img alt="" class="has" height="391" src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190416135741590.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl8zOTA0MzU2Nw==,size_16,color_FFFFFF,t_70" width="783"></p> 
+  <p><img alt="" class="has" src="https://uzshare.com/_p?https://img-blog.csdn.net/20180525144432751"></p> 
+  <p>&nbsp;当进行textFile时，调用了hadoopFile。</p> 
+  <pre class="has">
+<code class="language-java"> &nbsp;/**
+ &nbsp; * Read a text file from HDFS, a local file system (available on all nodes), or any
+ &nbsp; * Hadoop-supported file system URI, and return it as an RDD of Strings.
+ &nbsp; */
+ &nbsp;def textFile(
+ &nbsp; &nbsp; &nbsp;path: String,
+ &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[String] = withScope {
+ &nbsp; &nbsp;assertNotStopped()
+ &nbsp; &nbsp;hadoopFile(path, classOf[TextInputFormat], classOf[LongWritable], classOf[Text],
+ &nbsp; &nbsp; &nbsp;minPartitions).map(pair =&gt; pair._2.toString)
+  }
+</code></pre> 
+  <p>在HadoopFile中我们可以看到new了hadoopRDD，即返回了一个hadoopRDD。</p> 
+  <pre class="has">
+<code class="language-java"> def hadoopFile[K, V](
+ &nbsp; &nbsp; &nbsp;path: String,
+ &nbsp; &nbsp; &nbsp;inputFormatClass: Class[_ &lt;: InputFormat[K, V]],
+ &nbsp; &nbsp; &nbsp;keyClass: Class[K],
+ &nbsp; &nbsp; &nbsp;valueClass: Class[V],
+ &nbsp; &nbsp; &nbsp;minPartitions: Int = defaultMinPartitions): RDD[(K, V)] = withScope {
+ &nbsp; &nbsp;assertNotStopped()
+ &nbsp; &nbsp;// A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it.
+ &nbsp; &nbsp;val confBroadcast = broadcast(new SerializableConfiguration(hadoopConfiguration))
+ &nbsp; &nbsp;val setInputPathsFunc = (jobConf: JobConf) =&gt; FileInputFormat.setInputPaths(jobConf, path)
+ &nbsp; &nbsp;new HadoopRDD(
+ &nbsp; &nbsp; &nbsp;this,
+ &nbsp; &nbsp; &nbsp;confBroadcast,
+ &nbsp; &nbsp; &nbsp;Some(setInputPathsFunc),
+ &nbsp; &nbsp; &nbsp;inputFormatClass,
+ &nbsp; &nbsp; &nbsp;keyClass,
+ &nbsp; &nbsp; &nbsp;valueClass,
+ &nbsp; &nbsp; &nbsp;minPartitions).setName(path)
+  }
+</code></pre> 
+  <p>在hadoopRDD源码中，主要有getPartitions方法，compute方法</p> 
+  <pre class="has">
+<code class="language-java">override def getPartitions: Array[Partition] = {
+ &nbsp;val jobConf = getJobConf()
+ &nbsp;// add the credentials here as this can be called before SparkContext initialized
+ &nbsp;SparkHadoopUtil.get.addCredentials(jobConf)
+ &nbsp;val inputFormat = getInputFormat(jobConf)
+ &nbsp;if (inputFormat.isInstanceOf[Configurable]) {
+ &nbsp; &nbsp;inputFormat.asInstanceOf[Configurable].setConf(jobConf)
+  }
+ &nbsp;// 创建切片
+ &nbsp;val inputSplits = inputFormat.getSplits(jobConf, minPartitions)
+ &nbsp;val array = new Array[Partition](inputSplits.size)
+ &nbsp;// 根据切片创建分区Array并返回
+ &nbsp;for (i &lt;- 0 until inputSplits.size) {
+ &nbsp; &nbsp;array(i) = new HadoopPartition(id, i, inputSplits(i))
+  }
+ &nbsp;array
+}</code></pre> 
+  <pre class="has">
+<code class="language-java">override def compute(theSplit: Partition, context: TaskContext): InterruptibleIterator[(K, V)] = {
+ &nbsp; &nbsp;val iter = new NextIterator[(K, V)] {
+     &nbsp;// 将theSplit转为HadoopPartition
+ &nbsp; &nbsp; &nbsp;val split = theSplit.asInstanceOf[HadoopPartition]
+ &nbsp; &nbsp; &nbsp;logInfo("Input split: " + split.inputSplit)
+ &nbsp; &nbsp; &nbsp;val jobConf = getJobConf()
+​
+ &nbsp; &nbsp; &nbsp;val inputMetrics = context.taskMetrics.getInputMetricsForReadMethod(DataReadMethod.Hadoop)
+​
+ &nbsp; &nbsp; &nbsp;// 找到一个函数，该函数将返回该线程读取的文件系统字节。
+ &nbsp; &nbsp; &nbsp;// 创建RecordReader，因为RecordReader的构造函数可能读取一些字节
+ &nbsp; &nbsp; &nbsp;val bytesReadCallback = inputMetrics.bytesReadCallback.orElse {
+ &nbsp; &nbsp; &nbsp; &nbsp;split.inputSplit.value match {
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _: FileSplit | _: CombineFileSplit =&gt;
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;SparkHadoopUtil.get.getFSBytesReadOnThreadCallback()
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case _ =&gt; None
+ &nbsp; &nbsp; &nbsp;  }
+ &nbsp; &nbsp;  }
+ &nbsp; &nbsp; &nbsp;inputMetrics.setBytesReadCallback(bytesReadCallback)
+​
+ &nbsp; &nbsp; &nbsp;var reader: RecordReader[K, V] = null
+ &nbsp; &nbsp; &nbsp;val inputFormat = getInputFormat(jobConf)
+ &nbsp; &nbsp; &nbsp;HadoopRDD.addLocalConfiguration(new SimpleDateFormat("yyyyMMddHHmm").format(createTime),
+ &nbsp; &nbsp; &nbsp; &nbsp;context.stageId, theSplit.index, context.attemptNumber, jobConf)
+ &nbsp; &nbsp; &nbsp;reader = inputFormat.getRecordReader(split.inputSplit.value, jobConf, Reporter.NULL)
+​
+ &nbsp; &nbsp; &nbsp;// 注册一个任务完成回调，以关闭输入流。
+ &nbsp; &nbsp; &nbsp;context.addTaskCompletionListener{ context =&gt; closeIfNeeded() }
+ &nbsp; &nbsp; &nbsp;val key: K = reader.createKey()
+ &nbsp; &nbsp; &nbsp;val value: V = reader.createValue()
+​
+ &nbsp; &nbsp; &nbsp;override def getNext(): (K, V) = {
+ &nbsp; &nbsp; &nbsp; &nbsp;try {
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = !reader.next(key, value)
+ &nbsp; &nbsp; &nbsp;  } catch {
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;case eof: EOFException =&gt;
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;finished = true
+ &nbsp; &nbsp; &nbsp;  }
+ &nbsp; &nbsp; &nbsp; &nbsp;if (!finished) {
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;inputMetrics.incRecordsRead(1)
+ &nbsp; &nbsp; &nbsp;  }
+ &nbsp; &nbsp; &nbsp;  (key, value)
+ &nbsp; &nbsp;  }
+ &nbsp;  }
+</code></pre> 
+  <p>&nbsp;</p> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

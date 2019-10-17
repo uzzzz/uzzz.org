@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊Ethash算法源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊Ethash算法源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81364008 Ethash是以太坊目前使用的共识算法，其前身是Dagger-Hashimoto算法，但是进行了很大的改动。 1. Dagger-Hashimoto Dagger-Hashimoto算法想要达到以下几个目标： 抵制ASIC矿机 轻客户端验证 全链数据存储 实际上Dagger-Hashimoto是由两种不同的算法Dagger和Hashimoto融合而成的： Hashimoto Hashimoto算法由Thaddeus Dryja发明，旨在通过“内存读取”瓶颈来抵制ASIC矿机。ASIC矿机可以通过设计专用电路来提升计算速度，但是很难提升“内存读取”速度，因为经历了这么多年的发展，内存访问已经经过了极致的优化。Hashimoto算法直接采用区块链数据，也就是区块中的交易作为输入源。 注：为了减小计算量，Dagger-Hashimoto中实际上只使用了低64位参与移位。 Dagger Dagger算法由Vitalik Buterin发明，旨在通过DAG（有向无环图）来同时获得“memory-hard计算”和“memory-easy验证”这两个特性，其主要原理是针对每一个单独的nonce只需要访问数据集中的一小部分数据。Dagger曾经被认为可以替代一些memory-hard的算法（如Scrypt），但是后来被Sergio Lerner证明该算法易于遭受共享内存硬件加速的攻击，从而逐渐被废弃。 Dagger-Hashimoto vs. Hashimoto vs. Dagger Dagger-Hashimoto和Hashimoto的主要区别是： Hashimoto直接使用区块链数据作为输入源，而Dagger-Hashimoto使用一个定制的1GB的dataset(数据集）作为输入源，该dataset每隔N个区块会被更新。dataset是通过Dagger算法生成的，轻客户端验证算法可以针对每一个nonce对其中一个子集完成高效计算。 Dagger-Hashimoto和Dagger的主要区别是： 与Dagger不同，Dagger-Hashimoto用于查询区块的dataset是半持久化（semi-permanent）的，需要间隔很长一段时间才会更新。这样生成dataset的工作量比例接近于0，Sergio Lerner用于共享内存加速的参数就可以忽略不计了。 2. Ethash Ethash算法主要分为以下几个步骤： 根据区块信息生成一个seed 根据seed计算出一个16MB的伪随机cache，由轻客户端存储 根据cache计算出一个1GB的dataset，其中的每一个数据都是通过cache中的一小部分数据计算出来的。该dataset由完整客户端或者矿工存储，大小随时间线性增长 矿工会从dataset中随机取出数据计算hash 验证者会根据cache重新生成dataset中所需要的那部分数据，因此只需要存储cache就可以了 下面分别讨论这几个部分的实现。 2.1 生成seed consensus/ethash/ethash.go: func (d *dataset) generate(dir string, limit int, test bool) { ... ... seed := seedHash(d.epoch*epochLength + 1) ... ... } func seedHash(block uint64) []byte { seed := make([]byte, 32) if block &lt; epochLength { return seed } keccak256 := makeHasher(sha3.NewKeccak256()) for i := 0; i &lt; int(block/epochLength); i++ { keccak256(seed, seed) } return seed } 这里有个epoch（纪元）的概念：epochLength等于30000，也就是每30000个区块形成一个纪元，每个纪元更新一次数据集（就是前面提到的“半持久化”）。 seed初始值为0，每过一个纪元会取前一个seed的哈希值作为下一个纪元的seed。 2.2 生成cache 接下来就是用这个seed生成16MB的cache了。首先看一下cache大小的计算： func cacheSize(block uint64) uint64 { epoch := int(block / epochLength) if epoch &lt; maxEpoch { return cacheSizes[epoch] } return calcCacheSize(epoch) } func calcCacheSize(epoch int) uint64 { size := cacheInitBytes + cacheGrowthBytes*uint64(epoch) - hashBytes for !new(big.Int).SetUint64(size / hashBytes).ProbablyPrime(1) { size -= 2 * hashBytes } return size } 前2048(maxEpoch)个纪元的cache大小是硬编码在代码里的，如果超过这个数量就需要自己计算了。 cache的大小是线性增长的，size的值等于(2^24 + 2^17 * epoch - 64)，用这个值除以64看结果是否是一个质数，如果不是，减去128再重新计算，直到找到最大的质数为止。 接下来分析cache数据的生成： func generateCache(dest []uint32, epoch uint64, seed []byte) { ... ... // Create a hasher to reuse between invocations keccak512 := makeHasher(sha3.NewKeccak512()) // Sequentially produce the initial dataset keccak512(cache, seed) for offset := uint64(hashBytes); offset &lt; size; offset += hashBytes { keccak512(cache[offset:], cache[offset-hashBytes:offset]) atomic.AddUint32(&amp;progress, 1) } ... ... } 看明白没？先用seed的哈希值生成第一个数（64字节），然后以新生成的数作为seed，生成下一个数，依次迭代，直至填充满整个cache。当然这只是第一步，后面还要跟之前cache中的数据按一定规则做一次异或，然后再求一次哈希，具体细节参见一下代码： for i := 0; i &lt; cacheRounds; i++ { for j := 0; j &lt; rows; j++ { var ( srcOff = ((j - 1 + rows) % rows) * hashBytes dstOff = j * hashBytes xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes ) bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes]) keccak512(cache[dstOff:], temp) atomic.AddUint32(&amp;progress, 1) } } 2.3 生成dataset dataset大小的计算和cache类似，量级不同：2^30 + 2^23 * epoch - 128，然后每次减256寻找最大质数。 生成数据是一个循环，每次生成64个字节，所以看generateDatasetItem()就可以了。代码分为下面几个部分： 用cache里的值进行初始化，计算一次哈希 // Calculate the number of theoretical rows (we use one buffer nonetheless) rows := uint32(len(cache) / hashWords) // Initialize the mix mix := make([]byte, hashBytes) binary.LittleEndian.PutUint32(mix, cache[(index%rows)*hashWords]^index) for i := 1; i &lt; hashWords; i++ { binary.LittleEndian.PutUint32(mix[i*4:], cache[(index%rows)*hashWords+uint32(i)]) } keccak512(mix, mix) 转换成无符号整数 // Convert the mix to uint32s to avoid constant bit shifting intMix := make([]uint32, hashWords) for i := 0; i &lt; len(intMix); i++ { intMix[i] = binary.LittleEndian.Uint32(mix[i*4:]) } 2）计算FNV哈希 // fnv it with a lot of random cache nodes based on index for i := uint32(0); i &lt; datasetParents; i++ { parent := fnv(index^i, intMix[i%16]) % rows fnvHash(intMix, cache[parent*hashWords:]) } 4）整数转回字节数组，再计算一次哈希 // Flatten the uint32 mix into a binary one and return for i, val := range intMix { binary.LittleEndian.PutUint32(mix[i*4:], val) } keccak512(mix, mix) 这里用到了FNV哈希算法，这是一种不需要使用密钥的哈希算法，以它的三位发明者的名字命名：Glenn Fowler, Landon Curt Noll, Kiem-Phong Vo。 这个FNV算法很简单：a乘以FNV质数0x01000193，然后再和b异或。 首先用这个算法算出一个索引值，利用这个索引从cache中选出一个值（data），然后对mix中的每个字节都计算一次FNV，得到最终的哈希值： func fnv(a, b uint32) uint32 { return a*0x01000193 ^ b } func fnvHash(mix []uint32, data []uint32) { for i := 0; i &lt; len(mix); i++ { mix[i] = mix[i]*0x01000193 ^ data[i] } } 从这里可以看出，dataset的每个值都是根据对应的cache中的值生成的，因此轻客户端无需存储dataset，只需要在验证的时候按需生成即可。 2.4 矿工挖矿 挖矿流程参见下图： 具体代码参见consensus/ethash/algorithm.go中的hashimotoFull()函数： func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { lookup := func(index uint32) []uint32 { offset := index * hashWords return dataset[offset : offset+hashWords] } return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } 首先提供了一个lookup()函数，用于从dataset中查找数据。接着就是调用hashimoto()函数计算哈希了：首先根据hash和nonce生成一个seed，填充到mix数组中，然后用lookup()函数获取data，最后把mix和data送入fnvHash()函数中计算哈希值。具体代码这里就不分析了。 2.5 工作量验证 在节点收到新区块时，需要验证根据区块头的hash和nonce计算出来的FNV哈希值是否确实小于设定的难度值。入口位于core/blockchain.go的insertChain()方法： func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { ... ... for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) ... ... } 继续跟踪consensus/ethash/consensus.go中的VerifyHeaders()方法，最终会调用verifyHeader()： func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *types.Header, uncle bool, seal bool) error { ... ... if seal { if err := ethash.VerifySeal(chain, header); err != nil { return err } } ... ... } 这里会调用VerifySeal()方法验证区块头是否符合要求： func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Header) error { ... ... digest, result := hashimotoLight(size, cache.cache, header.HashNoNonce().Bytes(), header.Nonce.Uint64()) ... ... target := new(big.Int).Div(maxUint256, header.Difficulty) if new(big.Int).SetBytes(result).Cmp(target) &gt; 0 { return errInvalidPoW } return nil } 可以看到，这里调用hashimotoLight()函数计算FNV哈希值，然后跟目标难度比较，确认是否低于目标难度。这个hashimotoLight()就是为轻客户端节点计算FNV哈希值的，会根据需要通过cache生成少量dataset的值完成计算，有兴趣的同学可以再仔细研究一下具体细节。 3. 总结 Ethash是一种“memory-hard计算”和“memory-easy验证”的哈希算法，通过内存访问速度的瓶颈抵抗ASIC矿机，同时利用两级数据集实现挖矿和轻客户端验证的分离。 参考： https://github.com/ethereum/wiki/wiki/Dagger-Hashimoto https://github.com/ethereum/wiki/wiki/Ethash https://github.com/ethereum/wiki/wiki/Ethash-Design-Rationale https://www.vijaypradeep.com/blog/2017-04-28-ethereums-memory-hardness-explained/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81364008 Ethash是以太坊目前使用的共识算法，其前身是Dagger-Hashimoto算法，但是进行了很大的改动。 1. Dagger-Hashimoto Dagger-Hashimoto算法想要达到以下几个目标： 抵制ASIC矿机 轻客户端验证 全链数据存储 实际上Dagger-Hashimoto是由两种不同的算法Dagger和Hashimoto融合而成的： Hashimoto Hashimoto算法由Thaddeus Dryja发明，旨在通过“内存读取”瓶颈来抵制ASIC矿机。ASIC矿机可以通过设计专用电路来提升计算速度，但是很难提升“内存读取”速度，因为经历了这么多年的发展，内存访问已经经过了极致的优化。Hashimoto算法直接采用区块链数据，也就是区块中的交易作为输入源。 注：为了减小计算量，Dagger-Hashimoto中实际上只使用了低64位参与移位。 Dagger Dagger算法由Vitalik Buterin发明，旨在通过DAG（有向无环图）来同时获得“memory-hard计算”和“memory-easy验证”这两个特性，其主要原理是针对每一个单独的nonce只需要访问数据集中的一小部分数据。Dagger曾经被认为可以替代一些memory-hard的算法（如Scrypt），但是后来被Sergio Lerner证明该算法易于遭受共享内存硬件加速的攻击，从而逐渐被废弃。 Dagger-Hashimoto vs. Hashimoto vs. Dagger Dagger-Hashimoto和Hashimoto的主要区别是： Hashimoto直接使用区块链数据作为输入源，而Dagger-Hashimoto使用一个定制的1GB的dataset(数据集）作为输入源，该dataset每隔N个区块会被更新。dataset是通过Dagger算法生成的，轻客户端验证算法可以针对每一个nonce对其中一个子集完成高效计算。 Dagger-Hashimoto和Dagger的主要区别是： 与Dagger不同，Dagger-Hashimoto用于查询区块的dataset是半持久化（semi-permanent）的，需要间隔很长一段时间才会更新。这样生成dataset的工作量比例接近于0，Sergio Lerner用于共享内存加速的参数就可以忽略不计了。 2. Ethash Ethash算法主要分为以下几个步骤： 根据区块信息生成一个seed 根据seed计算出一个16MB的伪随机cache，由轻客户端存储 根据cache计算出一个1GB的dataset，其中的每一个数据都是通过cache中的一小部分数据计算出来的。该dataset由完整客户端或者矿工存储，大小随时间线性增长 矿工会从dataset中随机取出数据计算hash 验证者会根据cache重新生成dataset中所需要的那部分数据，因此只需要存储cache就可以了 下面分别讨论这几个部分的实现。 2.1 生成seed consensus/ethash/ethash.go: func (d *dataset) generate(dir string, limit int, test bool) { ... ... seed := seedHash(d.epoch*epochLength + 1) ... ... } func seedHash(block uint64) []byte { seed := make([]byte, 32) if block &lt; epochLength { return seed } keccak256 := makeHasher(sha3.NewKeccak256()) for i := 0; i &lt; int(block/epochLength); i++ { keccak256(seed, seed) } return seed } 这里有个epoch（纪元）的概念：epochLength等于30000，也就是每30000个区块形成一个纪元，每个纪元更新一次数据集（就是前面提到的“半持久化”）。 seed初始值为0，每过一个纪元会取前一个seed的哈希值作为下一个纪元的seed。 2.2 生成cache 接下来就是用这个seed生成16MB的cache了。首先看一下cache大小的计算： func cacheSize(block uint64) uint64 { epoch := int(block / epochLength) if epoch &lt; maxEpoch { return cacheSizes[epoch] } return calcCacheSize(epoch) } func calcCacheSize(epoch int) uint64 { size := cacheInitBytes + cacheGrowthBytes*uint64(epoch) - hashBytes for !new(big.Int).SetUint64(size / hashBytes).ProbablyPrime(1) { size -= 2 * hashBytes } return size } 前2048(maxEpoch)个纪元的cache大小是硬编码在代码里的，如果超过这个数量就需要自己计算了。 cache的大小是线性增长的，size的值等于(2^24 + 2^17 * epoch - 64)，用这个值除以64看结果是否是一个质数，如果不是，减去128再重新计算，直到找到最大的质数为止。 接下来分析cache数据的生成： func generateCache(dest []uint32, epoch uint64, seed []byte) { ... ... // Create a hasher to reuse between invocations keccak512 := makeHasher(sha3.NewKeccak512()) // Sequentially produce the initial dataset keccak512(cache, seed) for offset := uint64(hashBytes); offset &lt; size; offset += hashBytes { keccak512(cache[offset:], cache[offset-hashBytes:offset]) atomic.AddUint32(&amp;progress, 1) } ... ... } 看明白没？先用seed的哈希值生成第一个数（64字节），然后以新生成的数作为seed，生成下一个数，依次迭代，直至填充满整个cache。当然这只是第一步，后面还要跟之前cache中的数据按一定规则做一次异或，然后再求一次哈希，具体细节参见一下代码： for i := 0; i &lt; cacheRounds; i++ { for j := 0; j &lt; rows; j++ { var ( srcOff = ((j - 1 + rows) % rows) * hashBytes dstOff = j * hashBytes xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes ) bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes]) keccak512(cache[dstOff:], temp) atomic.AddUint32(&amp;progress, 1) } } 2.3 生成dataset dataset大小的计算和cache类似，量级不同：2^30 + 2^23 * epoch - 128，然后每次减256寻找最大质数。 生成数据是一个循环，每次生成64个字节，所以看generateDatasetItem()就可以了。代码分为下面几个部分： 用cache里的值进行初始化，计算一次哈希 // Calculate the number of theoretical rows (we use one buffer nonetheless) rows := uint32(len(cache) / hashWords) // Initialize the mix mix := make([]byte, hashBytes) binary.LittleEndian.PutUint32(mix, cache[(index%rows)*hashWords]^index) for i := 1; i &lt; hashWords; i++ { binary.LittleEndian.PutUint32(mix[i*4:], cache[(index%rows)*hashWords+uint32(i)]) } keccak512(mix, mix) 转换成无符号整数 // Convert the mix to uint32s to avoid constant bit shifting intMix := make([]uint32, hashWords) for i := 0; i &lt; len(intMix); i++ { intMix[i] = binary.LittleEndian.Uint32(mix[i*4:]) } 2）计算FNV哈希 // fnv it with a lot of random cache nodes based on index for i := uint32(0); i &lt; datasetParents; i++ { parent := fnv(index^i, intMix[i%16]) % rows fnvHash(intMix, cache[parent*hashWords:]) } 4）整数转回字节数组，再计算一次哈希 // Flatten the uint32 mix into a binary one and return for i, val := range intMix { binary.LittleEndian.PutUint32(mix[i*4:], val) } keccak512(mix, mix) 这里用到了FNV哈希算法，这是一种不需要使用密钥的哈希算法，以它的三位发明者的名字命名：Glenn Fowler, Landon Curt Noll, Kiem-Phong Vo。 这个FNV算法很简单：a乘以FNV质数0x01000193，然后再和b异或。 首先用这个算法算出一个索引值，利用这个索引从cache中选出一个值（data），然后对mix中的每个字节都计算一次FNV，得到最终的哈希值： func fnv(a, b uint32) uint32 { return a*0x01000193 ^ b } func fnvHash(mix []uint32, data []uint32) { for i := 0; i &lt; len(mix); i++ { mix[i] = mix[i]*0x01000193 ^ data[i] } } 从这里可以看出，dataset的每个值都是根据对应的cache中的值生成的，因此轻客户端无需存储dataset，只需要在验证的时候按需生成即可。 2.4 矿工挖矿 挖矿流程参见下图： 具体代码参见consensus/ethash/algorithm.go中的hashimotoFull()函数： func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { lookup := func(index uint32) []uint32 { offset := index * hashWords return dataset[offset : offset+hashWords] } return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } 首先提供了一个lookup()函数，用于从dataset中查找数据。接着就是调用hashimoto()函数计算哈希了：首先根据hash和nonce生成一个seed，填充到mix数组中，然后用lookup()函数获取data，最后把mix和data送入fnvHash()函数中计算哈希值。具体代码这里就不分析了。 2.5 工作量验证 在节点收到新区块时，需要验证根据区块头的hash和nonce计算出来的FNV哈希值是否确实小于设定的难度值。入口位于core/blockchain.go的insertChain()方法： func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { ... ... for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) ... ... } 继续跟踪consensus/ethash/consensus.go中的VerifyHeaders()方法，最终会调用verifyHeader()： func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *types.Header, uncle bool, seal bool) error { ... ... if seal { if err := ethash.VerifySeal(chain, header); err != nil { return err } } ... ... } 这里会调用VerifySeal()方法验证区块头是否符合要求： func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Header) error { ... ... digest, result := hashimotoLight(size, cache.cache, header.HashNoNonce().Bytes(), header.Nonce.Uint64()) ... ... target := new(big.Int).Div(maxUint256, header.Difficulty) if new(big.Int).SetBytes(result).Cmp(target) &gt; 0 { return errInvalidPoW } return nil } 可以看到，这里调用hashimotoLight()函数计算FNV哈希值，然后跟目标难度比较，确认是否低于目标难度。这个hashimotoLight()就是为轻客户端节点计算FNV哈希值的，会根据需要通过cache生成少量dataset的值完成计算，有兴趣的同学可以再仔细研究一下具体细节。 3. 总结 Ethash是一种“memory-hard计算”和“memory-easy验证”的哈希算法，通过内存访问速度的瓶颈抵抗ASIC矿机，同时利用两级数据集实现挖矿和轻客户端验证的分离。 参考： https://github.com/ethereum/wiki/wiki/Dagger-Hashimoto https://github.com/ethereum/wiki/wiki/Ethash https://github.com/ethereum/wiki/wiki/Ethash-Design-Rationale https://www.vijaypradeep.com/blog/2017-04-28-ethereums-memory-hardness-explained/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/02/e00a8ec5b35a84d5e833439fc1d02e14.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/02/e00a8ec5b35a84d5e833439fc1d02e14.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81364008 Ethash是以太坊目前使用的共识算法，其前身是Dagger-Hashimoto算法，但是进行了很大的改动。 1. Dagger-Hashimoto Dagger-Hashimoto算法想要达到以下几个目标： 抵制ASIC矿机 轻客户端验证 全链数据存储 实际上Dagger-Hashimoto是由两种不同的算法Dagger和Hashimoto融合而成的： Hashimoto Hashimoto算法由Thaddeus Dryja发明，旨在通过“内存读取”瓶颈来抵制ASIC矿机。ASIC矿机可以通过设计专用电路来提升计算速度，但是很难提升“内存读取”速度，因为经历了这么多年的发展，内存访问已经经过了极致的优化。Hashimoto算法直接采用区块链数据，也就是区块中的交易作为输入源。 注：为了减小计算量，Dagger-Hashimoto中实际上只使用了低64位参与移位。 Dagger Dagger算法由Vitalik Buterin发明，旨在通过DAG（有向无环图）来同时获得“memory-hard计算”和“memory-easy验证”这两个特性，其主要原理是针对每一个单独的nonce只需要访问数据集中的一小部分数据。Dagger曾经被认为可以替代一些memory-hard的算法（如Scrypt），但是后来被Sergio Lerner证明该算法易于遭受共享内存硬件加速的攻击，从而逐渐被废弃。 Dagger-Hashimoto vs. Hashimoto vs. Dagger Dagger-Hashimoto和Hashimoto的主要区别是： Hashimoto直接使用区块链数据作为输入源，而Dagger-Hashimoto使用一个定制的1GB的dataset(数据集）作为输入源，该dataset每隔N个区块会被更新。dataset是通过Dagger算法生成的，轻客户端验证算法可以针对每一个nonce对其中一个子集完成高效计算。 Dagger-Hashimoto和Dagger的主要区别是： 与Dagger不同，Dagger-Hashimoto用于查询区块的dataset是半持久化（semi-permanent）的，需要间隔很长一段时间才会更新。这样生成dataset的工作量比例接近于0，Sergio Lerner用于共享内存加速的参数就可以忽略不计了。 2. Ethash Ethash算法主要分为以下几个步骤： 根据区块信息生成一个seed 根据seed计算出一个16MB的伪随机cache，由轻客户端存储 根据cache计算出一个1GB的dataset，其中的每一个数据都是通过cache中的一小部分数据计算出来的。该dataset由完整客户端或者矿工存储，大小随时间线性增长 矿工会从dataset中随机取出数据计算hash 验证者会根据cache重新生成dataset中所需要的那部分数据，因此只需要存储cache就可以了 下面分别讨论这几个部分的实现。 2.1 生成seed consensus/ethash/ethash.go: func (d *dataset) generate(dir string, limit int, test bool) { ... ... seed := seedHash(d.epoch*epochLength + 1) ... ... } func seedHash(block uint64) []byte { seed := make([]byte, 32) if block &lt; epochLength { return seed } keccak256 := makeHasher(sha3.NewKeccak256()) for i := 0; i &lt; int(block/epochLength); i++ { keccak256(seed, seed) } return seed } 这里有个epoch（纪元）的概念：epochLength等于30000，也就是每30000个区块形成一个纪元，每个纪元更新一次数据集（就是前面提到的“半持久化”）。 seed初始值为0，每过一个纪元会取前一个seed的哈希值作为下一个纪元的seed。 2.2 生成cache 接下来就是用这个seed生成16MB的cache了。首先看一下cache大小的计算： func cacheSize(block uint64) uint64 { epoch := int(block / epochLength) if epoch &lt; maxEpoch { return cacheSizes[epoch] } return calcCacheSize(epoch) } func calcCacheSize(epoch int) uint64 { size := cacheInitBytes + cacheGrowthBytes*uint64(epoch) - hashBytes for !new(big.Int).SetUint64(size / hashBytes).ProbablyPrime(1) { size -= 2 * hashBytes } return size } 前2048(maxEpoch)个纪元的cache大小是硬编码在代码里的，如果超过这个数量就需要自己计算了。 cache的大小是线性增长的，size的值等于(2^24 + 2^17 * epoch - 64)，用这个值除以64看结果是否是一个质数，如果不是，减去128再重新计算，直到找到最大的质数为止。 接下来分析cache数据的生成： func generateCache(dest []uint32, epoch uint64, seed []byte) { ... ... // Create a hasher to reuse between invocations keccak512 := makeHasher(sha3.NewKeccak512()) // Sequentially produce the initial dataset keccak512(cache, seed) for offset := uint64(hashBytes); offset &lt; size; offset += hashBytes { keccak512(cache[offset:], cache[offset-hashBytes:offset]) atomic.AddUint32(&amp;progress, 1) } ... ... } 看明白没？先用seed的哈希值生成第一个数（64字节），然后以新生成的数作为seed，生成下一个数，依次迭代，直至填充满整个cache。当然这只是第一步，后面还要跟之前cache中的数据按一定规则做一次异或，然后再求一次哈希，具体细节参见一下代码： for i := 0; i &lt; cacheRounds; i++ { for j := 0; j &lt; rows; j++ { var ( srcOff = ((j - 1 + rows) % rows) * hashBytes dstOff = j * hashBytes xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes ) bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes]) keccak512(cache[dstOff:], temp) atomic.AddUint32(&amp;progress, 1) } } 2.3 生成dataset dataset大小的计算和cache类似，量级不同：2^30 + 2^23 * epoch - 128，然后每次减256寻找最大质数。 生成数据是一个循环，每次生成64个字节，所以看generateDatasetItem()就可以了。代码分为下面几个部分： 用cache里的值进行初始化，计算一次哈希 // Calculate the number of theoretical rows (we use one buffer nonetheless) rows := uint32(len(cache) / hashWords) // Initialize the mix mix := make([]byte, hashBytes) binary.LittleEndian.PutUint32(mix, cache[(index%rows)*hashWords]^index) for i := 1; i &lt; hashWords; i++ { binary.LittleEndian.PutUint32(mix[i*4:], cache[(index%rows)*hashWords+uint32(i)]) } keccak512(mix, mix) 转换成无符号整数 // Convert the mix to uint32s to avoid constant bit shifting intMix := make([]uint32, hashWords) for i := 0; i &lt; len(intMix); i++ { intMix[i] = binary.LittleEndian.Uint32(mix[i*4:]) } 2）计算FNV哈希 // fnv it with a lot of random cache nodes based on index for i := uint32(0); i &lt; datasetParents; i++ { parent := fnv(index^i, intMix[i%16]) % rows fnvHash(intMix, cache[parent*hashWords:]) } 4）整数转回字节数组，再计算一次哈希 // Flatten the uint32 mix into a binary one and return for i, val := range intMix { binary.LittleEndian.PutUint32(mix[i*4:], val) } keccak512(mix, mix) 这里用到了FNV哈希算法，这是一种不需要使用密钥的哈希算法，以它的三位发明者的名字命名：Glenn Fowler, Landon Curt Noll, Kiem-Phong Vo。 这个FNV算法很简单：a乘以FNV质数0x01000193，然后再和b异或。 首先用这个算法算出一个索引值，利用这个索引从cache中选出一个值（data），然后对mix中的每个字节都计算一次FNV，得到最终的哈希值： func fnv(a, b uint32) uint32 { return a*0x01000193 ^ b } func fnvHash(mix []uint32, data []uint32) { for i := 0; i &lt; len(mix); i++ { mix[i] = mix[i]*0x01000193 ^ data[i] } } 从这里可以看出，dataset的每个值都是根据对应的cache中的值生成的，因此轻客户端无需存储dataset，只需要在验证的时候按需生成即可。 2.4 矿工挖矿 挖矿流程参见下图： 具体代码参见consensus/ethash/algorithm.go中的hashimotoFull()函数： func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { lookup := func(index uint32) []uint32 { offset := index * hashWords return dataset[offset : offset+hashWords] } return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } 首先提供了一个lookup()函数，用于从dataset中查找数据。接着就是调用hashimoto()函数计算哈希了：首先根据hash和nonce生成一个seed，填充到mix数组中，然后用lookup()函数获取data，最后把mix和data送入fnvHash()函数中计算哈希值。具体代码这里就不分析了。 2.5 工作量验证 在节点收到新区块时，需要验证根据区块头的hash和nonce计算出来的FNV哈希值是否确实小于设定的难度值。入口位于core/blockchain.go的insertChain()方法： func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { ... ... for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) ... ... } 继续跟踪consensus/ethash/consensus.go中的VerifyHeaders()方法，最终会调用verifyHeader()： func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *types.Header, uncle bool, seal bool) error { ... ... if seal { if err := ethash.VerifySeal(chain, header); err != nil { return err } } ... ... } 这里会调用VerifySeal()方法验证区块头是否符合要求： func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Header) error { ... ... digest, result := hashimotoLight(size, cache.cache, header.HashNoNonce().Bytes(), header.Nonce.Uint64()) ... ... target := new(big.Int).Div(maxUint256, header.Difficulty) if new(big.Int).SetBytes(result).Cmp(target) &gt; 0 { return errInvalidPoW } return nil } 可以看到，这里调用hashimotoLight()函数计算FNV哈希值，然后跟目标难度比较，确认是否低于目标难度。这个hashimotoLight()就是为轻客户端节点计算FNV哈希值的，会根据需要通过cache生成少量dataset的值完成计算，有兴趣的同学可以再仔细研究一下具体细节。 3. 总结 Ethash是一种“memory-hard计算”和“memory-easy验证”的哈希算法，通过内存访问速度的瓶颈抵抗ASIC矿机，同时利用两级数据集实现挖矿和轻客户端验证的分离。 参考： https://github.com/ethereum/wiki/wiki/Dagger-Hashimoto https://github.com/ethereum/wiki/wiki/Ethash https://github.com/ethereum/wiki/wiki/Ethash-Design-Rationale https://www.vijaypradeep.com/blog/2017-04-28-ethereums-memory-hardness-explained/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/02/e00a8ec5b35a84d5e833439fc1d02e14.html","headline":"以太坊Ethash算法源码分析","dateModified":"2018-08-02T00:00:00+08:00","datePublished":"2018-08-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/02/e00a8ec5b35a84d5e833439fc1d02e14.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊Ethash算法源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81364008 
+ </div> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <p>Ethash是以太坊目前使用的共识算法，其前身是Dagger-Hashimoto算法，但是进行了很大的改动。</p> 
+  <h1><a id="1_DaggerHashimoto_2"></a>1. Dagger-Hashimoto</h1> 
+  <p>Dagger-Hashimoto算法想要达到以下几个目标：</p> 
+  <h3><a id="_5"></a></h3> 
+  <ul> 
+   <li>抵制ASIC矿机</li> 
+   <li>轻客户端验证</li> 
+   <li>全链数据存储</li> 
+  </ul> 
+  <p>实际上Dagger-Hashimoto是由两种不同的算法Dagger和Hashimoto融合而成的：</p> 
+  <h2><a id="Hashimoto_12"></a>Hashimoto</h2> 
+  <p>Hashimoto算法由Thaddeus Dryja发明，旨在通过“内存读取”瓶颈来抵制ASIC矿机。ASIC矿机可以通过设计专用电路来提升计算速度，但是很难提升“内存读取”速度，因为经历了这么多年的发展，内存访问已经经过了极致的优化。Hashimoto算法直接采用区块链数据，也就是区块中的交易作为输入源。</p> 
+  <p>注：为了减小计算量，Dagger-Hashimoto中实际上只使用了低64位参与移位。</p> 
+  <h2><a id="Dagger_18"></a>Dagger</h2> 
+  <p>Dagger算法由Vitalik Buterin发明，旨在通过DAG（有向无环图）来同时获得“memory-hard计算”和“memory-easy验证”这两个特性，其主要原理是针对每一个单独的nonce只需要访问数据集中的一小部分数据。Dagger曾经被认为可以替代一些memory-hard的算法（如Scrypt），但是后来被Sergio Lerner证明该算法易于遭受共享内存硬件加速的攻击，从而逐渐被废弃。</p> 
+  <h2><a id="DaggerHashimoto_vs_Hashimoto_vs_Dagger_22"></a>Dagger-Hashimoto vs. Hashimoto vs. Dagger</h2> 
+  <p>Dagger-Hashimoto和Hashimoto的主要区别是：<br> Hashimoto直接使用区块链数据作为输入源，而Dagger-Hashimoto使用一个定制的1GB的dataset(数据集）作为输入源，该dataset每隔N个区块会被更新。dataset是通过Dagger算法生成的，轻客户端验证算法可以针对每一个nonce对其中一个子集完成高效计算。</p> 
+  <p>Dagger-Hashimoto和Dagger的主要区别是：<br> 与Dagger不同，Dagger-Hashimoto用于查询区块的dataset是半持久化（semi-permanent）的，需要间隔很长一段时间才会更新。这样生成dataset的工作量比例接近于0，Sergio Lerner用于共享内存加速的参数就可以忽略不计了。</p> 
+  <h1><a id="2_Ethash_30"></a>2. Ethash</h1> 
+  <p>Ethash算法主要分为以下几个步骤：</p> 
+  <h3><a id="_33"></a></h3> 
+  <ul> 
+   <li>根据区块信息生成一个seed</li> 
+   <li>根据seed计算出一个16MB的伪随机cache，由轻客户端存储</li> 
+   <li>根据cache计算出一个1GB的dataset，其中的每一个数据都是通过cache中的一小部分数据计算出来的。该dataset由完整客户端或者矿工存储，大小随时间线性增长</li> 
+   <li>矿工会从dataset中随机取出数据计算hash</li> 
+   <li>验证者会根据cache重新生成dataset中所需要的那部分数据，因此只需要存储cache就可以了</li> 
+  </ul> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180802171255725?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>下面分别讨论这几个部分的实现。</p> 
+  <h2><a id="21_seed_44"></a>2.1 生成seed</h2> 
+  <p>consensus/ethash/ethash.go:</p> 
+  <pre><code>func (d *dataset) generate(dir string, limit int, test bool) {
+    ... ...
+    seed := seedHash(d.epoch*epochLength + 1)
+    ... ...
+}
+
+func seedHash(block uint64) []byte {
+    seed := make([]byte, 32)
+    if block &lt; epochLength {
+        return seed
+    }
+    keccak256 := makeHasher(sha3.NewKeccak256())
+    for i := 0; i &lt; int(block/epochLength); i++ {
+        keccak256(seed, seed)
+    }
+    return seed
+}
+</code></pre> 
+  <p>这里有个epoch（纪元）的概念：epochLength等于30000，也就是每30000个区块形成一个纪元，每个纪元更新一次数据集（就是前面提到的“半持久化”）。</p> 
+  <p>seed初始值为0，每过一个纪元会取前一个seed的哈希值作为下一个纪元的seed。</p> 
+  <h2><a id="22_cache_71"></a>2.2 生成cache</h2> 
+  <p>接下来就是用这个seed生成16MB的cache了。首先看一下cache大小的计算：</p> 
+  <pre><code>func cacheSize(block uint64) uint64 {
+    epoch := int(block / epochLength)
+    if epoch &lt; maxEpoch {
+        return cacheSizes[epoch]
+    }
+    return calcCacheSize(epoch)
+}
+
+func calcCacheSize(epoch int) uint64 {
+    size := cacheInitBytes + cacheGrowthBytes*uint64(epoch) - hashBytes
+    for !new(big.Int).SetUint64(size / hashBytes).ProbablyPrime(1) {
+        size -= 2 * hashBytes
+    }
+    return size
+}
+</code></pre> 
+  <p>前2048(maxEpoch)个纪元的cache大小是硬编码在代码里的，如果超过这个数量就需要自己计算了。<br> cache的大小是线性增长的，size的值等于(2^24 + 2^17 * epoch - 64)，用这个值除以64看结果是否是一个质数，如果不是，减去128再重新计算，直到找到最大的质数为止。</p> 
+  <p>接下来分析cache数据的生成：</p> 
+  <pre><code>func generateCache(dest []uint32, epoch uint64, seed []byte) {
+    ... ...
+    // Create a hasher to reuse between invocations
+    keccak512 := makeHasher(sha3.NewKeccak512())
+
+    // Sequentially produce the initial dataset
+    keccak512(cache, seed)
+    for offset := uint64(hashBytes); offset &lt; size; offset += hashBytes {
+        keccak512(cache[offset:], cache[offset-hashBytes:offset])
+        atomic.AddUint32(&amp;progress, 1)
+    }
+    ... ...
+}
+</code></pre> 
+  <p>看明白没？先用seed的哈希值生成第一个数（64字节），然后以新生成的数作为seed，生成下一个数，依次迭代，直至填充满整个cache。当然这只是第一步，后面还要跟之前cache中的数据按一定规则做一次异或，然后再求一次哈希，具体细节参见一下代码：</p> 
+  <pre><code>    for i := 0; i &lt; cacheRounds; i++ {
+        for j := 0; j &lt; rows; j++ {
+            var (
+                srcOff = ((j - 1 + rows) % rows) * hashBytes
+                dstOff = j * hashBytes
+                xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes
+            )
+            bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes])
+            keccak512(cache[dstOff:], temp)
+
+            atomic.AddUint32(&amp;progress, 1)
+        }
+    }
+</code></pre> 
+  <h2><a id="23_dataset_131"></a>2.3 生成dataset</h2> 
+  <p>dataset大小的计算和cache类似，量级不同：2^30 + 2^23 * epoch - 128，然后每次减256寻找最大质数。</p> 
+  <p>生成数据是一个循环，每次生成64个字节，所以看generateDatasetItem()就可以了。代码分为下面几个部分：</p> 
+  <ol> 
+   <li>用cache里的值进行初始化，计算一次哈希</li> 
+  </ol> 
+  <pre><code>    // Calculate the number of theoretical rows (we use one buffer nonetheless)
+    rows := uint32(len(cache) / hashWords)
+
+    // Initialize the mix
+    mix := make([]byte, hashBytes)
+
+    binary.LittleEndian.PutUint32(mix, cache[(index%rows)*hashWords]^index)
+    for i := 1; i &lt; hashWords; i++ {
+        binary.LittleEndian.PutUint32(mix[i*4:], cache[(index%rows)*hashWords+uint32(i)])
+    }
+    keccak512(mix, mix)
+</code></pre> 
+  <ol start="2"> 
+   <li>转换成无符号整数</li> 
+  </ol> 
+  <pre><code>    // Convert the mix to uint32s to avoid constant bit shifting
+    intMix := make([]uint32, hashWords)
+    for i := 0; i &lt; len(intMix); i++ {
+        intMix[i] = binary.LittleEndian.Uint32(mix[i*4:])
+    }
+</code></pre> 
+  <p>2）计算FNV哈希</p> 
+  <pre><code>    // fnv it with a lot of random cache nodes based on index
+    for i := uint32(0); i &lt; datasetParents; i++ {
+        parent := fnv(index^i, intMix[i%16]) % rows
+        fnvHash(intMix, cache[parent*hashWords:])
+    }
+</code></pre> 
+  <p>4）整数转回字节数组，再计算一次哈希</p> 
+  <pre><code>    // Flatten the uint32 mix into a binary one and return
+    for i, val := range intMix {
+        binary.LittleEndian.PutUint32(mix[i*4:], val)
+    }
+    keccak512(mix, mix)
+</code></pre> 
+  <p>这里用到了FNV哈希算法，这是一种不需要使用密钥的哈希算法，以它的三位发明者的名字命名：Glenn Fowler, Landon Curt Noll, Kiem-Phong Vo。<br> 这个FNV算法很简单：a乘以FNV质数0x01000193，然后再和b异或。<br> 首先用这个算法算出一个索引值，利用这个索引从cache中选出一个值（data），然后对mix中的每个字节都计算一次FNV，得到最终的哈希值：</p> 
+  <pre><code>func fnv(a, b uint32) uint32 {
+    return a*0x01000193 ^ b
+}
+
+func fnvHash(mix []uint32, data []uint32) {
+    for i := 0; i &lt; len(mix); i++ {
+        mix[i] = mix[i]*0x01000193 ^ data[i]
+    }
+}
+</code></pre> 
+  <p>从这里可以看出，dataset的每个值都是根据对应的cache中的值生成的，因此轻客户端无需存储dataset，只需要在验证的时候按需生成即可。</p> 
+  <h2><a id="24__201"></a>2.4 矿工挖矿</h2> 
+  <p>挖矿流程参见下图：<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180802171317213?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>具体代码参见consensus/ethash/algorithm.go中的hashimotoFull()函数：</p> 
+  <pre><code>func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) {
+    lookup := func(index uint32) []uint32 {
+        offset := index * hashWords
+        return dataset[offset : offset+hashWords]
+    }
+    return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup)
+}
+</code></pre> 
+  <p>首先提供了一个lookup()函数，用于从dataset中查找数据。接着就是调用hashimoto()函数计算哈希了：首先根据hash和nonce生成一个seed，填充到mix数组中，然后用lookup()函数获取data，最后把mix和data送入fnvHash()函数中计算哈希值。具体代码这里就不分析了。</p> 
+  <h2><a id="25__220"></a>2.5 工作量验证</h2> 
+  <p>在节点收到新区块时，需要验证根据区块头的hash和nonce计算出来的FNV哈希值是否确实小于设定的难度值。入口位于core/blockchain.go的insertChain()方法：</p> 
+  <pre><code>func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) {
+    ... ...
+    for i, block := range chain {
+        headers[i] = block.Header()
+        seals[i] = true
+    }
+    abort, results := bc.engine.VerifyHeaders(bc, headers, seals)
+    ... ...
+}
+</code></pre> 
+  <p>继续跟踪consensus/ethash/consensus.go中的VerifyHeaders()方法，最终会调用verifyHeader()：</p> 
+  <pre><code>func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *types.Header, uncle bool, seal bool) error {
+    ... ...
+    if seal {
+        if err := ethash.VerifySeal(chain, header); err != nil {
+            return err
+        }
+    }
+
+    ... ...
+}
+</code></pre> 
+  <p>这里会调用VerifySeal()方法验证区块头是否符合要求：</p> 
+  <pre><code>func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Header) error {
+    ... ...
+    digest, result := hashimotoLight(size, cache.cache, header.HashNoNonce().Bytes(), header.Nonce.Uint64())
+
+    ... ...
+    target := new(big.Int).Div(maxUint256, header.Difficulty)
+    if new(big.Int).SetBytes(result).Cmp(target) &gt; 0 {
+        return errInvalidPoW
+    }
+    return nil
+}
+</code></pre> 
+  <p>可以看到，这里调用hashimotoLight()函数计算FNV哈希值，然后跟目标难度比较，确认是否低于目标难度。这个hashimotoLight()就是为轻客户端节点计算FNV哈希值的，会根据需要通过cache生成少量dataset的值完成计算，有兴趣的同学可以再仔细研究一下具体细节。</p> 
+  <h1><a id="3__269"></a>3. 总结</h1> 
+  <p>Ethash是一种“memory-hard计算”和“memory-easy验证”的哈希算法，通过内存访问速度的瓶颈抵抗ASIC矿机，同时利用两级数据集实现挖矿和轻客户端验证的分离。</p> 
+  <blockquote> 
+   <p>参考：<br> <a href="https://github.com/ethereum/wiki/wiki/Dagger-Hashimoto" rel="nofollow">https://github.com/ethereum/wiki/wiki/Dagger-Hashimoto</a><br> <a href="https://github.com/ethereum/wiki/wiki/Ethash" rel="nofollow">https://github.com/ethereum/wiki/wiki/Ethash</a><br> <a href="https://github.com/ethereum/wiki/wiki/Ethash-Design-Rationale" rel="nofollow">https://github.com/ethereum/wiki/wiki/Ethash-Design-Rationale</a><br> <a href="https://www.vijaypradeep.com/blog/2017-04-28-ethereums-memory-hardness-explained/" rel="nofollow">https://www.vijaypradeep.com/blog/2017-04-28-ethereums-memory-hardness-explained/</a></p> 
+  </blockquote> 
+  <p><font color="red">更多文章欢迎关注“鑫鑫点灯”专栏：</font><a href="https://blog.csdn.net/turkeycock" rel="nofollow">https://blog.csdn.net/turkeycock</a><br> <font color="green">或关注飞久微信公众号：</font><br> <img src="https://img-blog.csdnimg.cn/20181030102302982.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-7f770a53f2.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/TurkeyCock/article/details/81364008,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/TurkeyCock/article/details/81364008,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

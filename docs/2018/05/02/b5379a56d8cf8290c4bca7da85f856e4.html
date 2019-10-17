@@ -1,0 +1,1139 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>BTS的DPoS共识之代码实现概述 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="BTS的DPoS共识之代码实现概述" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="关于BitShares的DPoS共识的概述请参考：股份授权证明(DPOS)概述 关于BitShares的DPoS共识的详细介绍请参考：BitShares的DPoS共识 关于BitShares的DPoS共识的竞争链共识补充说明请参考：DPOS共识算法 - 缺失的白皮书 关于BitShares的DPoS共识之代码实现概述请参考：BTS的DPoS共识之代码实现概述 本文基于的BitShares源代码GitHub地址如下：https://github.com/bitshares/bitshares-core 目录 1. DPoS共识算法概述 2. 洗牌算法 3. 统计投票和选出证人集合 4. 调度证人和生产区块 5. 证人节点初始化 6. 创建genesis.json文件 7. DPoS共识代码流程图 1. DPoS共识算法概述 任何共识机制都必须解决包括但不限于以下5个问题： 下一个添加到数据库的新区块应该由谁来生成？ 下一个块应该何时产生？ 该区块应包含哪些交易？ 怎样对本协议进行修改？ 该如何解决交易历史的竞争问题？ 本文主要讨论前3个问题，第4个问题本文不做讨论；关于第5个问题，即交易数据分叉和双花等问题的研究分析可参考：DPOS共识算法 - 缺失的白皮书 总体来说，为了解决PoW和PoS共识其交易性能低下的问题，DPoS使用见证人机制（witness）解决该问题。通过去中心化的投票机制选出前N个证人来保证信任问题；通过轮流安排证人打包生产区块来提高出块速度以及减少能耗问题；通过证人对区块进行验证从而减少确认的次数，从而加快共识的过程和提高交易结算的速度。总之，DPoS共识通过间接民主的方式既保证了最大限度的去中心化又极大的提高了性能同时降低了电力等成本。 DPoS的伪代码实现如下（伪代码参考了用伪代码理解DPoS）： for round i //分成很多个round，round无限持续 dlist_i = get N witnesses sort by votes //根据投票结果选出得票率最高的N个证人 dlist_i = shuffle(dlist_i) //随机改变顺序 loop //round完了，退出循环 slot = global_time_offset / block_interval pos = slot % N if dlist_i[pos] exists in this node //witness在这个节点 generateBlock(keypair of dlist_i[pos]) //生产block else skip 可以看到，在每一轮（round）循环里，系统会重新统计得票排名。在选出最高的N个证人里，系统采用先打乱顺序，然后证人轮流生产区块。一轮区块生产完毕后进入下一个周期。 在BitShares实际的代码中，过程比上述伪代码复杂得多，下面本文从3个方向讲解BTS中DPoS共识的实现过程： 打乱证人调度顺序的过程，即洗牌算法； 统计投票和选出证人集合的过程； 调度证人和生产区块的过程； 2. 洗牌算法 洗牌算法的代码流程图： 首先，为了存储证人的调度顺序，BTS定义了一个名叫witness_schedule_object的类，在该类中用了一个名为current_shuffled_witnesses的vector集合来存储： class witness_schedule_object : public graphene::db::abstract_object&lt;witness_schedule_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_witness_schedule_object_type; vector&lt; witness_id_type &gt; current_shuffled_witnesses; //用于存储证人的调度顺序 }; 有了上面的存储结构，下面来再看洗牌算法update_witness_schedule()： void database::update_witness_schedule() { const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); const global_property_object&amp; gpo = get_global_properties(); // 该条件控制了洗牌算法被调用的时机，必须是证人完整的轮转完一圈后 if( head_block_num() % gpo.active_witnesses.size() == 0 ) { modify( wso, [&amp;]( witness_schedule_object&amp; _wso ) { // 清空证人集合 _wso.current_shuffled_witnesses.clear(); _wso.current_shuffled_witnesses.reserve( gpo.active_witnesses.size() ); // 初始化证人集合数据 for( const witness_id_type&amp; w : gpo.active_witnesses ) _wso.current_shuffled_witnesses.push_back( w ); // 打乱证人的调度顺序 auto now_hi = uint64_t(head_block_time().sec_since_epoch()) &lt;&lt; 32; for( uint32_t i = 0; i &lt; _wso.current_shuffled_witnesses.size(); ++i ) { /// 此处使用了随机函数，具体原理请参看：http://xorshift.di.unimi.it/ uint64_t k = now_hi + uint64_t(i)*2685821657736338717ULL; k ^= (k &gt;&gt; 12); k ^= (k &lt;&lt; 25); k ^= (k &gt;&gt; 27); k *= 2685821657736338717ULL; uint32_t jmax = _wso.current_shuffled_witnesses.size() - i; uint32_t j = i + k%jmax; // 进行N次随机交换 std::swap( _wso.current_shuffled_witnesses[i], _wso.current_shuffled_witnesses[j] ); } }); } } 那么洗牌算法是在什么时候由哪个节点调用呢? 实际上update_witness_schedule()方法只在_apply_block()中调用: // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... update_witness_schedule(); //其他处理 ...... } 关于该方法的又是什么时候调用会在后文介绍，总之，证人节点每次将一个签名区块添加到链上之后调用洗牌算法，而在洗牌算法内部会在证人轮转完一圈时才真正洗牌。 这里要强调一下，洗牌算法只是打乱了证人的调度顺序，但可能还是原来那些证人。那么证人成员什么时候更新呢？现在回到洗牌算法update_witness_schedule()中，current_shuffled_witnesses是从gpo.active_witnesses中获得活跃证人的初始化数据的，只有当gpo.active_witnesses中的的成员发生变化时，current_shuffled_witnesses中的成员才发生变化，那么gpo.active_witnesses又是怎么更新的呢？ 3. 统计投票和选出证人集合 统计投票和选出证人集合代码流程图： 首先介绍和活跃证人集合相关的类，全局属性类global_property_object，该类中使用了名为active_witnesses的flat_set保存活跃证人： // 全局属性类 class global_property_object : public graphene::db::abstract_object&lt;global_property_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_global_property_object_type; chain_parameters parameters; optional&lt;chain_parameters&gt; pending_parameters; uint32_t next_available_vote_id = 0; vector&lt;committee_member_id_type&gt; active_committee_members; flat_set&lt;witness_id_type&gt; active_witnesses; // 活跃证人集合，每个维护间隔更新一次 }; 有了上面类的铺垫，下来再来讲活跃证人集合更新的事情。在BitShares的源代码中，gpo.active_witnesses的更新是通过update_active_witnesses()方法实现的： // 更新活跃证人 void database::update_active_witnesses() { // 统计投票的证人个数 assert( _witness_count_histogram_buffer.size() &gt; 0 ); share_type stake_target = (_total_voting_stake-_witness_count_histogram_buffer[0]) / 2; /// 为0或1个证人投票的账户不会就证人数量发表意见（他们弃权并且是无投票权的账户） share_type stake_tally = 0; size_t witness_count = 0; if( stake_target &gt; 0 ) { while( (witness_count &lt; _witness_count_histogram_buffer.size() - 1) &amp;&amp; (stake_tally &lt;= stake_target) ) { stake_tally += _witness_count_histogram_buffer[++witness_count]; } } const chain_property_object&amp; cpo = get_chain_properties(); // 排序选出前排名前N的证人 auto wits = sort_votable_objects&lt;witness_index&gt;(std::max(witness_count*2+1, (size_t)cpo.immutable_parameters.min_witness_count)); //其他处理 ...... // 将证人存入active_witnesses中 modify(gpo, [&amp;]( global_property_object&amp; gp ){ gp.active_witnesses.clear(); gp.active_witnesses.reserve(wits.size()); std::transform(wits.begin(), wits.end(), std::inserter(gp.active_witnesses, gp.active_witnesses.end()), [](const witness_object&amp; w) { return w.id; }); }); //其他处理 ...... } 在update_active_witnesses()方法中首先统计出投票的证人个数N，然后排序选出得票率最高的N个证人，再更新到active_witnesses中去。下面是排序算法sort_votable_objects的介绍： // 从高到低排列出前N个指定类型的可投票对象，并以vector的形式返回 template&lt;class Index&gt; vector&lt;std::reference_wrapper&lt;const typename Index::object_type&gt;&gt; database::sort_votable_objects(size_t count) const { using ObjectType = typename Index::object_type; // 获取所有对象 const auto&amp; all_objects = get_index_type&lt;Index&gt;().indices(); // 计算实际个数 count = std::min(count, all_objects.size()); vector&lt;std::reference_wrapper&lt;const ObjectType&gt;&gt; refs; refs.reserve(all_objects.size()); // 初始化refs std::transform(all_objects.begin(), all_objects.end(), std::back_inserter(refs), [](const ObjectType&amp; o) { return std::cref(o); }); // 排序（从高到低） std::partial_sort(refs.begin(), refs.begin() + count, refs.end(), [this](const ObjectType&amp; a, const ObjectType&amp; b)-&gt;bool { share_type oa_vote = _vote_tally_buffer[a.vote_id]; share_type ob_vote = _vote_tally_buffer[b.vote_id]; if( oa_vote != ob_vote ) return oa_vote &gt; ob_vote; return a.vote_id &lt; b.vote_id; }); // 截取，返回 refs.resize(count, refs.front()); return refs; } 再来看在update_active_witnesses()方法，可以看到证人的投票数据是从_witness_count_histogram_buffer中获取的，而该集合又是在什么时候更新呢？还有update_active_witnesses()方法又是什么时候调用呢？这些问题的答案都在perform_chain_maintenance()方法中： // 区块链维护处理 void database::perform_chain_maintenance(const signed_block&amp; next_block, const global_property_object&amp; global_props) { const auto&amp; gpo = get_global_properties(); //其他处理 ...... // 统计所有账户的投票，注意：此处是笔者为了便于理解，讲原代码中的泛型编程改写而成的 const auto&amp; idx = get_index_type&lt;account_index&gt;().indices().get&lt;by_name&gt;(); for( const account_object&amp; a : idx ) { database&amp; d = *this; const global_property_object&amp; props = gpo; //其他处理 ...... d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / 2 + 1); const account_object&amp; stake_account = a; // 获取实际投票账户 const account_object&amp; opinion_account = (stake_account.options.voting_account == GRAPHENE_PROXY_TO_SELF_ACCOUNT)? stake_account : d.get(stake_account.options.voting_account); // 获取实际投票数量 const auto&amp; stats = stake_account.statistics(d); uint64_t voting_stake = stats.total_core_in_orders.value + (stake_account.cashback_vb.valid() ? (*stake_account.cashback_vb)(d).balance.amount.value: 0) + d.get_balance(stake_account.get_id(), asset_id_type()).amount.value; //其他处理 ...... // 统计投票 if( opinion_account.options.num_witness &lt;= props.parameters.maximum_witness_count ) { uint16_t offset = std::min(size_t(opinion_account.options.num_witness/2), d._witness_count_histogram_buffer.size() - 1); d._witness_count_histogram_buffer[offset] += voting_stake; } } //其他处理 ...... // 注意：在这里更新活跃证人 update_active_witnesses(); //其他处理 ...... // 以下计算出下一次区块链维护时间，并更新到全局数据库 auto next_maintenance_time = get&lt;dynamic_global_property_object&gt;(dynamic_global_property_id_type()).next_maintenance_time; auto maintenance_interval = gpo.parameters.maintenance_interval; if( next_maintenance_time &lt;= next_block.timestamp ) { if( next_block.block_num() == 1 ) next_maintenance_time = time_point_sec() + (((next_block.timestamp.sec_since_epoch() / maintenance_interval) + 1) * maintenance_interval); else { auto y = (head_block_time() - next_maintenance_time).to_seconds() / maintenance_interval; next_maintenance_time += (y+1) * maintenance_interval; } } //其他处理 ...... d.next_maintenance_time = next_maintenance_time; //其他处理 ...... } 总结一下，在perform_chain_maintenance()方法中，首先统计出每个账户实际的投票数据，接着计算出投出的证人数量N和得票率前N的证人，再调用update_active_witnesses()更新活跃证人，最后计算出下一次的区块链维护时间。那么perform_chain_maintenance()方法又是什么时候调用呢？且看_apply_block()方法： // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... bool maint_needed = (dynamic_global_props.next_maintenance_time &lt;= next_block.timestamp); //其他处理 ...... // 当到了区块链维护时间时 if( maint_needed ) perform_chain_maintenance(next_block, global_props); //其他处理 ...... // 注意了，这里调用洗牌算法（前面讲过） update_witness_schedule(); //其他处理 ...... } 可以看到在_apply_block()方法中首先判断是否到了维护时间，如果到了维护时间就重新统计投票，得到新的活跃证人。这里就需要强调的是，在上一节讲的洗牌算法也是在该方法中调用，也就是说每次将一个区块添加的链上后，首先判断是否到了区块链维护时间，如果是就统计投票选出证人并更新，然后会调用洗牌算法，判断是否到了洗牌的时刻，再洗牌。 那么_apply_block()方法又是什么调用呢？或者说什么时候调度证人和生产区块呢？ 4. 调度证人和生产区块 调度证人和生产区块的代码流程图： 这一次，我们从main()方法开始讲解： // 应用程序入口 int main(int argc, char** argv) { app::application* node = new app::application(); //其他处理 ...... // 启动所有插件 node-&gt;startup_plugins(); //其他处理 ...... } 在main方法中，调用启动插件接口startup_plugins()，启动所有插件： void application::startup_plugins() { // 遍历map，启动所有有效的插件 for( auto&amp; entry : my-&gt;_active_plugins ) entry.second-&gt;plugin_startup(); return; } 在该方法中，会启动所有有效的插件，如果节点要运行证人节点的话需要特殊配置，请参考BitShares官网说明: Howto Run a Block-producing Witness，本文不做介绍。在所有插件中，就包括witness_plugin插件，其启动实现如下： // 证人插件启动 void witness_plugin::plugin_startup() { try { ilog(&quot;witness plugin: plugin_startup() begin&quot;); chain::database&amp; d = database(); if( !_witnesses.empty() ) { ilog(&quot;Launching block production for ${n} witnesses.&quot;, (&quot;n&quot;, _witnesses.size())); app().set_block_production(true); if( _production_enabled ) { if( d.head_block_num() == 0 ) new_chain_banner(d); _production_skip_flags |= graphene::chain::database::skip_undo_history_check; } // 开启调度生产循环 schedule_production_loop(); } else elog(&quot;No witnesses configured! Please add witness IDs and private keys to configuration.&quot;); ilog(&quot;witness plugin: plugin_startup() end&quot;); } FC_CAPTURE_AND_RETHROW() } 在该方法中，进行若干判断和初始化，然后调用schedule_production_loop()方法，开启调度生产循环，其实现如下： // 调度生产循环 void witness_plugin::schedule_production_loop() { // 计算下一秒的滴答时刻，不少于50毫秒 fc::time_point now = fc::time_point::now(); int64_t time_to_next_second = 1000000 - (now.time_since_epoch().count() % 1000000); if( time_to_next_second &lt; 50000 ) time_to_next_second += 1000000; fc::time_point next_wakeup( now + fc::microseconds( time_to_next_second ) ); // 调度区块生产循环 _block_production_task = fc::schedule([this]{block_production_loop();}, next_wakeup, &quot;Witness Block Production&quot;); } 在schedule_production_loop()方法里，计算时钟，调度区块生产循环方法block_production_loop()： // 区块生产循环 block_production_condition::block_production_condition_enum witness_plugin::block_production_loop() { //其他处理 ...... // 判断区块生产的条件是否满足，并生产区块 result = maybe_produce_block(capture); //其他处理 ...... // 循环调度生产 schedule_production_loop(); //其他处理 ...... } 在该方法中，调用生产区块的入口方法，然后继续执行循环，其maybe_produce_block()方法实现如下： // 判断区块生产的条件是否满足，并生产区块 block_production_condition::block_production_condition_enum witness_plugin::maybe_produce_block( fc::limited_mutable_variant_object&amp; capture ) { chain::database&amp; db = database(); fc::time_point now_fine = fc::time_point::now(); fc::time_point_sec now = now_fine + fc::microseconds( 500000 ); // 判断生产时钟是否同步 if( !_production_enabled ) { if( db.get_slot_time(1) &gt;= now ) _production_enabled = true; else return block_production_condition::not_synced; } // 判断生产时间槽已经开始 uint32_t slot = db.get_slot_at_time( now ); if( slot == 0 ) { capture(&quot;next_time&quot;, db.get_slot_time(1)); return block_production_condition::not_time_yet; } assert( now &gt; db.head_block_time() ); // 判断是否轮转到当前证人生产区块 graphene::chain::witness_id_type scheduled_witness = db.get_scheduled_witness( slot ); if( _witnesses.find( scheduled_witness ) == _witnesses.end() ) { capture(&quot;scheduled_witness&quot;, scheduled_witness); return block_production_condition::not_my_turn; } fc::time_point_sec scheduled_time = db.get_slot_time( slot ); graphene::chain::public_key_type scheduled_key = scheduled_witness( db ).signing_key; auto private_key_itr = _private_keys.find( scheduled_key ); // 判断私钥是否有效 if( private_key_itr == _private_keys.end() ) { capture(&quot;scheduled_key&quot;, scheduled_key); return block_production_condition::no_private_key; } // 判断是否达到最低参与率 uint32_t prate = db.witness_participation_rate(); if( prate &lt; _required_witness_participation ) { capture(&quot;pct&quot;, uint32_t(100*uint64_t(prate) / GRAPHENE_1_PERCENT)); return block_production_condition::low_participation; } // 判断时间间隔是否低于50毫秒 if( llabs((scheduled_time - now).count()) &gt; fc::milliseconds( 500 ).count() ) { capture(&quot;scheduled_time&quot;, scheduled_time)(&quot;now&quot;, now); return block_production_condition::lag; } // 生产区块 auto block = db.generate_block( scheduled_time, scheduled_witness, private_key_itr-&gt;second, _production_skip_flags ); capture(&quot;n&quot;, block.block_num())(&quot;t&quot;, block.timestamp)(&quot;c&quot;, now); // 将生产的区块同步广播到网络中 fc::async( [this,block](){ p2p_node().broadcast(net::block_message(block)); } ); return block_production_condition::produced; } 可以看到在maybe_produce_block()方法中，进行了各种条件判断，只有满足了所有条件才开始生产区块，并将生产后区块广播同步到网络中的其他节点。这里先介绍3个方法get_slot_time()、get_slot_at_time()和get_scheduled_witness()。 get_slot_time()方法，获得未来的第n个区块生产时间槽的时刻： fc::time_point_sec database::get_slot_time(uint32_t slot_num)const { if( slot_num == 0 ) return fc::time_point_sec(); // 区块生产时间间隔 auto interval = block_interval(); const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); if( head_block_num() == 0 ) { // 特殊情况，生产创世区块的时刻 fc::time_point_sec genesis_time = dpo.time; return genesis_time + slot_num * interval; } // 获取前一个区块生产时间槽时刻 int64_t head_block_abs_slot = head_block_time().sec_since_epoch() / interval; fc::time_point_sec head_slot_time(head_block_abs_slot * interval); const global_property_object&amp; gpo = get_global_properties(); // 如果当前为区块链维护时刻，则跳过指定个时间槽 if( dpo.dynamic_flags &amp; dynamic_global_property_object::maintenance_flag ) slot_num += gpo.parameters.maintenance_skip_slots; // 前一个生产时间+若干生产间隔 return head_slot_time + (slot_num * interval); } get_slot_at_time()方法主要是获取指定时间属于未来哪个时间槽： uint32_t database::get_slot_at_time(fc::time_point_sec when)const { fc::time_point_sec first_slot_time = get_slot_time( 1 ); // 判断指定的时间是否已经过时 if( when &lt; first_slot_time ) return 0; return (when - first_slot_time).to_seconds() / block_interval() + 1; } get_scheduled_witness()方法实现了获取指定时间槽的区块生产调度证人： witness_id_type database::get_scheduled_witness( uint32_t slot_num )const { const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); // 计算调度偏移量 uint64_t current_aslot = dpo.current_aslot + slot_num; return wso.current_shuffled_witnesses[ current_aslot % wso.current_shuffled_witnesses.size() ]; } 这里就和前面讲的洗牌算法衔接上了，get_scheduled_witness()方法是从洗牌后的集合current_shuffled_witnesses中获取证人。 下面再回到maybe_produce_block()方法中来，在该方法中调用了generate_block()方法生产区块，其实现如下： signed_block database::generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key, uint32_t skip /* = 0 */ ) { try { signed_block result; detail::with_skip_flags( *this, skip, [&amp;]() { // 调用实际生产区块方法 result = _generate_block( when, witness_id, block_signing_private_key ); } ); return result; } FC_CAPTURE_AND_RETHROW() } 在该方法中才调用用实际生产区块的方法_generate_block()： signed_block database::_generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key ) { try { //其他处理 ...... static const size_t max_block_header_size = fc::raw::pack_size( signed_block_header() ) + 4; auto maximum_block_size = get_global_properties().parameters.maximum_block_size; size_t total_block_size = max_block_header_size; signed_block pending_block; //其他处理 ...... for( const processed_transaction&amp; tx : _pending_tx ) { size_t new_total_size = total_block_size + fc::raw::pack_size( tx ); // 计算交易大小，防止超过最大限度 if( new_total_size &gt;= maximum_block_size ) { postponed_tx_count++; continue; } try { auto temp_session = _undo_db.start_undo_session(); processed_transaction ptx = _apply_transaction( tx ); temp_session.merge(); // 将交易添加到区块中 total_block_size += fc::raw::pack_size( ptx ); pending_block.transactions.push_back( ptx ); } //其他处理 ...... } //其他处理 ...... pending_block.previous = head_block_id(); // 添加上一个区块id pending_block.timestamp = when; //添加时间戳 pending_block.transaction_merkle_root = pending_block.calculate_merkle_root(); //添加交易树根 pending_block.witness = witness_id; //更新证人id // 签名 if( !(skip &amp; skip_witness_signature) ) pending_block.sign( block_signing_private_key ); // 检查区块大小 if( !(skip &amp; skip_block_size_check) ) { FC_ASSERT( fc::raw::pack_size(pending_block) &lt;= get_global_properties().parameters.maximum_block_size ); } // 调用推块方法 push_block( pending_block, skip ); return pending_block; } FC_CAPTURE_AND_RETHROW( (witness_id) ) } 再来看将待定区块添加到链的实现过程push_block()： bool database::push_block(const signed_block&amp; new_block, uint32_t skip) { bool result; detail::with_skip_flags( *this, skip, [&amp;]() { detail::without_pending_transactions( *this, std::move(_pending_tx), [&amp;]() { // 调用实际的推块方法 result = _push_block(new_block); }); }); return result; } 在该方法中调用实际的推块的方法_push_block()，其实现如下: bool database::_push_block(const signed_block&amp; new_block) { try { uint32_t skip = get_node_properties().skip_flags; // 在此处理区块链竞争分叉问题，理论讲解请参看本人翻译的另一篇文章： // https://blog.csdn.net/ggq89/article/details/80072876 try { auto session = _undo_db.start_undo_session(); // 将新区块添加到链上 apply_block(new_block, skip); // 存入数据库 _block_id_to_block.store(new_block.id(), new_block); session.commit(); } catch ( const fc::exception&amp; e ) { elog(&quot;Failed to push new block:\n${e}&quot;, (&quot;e&quot;, e.to_detail_string())); _fork_db.remove(new_block.id()); throw; } return false; } FC_CAPTURE_AND_RETHROW( (new_block) ) } 下面再看apply_block()的实现过程： void database::apply_block( const signed_block&amp; next_block, uint32_t skip ) { //其他处理 ...... detail::with_skip_flags( *this, skip, [&amp;]() { // 在此调用实际的添加区块方法 _apply_block( next_block ); } ); return; } 到这里就和前面所讲的全部内容衔接在一起了，这个第三次代码跟踪到_apply_block()方法，至此整个dpos共识过程基本讲解完毕。最后只剩下整个应用程序的初始化过程了 5. 证人节点初始化 证人节点初始化的代码流程图： 留下有个疑问，整个程序最开始运行时，证人节点是如何初始化的呢？实际上初始数据是在init_genesis()方法中初始的： // 初始创世数据 void database::init_genesis(const genesis_state_type&amp; genesis_state) { try { //其他处理 ...... // 创建初始账户 for( const auto&amp; account : genesis_state.initial_accounts ) { account_create_operation cop; cop.name = account.name; cop.registrar = GRAPHENE_TEMP_ACCOUNT; cop.owner = authority(1, account.owner_key, 1); if( account.active_key == public_key_type() ) { cop.active = cop.owner; cop.options.memo_key = account.owner_key; } else { cop.active = authority(1, account.active_key, 1); cop.options.memo_key = account.active_key; } account_id_type account_id(apply_operation(genesis_eval_state, cop).get&lt;object_id_type&gt;()); if( account.is_lifetime_member ) { account_upgrade_operation op; op.account_to_upgrade = account_id; op.upgrade_to_lifetime_member = true; apply_operation(genesis_eval_state, op); } } //其他处理 ...... // 创建初始证人 std::for_each(genesis_state.initial_witness_candidates.begin(), genesis_state.initial_witness_candidates.end(), [&amp;](const genesis_state_type::initial_witness_type&amp; witness) { witness_create_operation op; op.witness_account = get_account_id(witness.owner_name); op.block_signing_key = witness.block_signing_key; apply_operation(genesis_eval_state, op); }); //其他处理 ...... // 设置活跃证人 modify(get_global_properties(), [&amp;](global_property_object&amp; p) { for( uint32_t i = 1; i &lt;= genesis_state.initial_active_witnesses; ++i ) { p.active_witnesses.insert(witness_id_type(i)); } }); //其他处理 ...... // 创建证人调度顺序 create&lt;witness_schedule_object&gt;([&amp;]( witness_schedule_object&amp; wso ) { for( const witness_id_type&amp; wid : get_global_properties().active_witnesses ) wso.current_shuffled_witnesses.push_back( wid ); }); //其他处理 ...... } FC_CAPTURE_AND_RETHROW() } 整个init_genesis()方法都在进行各种属性值的初始，且创世数据是通过参数genesis_state传入，而该方法又在open()方法中调用： // 打开指定路径的数据库，如果存在就新建 void database::open( const fc::path&amp; data_dir, std::function&lt;genesis_state_type()&gt; genesis_loader, const std::string&amp; db_version) { try { //其他处理 ...... // 如果全局属性不存在，则初始创世数据 if( !find(global_property_id_type()) ) init_genesis(genesis_loader()); //其他处理 ...... } FC_CAPTURE_LOG_AND_RETHROW( (data_dir) ) } 可以看到在open()方法中调用init_genesis()方法时，其参数是通过调用genesis_loader()方法的返回值对init_genesis()方法的实参进行赋值。而init_genesis()方法也是open()方法的参数之一，而open()方法又是在startup()中调用： void startup() { try { //其他处理 ...... auto initial_state = [this] { ilog(&quot;Initializing database...&quot;); // 通过命令行参数指定genesis.json文件路径 if( _options-&gt;count(&quot;genesis-json&quot;) ) { std::string genesis_str; // 1. 读取genesis.json文件 fc::read_file_contents( _options-&gt;at(&quot;genesis-json&quot;).as&lt;boost::filesystem::path&gt;(), genesis_str ); // 2. 从json字符串中获取创世状态数据 genesis_state_type genesis = fc::json::from_string( genesis_str ).as&lt;genesis_state_type&gt;( 20 ); bool modified_genesis = false; if( _options-&gt;count(&quot;genesis-timestamp&quot;) ) { genesis.initial_timestamp = fc::time_point_sec( fc::time_point::now() ) + genesis.initial_parameters.block_interval + _options-&gt;at(&quot;genesis-timestamp&quot;).as&lt;uint32_t&gt;(); genesis.initial_timestamp -= ( genesis.initial_timestamp.sec_since_epoch() % genesis.initial_parameters.block_interval ); modified_genesis = true; std::cerr &lt;&lt; &quot;Used genesis timestamp: &quot; &lt;&lt; genesis.initial_timestamp.to_iso_string() &lt;&lt; &quot; (PLEASE RECORD THIS)\n&quot;; } if( _options-&gt;count(&quot;dbg-init-key&quot;) ) { std::string init_key = _options-&gt;at( &quot;dbg-init-key&quot; ).as&lt;string&gt;(); FC_ASSERT( genesis.initial_witness_candidates.size() &gt;= genesis.initial_active_witnesses ); set_dbg_init_key( genesis, init_key ); modified_genesis = true; std::cerr &lt;&lt; &quot;Set init witness key to &quot; &lt;&lt; init_key &lt;&lt; &quot;\n&quot;; } if( modified_genesis ) { std::cerr &lt;&lt; &quot;WARNING: GENESIS WAS MODIFIED, YOUR CHAIN ID MAY BE DIFFERENT\n&quot;; genesis_str += &quot;BOGUS&quot;; genesis.initial_chain_id = fc::sha256::hash( genesis_str ); } else genesis.initial_chain_id = fc::sha256::hash( genesis_str ); return genesis; } // 如果没指定genesis.json文件，则初始为空串 else { std::string egenesis_json; // 初始json文件为空串 graphene::egenesis::compute_egenesis_json( egenesis_json ); FC_ASSERT( egenesis_json != &quot;&quot; ); FC_ASSERT( graphene::egenesis::get_egenesis_json_hash() == fc::sha256::hash( egenesis_json ) ); auto genesis = fc::json::from_string( egenesis_json ).as&lt;genesis_state_type&gt;( 20 ); genesis.initial_chain_id = fc::sha256::hash( egenesis_json ); return genesis; } }; //其他处理 ...... try { // 打开数据库 _chain_db-&gt;open( _data_dir / &quot;blockchain&quot;, initial_state, GRAPHENE_CURRENT_DB_VERSION ); } catch( const fc::exception&amp; e ) { elog( &quot;Caught exception ${e} in open(), you might want to force a replay&quot;, (&quot;e&quot;, e.to_detail_string()) ); throw; } //其他处理 ...... } FC_LOG_AND_RETHROW() } 在startup()中包含了创世状态的实际初始过程initial_state函数指针（即genesis_loader()方法实际执行的是initial_state函数指针指向的代码），在initial_state的实现过程中通过命令行参数_options读取指定genesis.json文件的内容进行处理，而_options的赋值和startup()的调用都是在main()方法中进行的： // 证人节点应用程序入口 int main(int argc, char** argv) { // 创建应用 app::application* node = new app::application(); //其他处理 ...... // 命令行参数变量 bpo::variables_map options; // 注册证人插件 auto witness_plug = node-&gt;register_plugin&lt;witness_plugin::witness_plugin&gt;(); //其他处理 ...... // 命令行参数处理 try { bpo::options_description cli, cfg; // 设置其他命令行参数 node-&gt;set_program_options(cli, cfg); app_options.add(cli); cfg_options.add(cfg); //解析命令行参数 bpo::store(bpo::parse_command_line(argc, argv, app_options), options); } catch (const boost::program_options::error&amp; e) { std::cerr &lt;&lt; &quot;Error parsing command line: &quot; &lt;&lt; e.what() &lt;&lt; &quot;\n&quot;; return 1; } //其他处理 ...... // 程序初始化 node-&gt;initialize(data_dir, options); node-&gt;initialize_plugins( options ); // 启动程序 node-&gt;startup(); // 启动相关插件 node-&gt;startup_plugins(); //其他处理 ...... } 到这里我们又跟踪代码到main()方法，至此包括初始化和共识的主要过程全部讲解完毕。 6. 创建genesis.json文件 创建genesis.json文件的代码流程图如下： 最后，讲解一个BitShares中有意思事情，也是上一节留的一点尾巴，就是BitShares的genesis.json文件其实不用手动编写，而是调用程序自动生成的，这一点的Ethereum不一样。之前学习Ethereum时，genesis.json弄好好久才弄好，官方文档给的实例确定几个核心字段，最后在论坛中才找到解决方法： BitShares的genesis.json文件是通过运行以下指令创建的（请参考官网：GENESIS CONFIGURATION）： programs/witness_node/witness_node --create-genesis-json genesis/my-genesis.json 而在程序中，又是怎么执行，请回头看main()方法，在该方法中调用了initialize()方法： // 程序初始化 void application::initialize(const fc::path&amp; data_dir, const boost::program_options::variables_map&amp; options) { my-&gt;_data_dir = data_dir; my-&gt;_options = &amp;options; // 如果执行程序有&quot;create-genesis-json&quot;参数 if( options.count(&quot;create-genesis-json&quot;) ) { fc::path genesis_out = options.at(&quot;create-genesis-json&quot;).as&lt;boost::filesystem::path&gt;(); // 创建genesis.json文件内容 genesis_state_type genesis_state = detail::create_example_genesis(); if( fc::exists(genesis_out) ) { try { genesis_state = fc::json::from_file(genesis_out).as&lt;genesis_state_type&gt;( 20 ); } catch(const fc::exception&amp; e) { std::cerr &lt;&lt; &quot;Unable to parse existing genesis file:\n&quot; &lt;&lt; e.to_string() &lt;&lt; &quot;\nWould you like to replace it? [y/N] &quot;; char response = std::cin.get(); if( toupper(response) != &#39;Y&#39; ) return; } std::cerr &lt;&lt; &quot;Updating genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\n&quot;; } else { std::cerr &lt;&lt; &quot;Creating example genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\n&quot;; } // 保存到genesis.json文件 fc::json::save_to_file(genesis_state, genesis_out); std::exit(EXIT_SUCCESS); } //其他处理 ...... } 在initialize()方法中，调用了create_example_genesis()方法创建genesis.json文件内容，其实现如下： // 创建genesis.json实例文件 genesis_state_type create_example_genesis() { // 生成密钥 auto nathan_key = fc::ecc::private_key::regenerate(fc::sha256::hash(string(&quot;nathan&quot;))); dlog(&quot;Allocating all stake to ${key}&quot;, (&quot;key&quot;, utilities::key_to_wif(nathan_key))); genesis_state_type initial_state; // 设置各种创始值 initial_state.initial_parameters.current_fees = fee_schedule::get_default();//-&gt;set_all_fees(GRAPHENE_BLOCKCHAIN_PRECISION); // 设置初始活跃证人数量 initial_state.initial_active_witnesses = GRAPHENE_DEFAULT_MIN_WITNESS_COUNT; initial_state.initial_timestamp = time_point_sec(time_point::now().sec_since_epoch() / initial_state.initial_parameters.block_interval * initial_state.initial_parameters.block_interval); for( uint64_t i = 0; i &lt; initial_state.initial_active_witnesses; ++i ) { auto name = &quot;init&quot;+fc::to_string(i); // 设置初始账户 initial_state.initial_accounts.emplace_back(name, nathan_key.get_public_key(), nathan_key.get_public_key(), true); initial_state.initial_committee_candidates.push_back({name}); // 设置初始证人替补 initial_state.initial_witness_candidates.push_back({name, nathan_key.get_public_key()}); } initial_state.initial_accounts.emplace_back(&quot;nathan&quot;, nathan_key.get_public_key()); initial_state.initial_balances.push_back({nathan_key.get_public_key(), GRAPHENE_SYMBOL, GRAPHENE_MAX_SHARE_SUPPLY}); initial_state.initial_chain_id = fc::sha256::hash( &quot;BOGUS&quot; ); return initial_state; } 7. DPoS共识代码流程图 本人 ProcessOn 上 BTS的DPoS共识代码流程图 原图链接请点击：BTS的DPoS共识代码流程图 阅读更多" />
+<meta property="og:description" content="关于BitShares的DPoS共识的概述请参考：股份授权证明(DPOS)概述 关于BitShares的DPoS共识的详细介绍请参考：BitShares的DPoS共识 关于BitShares的DPoS共识的竞争链共识补充说明请参考：DPOS共识算法 - 缺失的白皮书 关于BitShares的DPoS共识之代码实现概述请参考：BTS的DPoS共识之代码实现概述 本文基于的BitShares源代码GitHub地址如下：https://github.com/bitshares/bitshares-core 目录 1. DPoS共识算法概述 2. 洗牌算法 3. 统计投票和选出证人集合 4. 调度证人和生产区块 5. 证人节点初始化 6. 创建genesis.json文件 7. DPoS共识代码流程图 1. DPoS共识算法概述 任何共识机制都必须解决包括但不限于以下5个问题： 下一个添加到数据库的新区块应该由谁来生成？ 下一个块应该何时产生？ 该区块应包含哪些交易？ 怎样对本协议进行修改？ 该如何解决交易历史的竞争问题？ 本文主要讨论前3个问题，第4个问题本文不做讨论；关于第5个问题，即交易数据分叉和双花等问题的研究分析可参考：DPOS共识算法 - 缺失的白皮书 总体来说，为了解决PoW和PoS共识其交易性能低下的问题，DPoS使用见证人机制（witness）解决该问题。通过去中心化的投票机制选出前N个证人来保证信任问题；通过轮流安排证人打包生产区块来提高出块速度以及减少能耗问题；通过证人对区块进行验证从而减少确认的次数，从而加快共识的过程和提高交易结算的速度。总之，DPoS共识通过间接民主的方式既保证了最大限度的去中心化又极大的提高了性能同时降低了电力等成本。 DPoS的伪代码实现如下（伪代码参考了用伪代码理解DPoS）： for round i //分成很多个round，round无限持续 dlist_i = get N witnesses sort by votes //根据投票结果选出得票率最高的N个证人 dlist_i = shuffle(dlist_i) //随机改变顺序 loop //round完了，退出循环 slot = global_time_offset / block_interval pos = slot % N if dlist_i[pos] exists in this node //witness在这个节点 generateBlock(keypair of dlist_i[pos]) //生产block else skip 可以看到，在每一轮（round）循环里，系统会重新统计得票排名。在选出最高的N个证人里，系统采用先打乱顺序，然后证人轮流生产区块。一轮区块生产完毕后进入下一个周期。 在BitShares实际的代码中，过程比上述伪代码复杂得多，下面本文从3个方向讲解BTS中DPoS共识的实现过程： 打乱证人调度顺序的过程，即洗牌算法； 统计投票和选出证人集合的过程； 调度证人和生产区块的过程； 2. 洗牌算法 洗牌算法的代码流程图： 首先，为了存储证人的调度顺序，BTS定义了一个名叫witness_schedule_object的类，在该类中用了一个名为current_shuffled_witnesses的vector集合来存储： class witness_schedule_object : public graphene::db::abstract_object&lt;witness_schedule_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_witness_schedule_object_type; vector&lt; witness_id_type &gt; current_shuffled_witnesses; //用于存储证人的调度顺序 }; 有了上面的存储结构，下面来再看洗牌算法update_witness_schedule()： void database::update_witness_schedule() { const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); const global_property_object&amp; gpo = get_global_properties(); // 该条件控制了洗牌算法被调用的时机，必须是证人完整的轮转完一圈后 if( head_block_num() % gpo.active_witnesses.size() == 0 ) { modify( wso, [&amp;]( witness_schedule_object&amp; _wso ) { // 清空证人集合 _wso.current_shuffled_witnesses.clear(); _wso.current_shuffled_witnesses.reserve( gpo.active_witnesses.size() ); // 初始化证人集合数据 for( const witness_id_type&amp; w : gpo.active_witnesses ) _wso.current_shuffled_witnesses.push_back( w ); // 打乱证人的调度顺序 auto now_hi = uint64_t(head_block_time().sec_since_epoch()) &lt;&lt; 32; for( uint32_t i = 0; i &lt; _wso.current_shuffled_witnesses.size(); ++i ) { /// 此处使用了随机函数，具体原理请参看：http://xorshift.di.unimi.it/ uint64_t k = now_hi + uint64_t(i)*2685821657736338717ULL; k ^= (k &gt;&gt; 12); k ^= (k &lt;&lt; 25); k ^= (k &gt;&gt; 27); k *= 2685821657736338717ULL; uint32_t jmax = _wso.current_shuffled_witnesses.size() - i; uint32_t j = i + k%jmax; // 进行N次随机交换 std::swap( _wso.current_shuffled_witnesses[i], _wso.current_shuffled_witnesses[j] ); } }); } } 那么洗牌算法是在什么时候由哪个节点调用呢? 实际上update_witness_schedule()方法只在_apply_block()中调用: // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... update_witness_schedule(); //其他处理 ...... } 关于该方法的又是什么时候调用会在后文介绍，总之，证人节点每次将一个签名区块添加到链上之后调用洗牌算法，而在洗牌算法内部会在证人轮转完一圈时才真正洗牌。 这里要强调一下，洗牌算法只是打乱了证人的调度顺序，但可能还是原来那些证人。那么证人成员什么时候更新呢？现在回到洗牌算法update_witness_schedule()中，current_shuffled_witnesses是从gpo.active_witnesses中获得活跃证人的初始化数据的，只有当gpo.active_witnesses中的的成员发生变化时，current_shuffled_witnesses中的成员才发生变化，那么gpo.active_witnesses又是怎么更新的呢？ 3. 统计投票和选出证人集合 统计投票和选出证人集合代码流程图： 首先介绍和活跃证人集合相关的类，全局属性类global_property_object，该类中使用了名为active_witnesses的flat_set保存活跃证人： // 全局属性类 class global_property_object : public graphene::db::abstract_object&lt;global_property_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_global_property_object_type; chain_parameters parameters; optional&lt;chain_parameters&gt; pending_parameters; uint32_t next_available_vote_id = 0; vector&lt;committee_member_id_type&gt; active_committee_members; flat_set&lt;witness_id_type&gt; active_witnesses; // 活跃证人集合，每个维护间隔更新一次 }; 有了上面类的铺垫，下来再来讲活跃证人集合更新的事情。在BitShares的源代码中，gpo.active_witnesses的更新是通过update_active_witnesses()方法实现的： // 更新活跃证人 void database::update_active_witnesses() { // 统计投票的证人个数 assert( _witness_count_histogram_buffer.size() &gt; 0 ); share_type stake_target = (_total_voting_stake-_witness_count_histogram_buffer[0]) / 2; /// 为0或1个证人投票的账户不会就证人数量发表意见（他们弃权并且是无投票权的账户） share_type stake_tally = 0; size_t witness_count = 0; if( stake_target &gt; 0 ) { while( (witness_count &lt; _witness_count_histogram_buffer.size() - 1) &amp;&amp; (stake_tally &lt;= stake_target) ) { stake_tally += _witness_count_histogram_buffer[++witness_count]; } } const chain_property_object&amp; cpo = get_chain_properties(); // 排序选出前排名前N的证人 auto wits = sort_votable_objects&lt;witness_index&gt;(std::max(witness_count*2+1, (size_t)cpo.immutable_parameters.min_witness_count)); //其他处理 ...... // 将证人存入active_witnesses中 modify(gpo, [&amp;]( global_property_object&amp; gp ){ gp.active_witnesses.clear(); gp.active_witnesses.reserve(wits.size()); std::transform(wits.begin(), wits.end(), std::inserter(gp.active_witnesses, gp.active_witnesses.end()), [](const witness_object&amp; w) { return w.id; }); }); //其他处理 ...... } 在update_active_witnesses()方法中首先统计出投票的证人个数N，然后排序选出得票率最高的N个证人，再更新到active_witnesses中去。下面是排序算法sort_votable_objects的介绍： // 从高到低排列出前N个指定类型的可投票对象，并以vector的形式返回 template&lt;class Index&gt; vector&lt;std::reference_wrapper&lt;const typename Index::object_type&gt;&gt; database::sort_votable_objects(size_t count) const { using ObjectType = typename Index::object_type; // 获取所有对象 const auto&amp; all_objects = get_index_type&lt;Index&gt;().indices(); // 计算实际个数 count = std::min(count, all_objects.size()); vector&lt;std::reference_wrapper&lt;const ObjectType&gt;&gt; refs; refs.reserve(all_objects.size()); // 初始化refs std::transform(all_objects.begin(), all_objects.end(), std::back_inserter(refs), [](const ObjectType&amp; o) { return std::cref(o); }); // 排序（从高到低） std::partial_sort(refs.begin(), refs.begin() + count, refs.end(), [this](const ObjectType&amp; a, const ObjectType&amp; b)-&gt;bool { share_type oa_vote = _vote_tally_buffer[a.vote_id]; share_type ob_vote = _vote_tally_buffer[b.vote_id]; if( oa_vote != ob_vote ) return oa_vote &gt; ob_vote; return a.vote_id &lt; b.vote_id; }); // 截取，返回 refs.resize(count, refs.front()); return refs; } 再来看在update_active_witnesses()方法，可以看到证人的投票数据是从_witness_count_histogram_buffer中获取的，而该集合又是在什么时候更新呢？还有update_active_witnesses()方法又是什么时候调用呢？这些问题的答案都在perform_chain_maintenance()方法中： // 区块链维护处理 void database::perform_chain_maintenance(const signed_block&amp; next_block, const global_property_object&amp; global_props) { const auto&amp; gpo = get_global_properties(); //其他处理 ...... // 统计所有账户的投票，注意：此处是笔者为了便于理解，讲原代码中的泛型编程改写而成的 const auto&amp; idx = get_index_type&lt;account_index&gt;().indices().get&lt;by_name&gt;(); for( const account_object&amp; a : idx ) { database&amp; d = *this; const global_property_object&amp; props = gpo; //其他处理 ...... d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / 2 + 1); const account_object&amp; stake_account = a; // 获取实际投票账户 const account_object&amp; opinion_account = (stake_account.options.voting_account == GRAPHENE_PROXY_TO_SELF_ACCOUNT)? stake_account : d.get(stake_account.options.voting_account); // 获取实际投票数量 const auto&amp; stats = stake_account.statistics(d); uint64_t voting_stake = stats.total_core_in_orders.value + (stake_account.cashback_vb.valid() ? (*stake_account.cashback_vb)(d).balance.amount.value: 0) + d.get_balance(stake_account.get_id(), asset_id_type()).amount.value; //其他处理 ...... // 统计投票 if( opinion_account.options.num_witness &lt;= props.parameters.maximum_witness_count ) { uint16_t offset = std::min(size_t(opinion_account.options.num_witness/2), d._witness_count_histogram_buffer.size() - 1); d._witness_count_histogram_buffer[offset] += voting_stake; } } //其他处理 ...... // 注意：在这里更新活跃证人 update_active_witnesses(); //其他处理 ...... // 以下计算出下一次区块链维护时间，并更新到全局数据库 auto next_maintenance_time = get&lt;dynamic_global_property_object&gt;(dynamic_global_property_id_type()).next_maintenance_time; auto maintenance_interval = gpo.parameters.maintenance_interval; if( next_maintenance_time &lt;= next_block.timestamp ) { if( next_block.block_num() == 1 ) next_maintenance_time = time_point_sec() + (((next_block.timestamp.sec_since_epoch() / maintenance_interval) + 1) * maintenance_interval); else { auto y = (head_block_time() - next_maintenance_time).to_seconds() / maintenance_interval; next_maintenance_time += (y+1) * maintenance_interval; } } //其他处理 ...... d.next_maintenance_time = next_maintenance_time; //其他处理 ...... } 总结一下，在perform_chain_maintenance()方法中，首先统计出每个账户实际的投票数据，接着计算出投出的证人数量N和得票率前N的证人，再调用update_active_witnesses()更新活跃证人，最后计算出下一次的区块链维护时间。那么perform_chain_maintenance()方法又是什么时候调用呢？且看_apply_block()方法： // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... bool maint_needed = (dynamic_global_props.next_maintenance_time &lt;= next_block.timestamp); //其他处理 ...... // 当到了区块链维护时间时 if( maint_needed ) perform_chain_maintenance(next_block, global_props); //其他处理 ...... // 注意了，这里调用洗牌算法（前面讲过） update_witness_schedule(); //其他处理 ...... } 可以看到在_apply_block()方法中首先判断是否到了维护时间，如果到了维护时间就重新统计投票，得到新的活跃证人。这里就需要强调的是，在上一节讲的洗牌算法也是在该方法中调用，也就是说每次将一个区块添加的链上后，首先判断是否到了区块链维护时间，如果是就统计投票选出证人并更新，然后会调用洗牌算法，判断是否到了洗牌的时刻，再洗牌。 那么_apply_block()方法又是什么调用呢？或者说什么时候调度证人和生产区块呢？ 4. 调度证人和生产区块 调度证人和生产区块的代码流程图： 这一次，我们从main()方法开始讲解： // 应用程序入口 int main(int argc, char** argv) { app::application* node = new app::application(); //其他处理 ...... // 启动所有插件 node-&gt;startup_plugins(); //其他处理 ...... } 在main方法中，调用启动插件接口startup_plugins()，启动所有插件： void application::startup_plugins() { // 遍历map，启动所有有效的插件 for( auto&amp; entry : my-&gt;_active_plugins ) entry.second-&gt;plugin_startup(); return; } 在该方法中，会启动所有有效的插件，如果节点要运行证人节点的话需要特殊配置，请参考BitShares官网说明: Howto Run a Block-producing Witness，本文不做介绍。在所有插件中，就包括witness_plugin插件，其启动实现如下： // 证人插件启动 void witness_plugin::plugin_startup() { try { ilog(&quot;witness plugin: plugin_startup() begin&quot;); chain::database&amp; d = database(); if( !_witnesses.empty() ) { ilog(&quot;Launching block production for ${n} witnesses.&quot;, (&quot;n&quot;, _witnesses.size())); app().set_block_production(true); if( _production_enabled ) { if( d.head_block_num() == 0 ) new_chain_banner(d); _production_skip_flags |= graphene::chain::database::skip_undo_history_check; } // 开启调度生产循环 schedule_production_loop(); } else elog(&quot;No witnesses configured! Please add witness IDs and private keys to configuration.&quot;); ilog(&quot;witness plugin: plugin_startup() end&quot;); } FC_CAPTURE_AND_RETHROW() } 在该方法中，进行若干判断和初始化，然后调用schedule_production_loop()方法，开启调度生产循环，其实现如下： // 调度生产循环 void witness_plugin::schedule_production_loop() { // 计算下一秒的滴答时刻，不少于50毫秒 fc::time_point now = fc::time_point::now(); int64_t time_to_next_second = 1000000 - (now.time_since_epoch().count() % 1000000); if( time_to_next_second &lt; 50000 ) time_to_next_second += 1000000; fc::time_point next_wakeup( now + fc::microseconds( time_to_next_second ) ); // 调度区块生产循环 _block_production_task = fc::schedule([this]{block_production_loop();}, next_wakeup, &quot;Witness Block Production&quot;); } 在schedule_production_loop()方法里，计算时钟，调度区块生产循环方法block_production_loop()： // 区块生产循环 block_production_condition::block_production_condition_enum witness_plugin::block_production_loop() { //其他处理 ...... // 判断区块生产的条件是否满足，并生产区块 result = maybe_produce_block(capture); //其他处理 ...... // 循环调度生产 schedule_production_loop(); //其他处理 ...... } 在该方法中，调用生产区块的入口方法，然后继续执行循环，其maybe_produce_block()方法实现如下： // 判断区块生产的条件是否满足，并生产区块 block_production_condition::block_production_condition_enum witness_plugin::maybe_produce_block( fc::limited_mutable_variant_object&amp; capture ) { chain::database&amp; db = database(); fc::time_point now_fine = fc::time_point::now(); fc::time_point_sec now = now_fine + fc::microseconds( 500000 ); // 判断生产时钟是否同步 if( !_production_enabled ) { if( db.get_slot_time(1) &gt;= now ) _production_enabled = true; else return block_production_condition::not_synced; } // 判断生产时间槽已经开始 uint32_t slot = db.get_slot_at_time( now ); if( slot == 0 ) { capture(&quot;next_time&quot;, db.get_slot_time(1)); return block_production_condition::not_time_yet; } assert( now &gt; db.head_block_time() ); // 判断是否轮转到当前证人生产区块 graphene::chain::witness_id_type scheduled_witness = db.get_scheduled_witness( slot ); if( _witnesses.find( scheduled_witness ) == _witnesses.end() ) { capture(&quot;scheduled_witness&quot;, scheduled_witness); return block_production_condition::not_my_turn; } fc::time_point_sec scheduled_time = db.get_slot_time( slot ); graphene::chain::public_key_type scheduled_key = scheduled_witness( db ).signing_key; auto private_key_itr = _private_keys.find( scheduled_key ); // 判断私钥是否有效 if( private_key_itr == _private_keys.end() ) { capture(&quot;scheduled_key&quot;, scheduled_key); return block_production_condition::no_private_key; } // 判断是否达到最低参与率 uint32_t prate = db.witness_participation_rate(); if( prate &lt; _required_witness_participation ) { capture(&quot;pct&quot;, uint32_t(100*uint64_t(prate) / GRAPHENE_1_PERCENT)); return block_production_condition::low_participation; } // 判断时间间隔是否低于50毫秒 if( llabs((scheduled_time - now).count()) &gt; fc::milliseconds( 500 ).count() ) { capture(&quot;scheduled_time&quot;, scheduled_time)(&quot;now&quot;, now); return block_production_condition::lag; } // 生产区块 auto block = db.generate_block( scheduled_time, scheduled_witness, private_key_itr-&gt;second, _production_skip_flags ); capture(&quot;n&quot;, block.block_num())(&quot;t&quot;, block.timestamp)(&quot;c&quot;, now); // 将生产的区块同步广播到网络中 fc::async( [this,block](){ p2p_node().broadcast(net::block_message(block)); } ); return block_production_condition::produced; } 可以看到在maybe_produce_block()方法中，进行了各种条件判断，只有满足了所有条件才开始生产区块，并将生产后区块广播同步到网络中的其他节点。这里先介绍3个方法get_slot_time()、get_slot_at_time()和get_scheduled_witness()。 get_slot_time()方法，获得未来的第n个区块生产时间槽的时刻： fc::time_point_sec database::get_slot_time(uint32_t slot_num)const { if( slot_num == 0 ) return fc::time_point_sec(); // 区块生产时间间隔 auto interval = block_interval(); const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); if( head_block_num() == 0 ) { // 特殊情况，生产创世区块的时刻 fc::time_point_sec genesis_time = dpo.time; return genesis_time + slot_num * interval; } // 获取前一个区块生产时间槽时刻 int64_t head_block_abs_slot = head_block_time().sec_since_epoch() / interval; fc::time_point_sec head_slot_time(head_block_abs_slot * interval); const global_property_object&amp; gpo = get_global_properties(); // 如果当前为区块链维护时刻，则跳过指定个时间槽 if( dpo.dynamic_flags &amp; dynamic_global_property_object::maintenance_flag ) slot_num += gpo.parameters.maintenance_skip_slots; // 前一个生产时间+若干生产间隔 return head_slot_time + (slot_num * interval); } get_slot_at_time()方法主要是获取指定时间属于未来哪个时间槽： uint32_t database::get_slot_at_time(fc::time_point_sec when)const { fc::time_point_sec first_slot_time = get_slot_time( 1 ); // 判断指定的时间是否已经过时 if( when &lt; first_slot_time ) return 0; return (when - first_slot_time).to_seconds() / block_interval() + 1; } get_scheduled_witness()方法实现了获取指定时间槽的区块生产调度证人： witness_id_type database::get_scheduled_witness( uint32_t slot_num )const { const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); // 计算调度偏移量 uint64_t current_aslot = dpo.current_aslot + slot_num; return wso.current_shuffled_witnesses[ current_aslot % wso.current_shuffled_witnesses.size() ]; } 这里就和前面讲的洗牌算法衔接上了，get_scheduled_witness()方法是从洗牌后的集合current_shuffled_witnesses中获取证人。 下面再回到maybe_produce_block()方法中来，在该方法中调用了generate_block()方法生产区块，其实现如下： signed_block database::generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key, uint32_t skip /* = 0 */ ) { try { signed_block result; detail::with_skip_flags( *this, skip, [&amp;]() { // 调用实际生产区块方法 result = _generate_block( when, witness_id, block_signing_private_key ); } ); return result; } FC_CAPTURE_AND_RETHROW() } 在该方法中才调用用实际生产区块的方法_generate_block()： signed_block database::_generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key ) { try { //其他处理 ...... static const size_t max_block_header_size = fc::raw::pack_size( signed_block_header() ) + 4; auto maximum_block_size = get_global_properties().parameters.maximum_block_size; size_t total_block_size = max_block_header_size; signed_block pending_block; //其他处理 ...... for( const processed_transaction&amp; tx : _pending_tx ) { size_t new_total_size = total_block_size + fc::raw::pack_size( tx ); // 计算交易大小，防止超过最大限度 if( new_total_size &gt;= maximum_block_size ) { postponed_tx_count++; continue; } try { auto temp_session = _undo_db.start_undo_session(); processed_transaction ptx = _apply_transaction( tx ); temp_session.merge(); // 将交易添加到区块中 total_block_size += fc::raw::pack_size( ptx ); pending_block.transactions.push_back( ptx ); } //其他处理 ...... } //其他处理 ...... pending_block.previous = head_block_id(); // 添加上一个区块id pending_block.timestamp = when; //添加时间戳 pending_block.transaction_merkle_root = pending_block.calculate_merkle_root(); //添加交易树根 pending_block.witness = witness_id; //更新证人id // 签名 if( !(skip &amp; skip_witness_signature) ) pending_block.sign( block_signing_private_key ); // 检查区块大小 if( !(skip &amp; skip_block_size_check) ) { FC_ASSERT( fc::raw::pack_size(pending_block) &lt;= get_global_properties().parameters.maximum_block_size ); } // 调用推块方法 push_block( pending_block, skip ); return pending_block; } FC_CAPTURE_AND_RETHROW( (witness_id) ) } 再来看将待定区块添加到链的实现过程push_block()： bool database::push_block(const signed_block&amp; new_block, uint32_t skip) { bool result; detail::with_skip_flags( *this, skip, [&amp;]() { detail::without_pending_transactions( *this, std::move(_pending_tx), [&amp;]() { // 调用实际的推块方法 result = _push_block(new_block); }); }); return result; } 在该方法中调用实际的推块的方法_push_block()，其实现如下: bool database::_push_block(const signed_block&amp; new_block) { try { uint32_t skip = get_node_properties().skip_flags; // 在此处理区块链竞争分叉问题，理论讲解请参看本人翻译的另一篇文章： // https://blog.csdn.net/ggq89/article/details/80072876 try { auto session = _undo_db.start_undo_session(); // 将新区块添加到链上 apply_block(new_block, skip); // 存入数据库 _block_id_to_block.store(new_block.id(), new_block); session.commit(); } catch ( const fc::exception&amp; e ) { elog(&quot;Failed to push new block:\n${e}&quot;, (&quot;e&quot;, e.to_detail_string())); _fork_db.remove(new_block.id()); throw; } return false; } FC_CAPTURE_AND_RETHROW( (new_block) ) } 下面再看apply_block()的实现过程： void database::apply_block( const signed_block&amp; next_block, uint32_t skip ) { //其他处理 ...... detail::with_skip_flags( *this, skip, [&amp;]() { // 在此调用实际的添加区块方法 _apply_block( next_block ); } ); return; } 到这里就和前面所讲的全部内容衔接在一起了，这个第三次代码跟踪到_apply_block()方法，至此整个dpos共识过程基本讲解完毕。最后只剩下整个应用程序的初始化过程了 5. 证人节点初始化 证人节点初始化的代码流程图： 留下有个疑问，整个程序最开始运行时，证人节点是如何初始化的呢？实际上初始数据是在init_genesis()方法中初始的： // 初始创世数据 void database::init_genesis(const genesis_state_type&amp; genesis_state) { try { //其他处理 ...... // 创建初始账户 for( const auto&amp; account : genesis_state.initial_accounts ) { account_create_operation cop; cop.name = account.name; cop.registrar = GRAPHENE_TEMP_ACCOUNT; cop.owner = authority(1, account.owner_key, 1); if( account.active_key == public_key_type() ) { cop.active = cop.owner; cop.options.memo_key = account.owner_key; } else { cop.active = authority(1, account.active_key, 1); cop.options.memo_key = account.active_key; } account_id_type account_id(apply_operation(genesis_eval_state, cop).get&lt;object_id_type&gt;()); if( account.is_lifetime_member ) { account_upgrade_operation op; op.account_to_upgrade = account_id; op.upgrade_to_lifetime_member = true; apply_operation(genesis_eval_state, op); } } //其他处理 ...... // 创建初始证人 std::for_each(genesis_state.initial_witness_candidates.begin(), genesis_state.initial_witness_candidates.end(), [&amp;](const genesis_state_type::initial_witness_type&amp; witness) { witness_create_operation op; op.witness_account = get_account_id(witness.owner_name); op.block_signing_key = witness.block_signing_key; apply_operation(genesis_eval_state, op); }); //其他处理 ...... // 设置活跃证人 modify(get_global_properties(), [&amp;](global_property_object&amp; p) { for( uint32_t i = 1; i &lt;= genesis_state.initial_active_witnesses; ++i ) { p.active_witnesses.insert(witness_id_type(i)); } }); //其他处理 ...... // 创建证人调度顺序 create&lt;witness_schedule_object&gt;([&amp;]( witness_schedule_object&amp; wso ) { for( const witness_id_type&amp; wid : get_global_properties().active_witnesses ) wso.current_shuffled_witnesses.push_back( wid ); }); //其他处理 ...... } FC_CAPTURE_AND_RETHROW() } 整个init_genesis()方法都在进行各种属性值的初始，且创世数据是通过参数genesis_state传入，而该方法又在open()方法中调用： // 打开指定路径的数据库，如果存在就新建 void database::open( const fc::path&amp; data_dir, std::function&lt;genesis_state_type()&gt; genesis_loader, const std::string&amp; db_version) { try { //其他处理 ...... // 如果全局属性不存在，则初始创世数据 if( !find(global_property_id_type()) ) init_genesis(genesis_loader()); //其他处理 ...... } FC_CAPTURE_LOG_AND_RETHROW( (data_dir) ) } 可以看到在open()方法中调用init_genesis()方法时，其参数是通过调用genesis_loader()方法的返回值对init_genesis()方法的实参进行赋值。而init_genesis()方法也是open()方法的参数之一，而open()方法又是在startup()中调用： void startup() { try { //其他处理 ...... auto initial_state = [this] { ilog(&quot;Initializing database...&quot;); // 通过命令行参数指定genesis.json文件路径 if( _options-&gt;count(&quot;genesis-json&quot;) ) { std::string genesis_str; // 1. 读取genesis.json文件 fc::read_file_contents( _options-&gt;at(&quot;genesis-json&quot;).as&lt;boost::filesystem::path&gt;(), genesis_str ); // 2. 从json字符串中获取创世状态数据 genesis_state_type genesis = fc::json::from_string( genesis_str ).as&lt;genesis_state_type&gt;( 20 ); bool modified_genesis = false; if( _options-&gt;count(&quot;genesis-timestamp&quot;) ) { genesis.initial_timestamp = fc::time_point_sec( fc::time_point::now() ) + genesis.initial_parameters.block_interval + _options-&gt;at(&quot;genesis-timestamp&quot;).as&lt;uint32_t&gt;(); genesis.initial_timestamp -= ( genesis.initial_timestamp.sec_since_epoch() % genesis.initial_parameters.block_interval ); modified_genesis = true; std::cerr &lt;&lt; &quot;Used genesis timestamp: &quot; &lt;&lt; genesis.initial_timestamp.to_iso_string() &lt;&lt; &quot; (PLEASE RECORD THIS)\n&quot;; } if( _options-&gt;count(&quot;dbg-init-key&quot;) ) { std::string init_key = _options-&gt;at( &quot;dbg-init-key&quot; ).as&lt;string&gt;(); FC_ASSERT( genesis.initial_witness_candidates.size() &gt;= genesis.initial_active_witnesses ); set_dbg_init_key( genesis, init_key ); modified_genesis = true; std::cerr &lt;&lt; &quot;Set init witness key to &quot; &lt;&lt; init_key &lt;&lt; &quot;\n&quot;; } if( modified_genesis ) { std::cerr &lt;&lt; &quot;WARNING: GENESIS WAS MODIFIED, YOUR CHAIN ID MAY BE DIFFERENT\n&quot;; genesis_str += &quot;BOGUS&quot;; genesis.initial_chain_id = fc::sha256::hash( genesis_str ); } else genesis.initial_chain_id = fc::sha256::hash( genesis_str ); return genesis; } // 如果没指定genesis.json文件，则初始为空串 else { std::string egenesis_json; // 初始json文件为空串 graphene::egenesis::compute_egenesis_json( egenesis_json ); FC_ASSERT( egenesis_json != &quot;&quot; ); FC_ASSERT( graphene::egenesis::get_egenesis_json_hash() == fc::sha256::hash( egenesis_json ) ); auto genesis = fc::json::from_string( egenesis_json ).as&lt;genesis_state_type&gt;( 20 ); genesis.initial_chain_id = fc::sha256::hash( egenesis_json ); return genesis; } }; //其他处理 ...... try { // 打开数据库 _chain_db-&gt;open( _data_dir / &quot;blockchain&quot;, initial_state, GRAPHENE_CURRENT_DB_VERSION ); } catch( const fc::exception&amp; e ) { elog( &quot;Caught exception ${e} in open(), you might want to force a replay&quot;, (&quot;e&quot;, e.to_detail_string()) ); throw; } //其他处理 ...... } FC_LOG_AND_RETHROW() } 在startup()中包含了创世状态的实际初始过程initial_state函数指针（即genesis_loader()方法实际执行的是initial_state函数指针指向的代码），在initial_state的实现过程中通过命令行参数_options读取指定genesis.json文件的内容进行处理，而_options的赋值和startup()的调用都是在main()方法中进行的： // 证人节点应用程序入口 int main(int argc, char** argv) { // 创建应用 app::application* node = new app::application(); //其他处理 ...... // 命令行参数变量 bpo::variables_map options; // 注册证人插件 auto witness_plug = node-&gt;register_plugin&lt;witness_plugin::witness_plugin&gt;(); //其他处理 ...... // 命令行参数处理 try { bpo::options_description cli, cfg; // 设置其他命令行参数 node-&gt;set_program_options(cli, cfg); app_options.add(cli); cfg_options.add(cfg); //解析命令行参数 bpo::store(bpo::parse_command_line(argc, argv, app_options), options); } catch (const boost::program_options::error&amp; e) { std::cerr &lt;&lt; &quot;Error parsing command line: &quot; &lt;&lt; e.what() &lt;&lt; &quot;\n&quot;; return 1; } //其他处理 ...... // 程序初始化 node-&gt;initialize(data_dir, options); node-&gt;initialize_plugins( options ); // 启动程序 node-&gt;startup(); // 启动相关插件 node-&gt;startup_plugins(); //其他处理 ...... } 到这里我们又跟踪代码到main()方法，至此包括初始化和共识的主要过程全部讲解完毕。 6. 创建genesis.json文件 创建genesis.json文件的代码流程图如下： 最后，讲解一个BitShares中有意思事情，也是上一节留的一点尾巴，就是BitShares的genesis.json文件其实不用手动编写，而是调用程序自动生成的，这一点的Ethereum不一样。之前学习Ethereum时，genesis.json弄好好久才弄好，官方文档给的实例确定几个核心字段，最后在论坛中才找到解决方法： BitShares的genesis.json文件是通过运行以下指令创建的（请参考官网：GENESIS CONFIGURATION）： programs/witness_node/witness_node --create-genesis-json genesis/my-genesis.json 而在程序中，又是怎么执行，请回头看main()方法，在该方法中调用了initialize()方法： // 程序初始化 void application::initialize(const fc::path&amp; data_dir, const boost::program_options::variables_map&amp; options) { my-&gt;_data_dir = data_dir; my-&gt;_options = &amp;options; // 如果执行程序有&quot;create-genesis-json&quot;参数 if( options.count(&quot;create-genesis-json&quot;) ) { fc::path genesis_out = options.at(&quot;create-genesis-json&quot;).as&lt;boost::filesystem::path&gt;(); // 创建genesis.json文件内容 genesis_state_type genesis_state = detail::create_example_genesis(); if( fc::exists(genesis_out) ) { try { genesis_state = fc::json::from_file(genesis_out).as&lt;genesis_state_type&gt;( 20 ); } catch(const fc::exception&amp; e) { std::cerr &lt;&lt; &quot;Unable to parse existing genesis file:\n&quot; &lt;&lt; e.to_string() &lt;&lt; &quot;\nWould you like to replace it? [y/N] &quot;; char response = std::cin.get(); if( toupper(response) != &#39;Y&#39; ) return; } std::cerr &lt;&lt; &quot;Updating genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\n&quot;; } else { std::cerr &lt;&lt; &quot;Creating example genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\n&quot;; } // 保存到genesis.json文件 fc::json::save_to_file(genesis_state, genesis_out); std::exit(EXIT_SUCCESS); } //其他处理 ...... } 在initialize()方法中，调用了create_example_genesis()方法创建genesis.json文件内容，其实现如下： // 创建genesis.json实例文件 genesis_state_type create_example_genesis() { // 生成密钥 auto nathan_key = fc::ecc::private_key::regenerate(fc::sha256::hash(string(&quot;nathan&quot;))); dlog(&quot;Allocating all stake to ${key}&quot;, (&quot;key&quot;, utilities::key_to_wif(nathan_key))); genesis_state_type initial_state; // 设置各种创始值 initial_state.initial_parameters.current_fees = fee_schedule::get_default();//-&gt;set_all_fees(GRAPHENE_BLOCKCHAIN_PRECISION); // 设置初始活跃证人数量 initial_state.initial_active_witnesses = GRAPHENE_DEFAULT_MIN_WITNESS_COUNT; initial_state.initial_timestamp = time_point_sec(time_point::now().sec_since_epoch() / initial_state.initial_parameters.block_interval * initial_state.initial_parameters.block_interval); for( uint64_t i = 0; i &lt; initial_state.initial_active_witnesses; ++i ) { auto name = &quot;init&quot;+fc::to_string(i); // 设置初始账户 initial_state.initial_accounts.emplace_back(name, nathan_key.get_public_key(), nathan_key.get_public_key(), true); initial_state.initial_committee_candidates.push_back({name}); // 设置初始证人替补 initial_state.initial_witness_candidates.push_back({name, nathan_key.get_public_key()}); } initial_state.initial_accounts.emplace_back(&quot;nathan&quot;, nathan_key.get_public_key()); initial_state.initial_balances.push_back({nathan_key.get_public_key(), GRAPHENE_SYMBOL, GRAPHENE_MAX_SHARE_SUPPLY}); initial_state.initial_chain_id = fc::sha256::hash( &quot;BOGUS&quot; ); return initial_state; } 7. DPoS共识代码流程图 本人 ProcessOn 上 BTS的DPoS共识代码流程图 原图链接请点击：BTS的DPoS共识代码流程图 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/02/b5379a56d8cf8290c4bca7da85f856e4.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/02/b5379a56d8cf8290c4bca7da85f856e4.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"关于BitShares的DPoS共识的概述请参考：股份授权证明(DPOS)概述 关于BitShares的DPoS共识的详细介绍请参考：BitShares的DPoS共识 关于BitShares的DPoS共识的竞争链共识补充说明请参考：DPOS共识算法 - 缺失的白皮书 关于BitShares的DPoS共识之代码实现概述请参考：BTS的DPoS共识之代码实现概述 本文基于的BitShares源代码GitHub地址如下：https://github.com/bitshares/bitshares-core 目录 1. DPoS共识算法概述 2. 洗牌算法 3. 统计投票和选出证人集合 4. 调度证人和生产区块 5. 证人节点初始化 6. 创建genesis.json文件 7. DPoS共识代码流程图 1. DPoS共识算法概述 任何共识机制都必须解决包括但不限于以下5个问题： 下一个添加到数据库的新区块应该由谁来生成？ 下一个块应该何时产生？ 该区块应包含哪些交易？ 怎样对本协议进行修改？ 该如何解决交易历史的竞争问题？ 本文主要讨论前3个问题，第4个问题本文不做讨论；关于第5个问题，即交易数据分叉和双花等问题的研究分析可参考：DPOS共识算法 - 缺失的白皮书 总体来说，为了解决PoW和PoS共识其交易性能低下的问题，DPoS使用见证人机制（witness）解决该问题。通过去中心化的投票机制选出前N个证人来保证信任问题；通过轮流安排证人打包生产区块来提高出块速度以及减少能耗问题；通过证人对区块进行验证从而减少确认的次数，从而加快共识的过程和提高交易结算的速度。总之，DPoS共识通过间接民主的方式既保证了最大限度的去中心化又极大的提高了性能同时降低了电力等成本。 DPoS的伪代码实现如下（伪代码参考了用伪代码理解DPoS）： for round i //分成很多个round，round无限持续 dlist_i = get N witnesses sort by votes //根据投票结果选出得票率最高的N个证人 dlist_i = shuffle(dlist_i) //随机改变顺序 loop //round完了，退出循环 slot = global_time_offset / block_interval pos = slot % N if dlist_i[pos] exists in this node //witness在这个节点 generateBlock(keypair of dlist_i[pos]) //生产block else skip 可以看到，在每一轮（round）循环里，系统会重新统计得票排名。在选出最高的N个证人里，系统采用先打乱顺序，然后证人轮流生产区块。一轮区块生产完毕后进入下一个周期。 在BitShares实际的代码中，过程比上述伪代码复杂得多，下面本文从3个方向讲解BTS中DPoS共识的实现过程： 打乱证人调度顺序的过程，即洗牌算法； 统计投票和选出证人集合的过程； 调度证人和生产区块的过程； 2. 洗牌算法 洗牌算法的代码流程图： 首先，为了存储证人的调度顺序，BTS定义了一个名叫witness_schedule_object的类，在该类中用了一个名为current_shuffled_witnesses的vector集合来存储： class witness_schedule_object : public graphene::db::abstract_object&lt;witness_schedule_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_witness_schedule_object_type; vector&lt; witness_id_type &gt; current_shuffled_witnesses; //用于存储证人的调度顺序 }; 有了上面的存储结构，下面来再看洗牌算法update_witness_schedule()： void database::update_witness_schedule() { const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); const global_property_object&amp; gpo = get_global_properties(); // 该条件控制了洗牌算法被调用的时机，必须是证人完整的轮转完一圈后 if( head_block_num() % gpo.active_witnesses.size() == 0 ) { modify( wso, [&amp;]( witness_schedule_object&amp; _wso ) { // 清空证人集合 _wso.current_shuffled_witnesses.clear(); _wso.current_shuffled_witnesses.reserve( gpo.active_witnesses.size() ); // 初始化证人集合数据 for( const witness_id_type&amp; w : gpo.active_witnesses ) _wso.current_shuffled_witnesses.push_back( w ); // 打乱证人的调度顺序 auto now_hi = uint64_t(head_block_time().sec_since_epoch()) &lt;&lt; 32; for( uint32_t i = 0; i &lt; _wso.current_shuffled_witnesses.size(); ++i ) { /// 此处使用了随机函数，具体原理请参看：http://xorshift.di.unimi.it/ uint64_t k = now_hi + uint64_t(i)*2685821657736338717ULL; k ^= (k &gt;&gt; 12); k ^= (k &lt;&lt; 25); k ^= (k &gt;&gt; 27); k *= 2685821657736338717ULL; uint32_t jmax = _wso.current_shuffled_witnesses.size() - i; uint32_t j = i + k%jmax; // 进行N次随机交换 std::swap( _wso.current_shuffled_witnesses[i], _wso.current_shuffled_witnesses[j] ); } }); } } 那么洗牌算法是在什么时候由哪个节点调用呢? 实际上update_witness_schedule()方法只在_apply_block()中调用: // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... update_witness_schedule(); //其他处理 ...... } 关于该方法的又是什么时候调用会在后文介绍，总之，证人节点每次将一个签名区块添加到链上之后调用洗牌算法，而在洗牌算法内部会在证人轮转完一圈时才真正洗牌。 这里要强调一下，洗牌算法只是打乱了证人的调度顺序，但可能还是原来那些证人。那么证人成员什么时候更新呢？现在回到洗牌算法update_witness_schedule()中，current_shuffled_witnesses是从gpo.active_witnesses中获得活跃证人的初始化数据的，只有当gpo.active_witnesses中的的成员发生变化时，current_shuffled_witnesses中的成员才发生变化，那么gpo.active_witnesses又是怎么更新的呢？ 3. 统计投票和选出证人集合 统计投票和选出证人集合代码流程图： 首先介绍和活跃证人集合相关的类，全局属性类global_property_object，该类中使用了名为active_witnesses的flat_set保存活跃证人： // 全局属性类 class global_property_object : public graphene::db::abstract_object&lt;global_property_object&gt; { public: static const uint8_t space_id = implementation_ids; static const uint8_t type_id = impl_global_property_object_type; chain_parameters parameters; optional&lt;chain_parameters&gt; pending_parameters; uint32_t next_available_vote_id = 0; vector&lt;committee_member_id_type&gt; active_committee_members; flat_set&lt;witness_id_type&gt; active_witnesses; // 活跃证人集合，每个维护间隔更新一次 }; 有了上面类的铺垫，下来再来讲活跃证人集合更新的事情。在BitShares的源代码中，gpo.active_witnesses的更新是通过update_active_witnesses()方法实现的： // 更新活跃证人 void database::update_active_witnesses() { // 统计投票的证人个数 assert( _witness_count_histogram_buffer.size() &gt; 0 ); share_type stake_target = (_total_voting_stake-_witness_count_histogram_buffer[0]) / 2; /// 为0或1个证人投票的账户不会就证人数量发表意见（他们弃权并且是无投票权的账户） share_type stake_tally = 0; size_t witness_count = 0; if( stake_target &gt; 0 ) { while( (witness_count &lt; _witness_count_histogram_buffer.size() - 1) &amp;&amp; (stake_tally &lt;= stake_target) ) { stake_tally += _witness_count_histogram_buffer[++witness_count]; } } const chain_property_object&amp; cpo = get_chain_properties(); // 排序选出前排名前N的证人 auto wits = sort_votable_objects&lt;witness_index&gt;(std::max(witness_count*2+1, (size_t)cpo.immutable_parameters.min_witness_count)); //其他处理 ...... // 将证人存入active_witnesses中 modify(gpo, [&amp;]( global_property_object&amp; gp ){ gp.active_witnesses.clear(); gp.active_witnesses.reserve(wits.size()); std::transform(wits.begin(), wits.end(), std::inserter(gp.active_witnesses, gp.active_witnesses.end()), [](const witness_object&amp; w) { return w.id; }); }); //其他处理 ...... } 在update_active_witnesses()方法中首先统计出投票的证人个数N，然后排序选出得票率最高的N个证人，再更新到active_witnesses中去。下面是排序算法sort_votable_objects的介绍： // 从高到低排列出前N个指定类型的可投票对象，并以vector的形式返回 template&lt;class Index&gt; vector&lt;std::reference_wrapper&lt;const typename Index::object_type&gt;&gt; database::sort_votable_objects(size_t count) const { using ObjectType = typename Index::object_type; // 获取所有对象 const auto&amp; all_objects = get_index_type&lt;Index&gt;().indices(); // 计算实际个数 count = std::min(count, all_objects.size()); vector&lt;std::reference_wrapper&lt;const ObjectType&gt;&gt; refs; refs.reserve(all_objects.size()); // 初始化refs std::transform(all_objects.begin(), all_objects.end(), std::back_inserter(refs), [](const ObjectType&amp; o) { return std::cref(o); }); // 排序（从高到低） std::partial_sort(refs.begin(), refs.begin() + count, refs.end(), [this](const ObjectType&amp; a, const ObjectType&amp; b)-&gt;bool { share_type oa_vote = _vote_tally_buffer[a.vote_id]; share_type ob_vote = _vote_tally_buffer[b.vote_id]; if( oa_vote != ob_vote ) return oa_vote &gt; ob_vote; return a.vote_id &lt; b.vote_id; }); // 截取，返回 refs.resize(count, refs.front()); return refs; } 再来看在update_active_witnesses()方法，可以看到证人的投票数据是从_witness_count_histogram_buffer中获取的，而该集合又是在什么时候更新呢？还有update_active_witnesses()方法又是什么时候调用呢？这些问题的答案都在perform_chain_maintenance()方法中： // 区块链维护处理 void database::perform_chain_maintenance(const signed_block&amp; next_block, const global_property_object&amp; global_props) { const auto&amp; gpo = get_global_properties(); //其他处理 ...... // 统计所有账户的投票，注意：此处是笔者为了便于理解，讲原代码中的泛型编程改写而成的 const auto&amp; idx = get_index_type&lt;account_index&gt;().indices().get&lt;by_name&gt;(); for( const account_object&amp; a : idx ) { database&amp; d = *this; const global_property_object&amp; props = gpo; //其他处理 ...... d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / 2 + 1); const account_object&amp; stake_account = a; // 获取实际投票账户 const account_object&amp; opinion_account = (stake_account.options.voting_account == GRAPHENE_PROXY_TO_SELF_ACCOUNT)? stake_account : d.get(stake_account.options.voting_account); // 获取实际投票数量 const auto&amp; stats = stake_account.statistics(d); uint64_t voting_stake = stats.total_core_in_orders.value + (stake_account.cashback_vb.valid() ? (*stake_account.cashback_vb)(d).balance.amount.value: 0) + d.get_balance(stake_account.get_id(), asset_id_type()).amount.value; //其他处理 ...... // 统计投票 if( opinion_account.options.num_witness &lt;= props.parameters.maximum_witness_count ) { uint16_t offset = std::min(size_t(opinion_account.options.num_witness/2), d._witness_count_histogram_buffer.size() - 1); d._witness_count_histogram_buffer[offset] += voting_stake; } } //其他处理 ...... // 注意：在这里更新活跃证人 update_active_witnesses(); //其他处理 ...... // 以下计算出下一次区块链维护时间，并更新到全局数据库 auto next_maintenance_time = get&lt;dynamic_global_property_object&gt;(dynamic_global_property_id_type()).next_maintenance_time; auto maintenance_interval = gpo.parameters.maintenance_interval; if( next_maintenance_time &lt;= next_block.timestamp ) { if( next_block.block_num() == 1 ) next_maintenance_time = time_point_sec() + (((next_block.timestamp.sec_since_epoch() / maintenance_interval) + 1) * maintenance_interval); else { auto y = (head_block_time() - next_maintenance_time).to_seconds() / maintenance_interval; next_maintenance_time += (y+1) * maintenance_interval; } } //其他处理 ...... d.next_maintenance_time = next_maintenance_time; //其他处理 ...... } 总结一下，在perform_chain_maintenance()方法中，首先统计出每个账户实际的投票数据，接着计算出投出的证人数量N和得票率前N的证人，再调用update_active_witnesses()更新活跃证人，最后计算出下一次的区块链维护时间。那么perform_chain_maintenance()方法又是什么时候调用呢？且看_apply_block()方法： // 将一个签名后的区块添加到链上 void database::_apply_block( const signed_block&amp; next_block ) { //其他处理 ...... bool maint_needed = (dynamic_global_props.next_maintenance_time &lt;= next_block.timestamp); //其他处理 ...... // 当到了区块链维护时间时 if( maint_needed ) perform_chain_maintenance(next_block, global_props); //其他处理 ...... // 注意了，这里调用洗牌算法（前面讲过） update_witness_schedule(); //其他处理 ...... } 可以看到在_apply_block()方法中首先判断是否到了维护时间，如果到了维护时间就重新统计投票，得到新的活跃证人。这里就需要强调的是，在上一节讲的洗牌算法也是在该方法中调用，也就是说每次将一个区块添加的链上后，首先判断是否到了区块链维护时间，如果是就统计投票选出证人并更新，然后会调用洗牌算法，判断是否到了洗牌的时刻，再洗牌。 那么_apply_block()方法又是什么调用呢？或者说什么时候调度证人和生产区块呢？ 4. 调度证人和生产区块 调度证人和生产区块的代码流程图： 这一次，我们从main()方法开始讲解： // 应用程序入口 int main(int argc, char** argv) { app::application* node = new app::application(); //其他处理 ...... // 启动所有插件 node-&gt;startup_plugins(); //其他处理 ...... } 在main方法中，调用启动插件接口startup_plugins()，启动所有插件： void application::startup_plugins() { // 遍历map，启动所有有效的插件 for( auto&amp; entry : my-&gt;_active_plugins ) entry.second-&gt;plugin_startup(); return; } 在该方法中，会启动所有有效的插件，如果节点要运行证人节点的话需要特殊配置，请参考BitShares官网说明: Howto Run a Block-producing Witness，本文不做介绍。在所有插件中，就包括witness_plugin插件，其启动实现如下： // 证人插件启动 void witness_plugin::plugin_startup() { try { ilog(&quot;witness plugin: plugin_startup() begin&quot;); chain::database&amp; d = database(); if( !_witnesses.empty() ) { ilog(&quot;Launching block production for ${n} witnesses.&quot;, (&quot;n&quot;, _witnesses.size())); app().set_block_production(true); if( _production_enabled ) { if( d.head_block_num() == 0 ) new_chain_banner(d); _production_skip_flags |= graphene::chain::database::skip_undo_history_check; } // 开启调度生产循环 schedule_production_loop(); } else elog(&quot;No witnesses configured! Please add witness IDs and private keys to configuration.&quot;); ilog(&quot;witness plugin: plugin_startup() end&quot;); } FC_CAPTURE_AND_RETHROW() } 在该方法中，进行若干判断和初始化，然后调用schedule_production_loop()方法，开启调度生产循环，其实现如下： // 调度生产循环 void witness_plugin::schedule_production_loop() { // 计算下一秒的滴答时刻，不少于50毫秒 fc::time_point now = fc::time_point::now(); int64_t time_to_next_second = 1000000 - (now.time_since_epoch().count() % 1000000); if( time_to_next_second &lt; 50000 ) time_to_next_second += 1000000; fc::time_point next_wakeup( now + fc::microseconds( time_to_next_second ) ); // 调度区块生产循环 _block_production_task = fc::schedule([this]{block_production_loop();}, next_wakeup, &quot;Witness Block Production&quot;); } 在schedule_production_loop()方法里，计算时钟，调度区块生产循环方法block_production_loop()： // 区块生产循环 block_production_condition::block_production_condition_enum witness_plugin::block_production_loop() { //其他处理 ...... // 判断区块生产的条件是否满足，并生产区块 result = maybe_produce_block(capture); //其他处理 ...... // 循环调度生产 schedule_production_loop(); //其他处理 ...... } 在该方法中，调用生产区块的入口方法，然后继续执行循环，其maybe_produce_block()方法实现如下： // 判断区块生产的条件是否满足，并生产区块 block_production_condition::block_production_condition_enum witness_plugin::maybe_produce_block( fc::limited_mutable_variant_object&amp; capture ) { chain::database&amp; db = database(); fc::time_point now_fine = fc::time_point::now(); fc::time_point_sec now = now_fine + fc::microseconds( 500000 ); // 判断生产时钟是否同步 if( !_production_enabled ) { if( db.get_slot_time(1) &gt;= now ) _production_enabled = true; else return block_production_condition::not_synced; } // 判断生产时间槽已经开始 uint32_t slot = db.get_slot_at_time( now ); if( slot == 0 ) { capture(&quot;next_time&quot;, db.get_slot_time(1)); return block_production_condition::not_time_yet; } assert( now &gt; db.head_block_time() ); // 判断是否轮转到当前证人生产区块 graphene::chain::witness_id_type scheduled_witness = db.get_scheduled_witness( slot ); if( _witnesses.find( scheduled_witness ) == _witnesses.end() ) { capture(&quot;scheduled_witness&quot;, scheduled_witness); return block_production_condition::not_my_turn; } fc::time_point_sec scheduled_time = db.get_slot_time( slot ); graphene::chain::public_key_type scheduled_key = scheduled_witness( db ).signing_key; auto private_key_itr = _private_keys.find( scheduled_key ); // 判断私钥是否有效 if( private_key_itr == _private_keys.end() ) { capture(&quot;scheduled_key&quot;, scheduled_key); return block_production_condition::no_private_key; } // 判断是否达到最低参与率 uint32_t prate = db.witness_participation_rate(); if( prate &lt; _required_witness_participation ) { capture(&quot;pct&quot;, uint32_t(100*uint64_t(prate) / GRAPHENE_1_PERCENT)); return block_production_condition::low_participation; } // 判断时间间隔是否低于50毫秒 if( llabs((scheduled_time - now).count()) &gt; fc::milliseconds( 500 ).count() ) { capture(&quot;scheduled_time&quot;, scheduled_time)(&quot;now&quot;, now); return block_production_condition::lag; } // 生产区块 auto block = db.generate_block( scheduled_time, scheduled_witness, private_key_itr-&gt;second, _production_skip_flags ); capture(&quot;n&quot;, block.block_num())(&quot;t&quot;, block.timestamp)(&quot;c&quot;, now); // 将生产的区块同步广播到网络中 fc::async( [this,block](){ p2p_node().broadcast(net::block_message(block)); } ); return block_production_condition::produced; } 可以看到在maybe_produce_block()方法中，进行了各种条件判断，只有满足了所有条件才开始生产区块，并将生产后区块广播同步到网络中的其他节点。这里先介绍3个方法get_slot_time()、get_slot_at_time()和get_scheduled_witness()。 get_slot_time()方法，获得未来的第n个区块生产时间槽的时刻： fc::time_point_sec database::get_slot_time(uint32_t slot_num)const { if( slot_num == 0 ) return fc::time_point_sec(); // 区块生产时间间隔 auto interval = block_interval(); const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); if( head_block_num() == 0 ) { // 特殊情况，生产创世区块的时刻 fc::time_point_sec genesis_time = dpo.time; return genesis_time + slot_num * interval; } // 获取前一个区块生产时间槽时刻 int64_t head_block_abs_slot = head_block_time().sec_since_epoch() / interval; fc::time_point_sec head_slot_time(head_block_abs_slot * interval); const global_property_object&amp; gpo = get_global_properties(); // 如果当前为区块链维护时刻，则跳过指定个时间槽 if( dpo.dynamic_flags &amp; dynamic_global_property_object::maintenance_flag ) slot_num += gpo.parameters.maintenance_skip_slots; // 前一个生产时间+若干生产间隔 return head_slot_time + (slot_num * interval); } get_slot_at_time()方法主要是获取指定时间属于未来哪个时间槽： uint32_t database::get_slot_at_time(fc::time_point_sec when)const { fc::time_point_sec first_slot_time = get_slot_time( 1 ); // 判断指定的时间是否已经过时 if( when &lt; first_slot_time ) return 0; return (when - first_slot_time).to_seconds() / block_interval() + 1; } get_scheduled_witness()方法实现了获取指定时间槽的区块生产调度证人： witness_id_type database::get_scheduled_witness( uint32_t slot_num )const { const dynamic_global_property_object&amp; dpo = get_dynamic_global_properties(); const witness_schedule_object&amp; wso = witness_schedule_id_type()(*this); // 计算调度偏移量 uint64_t current_aslot = dpo.current_aslot + slot_num; return wso.current_shuffled_witnesses[ current_aslot % wso.current_shuffled_witnesses.size() ]; } 这里就和前面讲的洗牌算法衔接上了，get_scheduled_witness()方法是从洗牌后的集合current_shuffled_witnesses中获取证人。 下面再回到maybe_produce_block()方法中来，在该方法中调用了generate_block()方法生产区块，其实现如下： signed_block database::generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key, uint32_t skip /* = 0 */ ) { try { signed_block result; detail::with_skip_flags( *this, skip, [&amp;]() { // 调用实际生产区块方法 result = _generate_block( when, witness_id, block_signing_private_key ); } ); return result; } FC_CAPTURE_AND_RETHROW() } 在该方法中才调用用实际生产区块的方法_generate_block()： signed_block database::_generate_block( fc::time_point_sec when, witness_id_type witness_id, const fc::ecc::private_key&amp; block_signing_private_key ) { try { //其他处理 ...... static const size_t max_block_header_size = fc::raw::pack_size( signed_block_header() ) + 4; auto maximum_block_size = get_global_properties().parameters.maximum_block_size; size_t total_block_size = max_block_header_size; signed_block pending_block; //其他处理 ...... for( const processed_transaction&amp; tx : _pending_tx ) { size_t new_total_size = total_block_size + fc::raw::pack_size( tx ); // 计算交易大小，防止超过最大限度 if( new_total_size &gt;= maximum_block_size ) { postponed_tx_count++; continue; } try { auto temp_session = _undo_db.start_undo_session(); processed_transaction ptx = _apply_transaction( tx ); temp_session.merge(); // 将交易添加到区块中 total_block_size += fc::raw::pack_size( ptx ); pending_block.transactions.push_back( ptx ); } //其他处理 ...... } //其他处理 ...... pending_block.previous = head_block_id(); // 添加上一个区块id pending_block.timestamp = when; //添加时间戳 pending_block.transaction_merkle_root = pending_block.calculate_merkle_root(); //添加交易树根 pending_block.witness = witness_id; //更新证人id // 签名 if( !(skip &amp; skip_witness_signature) ) pending_block.sign( block_signing_private_key ); // 检查区块大小 if( !(skip &amp; skip_block_size_check) ) { FC_ASSERT( fc::raw::pack_size(pending_block) &lt;= get_global_properties().parameters.maximum_block_size ); } // 调用推块方法 push_block( pending_block, skip ); return pending_block; } FC_CAPTURE_AND_RETHROW( (witness_id) ) } 再来看将待定区块添加到链的实现过程push_block()： bool database::push_block(const signed_block&amp; new_block, uint32_t skip) { bool result; detail::with_skip_flags( *this, skip, [&amp;]() { detail::without_pending_transactions( *this, std::move(_pending_tx), [&amp;]() { // 调用实际的推块方法 result = _push_block(new_block); }); }); return result; } 在该方法中调用实际的推块的方法_push_block()，其实现如下: bool database::_push_block(const signed_block&amp; new_block) { try { uint32_t skip = get_node_properties().skip_flags; // 在此处理区块链竞争分叉问题，理论讲解请参看本人翻译的另一篇文章： // https://blog.csdn.net/ggq89/article/details/80072876 try { auto session = _undo_db.start_undo_session(); // 将新区块添加到链上 apply_block(new_block, skip); // 存入数据库 _block_id_to_block.store(new_block.id(), new_block); session.commit(); } catch ( const fc::exception&amp; e ) { elog(&quot;Failed to push new block:\\n${e}&quot;, (&quot;e&quot;, e.to_detail_string())); _fork_db.remove(new_block.id()); throw; } return false; } FC_CAPTURE_AND_RETHROW( (new_block) ) } 下面再看apply_block()的实现过程： void database::apply_block( const signed_block&amp; next_block, uint32_t skip ) { //其他处理 ...... detail::with_skip_flags( *this, skip, [&amp;]() { // 在此调用实际的添加区块方法 _apply_block( next_block ); } ); return; } 到这里就和前面所讲的全部内容衔接在一起了，这个第三次代码跟踪到_apply_block()方法，至此整个dpos共识过程基本讲解完毕。最后只剩下整个应用程序的初始化过程了 5. 证人节点初始化 证人节点初始化的代码流程图： 留下有个疑问，整个程序最开始运行时，证人节点是如何初始化的呢？实际上初始数据是在init_genesis()方法中初始的： // 初始创世数据 void database::init_genesis(const genesis_state_type&amp; genesis_state) { try { //其他处理 ...... // 创建初始账户 for( const auto&amp; account : genesis_state.initial_accounts ) { account_create_operation cop; cop.name = account.name; cop.registrar = GRAPHENE_TEMP_ACCOUNT; cop.owner = authority(1, account.owner_key, 1); if( account.active_key == public_key_type() ) { cop.active = cop.owner; cop.options.memo_key = account.owner_key; } else { cop.active = authority(1, account.active_key, 1); cop.options.memo_key = account.active_key; } account_id_type account_id(apply_operation(genesis_eval_state, cop).get&lt;object_id_type&gt;()); if( account.is_lifetime_member ) { account_upgrade_operation op; op.account_to_upgrade = account_id; op.upgrade_to_lifetime_member = true; apply_operation(genesis_eval_state, op); } } //其他处理 ...... // 创建初始证人 std::for_each(genesis_state.initial_witness_candidates.begin(), genesis_state.initial_witness_candidates.end(), [&amp;](const genesis_state_type::initial_witness_type&amp; witness) { witness_create_operation op; op.witness_account = get_account_id(witness.owner_name); op.block_signing_key = witness.block_signing_key; apply_operation(genesis_eval_state, op); }); //其他处理 ...... // 设置活跃证人 modify(get_global_properties(), [&amp;](global_property_object&amp; p) { for( uint32_t i = 1; i &lt;= genesis_state.initial_active_witnesses; ++i ) { p.active_witnesses.insert(witness_id_type(i)); } }); //其他处理 ...... // 创建证人调度顺序 create&lt;witness_schedule_object&gt;([&amp;]( witness_schedule_object&amp; wso ) { for( const witness_id_type&amp; wid : get_global_properties().active_witnesses ) wso.current_shuffled_witnesses.push_back( wid ); }); //其他处理 ...... } FC_CAPTURE_AND_RETHROW() } 整个init_genesis()方法都在进行各种属性值的初始，且创世数据是通过参数genesis_state传入，而该方法又在open()方法中调用： // 打开指定路径的数据库，如果存在就新建 void database::open( const fc::path&amp; data_dir, std::function&lt;genesis_state_type()&gt; genesis_loader, const std::string&amp; db_version) { try { //其他处理 ...... // 如果全局属性不存在，则初始创世数据 if( !find(global_property_id_type()) ) init_genesis(genesis_loader()); //其他处理 ...... } FC_CAPTURE_LOG_AND_RETHROW( (data_dir) ) } 可以看到在open()方法中调用init_genesis()方法时，其参数是通过调用genesis_loader()方法的返回值对init_genesis()方法的实参进行赋值。而init_genesis()方法也是open()方法的参数之一，而open()方法又是在startup()中调用： void startup() { try { //其他处理 ...... auto initial_state = [this] { ilog(&quot;Initializing database...&quot;); // 通过命令行参数指定genesis.json文件路径 if( _options-&gt;count(&quot;genesis-json&quot;) ) { std::string genesis_str; // 1. 读取genesis.json文件 fc::read_file_contents( _options-&gt;at(&quot;genesis-json&quot;).as&lt;boost::filesystem::path&gt;(), genesis_str ); // 2. 从json字符串中获取创世状态数据 genesis_state_type genesis = fc::json::from_string( genesis_str ).as&lt;genesis_state_type&gt;( 20 ); bool modified_genesis = false; if( _options-&gt;count(&quot;genesis-timestamp&quot;) ) { genesis.initial_timestamp = fc::time_point_sec( fc::time_point::now() ) + genesis.initial_parameters.block_interval + _options-&gt;at(&quot;genesis-timestamp&quot;).as&lt;uint32_t&gt;(); genesis.initial_timestamp -= ( genesis.initial_timestamp.sec_since_epoch() % genesis.initial_parameters.block_interval ); modified_genesis = true; std::cerr &lt;&lt; &quot;Used genesis timestamp: &quot; &lt;&lt; genesis.initial_timestamp.to_iso_string() &lt;&lt; &quot; (PLEASE RECORD THIS)\\n&quot;; } if( _options-&gt;count(&quot;dbg-init-key&quot;) ) { std::string init_key = _options-&gt;at( &quot;dbg-init-key&quot; ).as&lt;string&gt;(); FC_ASSERT( genesis.initial_witness_candidates.size() &gt;= genesis.initial_active_witnesses ); set_dbg_init_key( genesis, init_key ); modified_genesis = true; std::cerr &lt;&lt; &quot;Set init witness key to &quot; &lt;&lt; init_key &lt;&lt; &quot;\\n&quot;; } if( modified_genesis ) { std::cerr &lt;&lt; &quot;WARNING: GENESIS WAS MODIFIED, YOUR CHAIN ID MAY BE DIFFERENT\\n&quot;; genesis_str += &quot;BOGUS&quot;; genesis.initial_chain_id = fc::sha256::hash( genesis_str ); } else genesis.initial_chain_id = fc::sha256::hash( genesis_str ); return genesis; } // 如果没指定genesis.json文件，则初始为空串 else { std::string egenesis_json; // 初始json文件为空串 graphene::egenesis::compute_egenesis_json( egenesis_json ); FC_ASSERT( egenesis_json != &quot;&quot; ); FC_ASSERT( graphene::egenesis::get_egenesis_json_hash() == fc::sha256::hash( egenesis_json ) ); auto genesis = fc::json::from_string( egenesis_json ).as&lt;genesis_state_type&gt;( 20 ); genesis.initial_chain_id = fc::sha256::hash( egenesis_json ); return genesis; } }; //其他处理 ...... try { // 打开数据库 _chain_db-&gt;open( _data_dir / &quot;blockchain&quot;, initial_state, GRAPHENE_CURRENT_DB_VERSION ); } catch( const fc::exception&amp; e ) { elog( &quot;Caught exception ${e} in open(), you might want to force a replay&quot;, (&quot;e&quot;, e.to_detail_string()) ); throw; } //其他处理 ...... } FC_LOG_AND_RETHROW() } 在startup()中包含了创世状态的实际初始过程initial_state函数指针（即genesis_loader()方法实际执行的是initial_state函数指针指向的代码），在initial_state的实现过程中通过命令行参数_options读取指定genesis.json文件的内容进行处理，而_options的赋值和startup()的调用都是在main()方法中进行的： // 证人节点应用程序入口 int main(int argc, char** argv) { // 创建应用 app::application* node = new app::application(); //其他处理 ...... // 命令行参数变量 bpo::variables_map options; // 注册证人插件 auto witness_plug = node-&gt;register_plugin&lt;witness_plugin::witness_plugin&gt;(); //其他处理 ...... // 命令行参数处理 try { bpo::options_description cli, cfg; // 设置其他命令行参数 node-&gt;set_program_options(cli, cfg); app_options.add(cli); cfg_options.add(cfg); //解析命令行参数 bpo::store(bpo::parse_command_line(argc, argv, app_options), options); } catch (const boost::program_options::error&amp; e) { std::cerr &lt;&lt; &quot;Error parsing command line: &quot; &lt;&lt; e.what() &lt;&lt; &quot;\\n&quot;; return 1; } //其他处理 ...... // 程序初始化 node-&gt;initialize(data_dir, options); node-&gt;initialize_plugins( options ); // 启动程序 node-&gt;startup(); // 启动相关插件 node-&gt;startup_plugins(); //其他处理 ...... } 到这里我们又跟踪代码到main()方法，至此包括初始化和共识的主要过程全部讲解完毕。 6. 创建genesis.json文件 创建genesis.json文件的代码流程图如下： 最后，讲解一个BitShares中有意思事情，也是上一节留的一点尾巴，就是BitShares的genesis.json文件其实不用手动编写，而是调用程序自动生成的，这一点的Ethereum不一样。之前学习Ethereum时，genesis.json弄好好久才弄好，官方文档给的实例确定几个核心字段，最后在论坛中才找到解决方法： BitShares的genesis.json文件是通过运行以下指令创建的（请参考官网：GENESIS CONFIGURATION）： programs/witness_node/witness_node --create-genesis-json genesis/my-genesis.json 而在程序中，又是怎么执行，请回头看main()方法，在该方法中调用了initialize()方法： // 程序初始化 void application::initialize(const fc::path&amp; data_dir, const boost::program_options::variables_map&amp; options) { my-&gt;_data_dir = data_dir; my-&gt;_options = &amp;options; // 如果执行程序有&quot;create-genesis-json&quot;参数 if( options.count(&quot;create-genesis-json&quot;) ) { fc::path genesis_out = options.at(&quot;create-genesis-json&quot;).as&lt;boost::filesystem::path&gt;(); // 创建genesis.json文件内容 genesis_state_type genesis_state = detail::create_example_genesis(); if( fc::exists(genesis_out) ) { try { genesis_state = fc::json::from_file(genesis_out).as&lt;genesis_state_type&gt;( 20 ); } catch(const fc::exception&amp; e) { std::cerr &lt;&lt; &quot;Unable to parse existing genesis file:\\n&quot; &lt;&lt; e.to_string() &lt;&lt; &quot;\\nWould you like to replace it? [y/N] &quot;; char response = std::cin.get(); if( toupper(response) != &#39;Y&#39; ) return; } std::cerr &lt;&lt; &quot;Updating genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\\n&quot;; } else { std::cerr &lt;&lt; &quot;Creating example genesis state in file &quot; &lt;&lt; genesis_out.generic_string() &lt;&lt; &quot;\\n&quot;; } // 保存到genesis.json文件 fc::json::save_to_file(genesis_state, genesis_out); std::exit(EXIT_SUCCESS); } //其他处理 ...... } 在initialize()方法中，调用了create_example_genesis()方法创建genesis.json文件内容，其实现如下： // 创建genesis.json实例文件 genesis_state_type create_example_genesis() { // 生成密钥 auto nathan_key = fc::ecc::private_key::regenerate(fc::sha256::hash(string(&quot;nathan&quot;))); dlog(&quot;Allocating all stake to ${key}&quot;, (&quot;key&quot;, utilities::key_to_wif(nathan_key))); genesis_state_type initial_state; // 设置各种创始值 initial_state.initial_parameters.current_fees = fee_schedule::get_default();//-&gt;set_all_fees(GRAPHENE_BLOCKCHAIN_PRECISION); // 设置初始活跃证人数量 initial_state.initial_active_witnesses = GRAPHENE_DEFAULT_MIN_WITNESS_COUNT; initial_state.initial_timestamp = time_point_sec(time_point::now().sec_since_epoch() / initial_state.initial_parameters.block_interval * initial_state.initial_parameters.block_interval); for( uint64_t i = 0; i &lt; initial_state.initial_active_witnesses; ++i ) { auto name = &quot;init&quot;+fc::to_string(i); // 设置初始账户 initial_state.initial_accounts.emplace_back(name, nathan_key.get_public_key(), nathan_key.get_public_key(), true); initial_state.initial_committee_candidates.push_back({name}); // 设置初始证人替补 initial_state.initial_witness_candidates.push_back({name, nathan_key.get_public_key()}); } initial_state.initial_accounts.emplace_back(&quot;nathan&quot;, nathan_key.get_public_key()); initial_state.initial_balances.push_back({nathan_key.get_public_key(), GRAPHENE_SYMBOL, GRAPHENE_MAX_SHARE_SUPPLY}); initial_state.initial_chain_id = fc::sha256::hash( &quot;BOGUS&quot; ); return initial_state; } 7. DPoS共识代码流程图 本人 ProcessOn 上 BTS的DPoS共识代码流程图 原图链接请点击：BTS的DPoS共识代码流程图 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/02/b5379a56d8cf8290c4bca7da85f856e4.html","headline":"BTS的DPoS共识之代码实现概述","dateModified":"2018-05-02T00:00:00+08:00","datePublished":"2018-05-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/02/b5379a56d8cf8290c4bca7da85f856e4.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>BTS的DPoS共识之代码实现概述</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>关于BitShares的DPoS共识的概述请参考：<a href="https://blog.csdn.net/ggq89/article/details/80188930" rel="nofollow">股份授权证明(DPOS)概述</a></p> 
+  <p>关于BitShares的DPoS共识的详细介绍请参考：<a href="https://blog.csdn.net/ggq89/article/details/80014631" rel="nofollow">BitShares的DPoS共识</a></p> 
+  <p>关于BitShares的DPoS共识的竞争链共识补充说明请参考：<a href="https://blog.csdn.net/ggq89/article/details/80072876" rel="nofollow">DPOS共识算法 - 缺失的白皮书</a></p> 
+  <p>关于BitShares的DPoS共识之代码实现概述请参考：<a href="https://blog.csdn.net/ggq89/article/details/80068306" rel="nofollow">BTS的DPoS共识之代码实现概述</a></p> 
+  <p>本文基于的BitShares源代码GitHub地址如下：<a href="https://github.com/bitshares/bitshares-core" rel="nofollow">https://github.com/bitshares/bitshares-core</a></p> 
+  <p><strong>目录</strong></p> 
+  <p></p>
+  <div class="toc"> 
+   <ul> 
+    <li><a href="#1-dpos共识算法概述" rel="nofollow">1. DPoS共识算法概述</a></li> 
+    <li><a href="#2-洗牌算法" rel="nofollow">2. 洗牌算法</a></li> 
+    <li><a href="#3-统计投票和选出证人集合" rel="nofollow">3. 统计投票和选出证人集合</a></li> 
+    <li><a href="#4-调度证人和生产区块" rel="nofollow">4. 调度证人和生产区块</a></li> 
+    <li><a href="#5-证人节点初始化" rel="nofollow">5. 证人节点初始化</a></li> 
+    <li><a href="#6-创建genesisjson文件" rel="nofollow">6. 创建genesis.json文件</a></li> 
+    <li><a href="#7-dpos共识代码流程图" rel="nofollow">7. DPoS共识代码流程图</a></li> 
+   </ul> 
+  </div> 
+  <p></p> 
+  <h1 id="1-dpos共识算法概述">1. DPoS共识算法概述</h1> 
+  <p>任何共识机制都必须解决包括但不限于以下5个问题：</p> 
+  <ol> 
+   <li>下一个添加到数据库的新区块应该由谁来生成？</li> 
+   <li>下一个块应该何时产生？</li> 
+   <li>该区块应包含哪些交易？</li> 
+   <li>怎样对本协议进行修改？</li> 
+   <li>该如何解决交易历史的竞争问题？</li> 
+  </ol> 
+  <p>本文主要讨论前3个问题，第4个问题本文不做讨论；关于第5个问题，即交易数据分叉和双花等问题的研究分析可参考：<a href="https://blog.csdn.net/ggq89/article/details/80072876" rel="nofollow">DPOS共识算法 - 缺失的白皮书</a></p> 
+  <p>总体来说，为了解决PoW和PoS共识其交易性能低下的问题，DPoS使用见证人机制（witness）解决该问题。通过去中心化的投票机制选出前N个证人来保证信任问题；通过轮流安排证人打包生产区块来提高出块速度以及减少能耗问题；通过证人对区块进行验证从而减少确认的次数，从而加快共识的过程和提高交易结算的速度。总之，DPoS共识通过间接民主的方式既保证了最大限度的去中心化又极大的提高了性能同时降低了电力等成本。</p> 
+  <p>DPoS的伪代码实现如下（伪代码参考了<a href="https://mp.weixin.qq.com/s?__biz=MjM5ODIzNDQ3Mw==&amp;mid=2649967768&amp;idx=1&amp;sn=596fe0f892aa64b3b948ac629067dc51&amp;chksm=beca3c9e89bdb5882a7de2c678a23b3e67d7ca478cc0a183eefba0c6523d79e63d4ab6357fd6&amp;mpshare=1&amp;scene=1&amp;srcid=02282VSyPVH3qoV99lWkkoWY#rd" rel="nofollow">用伪代码理解DPoS</a>）：</p> 
+  <pre class="prettyprint"><code class=" hljs livecodeserver"><span class="hljs-keyword">for</span> <span class="hljs-built_in">round</span> i<span class="hljs-comment"> //分成很多个round，round无限持续</span>
+    dlist_i = <span class="hljs-built_in">get</span> N witnesses <span class="hljs-built_in">sort</span> <span class="hljs-keyword">by</span> votes<span class="hljs-comment"> //根据投票结果选出得票率最高的N个证人</span>
+    dlist_i = shuffle(dlist_i)<span class="hljs-comment"> //随机改变顺序</span>
+    loop<span class="hljs-comment"> //round完了，退出循环</span>
+        slot = global_time_offset / block_interval
+        pos = slot % N
+        <span class="hljs-keyword">if</span> dlist_i[pos] exists <span class="hljs-operator">in</span> this node<span class="hljs-comment"> //witness在这个节点</span>
+            generateBlock(keypair <span class="hljs-operator">of</span> dlist_i[pos])<span class="hljs-comment"> //生产block</span>
+        <span class="hljs-keyword">else</span>
+            skip</code></pre> 
+  <p>可以看到，在每一轮（round）循环里，系统会重新统计得票排名。在选出最高的N个证人里，系统采用先打乱顺序，然后证人轮流生产区块。一轮区块生产完毕后进入下一个周期。</p> 
+  <p>在BitShares实际的代码中，过程比上述伪代码复杂得多，下面本文从3个方向讲解BTS中DPoS共识的实现过程：</p> 
+  <ol> 
+   <li>打乱证人调度顺序的过程，即洗牌算法；</li> 
+   <li>统计投票和选出证人集合的过程；</li> 
+   <li>调度证人和生产区块的过程；</li> 
+  </ol> 
+  <h1 id="2-洗牌算法">2. 洗牌算法</h1> 
+  <p>洗牌算法的代码流程图： <br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018051717510184" alt="这里写图片描述" title=""></p> 
+  <p>首先，为了存储证人的调度顺序，BTS定义了一个名叫<code>witness_schedule_object</code>的类，在该类中用了一个名为<code>current_shuffled_witnesses</code>的<code>vector</code>集合来存储：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">class</span> witness_schedule_object : 
+    <span class="hljs-keyword">public</span> graphene::db::abstract_object&lt;witness_schedule_object&gt;
+{
+   <span class="hljs-keyword">public</span>:
+      <span class="hljs-keyword">static</span> <span class="hljs-keyword">const</span> uint8_t space_id = implementation_ids;
+      <span class="hljs-keyword">static</span> <span class="hljs-keyword">const</span> uint8_t type_id = impl_witness_schedule_object_type;
+
+      <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt; witness_id_type &gt;</span> current_shuffled_witnesses;    <span class="hljs-comment">//用于存储证人的调度顺序</span>
+};</code></pre> 
+  <p>有了上面的存储结构，下面来再看洗牌算法<code>update_witness_schedule()</code>：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">void</span> database::update_witness_schedule()
+{
+   <span class="hljs-keyword">const</span> witness_schedule_object&amp; wso = witness_schedule_id_type()(*<span class="hljs-keyword">this</span>);
+   <span class="hljs-keyword">const</span> global_property_object&amp; gpo = get_global_properties();
+
+   <span class="hljs-comment">// 该条件控制了洗牌算法被调用的时机，必须是证人完整的轮转完一圈后</span>
+   <span class="hljs-keyword">if</span>( head_block_num() % gpo.active_witnesses.size() == <span class="hljs-number">0</span> )
+   {
+      modify( wso, [&amp;]( witness_schedule_object&amp; _wso )
+      {
+         <span class="hljs-comment">// 清空证人集合</span>
+         _wso.current_shuffled_witnesses.clear();
+         _wso.current_shuffled_witnesses.reserve( gpo.active_witnesses.size() );
+
+         <span class="hljs-comment">// 初始化证人集合数据</span>
+         <span class="hljs-keyword">for</span>( <span class="hljs-keyword">const</span> witness_id_type&amp; w : gpo.active_witnesses )
+            _wso.current_shuffled_witnesses.push_back( w );
+
+         <span class="hljs-comment">// 打乱证人的调度顺序</span>
+         <span class="hljs-keyword">auto</span> now_hi = uint64_t(head_block_time().sec_since_epoch()) &lt;&lt; <span class="hljs-number">32</span>;
+         <span class="hljs-keyword">for</span>( uint32_t i = <span class="hljs-number">0</span>; i &lt; _wso.current_shuffled_witnesses.size(); ++i )
+         {
+            <span class="hljs-comment">/// 此处使用了随机函数，具体原理请参看：http://xorshift.di.unimi.it/</span>
+            uint64_t k = now_hi + uint64_t(i)*<span class="hljs-number">2685821657736338717U</span>LL;
+            k ^= (k &gt;&gt; <span class="hljs-number">12</span>);
+            k ^= (k &lt;&lt; <span class="hljs-number">25</span>);
+            k ^= (k &gt;&gt; <span class="hljs-number">27</span>);
+            k *= <span class="hljs-number">2685821657736338717U</span>LL;
+
+            uint32_t jmax = _wso.current_shuffled_witnesses.size() - i;
+            uint32_t j = i + k%jmax;
+            <span class="hljs-comment">// 进行N次随机交换</span>
+            <span class="hljs-built_in">std</span>::swap( _wso.current_shuffled_witnesses[i],
+                       _wso.current_shuffled_witnesses[j] );
+         }
+      });
+   }
+}</code></pre> 
+  <p>那么洗牌算法是在什么时候由哪个节点调用呢? <br> 实际上<code>update_witness_schedule()</code>方法只在<code>_apply_block()</code>中调用:</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 将一个签名后的区块添加到链上</span>
+<span class="hljs-keyword">void</span> database::_apply_block( <span class="hljs-keyword">const</span> signed_block&amp; next_block )
+{ 
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    update_witness_schedule();
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+}</code></pre> 
+  <p>关于该方法的又是什么时候调用会在后文介绍，总之，证人节点每次将一个签名区块添加到链上之后调用洗牌算法，而在洗牌算法内部会在证人轮转完一圈时才真正洗牌。</p> 
+  <p>这里要强调一下，洗牌算法只是打乱了证人的调度顺序，但可能还是原来那些证人。那么证人成员什么时候更新呢？现在回到洗牌算法<code>update_witness_schedule()</code>中，<code>current_shuffled_witnesses</code>是从<code>gpo.active_witnesses</code>中获得活跃证人的初始化数据的，只有当<code>gpo.active_witnesses</code>中的的成员发生变化时，<code>current_shuffled_witnesses</code>中的成员才发生变化，那么<code>gpo.active_witnesses</code>又是怎么更新的呢？</p> 
+  <h1 id="3-统计投票和选出证人集合">3. 统计投票和选出证人集合</h1> 
+  <p>统计投票和选出证人集合代码流程图： <br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180517190637334" alt="这里写图片描述" title=""></p> 
+  <p>首先介绍和活跃证人集合相关的类，全局属性类<code>global_property_object</code>，该类中使用了名为<code>active_witnesses</code>的<code>flat_set</code>保存活跃证人：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 全局属性类</span>
+<span class="hljs-keyword">class</span> global_property_object : <span class="hljs-keyword">public</span> graphene::db::abstract_object&lt;global_property_object&gt;
+   {
+      <span class="hljs-keyword">public</span>:
+         <span class="hljs-keyword">static</span> <span class="hljs-keyword">const</span> uint8_t space_id = implementation_ids;
+         <span class="hljs-keyword">static</span> <span class="hljs-keyword">const</span> uint8_t type_id  = impl_global_property_object_type;
+
+         chain_parameters           parameters;
+         optional&lt;chain_parameters&gt; pending_parameters;
+
+         uint32_t                           next_available_vote_id = <span class="hljs-number">0</span>;
+         <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;committee_member_id_type&gt;</span>   active_committee_members;
+         flat_set&lt;witness_id_type&gt;          active_witnesses; <span class="hljs-comment">// 活跃证人集合，每个维护间隔更新一次</span>
+   };</code></pre> 
+  <p>有了上面类的铺垫，下来再来讲活跃证人集合更新的事情。在BitShares的源代码中，<code>gpo.active_witnesses</code>的更新是通过<code>update_active_witnesses()</code>方法实现的：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 更新活跃证人</span>
+<span class="hljs-keyword">void</span> database::update_active_witnesses()
+{ 
+    <span class="hljs-comment">// 统计投票的证人个数</span>
+    assert( _witness_count_histogram_buffer.size() &gt; <span class="hljs-number">0</span> );
+    share_type stake_target = (_total_voting_stake-_witness_count_histogram_buffer[<span class="hljs-number">0</span>]) / <span class="hljs-number">2</span>;
+
+    <span class="hljs-comment">/// 为0或1个证人投票的账户不会就证人数量发表意见（他们弃权并且是无投票权的账户）</span>
+
+    share_type stake_tally = <span class="hljs-number">0</span>; 
+
+    size_t witness_count = <span class="hljs-number">0</span>;
+    <span class="hljs-keyword">if</span>( stake_target &gt; <span class="hljs-number">0</span> )
+    {
+        <span class="hljs-keyword">while</span>( (witness_count &lt; _witness_count_histogram_buffer.size() - <span class="hljs-number">1</span>)
+             &amp;&amp; (stake_tally &lt;= stake_target) )
+        {
+            stake_tally += _witness_count_histogram_buffer[++witness_count];
+        }
+    }
+
+    <span class="hljs-keyword">const</span> chain_property_object&amp; cpo = get_chain_properties();
+    <span class="hljs-comment">// 排序选出前排名前N的证人</span>
+    <span class="hljs-keyword">auto</span> wits = sort_votable_objects&lt;witness_index&gt;(<span class="hljs-built_in">std</span>::max(witness_count*<span class="hljs-number">2</span>+<span class="hljs-number">1</span>, (size_t)cpo.immutable_parameters.min_witness_count));
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 将证人存入active_witnesses中</span>
+    modify(gpo, [&amp;]( global_property_object&amp; gp ){
+        gp.active_witnesses.clear();
+        gp.active_witnesses.reserve(wits.size());
+        <span class="hljs-built_in">std</span>::transform(wits.begin(), 
+                       wits.end(),
+                       <span class="hljs-built_in">std</span>::inserter(gp.active_witnesses, gp.active_witnesses.end()),
+                       [](<span class="hljs-keyword">const</span> witness_object&amp; w) {
+                           <span class="hljs-keyword">return</span> w.id;
+                       });
+    });
+
+    <span class="hljs-comment">//其他处理</span>
+    ...... 
+}</code></pre> 
+  <p>在<code>update_active_witnesses()</code>方法中首先统计出投票的证人个数N，然后排序选出得票率最高的N个证人，再更新到<code>active_witnesses</code>中去。下面是排序算法<code>sort_votable_objects</code>的介绍：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 从高到低排列出前N个指定类型的可投票对象，并以vector的形式返回</span>
+<span class="hljs-keyword">template</span>&lt;<span class="hljs-keyword">class</span> Index&gt;
+<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-built_in">std</span>::reference_wrapper&lt;<span class="hljs-keyword">const</span> <span class="hljs-keyword">typename</span> Index::object_type&gt;</span>&gt; database::sort_votable_objects(size_t count) <span class="hljs-keyword">const</span>
+{
+   <span class="hljs-keyword">using</span> ObjectType = <span class="hljs-keyword">typename</span> Index::object_type;
+   <span class="hljs-comment">// 获取所有对象</span>
+   <span class="hljs-keyword">const</span> <span class="hljs-keyword">auto</span>&amp; all_objects = get_index_type&lt;Index&gt;().indices();
+   <span class="hljs-comment">// 计算实际个数</span>
+   count = <span class="hljs-built_in">std</span>::min(count, all_objects.size());
+   <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;<span class="hljs-built_in">std</span>::reference_wrapper&lt;<span class="hljs-keyword">const</span> ObjectType&gt;</span>&gt; refs;
+   refs.reserve(all_objects.size());
+   <span class="hljs-comment">// 初始化refs</span>
+   <span class="hljs-built_in">std</span>::transform(all_objects.begin(), all_objects.end(),
+                  <span class="hljs-built_in">std</span>::back_inserter(refs),
+                  [](<span class="hljs-keyword">const</span> ObjectType&amp; o) { <span class="hljs-keyword">return</span> <span class="hljs-built_in">std</span>::cref(o); });
+   <span class="hljs-comment">// 排序（从高到低）</span>
+   <span class="hljs-built_in">std</span>::partial_sort(refs.begin(), refs.begin() + count, refs.end(),
+                   [<span class="hljs-keyword">this</span>](<span class="hljs-keyword">const</span> ObjectType&amp; a, <span class="hljs-keyword">const</span> ObjectType&amp; b)-&gt;<span class="hljs-keyword">bool</span> {
+      share_type oa_vote = _vote_tally_buffer[a.vote_id];
+      share_type ob_vote = _vote_tally_buffer[b.vote_id];
+      <span class="hljs-keyword">if</span>( oa_vote != ob_vote )
+         <span class="hljs-keyword">return</span> oa_vote &gt; ob_vote;
+      <span class="hljs-keyword">return</span> a.vote_id &lt; b.vote_id;
+   });
+
+   <span class="hljs-comment">// 截取，返回</span>
+   refs.resize(count, refs.front());
+   <span class="hljs-keyword">return</span> refs;
+}</code></pre> 
+  <p>再来看在<code>update_active_witnesses()</code>方法，可以看到证人的投票数据是从<code>_witness_count_histogram_buffer</code>中获取的，而该集合又是在什么时候更新呢？还有<code>update_active_witnesses()</code>方法又是什么时候调用呢？这些问题的答案都在<code>perform_chain_maintenance()</code>方法中：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 区块链维护处理</span>
+<span class="hljs-keyword">void</span> database::perform_chain_maintenance(<span class="hljs-keyword">const</span> signed_block&amp; next_block, <span class="hljs-keyword">const</span> global_property_object&amp; global_props)
+{
+   <span class="hljs-keyword">const</span> <span class="hljs-keyword">auto</span>&amp; gpo = get_global_properties();
+
+   <span class="hljs-comment">//其他处理</span>
+   ......
+
+   <span class="hljs-comment">// 统计所有账户的投票，注意：此处是笔者为了便于理解，讲原代码中的泛型编程改写而成的</span>
+   <span class="hljs-keyword">const</span> <span class="hljs-keyword">auto</span>&amp; idx = get_index_type&lt;account_index&gt;().indices().get&lt;by_name&gt;();
+   <span class="hljs-keyword">for</span>( <span class="hljs-keyword">const</span> account_object&amp; a : idx )
+   {      
+       database&amp; d = *<span class="hljs-keyword">this</span>;
+       <span class="hljs-keyword">const</span> global_property_object&amp; props = gpo;
+
+       <span class="hljs-comment">//其他处理</span>
+       ......
+
+       d._witness_count_histogram_buffer.resize(props.parameters.maximum_witness_count / <span class="hljs-number">2</span> + <span class="hljs-number">1</span>);
+
+       <span class="hljs-keyword">const</span> account_object&amp; stake_account = a;
+
+       <span class="hljs-comment">// 获取实际投票账户</span>
+       <span class="hljs-keyword">const</span> account_object&amp; opinion_account =
+          (stake_account.options.voting_account ==
+           GRAPHENE_PROXY_TO_SELF_ACCOUNT)? stake_account
+             : d.get(stake_account.options.voting_account);
+
+       <span class="hljs-comment">// 获取实际投票数量</span>
+       <span class="hljs-keyword">const</span> <span class="hljs-keyword">auto</span>&amp; stats = stake_account.statistics(d);
+       uint64_t voting_stake = stats.total_core_in_orders.value
+             + (stake_account.cashback_vb.valid() ? (*stake_account.cashback_vb)(d).balance.amount.value: <span class="hljs-number">0</span>)
+             + d.get_balance(stake_account.get_id(), asset_id_type()).amount.value;
+
+       <span class="hljs-comment">//其他处理</span>
+       ......
+
+       <span class="hljs-comment">// 统计投票</span>
+       <span class="hljs-keyword">if</span>( opinion_account.options.num_witness &lt;= props.parameters.maximum_witness_count )
+       {
+          uint16_t offset = <span class="hljs-built_in">std</span>::min(size_t(opinion_account.options.num_witness/<span class="hljs-number">2</span>), d._witness_count_histogram_buffer.size() - <span class="hljs-number">1</span>);
+          d._witness_count_histogram_buffer[offset] += voting_stake;
+       }
+   }
+
+   <span class="hljs-comment">//其他处理</span>
+   ......
+
+   <span class="hljs-comment">// 注意：在这里更新活跃证人</span>
+   update_active_witnesses();
+
+   <span class="hljs-comment">//其他处理</span>
+   ......
+
+   <span class="hljs-comment">// 以下计算出下一次区块链维护时间，并更新到全局数据库</span>
+
+   <span class="hljs-keyword">auto</span> next_maintenance_time = get&lt;dynamic_global_property_object&gt;(dynamic_global_property_id_type()).next_maintenance_time;
+   <span class="hljs-keyword">auto</span> maintenance_interval = gpo.parameters.maintenance_interval;
+
+   <span class="hljs-keyword">if</span>( next_maintenance_time &lt;= next_block.timestamp )
+   {
+      <span class="hljs-keyword">if</span>( next_block.block_num() == <span class="hljs-number">1</span> )
+         next_maintenance_time = time_point_sec() +
+               (((next_block.timestamp.sec_since_epoch() / maintenance_interval) + <span class="hljs-number">1</span>) * maintenance_interval);
+      <span class="hljs-keyword">else</span>
+      {
+         <span class="hljs-keyword">auto</span> y = (head_block_time() - next_maintenance_time).to_seconds() / maintenance_interval;
+         next_maintenance_time += (y+<span class="hljs-number">1</span>) * maintenance_interval;
+      }
+   }
+
+   <span class="hljs-comment">//其他处理</span>
+   ......
+
+   d.next_maintenance_time = next_maintenance_time;
+
+
+   <span class="hljs-comment">//其他处理</span>
+   ......
+
+}</code></pre> 
+  <p>总结一下，在<code>perform_chain_maintenance()</code>方法中，首先统计出每个账户实际的投票数据，接着计算出投出的证人数量N和得票率前N的证人，再调用<code>update_active_witnesses()</code>更新活跃证人，最后计算出下一次的区块链维护时间。那么<code>perform_chain_maintenance()</code>方法又是什么时候调用呢？且看<code>_apply_block()</code>方法：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 将一个签名后的区块添加到链上</span>
+<span class="hljs-keyword">void</span> database::_apply_block( <span class="hljs-keyword">const</span> signed_block&amp; next_block )
+{ 
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-keyword">bool</span> maint_needed = (dynamic_global_props.next_maintenance_time &lt;= next_block.timestamp);
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-comment">// 当到了区块链维护时间时</span>
+   <span class="hljs-keyword">if</span>( maint_needed )
+      perform_chain_maintenance(next_block, global_props);
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 注意了，这里调用洗牌算法（前面讲过）</span>
+    update_witness_schedule();
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+}</code></pre> 
+  <p>可以看到在<code>_apply_block()</code>方法中首先判断是否到了维护时间，如果到了维护时间就重新统计投票，得到新的活跃证人。这里就需要强调的是，在上一节讲的洗牌算法也是在该方法中调用，也就是说每次将一个区块添加的链上后，首先判断是否到了区块链维护时间，如果是就统计投票选出证人并更新，然后会调用洗牌算法，判断是否到了洗牌的时刻，再洗牌。</p> 
+  <p>那么<code>_apply_block()</code>方法又是什么调用呢？或者说什么时候调度证人和生产区块呢？</p> 
+  <h1 id="4-调度证人和生产区块">4. 调度证人和生产区块</h1> 
+  <p>调度证人和生产区块的代码流程图： <br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180517190802263" alt="这里写图片描述" title=""></p> 
+  <p>这一次，我们从<code>main()</code>方法开始讲解：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 应用程序入口</span>
+<span class="hljs-keyword">int</span> main(<span class="hljs-keyword">int</span> argc, <span class="hljs-keyword">char</span>** argv) {
+   app::application* node = <span class="hljs-keyword">new</span> app::application();
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 启动所有插件</span>
+      node-&gt;startup_plugins();
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+}</code></pre> 
+  <p>在main方法中，调用启动插件接口<code>startup_plugins()</code>，启动所有插件：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">void</span> application::startup_plugins()
+{
+    <span class="hljs-comment">// 遍历map，启动所有有效的插件</span>
+   <span class="hljs-keyword">for</span>( <span class="hljs-keyword">auto</span>&amp; entry : my-&gt;_active_plugins )
+      entry.second-&gt;plugin_startup();
+   <span class="hljs-keyword">return</span>;
+}</code></pre> 
+  <p>在该方法中，会启动所有有效的插件，如果节点要运行证人节点的话需要特殊配置，请参考BitShares官网说明: <a href="http://docs.bitshares.org/bitshares/tutorials/witness-howto.html" rel="nofollow">Howto Run a Block-producing Witness</a>，本文不做介绍。在所有插件中，就包括<code>witness_plugin</code>插件，其启动实现如下：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 证人插件启动</span>
+<span class="hljs-keyword">void</span> witness_plugin::plugin_startup()
+{ <span class="hljs-keyword">try</span> {
+   ilog(<span class="hljs-string">"witness plugin: plugin_startup() begin"</span>);
+   chain::database&amp; d = database();
+
+   <span class="hljs-keyword">if</span>( !_witnesses.empty() )
+   {
+      ilog(<span class="hljs-string">"Launching block production for ${n} witnesses."</span>, (<span class="hljs-string">"n"</span>, _witnesses.size()));
+      app().set_block_production(<span class="hljs-keyword">true</span>);
+      <span class="hljs-keyword">if</span>( _production_enabled )
+      {
+         <span class="hljs-keyword">if</span>( d.head_block_num() == <span class="hljs-number">0</span> )
+            new_chain_banner(d);
+         _production_skip_flags |= graphene::chain::database::skip_undo_history_check;
+      }
+      <span class="hljs-comment">// 开启调度生产循环</span>
+      schedule_production_loop();
+   } <span class="hljs-keyword">else</span>
+      elog(<span class="hljs-string">"No witnesses configured! Please add witness IDs and private keys to configuration."</span>);
+   ilog(<span class="hljs-string">"witness plugin: plugin_startup() end"</span>);
+} FC_CAPTURE_AND_RETHROW() }</code></pre> 
+  <p>在该方法中，进行若干判断和初始化，然后调用<code>schedule_production_loop()</code>方法，开启调度生产循环，其实现如下：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 调度生产循环</span>
+<span class="hljs-keyword">void</span> witness_plugin::schedule_production_loop()
+{
+   <span class="hljs-comment">// 计算下一秒的滴答时刻，不少于50毫秒</span>
+   fc::time_point now = fc::time_point::now();
+   int64_t time_to_next_second = <span class="hljs-number">1000000</span> - (now.time_since_epoch().count() % <span class="hljs-number">1000000</span>);
+   <span class="hljs-keyword">if</span>( time_to_next_second &lt; <span class="hljs-number">50000</span> )
+       time_to_next_second += <span class="hljs-number">1000000</span>;
+
+   fc::time_point next_wakeup( now + fc::microseconds( time_to_next_second ) );
+
+   <span class="hljs-comment">// 调度区块生产循环</span>
+   _block_production_task = fc::schedule([<span class="hljs-keyword">this</span>]{block_production_loop();},
+                                         next_wakeup, <span class="hljs-string">"Witness Block Production"</span>);
+}</code></pre> 
+  <p>在<code>schedule_production_loop()</code>方法里，计算时钟，调度区块生产循环方法<code>block_production_loop()</code>：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 区块生产循环</span>
+block_production_condition::block_production_condition_enum witness_plugin::block_production_loop()
+{
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 判断区块生产的条件是否满足，并生产区块</span>
+    result = maybe_produce_block(capture);
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 循环调度生产</span>
+    schedule_production_loop();
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+}</code></pre> 
+  <p>在该方法中，调用生产区块的入口方法，然后继续执行循环，其<code>maybe_produce_block()</code>方法实现如下：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 判断区块生产的条件是否满足，并生产区块</span>
+block_production_condition::block_production_condition_enum witness_plugin::maybe_produce_block( fc::limited_mutable_variant_object&amp; capture )
+{
+   chain::database&amp; db = database();
+   fc::time_point now_fine = fc::time_point::now();
+   fc::time_point_sec now = now_fine + fc::microseconds( <span class="hljs-number">500000</span> );
+
+   <span class="hljs-comment">// 判断生产时钟是否同步</span>
+   <span class="hljs-keyword">if</span>( !_production_enabled )
+   {
+      <span class="hljs-keyword">if</span>( db.get_slot_time(<span class="hljs-number">1</span>) &gt;= now )
+         _production_enabled = <span class="hljs-keyword">true</span>;
+      <span class="hljs-keyword">else</span>
+         <span class="hljs-keyword">return</span> block_production_condition::not_synced;
+   }
+
+   <span class="hljs-comment">// 判断生产时间槽已经开始</span>
+   uint32_t slot = db.get_slot_at_time( now );
+   <span class="hljs-keyword">if</span>( slot == <span class="hljs-number">0</span> )
+   {
+      capture(<span class="hljs-string">"next_time"</span>, db.get_slot_time(<span class="hljs-number">1</span>));
+      <span class="hljs-keyword">return</span> block_production_condition::not_time_yet;
+   }
+
+   assert( now &gt; db.head_block_time() );
+
+   <span class="hljs-comment">// 判断是否轮转到当前证人生产区块</span>
+   graphene::chain::witness_id_type scheduled_witness = db.get_scheduled_witness( slot );
+   <span class="hljs-keyword">if</span>( _witnesses.find( scheduled_witness ) == _witnesses.end() )
+   {
+      capture(<span class="hljs-string">"scheduled_witness"</span>, scheduled_witness);
+      <span class="hljs-keyword">return</span> block_production_condition::not_my_turn;
+   }
+
+   fc::time_point_sec scheduled_time = db.get_slot_time( slot );
+   graphene::chain::public_key_type scheduled_key = scheduled_witness( db ).signing_key;
+   <span class="hljs-keyword">auto</span> private_key_itr = _private_keys.find( scheduled_key );
+
+    <span class="hljs-comment">// 判断私钥是否有效</span>
+   <span class="hljs-keyword">if</span>( private_key_itr == _private_keys.end() )
+   {
+      capture(<span class="hljs-string">"scheduled_key"</span>, scheduled_key);
+      <span class="hljs-keyword">return</span> block_production_condition::no_private_key;
+   }
+
+   <span class="hljs-comment">// 判断是否达到最低参与率</span>
+   uint32_t prate = db.witness_participation_rate();
+   <span class="hljs-keyword">if</span>( prate &lt; _required_witness_participation )
+   {
+      capture(<span class="hljs-string">"pct"</span>, uint32_t(<span class="hljs-number">100</span>*uint64_t(prate) / GRAPHENE_1_PERCENT));
+      <span class="hljs-keyword">return</span> block_production_condition::low_participation;
+   }
+
+    <span class="hljs-comment">// 判断时间间隔是否低于50毫秒</span>
+   <span class="hljs-keyword">if</span>( llabs((scheduled_time - now).count()) &gt; fc::milliseconds( <span class="hljs-number">500</span> ).count() )
+   {
+      capture(<span class="hljs-string">"scheduled_time"</span>, scheduled_time)(<span class="hljs-string">"now"</span>, now);
+      <span class="hljs-keyword">return</span> block_production_condition::lag;
+   }
+
+    <span class="hljs-comment">// 生产区块</span>
+   <span class="hljs-keyword">auto</span> block = db.generate_block(
+      scheduled_time,
+      scheduled_witness,
+      private_key_itr-&gt;second,
+      _production_skip_flags
+      );
+   capture(<span class="hljs-string">"n"</span>, block.block_num())(<span class="hljs-string">"t"</span>, block.timestamp)(<span class="hljs-string">"c"</span>, now);
+   <span class="hljs-comment">// 将生产的区块同步广播到网络中</span>
+   fc::async( [<span class="hljs-keyword">this</span>,block](){ p2p_node().broadcast(net::block_message(block)); } );
+
+   <span class="hljs-keyword">return</span> block_production_condition::produced;
+}</code></pre> 
+  <p>可以看到在<code>maybe_produce_block()</code>方法中，进行了各种条件判断，只有满足了所有条件才开始生产区块，并将生产后区块广播同步到网络中的其他节点。这里先介绍3个方法<code>get_slot_time()</code>、<code>get_slot_at_time()</code>和<code>get_scheduled_witness()</code>。</p> 
+  <p><code>get_slot_time()</code>方法，获得未来的第n个区块生产时间槽的时刻：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">fc::time_point_sec database::get_slot_time(uint32_t slot_num)<span class="hljs-keyword">const</span>
+{
+   <span class="hljs-keyword">if</span>( slot_num == <span class="hljs-number">0</span> )
+      <span class="hljs-keyword">return</span> fc::time_point_sec();
+
+    <span class="hljs-comment">// 区块生产时间间隔</span>
+   <span class="hljs-keyword">auto</span> interval = block_interval();
+   <span class="hljs-keyword">const</span> dynamic_global_property_object&amp; dpo = get_dynamic_global_properties();
+
+   <span class="hljs-keyword">if</span>( head_block_num() == <span class="hljs-number">0</span> )
+   {
+      <span class="hljs-comment">// 特殊情况，生产创世区块的时刻</span>
+      fc::time_point_sec genesis_time = dpo.time;
+      <span class="hljs-keyword">return</span> genesis_time + slot_num * interval;
+   }
+
+    <span class="hljs-comment">// 获取前一个区块生产时间槽时刻</span>
+   int64_t head_block_abs_slot = head_block_time().sec_since_epoch() / interval;
+   fc::time_point_sec head_slot_time(head_block_abs_slot * interval);
+
+   <span class="hljs-keyword">const</span> global_property_object&amp; gpo = get_global_properties();
+
+    <span class="hljs-comment">// 如果当前为区块链维护时刻，则跳过指定个时间槽</span>
+   <span class="hljs-keyword">if</span>( dpo.dynamic_flags &amp; dynamic_global_property_object::maintenance_flag )
+      slot_num += gpo.parameters.maintenance_skip_slots;
+
+  <span class="hljs-comment">// 前一个生产时间+若干生产间隔</span>
+   <span class="hljs-keyword">return</span> head_slot_time + (slot_num * interval);
+}</code></pre> 
+  <p><code>get_slot_at_time()</code>方法主要是获取指定时间属于未来哪个时间槽：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">uint32_t database::get_slot_at_time(fc::time_point_sec when)<span class="hljs-keyword">const</span>
+{
+   fc::time_point_sec first_slot_time = get_slot_time( <span class="hljs-number">1</span> );
+    <span class="hljs-comment">// 判断指定的时间是否已经过时</span>
+   <span class="hljs-keyword">if</span>( when &lt; first_slot_time )
+      <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>;
+   <span class="hljs-keyword">return</span> (when - first_slot_time).to_seconds() / block_interval() + <span class="hljs-number">1</span>;
+}</code></pre> 
+  <p><code>get_scheduled_witness()</code>方法实现了获取指定时间槽的区块生产调度证人：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">witness_id_type database::get_scheduled_witness( uint32_t slot_num )<span class="hljs-keyword">const</span>
+{
+   <span class="hljs-keyword">const</span> dynamic_global_property_object&amp; dpo = get_dynamic_global_properties();
+   <span class="hljs-keyword">const</span> witness_schedule_object&amp; wso = witness_schedule_id_type()(*<span class="hljs-keyword">this</span>);
+   <span class="hljs-comment">// 计算调度偏移量</span>
+   uint64_t current_aslot = dpo.current_aslot + slot_num;
+   <span class="hljs-keyword">return</span> wso.current_shuffled_witnesses[ current_aslot % wso.current_shuffled_witnesses.size() ];
+}</code></pre> 
+  <p>这里就和前面讲的洗牌算法衔接上了，<code>get_scheduled_witness()</code>方法是从洗牌后的集合<code>current_shuffled_witnesses</code>中获取证人。</p> 
+  <p>下面再回到<code>maybe_produce_block()</code>方法中来，在该方法中调用了<code>generate_block()</code>方法生产区块，其实现如下：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">signed_block database::generate_block(
+   fc::time_point_sec when,
+   witness_id_type witness_id,
+   <span class="hljs-keyword">const</span> fc::ecc::private_key&amp; block_signing_private_key,
+   uint32_t skip <span class="hljs-comment">/* = 0 */</span>
+   )
+{ <span class="hljs-keyword">try</span> {
+   signed_block result;
+   detail::with_skip_flags( *<span class="hljs-keyword">this</span>, skip, [&amp;]()
+   {
+       <span class="hljs-comment">// 调用实际生产区块方法</span>
+      result = _generate_block( when, witness_id, block_signing_private_key );
+   } );
+   <span class="hljs-keyword">return</span> result;
+} FC_CAPTURE_AND_RETHROW() }</code></pre> 
+  <p>在该方法中才调用用实际生产区块的方法<code>_generate_block()</code>：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">signed_block database::_generate_block(
+   fc::time_point_sec when,
+   witness_id_type witness_id,
+   <span class="hljs-keyword">const</span> fc::ecc::private_key&amp; block_signing_private_key
+   )
+{
+   <span class="hljs-keyword">try</span> {
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-keyword">static</span> <span class="hljs-keyword">const</span> size_t max_block_header_size = fc::raw::pack_size( signed_block_header() ) + <span class="hljs-number">4</span>;
+   <span class="hljs-keyword">auto</span> maximum_block_size = get_global_properties().parameters.maximum_block_size;
+   size_t total_block_size = max_block_header_size;
+
+   signed_block pending_block;
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-keyword">for</span>( <span class="hljs-keyword">const</span> processed_transaction&amp; tx : _pending_tx )
+   {
+      size_t new_total_size = total_block_size + fc::raw::pack_size( tx );
+
+      <span class="hljs-comment">// 计算交易大小，防止超过最大限度</span>
+      <span class="hljs-keyword">if</span>( new_total_size &gt;= maximum_block_size )
+      {
+         postponed_tx_count++;
+         <span class="hljs-keyword">continue</span>;
+      }
+
+      <span class="hljs-keyword">try</span>
+      {
+         <span class="hljs-keyword">auto</span> temp_session = _undo_db.start_undo_session();
+         processed_transaction ptx = _apply_transaction( tx );
+         temp_session.merge();
+
+         <span class="hljs-comment">// 将交易添加到区块中</span>
+         total_block_size += fc::raw::pack_size( ptx );
+         pending_block.transactions.push_back( ptx );
+      }
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+   }
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   pending_block.previous = head_block_id(); <span class="hljs-comment">// 添加上一个区块id</span>
+   pending_block.timestamp = when; <span class="hljs-comment">//添加时间戳</span>
+   pending_block.transaction_merkle_root = pending_block.calculate_merkle_root(); <span class="hljs-comment">//添加交易树根</span>
+   pending_block.witness = witness_id; <span class="hljs-comment">//更新证人id</span>
+
+    <span class="hljs-comment">// 签名</span>
+   <span class="hljs-keyword">if</span>( !(skip &amp; skip_witness_signature) )
+      pending_block.sign( block_signing_private_key );
+
+   <span class="hljs-comment">// 检查区块大小</span>
+   <span class="hljs-keyword">if</span>( !(skip &amp; skip_block_size_check) )
+   {
+      FC_ASSERT( fc::raw::pack_size(pending_block) &lt;= get_global_properties().parameters.maximum_block_size );
+   }
+
+    <span class="hljs-comment">// 调用推块方法</span>
+   push_block( pending_block, skip );
+
+   <span class="hljs-keyword">return</span> pending_block;
+} FC_CAPTURE_AND_RETHROW( (witness_id) ) }</code></pre> 
+  <p>再来看将待定区块添加到链的实现过程<code>push_block()</code>：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">bool</span> database::push_block(<span class="hljs-keyword">const</span> signed_block&amp; new_block, uint32_t skip)
+{
+   <span class="hljs-keyword">bool</span> result;
+   detail::with_skip_flags( *<span class="hljs-keyword">this</span>, skip, [&amp;]()
+   {
+      detail::without_pending_transactions( *<span class="hljs-keyword">this</span>, <span class="hljs-built_in">std</span>::move(_pending_tx),
+      [&amp;]()
+      {
+          <span class="hljs-comment">// 调用实际的推块方法</span>
+         result = _push_block(new_block);
+      });
+   });
+   <span class="hljs-keyword">return</span> result;
+}</code></pre> 
+  <p>在该方法中调用实际的推块的方法<code>_push_block()</code>，其实现如下:</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">bool</span> database::_push_block(<span class="hljs-keyword">const</span> signed_block&amp; new_block)
+{ <span class="hljs-keyword">try</span> {
+   uint32_t skip = get_node_properties().skip_flags;
+
+   <span class="hljs-comment">// 在此处理区块链竞争分叉问题，理论讲解请参看本人翻译的另一篇文章：</span>
+   <span class="hljs-comment">// https://blog.csdn.net/ggq89/article/details/80072876</span>
+
+   <span class="hljs-keyword">try</span> {
+      <span class="hljs-keyword">auto</span> session = _undo_db.start_undo_session();
+      <span class="hljs-comment">// 将新区块添加到链上</span>
+      apply_block(new_block, skip);
+      <span class="hljs-comment">// 存入数据库</span>
+      _block_id_to_block.store(new_block.id(), new_block);
+      session.commit();
+   } <span class="hljs-keyword">catch</span> ( <span class="hljs-keyword">const</span> fc::exception&amp; e ) {
+      elog(<span class="hljs-string">"Failed to push new block:\n${e}"</span>, (<span class="hljs-string">"e"</span>, e.to_detail_string()));
+      _fork_db.remove(new_block.id());
+      <span class="hljs-keyword">throw</span>;
+   }
+
+   <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+} FC_CAPTURE_AND_RETHROW( (new_block) ) }</code></pre> 
+  <p>下面再看<code>apply_block()</code>的实现过程：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">void</span> database::apply_block( <span class="hljs-keyword">const</span> signed_block&amp; next_block, uint32_t skip )
+{
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   detail::with_skip_flags( *<span class="hljs-keyword">this</span>, skip, [&amp;]()
+   {
+       <span class="hljs-comment">// 在此调用实际的添加区块方法</span>
+      _apply_block( next_block );
+   } );
+   <span class="hljs-keyword">return</span>;
+}</code></pre> 
+  <p>到这里就和前面所讲的全部内容衔接在一起了，这个第三次代码跟踪到<code>_apply_block()</code>方法，至此整个dpos共识过程基本讲解完毕。最后只剩下整个应用程序的初始化过程了</p> 
+  <h1 id="5-证人节点初始化">5. 证人节点初始化</h1> 
+  <p>证人节点初始化的代码流程图： <br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180517201622875" alt="这里写图片描述" title=""></p> 
+  <p>留下有个疑问，整个程序最开始运行时，证人节点是如何初始化的呢？实际上初始数据是在<code>init_genesis()</code>方法中初始的：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 初始创世数据</span>
+<span class="hljs-keyword">void</span> database::init_genesis(<span class="hljs-keyword">const</span> genesis_state_type&amp; genesis_state)
+{ <span class="hljs-keyword">try</span> {
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-comment">// 创建初始账户</span>
+   <span class="hljs-keyword">for</span>( <span class="hljs-keyword">const</span> <span class="hljs-keyword">auto</span>&amp; account : genesis_state.initial_accounts )
+   {
+      account_create_operation cop;
+      cop.name = account.name;
+      cop.registrar = GRAPHENE_TEMP_ACCOUNT;
+      cop.owner = authority(<span class="hljs-number">1</span>, account.owner_key, <span class="hljs-number">1</span>);
+      <span class="hljs-keyword">if</span>( account.active_key == public_key_type() )
+      {
+         cop.active = cop.owner;
+         cop.options.memo_key = account.owner_key;
+      }
+      <span class="hljs-keyword">else</span>
+      {
+         cop.active = authority(<span class="hljs-number">1</span>, account.active_key, <span class="hljs-number">1</span>);
+         cop.options.memo_key = account.active_key;
+      }
+      account_id_type account_id(apply_operation(genesis_eval_state, cop).get&lt;object_id_type&gt;());
+
+      <span class="hljs-keyword">if</span>( account.is_lifetime_member )
+      {
+          account_upgrade_operation op;
+          op.account_to_upgrade = account_id;
+          op.upgrade_to_lifetime_member = <span class="hljs-keyword">true</span>;
+          apply_operation(genesis_eval_state, op);
+      }
+   }
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-comment">// 创建初始证人</span>
+   <span class="hljs-built_in">std</span>::for_each(genesis_state.initial_witness_candidates.begin(), genesis_state.initial_witness_candidates.end(),
+                 [&amp;](<span class="hljs-keyword">const</span> genesis_state_type::initial_witness_type&amp; witness) {
+      witness_create_operation op;
+      op.witness_account = get_account_id(witness.owner_name);
+      op.block_signing_key = witness.block_signing_key;
+      apply_operation(genesis_eval_state, op);
+   });
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-comment">// 设置活跃证人</span>
+   modify(get_global_properties(), [&amp;](global_property_object&amp; p) {
+      <span class="hljs-keyword">for</span>( uint32_t i = <span class="hljs-number">1</span>; i &lt;= genesis_state.initial_active_witnesses; ++i )
+      {
+         p.active_witnesses.insert(witness_id_type(i));
+      }
+   });
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   <span class="hljs-comment">// 创建证人调度顺序</span>
+   create&lt;witness_schedule_object&gt;([&amp;]( witness_schedule_object&amp; wso )
+   {
+      <span class="hljs-keyword">for</span>( <span class="hljs-keyword">const</span> witness_id_type&amp; wid : get_global_properties().active_witnesses )
+         wso.current_shuffled_witnesses.push_back( wid );
+   });
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+} FC_CAPTURE_AND_RETHROW() }</code></pre> 
+  <p>整个<code>init_genesis()</code>方法都在进行各种属性值的初始，且创世数据是通过参数<code>genesis_state</code>传入，而该方法又在<code>open()</code>方法中调用：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 打开指定路径的数据库，如果存在就新建</span>
+<span class="hljs-keyword">void</span> database::open(
+   <span class="hljs-keyword">const</span> fc::path&amp; data_dir,
+   <span class="hljs-built_in">std</span>::function&lt;genesis_state_type()&gt; genesis_loader,
+   <span class="hljs-keyword">const</span> <span class="hljs-built_in">std</span>::<span class="hljs-built_in">string</span>&amp; db_version)
+{
+   <span class="hljs-keyword">try</span>
+   {
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 如果全局属性不存在，则初始创世数据</span>
+      <span class="hljs-keyword">if</span>( !find(global_property_id_type()) )
+         init_genesis(genesis_loader());
+
+    <span class="hljs-comment">//其他处理</span>
+    ......
+
+   }
+   FC_CAPTURE_LOG_AND_RETHROW( (data_dir) )
+}</code></pre> 
+  <p>可以看到在<code>open()</code>方法中调用<code>init_genesis()</code>方法时，其参数是通过调用<code>genesis_loader()</code>方法的返回值对<code>init_genesis()</code>方法的实参进行赋值。而<code>init_genesis()</code>方法也是<code>open()</code>方法的参数之一，而<code>open()</code>方法又是在<code>startup()</code>中调用：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">void</span> startup()
+      { <span class="hljs-keyword">try</span> {
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+         <span class="hljs-keyword">auto</span> initial_state = [<span class="hljs-keyword">this</span>] {
+            ilog(<span class="hljs-string">"Initializing database..."</span>);
+            <span class="hljs-comment">// 通过命令行参数指定genesis.json文件路径</span>
+            <span class="hljs-keyword">if</span>( _options-&gt;count(<span class="hljs-string">"genesis-json"</span>) )
+            {
+               <span class="hljs-built_in">std</span>::<span class="hljs-built_in">string</span> genesis_str;
+               <span class="hljs-comment">// 1. 读取genesis.json文件</span>
+               fc::read_file_contents( _options-&gt;at(<span class="hljs-string">"genesis-json"</span>).as&lt;boost::filesystem::path&gt;(), genesis_str );
+               <span class="hljs-comment">// 2. 从json字符串中获取创世状态数据</span>
+               genesis_state_type genesis = fc::json::from_string( genesis_str ).as&lt;genesis_state_type&gt;( <span class="hljs-number">20</span> );
+               <span class="hljs-keyword">bool</span> modified_genesis = <span class="hljs-keyword">false</span>;
+               <span class="hljs-keyword">if</span>( _options-&gt;count(<span class="hljs-string">"genesis-timestamp"</span>) )
+               {
+                  genesis.initial_timestamp = fc::time_point_sec( fc::time_point::now() )
+                                            + genesis.initial_parameters.block_interval
+                                            + _options-&gt;at(<span class="hljs-string">"genesis-timestamp"</span>).as&lt;uint32_t&gt;();
+                  genesis.initial_timestamp -= ( genesis.initial_timestamp.sec_since_epoch()
+                                                 % genesis.initial_parameters.block_interval );
+                  modified_genesis = <span class="hljs-keyword">true</span>;
+                  <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Used genesis timestamp: "</span> &lt;&lt; genesis.initial_timestamp.to_iso_string()
+                            &lt;&lt; <span class="hljs-string">" (PLEASE RECORD THIS)\n"</span>;
+               }
+               <span class="hljs-keyword">if</span>( _options-&gt;count(<span class="hljs-string">"dbg-init-key"</span>) )
+               {
+                  <span class="hljs-built_in">std</span>::<span class="hljs-built_in">string</span> init_key = _options-&gt;at( <span class="hljs-string">"dbg-init-key"</span> ).as&lt;<span class="hljs-built_in">string</span>&gt;();
+                  FC_ASSERT( genesis.initial_witness_candidates.size() &gt;= genesis.initial_active_witnesses );
+                  set_dbg_init_key( genesis, init_key );
+                  modified_genesis = <span class="hljs-keyword">true</span>;
+                  <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Set init witness key to "</span> &lt;&lt; init_key &lt;&lt; <span class="hljs-string">"\n"</span>;
+               }
+               <span class="hljs-keyword">if</span>( modified_genesis )
+               {
+                  <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"WARNING: GENESIS WAS MODIFIED, YOUR CHAIN ID MAY BE DIFFERENT\n"</span>;
+                  genesis_str += <span class="hljs-string">"BOGUS"</span>;
+                  genesis.initial_chain_id = fc::sha256::hash( genesis_str );
+               }
+               <span class="hljs-keyword">else</span>
+                  genesis.initial_chain_id = fc::sha256::hash( genesis_str );
+               <span class="hljs-keyword">return</span> genesis;
+            }
+            <span class="hljs-comment">// 如果没指定genesis.json文件，则初始为空串</span>
+            <span class="hljs-keyword">else</span>
+            {
+               <span class="hljs-built_in">std</span>::<span class="hljs-built_in">string</span> egenesis_json;
+               <span class="hljs-comment">// 初始json文件为空串</span>
+               graphene::egenesis::compute_egenesis_json( egenesis_json );
+               FC_ASSERT( egenesis_json != <span class="hljs-string">""</span> );
+               FC_ASSERT( graphene::egenesis::get_egenesis_json_hash() == fc::sha256::hash( egenesis_json ) );
+               <span class="hljs-keyword">auto</span> genesis = fc::json::from_string( egenesis_json ).as&lt;genesis_state_type&gt;( <span class="hljs-number">20</span> );
+               genesis.initial_chain_id = fc::sha256::hash( egenesis_json );
+               <span class="hljs-keyword">return</span> genesis;
+            }
+         };
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+         <span class="hljs-keyword">try</span>
+         {
+         <span class="hljs-comment">// 打开数据库</span>
+            _chain_db-&gt;open( _data_dir / <span class="hljs-string">"blockchain"</span>, initial_state, GRAPHENE_CURRENT_DB_VERSION );
+         }
+         <span class="hljs-keyword">catch</span>( <span class="hljs-keyword">const</span> fc::exception&amp; e )
+         {
+            elog( <span class="hljs-string">"Caught exception ${e} in open(), you might want to force a replay"</span>, (<span class="hljs-string">"e"</span>, e.to_detail_string()) );
+            <span class="hljs-keyword">throw</span>;
+         }
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+      } FC_LOG_AND_RETHROW() }</code></pre> 
+  <p>在<code>startup()</code>中包含了创世状态的实际初始过程<code>initial_state</code>函数指针（即<code>genesis_loader()</code>方法实际执行的是<code>initial_state</code>函数指针指向的代码），在<code>initial_state</code>的实现过程中通过命令行参数<code>_options</code>读取指定<code>genesis.json</code>文件的内容进行处理，而<code>_options</code>的赋值和<code>startup()</code>的调用都是在<code>main()</code>方法中进行的：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 证人节点应用程序入口</span>
+<span class="hljs-keyword">int</span> main(<span class="hljs-keyword">int</span> argc, <span class="hljs-keyword">char</span>** argv) {
+    <span class="hljs-comment">// 创建应用</span>
+   app::application* node = <span class="hljs-keyword">new</span> app::application();
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 命令行参数变量</span>
+      bpo::variables_map options;
+
+    <span class="hljs-comment">// 注册证人插件</span>
+      <span class="hljs-keyword">auto</span> witness_plug = node-&gt;register_plugin&lt;witness_plugin::witness_plugin&gt;();
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 命令行参数处理</span>
+      <span class="hljs-keyword">try</span>
+      {
+         bpo::options_description cli, cfg;
+         <span class="hljs-comment">// 设置其他命令行参数</span>
+         node-&gt;set_program_options(cli, cfg);
+         app_options.add(cli);
+         cfg_options.add(cfg);
+         <span class="hljs-comment">//解析命令行参数</span>
+         bpo::store(bpo::parse_command_line(argc, argv, app_options), options);
+      }
+      <span class="hljs-keyword">catch</span> (<span class="hljs-keyword">const</span> boost::program_options::error&amp; e)
+      {
+        <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Error parsing command line: "</span> &lt;&lt; e.what() &lt;&lt; <span class="hljs-string">"\n"</span>;
+        <span class="hljs-keyword">return</span> <span class="hljs-number">1</span>;
+      }
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+    <span class="hljs-comment">// 程序初始化</span>
+      node-&gt;initialize(data_dir, options);
+      node-&gt;initialize_plugins( options );
+
+    <span class="hljs-comment">// 启动程序</span>
+      node-&gt;startup();
+    <span class="hljs-comment">// 启动相关插件</span>
+      node-&gt;startup_plugins();
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+
+}</code></pre> 
+  <p>到这里我们又跟踪代码到<code>main()</code>方法，至此包括初始化和共识的主要过程全部讲解完毕。</p> 
+  <h1 id="6-创建genesisjson文件">6. 创建genesis.json文件</h1> 
+  <p>创建<code>genesis.json</code>文件的代码流程图如下： <br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180517174434967" alt="这里写图片描述" title=""></p> 
+  <p>最后，讲解一个<strong>BitShares</strong>中有意思事情，也是上一节留的一点尾巴，就是<strong>BitShares</strong>的<code>genesis.json</code>文件其实不用手动编写，而是调用程序自动生成的，这一点的<strong>Ethereum</strong>不一样。之前学习<strong>Ethereum</strong>时，<code>genesis.json</code>弄好好久才弄好，官方文档给的实例确定几个核心字段，最后在论坛中才找到解决方法：</p> 
+  <p><strong>BitShares</strong>的<code>genesis.json</code>文件是通过运行以下指令创建的（请参考官网：<a href="http://docs.bitshares.org/testnet/2-genesis.html" rel="nofollow">GENESIS CONFIGURATION</a>）：</p> 
+  <pre class="prettyprint"><code class=" hljs lasso">programs/witness_node/witness_node <span class="hljs-subst">--</span>create<span class="hljs-attribute">-genesis</span><span class="hljs-attribute">-json</span> genesis/my<span class="hljs-attribute">-genesis</span><span class="hljs-built_in">.</span>json</code></pre> 
+  <p>而在程序中，又是怎么执行，请回头看<code>main()</code>方法，在该方法中调用了<code>initialize()</code>方法：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 程序初始化</span>
+<span class="hljs-keyword">void</span> application::initialize(<span class="hljs-keyword">const</span> fc::path&amp; data_dir, <span class="hljs-keyword">const</span> boost::program_options::variables_map&amp; options)
+{
+   my-&gt;_data_dir = data_dir;
+   my-&gt;_options = &amp;options;
+
+    <span class="hljs-comment">// 如果执行程序有"create-genesis-json"参数</span>
+   <span class="hljs-keyword">if</span>( options.count(<span class="hljs-string">"create-genesis-json"</span>) )
+   {
+      fc::path genesis_out = options.at(<span class="hljs-string">"create-genesis-json"</span>).as&lt;boost::filesystem::path&gt;();
+      <span class="hljs-comment">// 创建genesis.json文件内容</span>
+      genesis_state_type genesis_state = detail::create_example_genesis();
+      <span class="hljs-keyword">if</span>( fc::exists(genesis_out) )
+      {
+         <span class="hljs-keyword">try</span> {
+            genesis_state = fc::json::from_file(genesis_out).as&lt;genesis_state_type&gt;( <span class="hljs-number">20</span> );
+         } <span class="hljs-keyword">catch</span>(<span class="hljs-keyword">const</span> fc::exception&amp; e) {
+            <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Unable to parse existing genesis file:\n"</span> &lt;&lt; e.to_string()
+                      &lt;&lt; <span class="hljs-string">"\nWould you like to replace it? [y/N] "</span>;
+            <span class="hljs-keyword">char</span> response = <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cin</span>.get();
+            <span class="hljs-keyword">if</span>( <span class="hljs-built_in">toupper</span>(response) != <span class="hljs-string">'Y'</span> )
+               <span class="hljs-keyword">return</span>;
+         }
+
+         <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Updating genesis state in file "</span> &lt;&lt; genesis_out.generic_string() &lt;&lt; <span class="hljs-string">"\n"</span>;
+      } <span class="hljs-keyword">else</span> {
+         <span class="hljs-built_in">std</span>::<span class="hljs-built_in">cerr</span> &lt;&lt; <span class="hljs-string">"Creating example genesis state in file "</span> &lt;&lt; genesis_out.generic_string() &lt;&lt; <span class="hljs-string">"\n"</span>;
+      }
+      <span class="hljs-comment">// 保存到genesis.json文件</span>
+      fc::json::save_to_file(genesis_state, genesis_out);
+
+      <span class="hljs-built_in">std</span>::<span class="hljs-built_in">exit</span>(EXIT_SUCCESS);
+   }
+
+     <span class="hljs-comment">//其他处理</span>
+    ......
+}</code></pre> 
+  <p>在<code>initialize()</code>方法中，调用了<code>create_example_genesis()</code>方法创建<code>genesis.json</code>文件内容，其实现如下：</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 创建genesis.json实例文件</span>
+genesis_state_type create_example_genesis() {
+      <span class="hljs-comment">// 生成密钥</span>
+      <span class="hljs-keyword">auto</span> nathan_key = fc::ecc::private_key::regenerate(fc::sha256::hash(<span class="hljs-built_in">string</span>(<span class="hljs-string">"nathan"</span>)));
+      dlog(<span class="hljs-string">"Allocating all stake to ${key}"</span>, (<span class="hljs-string">"key"</span>, utilities::key_to_wif(nathan_key)));
+      genesis_state_type initial_state;
+      <span class="hljs-comment">// 设置各种创始值</span>
+      initial_state.initial_parameters.current_fees = fee_schedule::get_default();<span class="hljs-comment">//-&gt;set_all_fees(GRAPHENE_BLOCKCHAIN_PRECISION);</span>
+      <span class="hljs-comment">// 设置初始活跃证人数量</span>
+      initial_state.initial_active_witnesses = GRAPHENE_DEFAULT_MIN_WITNESS_COUNT;
+      initial_state.initial_timestamp = time_point_sec(time_point::now().sec_since_epoch() /
+            initial_state.initial_parameters.block_interval *
+            initial_state.initial_parameters.block_interval);
+      <span class="hljs-keyword">for</span>( uint64_t i = <span class="hljs-number">0</span>; i &lt; initial_state.initial_active_witnesses; ++i )
+      {
+         <span class="hljs-keyword">auto</span> name = <span class="hljs-string">"init"</span>+fc::to_string(i);
+         <span class="hljs-comment">// 设置初始账户</span>
+         initial_state.initial_accounts.emplace_back(name,
+                                                     nathan_key.get_public_key(),
+                                                     nathan_key.get_public_key(),
+                                                     <span class="hljs-keyword">true</span>);
+         initial_state.initial_committee_candidates.push_back({name});
+         <span class="hljs-comment">// 设置初始证人替补</span>
+         initial_state.initial_witness_candidates.push_back({name, nathan_key.get_public_key()});
+      }
+
+      initial_state.initial_accounts.emplace_back(<span class="hljs-string">"nathan"</span>, nathan_key.get_public_key());
+      initial_state.initial_balances.push_back({nathan_key.get_public_key(),
+                                                GRAPHENE_SYMBOL,
+                                                GRAPHENE_MAX_SHARE_SUPPLY});
+      initial_state.initial_chain_id = fc::sha256::hash( <span class="hljs-string">"BOGUS"</span> );
+
+      <span class="hljs-keyword">return</span> initial_state;
+   }</code></pre> 
+  <h1 id="7-dpos共识代码流程图">7. DPoS共识代码流程图</h1> 
+  <p>本人 ProcessOn 上 BTS的DPoS共识代码流程图 原图链接请点击：<a href="https://www.processon.com/view/link/5af01c73e4b001f7e0c5fdc6" rel="nofollow">BTS的DPoS共识代码流程图</a></p> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180517201710210" alt="BTS的DPoS共识代码流程图" title=""></p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/ggq89/article/details/80068306,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/ggq89/article/details/80068306,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

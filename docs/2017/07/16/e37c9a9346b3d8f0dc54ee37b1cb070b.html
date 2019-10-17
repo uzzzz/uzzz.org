@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>bigchaindb源码分析（七）——投票 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="bigchaindb源码分析（七）——投票" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="现在我们来根据源码分析（六）的思路来分析投票进程（votes），vote进程也是一个pipeline # bigchaindb/pipelines/vote.py def start(): &quot;&quot;&quot;Create, start, and return the block pipeline.&quot;&quot;&quot; pipeline = create_pipeline() pipeline.setup(indata=get_changefeed()) pipeline.start() return pipeline def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 对于一个pipeline，我们还是首先来找到它的indata是什么，根据indata我们会知道什么时候会触发pipeline indata 按照get_changefeed函数体字面上的意思与block进程的逻辑，我们先猜测该函数将首先找到最后的投票区块，然后再对于这个最后的区块之后所有添加的区块都使用yield进行抛出到indata的输入队列中 获取最后一个投票过的区块id 先来看如何获取最后一个投票的区块，对应的函数为get_last_voted_block # bigchaindb/core.py def get_last_voted_block(self): &quot;&quot;&quot;Returns the last block that this node voted on.&quot;&quot;&quot; last_block_id = backend.query.get_last_voted_block_id(self.connection, self.me) return Block.from_dict(self.get_block(last_block_id)) backend.query很明显又使用了singledispatch，所以最终实现函数在bigchaindb/backend/mongodb/query.py中，注意第二个参数为本节点（投票节点）的公钥 # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_last_voted_block_id(conn, node_pubkey): last_voted = conn.run( conn.collection(&#39;votes&#39;) .find({&#39;node_pubkey&#39;: node_pubkey}, sort=[(&#39;vote.timestamp&#39;, -1)])) if last_voted.count() == 0: return get_genesis_block(conn)[&#39;id&#39;] mapping = {v[&#39;vote&#39;][&#39;previous_block&#39;]: v[&#39;vote&#39;][&#39;voting_for_block&#39;] for v in last_voted} last_block_id = list(mapping.values())[0] explored = set() while True: try: if last_block_id in explored: raise CyclicBlockchainError() explored.add(last_block_id) last_block_id = mapping[last_block_id] except KeyError: break return last_block_id get_last_voted_block_id将从votes表中找到所有自己投票过的记录，如果一条都没有，则直接返回创世区块的id。若是找到的话，创建一个hashmap，map的key为前一个区块，value为后一个区块，所以实际上记录了区块与区块之间的关系。之后取出hashmap中的第一个value，依次从hashmap中找该区块的子区块，直到无法找到为止。此时返回的将是最后一个本节点投票过的节点 获取反馈 当找到最后一个投票过的区块之后，反馈的基准线即已经建立，之后所以时间戳比该区块新的区块都应该进行投票 get_new_blocks_feed的最终实现也在bigchaindb/backend/mongodb/query.py中。首先从oplog中查找到最后一个投票过的区块的时间戳，然后调用run_changefeed函数 @register_query(MongoDBConnection) def get_new_blocks_feed(conn, start_block_id): namespace = conn.dbname + &#39;.bigchain&#39; match = {&#39;o.id&#39;: start_block_id, &#39;op&#39;: &#39;i&#39;, &#39;ns&#39;: namespace} # Neccesary to find in descending order since tests may write same block id several times query = conn.query().local.oplog.rs.find(match).sort(&#39;$natural&#39;, -1).next()[&#39;ts&#39;] last_ts = conn.run(query) feed = run_changefeed(conn, &#39;bigchain&#39;, last_ts) return (evt[&#39;o&#39;] for evt in feed if evt[&#39;op&#39;] == &#39;i&#39;) run_changefeed的代码在源码分析（六）已经进行了介绍，该函数是一个无限循环，不断从oplog中查找比输入的last_ts更新时间戳的记录，对这些记录通过yield关键进行抛出，同时将新记录的时间戳赋值给last_ts。如此循环，使得其能够监听所有bigchain表中新增的区块记录，当有新增区块时，get_new_blocks_feed即会把新区块返回 再看get_changefeed函数，该函数的返回值即为indata。get_new_blocks_feed的返回值是一个生成器（用圆括号而不是中括号）， def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 为了理解这段代码，我们来写个测试例子。可以看到Node类实际上只实例化一次，而每次只要yield抛出数据后，生成器的__next__即将指向新抛出的数据。因此，所有由get_new_blocks_feed抛出的新的区块将会被依次赋值给feed.__next__，而pipeline的Node类是一个无限循环，所有feed.__next__将会被调用，并将返回值放入到该Node的输出队列中，而feed.__next__()本身就为区块记录本身，故而，所有新区块全部放入到了输出队列中。indata的反馈成功建立 class Node(): def __init__(self, target): self.target = target print(&quot;init... &quot;, target) def test1(): for i in range(0, 3): yield i def invoke(): feed = (i for i in test1()) return Node(feed.__next__) indata = invoke() while True: print(indata.target()) 输出结果将为 init... &lt;method-wrapper &#39;__next__&#39; of generator object at 0x7f24338c4938&gt; 0 1 2 Traceback (most recent call last): File &quot;/root/workspace/test/yield.py&quot;, line 20, in &lt;module&gt; print(indata.target()) StopIteration pipeline 我们依旧先来看vote进程的pipeline的节点定义，很明显其pipeline的执行过程为indata-&gt;validate_block-&gt;ungroup-&gt;validate_tx-&gt;vote-&gt;write_vote，所有函数都在bigchaindb/pipelines/vote.py def create_pipeline(): voter = Vote() return Pipeline([ Node(voter.validate_block), Node(voter.ungroup), Node(voter.validate_tx, fraction_of_cores=1), Node(voter.vote), Node(voter.write_vote) ]) validate_block 在进入该函数时，首先判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。否则调用from_db来重构区块，这一步主要是为了更新本区块中所有的asset项，如若重构区块失败，则直接返回一个无效的事务invalid_dummy_tx，使得pipeline依旧生效，同时确保pipeline的最后结果为验证失败。若重构区块成功，则调用_validate_block来验证区块，若验证失败同样返回无效的事务invalid_dummy_tx给pipeline。若重构成功且验证区块成功，则将区块里的所有的事务返回给pipeline的下一个Node，等待更进一步处理 def validate_block(self, block_dict): if not self.bigchain.has_previous_vote(block_dict[&#39;id&#39;]): try: block = Block.from_db(self.bigchain, block_dict, from_dict_kwargs={ &#39;tx_construct&#39;: FastTransaction }) except (exceptions.InvalidHash): return block_dict[&#39;id&#39;], [self.invalid_dummy_tx] try: block._validate_block(self.bigchain) except exceptions.ValidationError: return block.id, [self.invalid_dummy_tx] return block.id, block_dict[&#39;block&#39;][&#39;transactions&#39;] 在判断vote中是否已经投票过的过程分为两步，首先是从vote表中找到本节点对该区块的所有投票记录，然后调用partition_eligible_votes对所查询到的投票记录验证本节点的签名。当存在通过签名验证的记录时，has_previous_vote将会返回真 # bighciandb/core.py def has_previous_vote(self, block_id): votes = list(backend.query.get_votes_by_block_id_and_voter(self.connection, block_id, self.me)) el, _ = self.consensus.voting.partition_eligible_votes(votes, [self.me]) return bool(el) # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_votes_by_block_id_and_voter(conn, block_id, node_pubkey): return conn.run( conn.collection(&#39;votes&#39;) .find({&#39;vote.voting_for_block&#39;: block_id, &#39;node_pubkey&#39;: node_pubkey}, projection={&#39;_id&#39;: False})) # bigchaindb/vote.py def partition_eligible_votes(cls, votes, eligible_voters): eligible, ineligible = ([], []) for vote in votes: voter_eligible = vote.get(&#39;node_pubkey&#39;) in eligible_voters if voter_eligible: try: if cls.verify_vote_signature(vote): eligible.append(vote) continue except ValueError: pass ineligible.append(vote) return eligible, ineligible 对区块的重构实际上在于对区块中所有事务的asset的更新。首先从区块中提取到所有asset的id，然后从assets表中找到这些id所对应的asset记录，然后调用couple_assets对区块中的CREATE事务（或者创世区块）的asset项更新为assets表中的记录。而TRANSFER事务只要维护着转移的asset的id即可（根据id可以找到asset记录） # bigchaindb/models.py def from_db(cls, bigchain, block_dict, from_dict_kwargs=None): asset_ids = cls.get_asset_ids(block_dict) assets = bigchain.get_assets(asset_ids) block_dict = cls.couple_assets(block_dict, assets) kwargs = from_dict_kwargs or {} return cls.from_dict(block_dict, **kwargs) 最后一步则是验证区块（不包括验证区块里的事务），验证分为三步：1）验证创建区块的节点是否位于联盟之内；2）验证区块的签名是否正确；3）验证区块中的事务是否有重复 def _validate_block(self, bigchain): # Check if the block was created by a federation node if self.node_pubkey not in bigchain.federation: raise SybilError(&#39;Only federation nodes can create blocks&#39;) # Check that the signature is valid if not self.is_signature_valid(): raise InvalidSignature(&#39;Invalid block signature&#39;) # Check that the block contains no duplicated transactions txids = [tx.id for tx in self.transactions] if len(txids) != len(set(txids)): raise DuplicateTransaction(&#39;Block has duplicate transaction&#39;) ungroup pipeline的上一Nodevalidate_block将会返回区块的id与区块中所有的事务给ungroupNode。ungroup操作及其简单，为直接使用生成器的方式将区块中的事务一个个地返回给pipeline的下一Node def ungroup(self, block_id, transactions): num_tx = len(transactions) for tx in transactions: yield tx, block_id, num_tx validate_tx 对于区块中每个事务，validate_tx将会首先判断该事务是否是一个“新的事务”，若是，则验证这个事务的签名。验证事务签名的函数tx.validate(self.bigchain)在之前已经介绍过，这里不再说明 def validate_tx(self, tx_dict, block_id, num_tx): try: tx = Transaction.from_dict(tx_dict) new = self.bigchain.is_new_transaction(tx.id, exclude_block_id=block_id) if not new: raise exceptions.ValidationError(&#39;Tx already exists, %s&#39;, tx.id) tx.validate(self.bigchain) valid = True except exceptions.ValidationError as e: valid = False logger.warning(&#39;Invalid tx: %s&#39;, e) return valid, block_id, num_tx 注意这个“新的事务”并不是指的首次创建的事务，而是，只有先前存在过，且投票不为invalid的事务才不是新的事务。is_new_transaction首先拿到所有包含有该事务的区块的投票状态，只有当存在投票不为invalid的（valid或者undecided）才返回False。简单来说，从未出现过的事务当然为新的事务，此外，还需要让事先投票为invalid的事务有机会来参与到新的投票环节中 def is_new_transaction(self, txid, exclude_block_id=None): block_statuses = self.get_blocks_status_containing_tx(txid) block_statuses.pop(exclude_block_id, None) for status in block_statuses.values(): if status != self.BLOCK_INVALID: return False return True vote Nodevote维护了一个名为counter的计数器，当计数器的数目等于本区块中事务的个数，且每个事务的验证节点都为True时，才构造一个由该投票节点签名的投票记录，将记录返回给pipeline的下一个Node。同时在返回给下一个Node之前，本投票节点实际上已经进行了投票（除了还没有将记录写入vote表中），所以此时要更新本节点最后一个投票的区块的id（每次投票时，投票记录中记录了本节点上一次投票的区块的id） def vote(self, tx_validity, block_id, num_tx): self.counters[block_id] += 1 self.validity[block_id] = tx_validity and self.validity.get(block_id, True) if self.counters[block_id] == num_tx: vote = self.bigchain.vote(block_id, self.last_voted_id, self.validity[block_id]) self.last_voted_id = block_id del self.counters[block_id] del self.validity[block_id] return vote, num_tx write_vote Nodewrite_vote则是将投票写入到vote表中 def write_vote(self, vote): return backend.query.write_vote(self.connection, vote) 至此投票的pipeline结束 总结 pipeline进程的流程为： indata: 找到本节点最后投票的区块，然后对这个最后的区块之后所有bigchain表中添加的区块都使用yield进行抛出到indata的输出队列中 validate_block：判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。若还未投票，则从assets表中查询该区块中所有事务的资产，并将CREATE事务（以及创世区块）的asset项更新为assets表中的记录。确保所有CREATE事务（以及创世区块）的asset项为完整的资产记录，而TRANSFER区块的asset项为asset的id validate_block：验证写区块节点身份，验证区块签名 validate_tx：对区块中的每个事务进行处理。若包含该事务的区块的投票结果为valid或者undecided，抛出“事务已经存在”的异常，否则验证事务的签名。这样给予了之前投票为invalid的事务再次被投票的机会 vote：当验证完本区块中的所有事务，且验证结果均为True时，构建投票记录，并对投票记录进行签名 write_vote：将投票记录写入votes表中 阅读更多" />
+<meta property="og:description" content="现在我们来根据源码分析（六）的思路来分析投票进程（votes），vote进程也是一个pipeline # bigchaindb/pipelines/vote.py def start(): &quot;&quot;&quot;Create, start, and return the block pipeline.&quot;&quot;&quot; pipeline = create_pipeline() pipeline.setup(indata=get_changefeed()) pipeline.start() return pipeline def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 对于一个pipeline，我们还是首先来找到它的indata是什么，根据indata我们会知道什么时候会触发pipeline indata 按照get_changefeed函数体字面上的意思与block进程的逻辑，我们先猜测该函数将首先找到最后的投票区块，然后再对于这个最后的区块之后所有添加的区块都使用yield进行抛出到indata的输入队列中 获取最后一个投票过的区块id 先来看如何获取最后一个投票的区块，对应的函数为get_last_voted_block # bigchaindb/core.py def get_last_voted_block(self): &quot;&quot;&quot;Returns the last block that this node voted on.&quot;&quot;&quot; last_block_id = backend.query.get_last_voted_block_id(self.connection, self.me) return Block.from_dict(self.get_block(last_block_id)) backend.query很明显又使用了singledispatch，所以最终实现函数在bigchaindb/backend/mongodb/query.py中，注意第二个参数为本节点（投票节点）的公钥 # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_last_voted_block_id(conn, node_pubkey): last_voted = conn.run( conn.collection(&#39;votes&#39;) .find({&#39;node_pubkey&#39;: node_pubkey}, sort=[(&#39;vote.timestamp&#39;, -1)])) if last_voted.count() == 0: return get_genesis_block(conn)[&#39;id&#39;] mapping = {v[&#39;vote&#39;][&#39;previous_block&#39;]: v[&#39;vote&#39;][&#39;voting_for_block&#39;] for v in last_voted} last_block_id = list(mapping.values())[0] explored = set() while True: try: if last_block_id in explored: raise CyclicBlockchainError() explored.add(last_block_id) last_block_id = mapping[last_block_id] except KeyError: break return last_block_id get_last_voted_block_id将从votes表中找到所有自己投票过的记录，如果一条都没有，则直接返回创世区块的id。若是找到的话，创建一个hashmap，map的key为前一个区块，value为后一个区块，所以实际上记录了区块与区块之间的关系。之后取出hashmap中的第一个value，依次从hashmap中找该区块的子区块，直到无法找到为止。此时返回的将是最后一个本节点投票过的节点 获取反馈 当找到最后一个投票过的区块之后，反馈的基准线即已经建立，之后所以时间戳比该区块新的区块都应该进行投票 get_new_blocks_feed的最终实现也在bigchaindb/backend/mongodb/query.py中。首先从oplog中查找到最后一个投票过的区块的时间戳，然后调用run_changefeed函数 @register_query(MongoDBConnection) def get_new_blocks_feed(conn, start_block_id): namespace = conn.dbname + &#39;.bigchain&#39; match = {&#39;o.id&#39;: start_block_id, &#39;op&#39;: &#39;i&#39;, &#39;ns&#39;: namespace} # Neccesary to find in descending order since tests may write same block id several times query = conn.query().local.oplog.rs.find(match).sort(&#39;$natural&#39;, -1).next()[&#39;ts&#39;] last_ts = conn.run(query) feed = run_changefeed(conn, &#39;bigchain&#39;, last_ts) return (evt[&#39;o&#39;] for evt in feed if evt[&#39;op&#39;] == &#39;i&#39;) run_changefeed的代码在源码分析（六）已经进行了介绍，该函数是一个无限循环，不断从oplog中查找比输入的last_ts更新时间戳的记录，对这些记录通过yield关键进行抛出，同时将新记录的时间戳赋值给last_ts。如此循环，使得其能够监听所有bigchain表中新增的区块记录，当有新增区块时，get_new_blocks_feed即会把新区块返回 再看get_changefeed函数，该函数的返回值即为indata。get_new_blocks_feed的返回值是一个生成器（用圆括号而不是中括号）， def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 为了理解这段代码，我们来写个测试例子。可以看到Node类实际上只实例化一次，而每次只要yield抛出数据后，生成器的__next__即将指向新抛出的数据。因此，所有由get_new_blocks_feed抛出的新的区块将会被依次赋值给feed.__next__，而pipeline的Node类是一个无限循环，所有feed.__next__将会被调用，并将返回值放入到该Node的输出队列中，而feed.__next__()本身就为区块记录本身，故而，所有新区块全部放入到了输出队列中。indata的反馈成功建立 class Node(): def __init__(self, target): self.target = target print(&quot;init... &quot;, target) def test1(): for i in range(0, 3): yield i def invoke(): feed = (i for i in test1()) return Node(feed.__next__) indata = invoke() while True: print(indata.target()) 输出结果将为 init... &lt;method-wrapper &#39;__next__&#39; of generator object at 0x7f24338c4938&gt; 0 1 2 Traceback (most recent call last): File &quot;/root/workspace/test/yield.py&quot;, line 20, in &lt;module&gt; print(indata.target()) StopIteration pipeline 我们依旧先来看vote进程的pipeline的节点定义，很明显其pipeline的执行过程为indata-&gt;validate_block-&gt;ungroup-&gt;validate_tx-&gt;vote-&gt;write_vote，所有函数都在bigchaindb/pipelines/vote.py def create_pipeline(): voter = Vote() return Pipeline([ Node(voter.validate_block), Node(voter.ungroup), Node(voter.validate_tx, fraction_of_cores=1), Node(voter.vote), Node(voter.write_vote) ]) validate_block 在进入该函数时，首先判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。否则调用from_db来重构区块，这一步主要是为了更新本区块中所有的asset项，如若重构区块失败，则直接返回一个无效的事务invalid_dummy_tx，使得pipeline依旧生效，同时确保pipeline的最后结果为验证失败。若重构区块成功，则调用_validate_block来验证区块，若验证失败同样返回无效的事务invalid_dummy_tx给pipeline。若重构成功且验证区块成功，则将区块里的所有的事务返回给pipeline的下一个Node，等待更进一步处理 def validate_block(self, block_dict): if not self.bigchain.has_previous_vote(block_dict[&#39;id&#39;]): try: block = Block.from_db(self.bigchain, block_dict, from_dict_kwargs={ &#39;tx_construct&#39;: FastTransaction }) except (exceptions.InvalidHash): return block_dict[&#39;id&#39;], [self.invalid_dummy_tx] try: block._validate_block(self.bigchain) except exceptions.ValidationError: return block.id, [self.invalid_dummy_tx] return block.id, block_dict[&#39;block&#39;][&#39;transactions&#39;] 在判断vote中是否已经投票过的过程分为两步，首先是从vote表中找到本节点对该区块的所有投票记录，然后调用partition_eligible_votes对所查询到的投票记录验证本节点的签名。当存在通过签名验证的记录时，has_previous_vote将会返回真 # bighciandb/core.py def has_previous_vote(self, block_id): votes = list(backend.query.get_votes_by_block_id_and_voter(self.connection, block_id, self.me)) el, _ = self.consensus.voting.partition_eligible_votes(votes, [self.me]) return bool(el) # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_votes_by_block_id_and_voter(conn, block_id, node_pubkey): return conn.run( conn.collection(&#39;votes&#39;) .find({&#39;vote.voting_for_block&#39;: block_id, &#39;node_pubkey&#39;: node_pubkey}, projection={&#39;_id&#39;: False})) # bigchaindb/vote.py def partition_eligible_votes(cls, votes, eligible_voters): eligible, ineligible = ([], []) for vote in votes: voter_eligible = vote.get(&#39;node_pubkey&#39;) in eligible_voters if voter_eligible: try: if cls.verify_vote_signature(vote): eligible.append(vote) continue except ValueError: pass ineligible.append(vote) return eligible, ineligible 对区块的重构实际上在于对区块中所有事务的asset的更新。首先从区块中提取到所有asset的id，然后从assets表中找到这些id所对应的asset记录，然后调用couple_assets对区块中的CREATE事务（或者创世区块）的asset项更新为assets表中的记录。而TRANSFER事务只要维护着转移的asset的id即可（根据id可以找到asset记录） # bigchaindb/models.py def from_db(cls, bigchain, block_dict, from_dict_kwargs=None): asset_ids = cls.get_asset_ids(block_dict) assets = bigchain.get_assets(asset_ids) block_dict = cls.couple_assets(block_dict, assets) kwargs = from_dict_kwargs or {} return cls.from_dict(block_dict, **kwargs) 最后一步则是验证区块（不包括验证区块里的事务），验证分为三步：1）验证创建区块的节点是否位于联盟之内；2）验证区块的签名是否正确；3）验证区块中的事务是否有重复 def _validate_block(self, bigchain): # Check if the block was created by a federation node if self.node_pubkey not in bigchain.federation: raise SybilError(&#39;Only federation nodes can create blocks&#39;) # Check that the signature is valid if not self.is_signature_valid(): raise InvalidSignature(&#39;Invalid block signature&#39;) # Check that the block contains no duplicated transactions txids = [tx.id for tx in self.transactions] if len(txids) != len(set(txids)): raise DuplicateTransaction(&#39;Block has duplicate transaction&#39;) ungroup pipeline的上一Nodevalidate_block将会返回区块的id与区块中所有的事务给ungroupNode。ungroup操作及其简单，为直接使用生成器的方式将区块中的事务一个个地返回给pipeline的下一Node def ungroup(self, block_id, transactions): num_tx = len(transactions) for tx in transactions: yield tx, block_id, num_tx validate_tx 对于区块中每个事务，validate_tx将会首先判断该事务是否是一个“新的事务”，若是，则验证这个事务的签名。验证事务签名的函数tx.validate(self.bigchain)在之前已经介绍过，这里不再说明 def validate_tx(self, tx_dict, block_id, num_tx): try: tx = Transaction.from_dict(tx_dict) new = self.bigchain.is_new_transaction(tx.id, exclude_block_id=block_id) if not new: raise exceptions.ValidationError(&#39;Tx already exists, %s&#39;, tx.id) tx.validate(self.bigchain) valid = True except exceptions.ValidationError as e: valid = False logger.warning(&#39;Invalid tx: %s&#39;, e) return valid, block_id, num_tx 注意这个“新的事务”并不是指的首次创建的事务，而是，只有先前存在过，且投票不为invalid的事务才不是新的事务。is_new_transaction首先拿到所有包含有该事务的区块的投票状态，只有当存在投票不为invalid的（valid或者undecided）才返回False。简单来说，从未出现过的事务当然为新的事务，此外，还需要让事先投票为invalid的事务有机会来参与到新的投票环节中 def is_new_transaction(self, txid, exclude_block_id=None): block_statuses = self.get_blocks_status_containing_tx(txid) block_statuses.pop(exclude_block_id, None) for status in block_statuses.values(): if status != self.BLOCK_INVALID: return False return True vote Nodevote维护了一个名为counter的计数器，当计数器的数目等于本区块中事务的个数，且每个事务的验证节点都为True时，才构造一个由该投票节点签名的投票记录，将记录返回给pipeline的下一个Node。同时在返回给下一个Node之前，本投票节点实际上已经进行了投票（除了还没有将记录写入vote表中），所以此时要更新本节点最后一个投票的区块的id（每次投票时，投票记录中记录了本节点上一次投票的区块的id） def vote(self, tx_validity, block_id, num_tx): self.counters[block_id] += 1 self.validity[block_id] = tx_validity and self.validity.get(block_id, True) if self.counters[block_id] == num_tx: vote = self.bigchain.vote(block_id, self.last_voted_id, self.validity[block_id]) self.last_voted_id = block_id del self.counters[block_id] del self.validity[block_id] return vote, num_tx write_vote Nodewrite_vote则是将投票写入到vote表中 def write_vote(self, vote): return backend.query.write_vote(self.connection, vote) 至此投票的pipeline结束 总结 pipeline进程的流程为： indata: 找到本节点最后投票的区块，然后对这个最后的区块之后所有bigchain表中添加的区块都使用yield进行抛出到indata的输出队列中 validate_block：判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。若还未投票，则从assets表中查询该区块中所有事务的资产，并将CREATE事务（以及创世区块）的asset项更新为assets表中的记录。确保所有CREATE事务（以及创世区块）的asset项为完整的资产记录，而TRANSFER区块的asset项为asset的id validate_block：验证写区块节点身份，验证区块签名 validate_tx：对区块中的每个事务进行处理。若包含该事务的区块的投票结果为valid或者undecided，抛出“事务已经存在”的异常，否则验证事务的签名。这样给予了之前投票为invalid的事务再次被投票的机会 vote：当验证完本区块中的所有事务，且验证结果均为True时，构建投票记录，并对投票记录进行签名 write_vote：将投票记录写入votes表中 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/07/16/e37c9a9346b3d8f0dc54ee37b1cb070b.html" />
+<meta property="og:url" content="https://uzzz.org/2017/07/16/e37c9a9346b3d8f0dc54ee37b1cb070b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-07-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"现在我们来根据源码分析（六）的思路来分析投票进程（votes），vote进程也是一个pipeline # bigchaindb/pipelines/vote.py def start(): &quot;&quot;&quot;Create, start, and return the block pipeline.&quot;&quot;&quot; pipeline = create_pipeline() pipeline.setup(indata=get_changefeed()) pipeline.start() return pipeline def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 对于一个pipeline，我们还是首先来找到它的indata是什么，根据indata我们会知道什么时候会触发pipeline indata 按照get_changefeed函数体字面上的意思与block进程的逻辑，我们先猜测该函数将首先找到最后的投票区块，然后再对于这个最后的区块之后所有添加的区块都使用yield进行抛出到indata的输入队列中 获取最后一个投票过的区块id 先来看如何获取最后一个投票的区块，对应的函数为get_last_voted_block # bigchaindb/core.py def get_last_voted_block(self): &quot;&quot;&quot;Returns the last block that this node voted on.&quot;&quot;&quot; last_block_id = backend.query.get_last_voted_block_id(self.connection, self.me) return Block.from_dict(self.get_block(last_block_id)) backend.query很明显又使用了singledispatch，所以最终实现函数在bigchaindb/backend/mongodb/query.py中，注意第二个参数为本节点（投票节点）的公钥 # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_last_voted_block_id(conn, node_pubkey): last_voted = conn.run( conn.collection(&#39;votes&#39;) .find({&#39;node_pubkey&#39;: node_pubkey}, sort=[(&#39;vote.timestamp&#39;, -1)])) if last_voted.count() == 0: return get_genesis_block(conn)[&#39;id&#39;] mapping = {v[&#39;vote&#39;][&#39;previous_block&#39;]: v[&#39;vote&#39;][&#39;voting_for_block&#39;] for v in last_voted} last_block_id = list(mapping.values())[0] explored = set() while True: try: if last_block_id in explored: raise CyclicBlockchainError() explored.add(last_block_id) last_block_id = mapping[last_block_id] except KeyError: break return last_block_id get_last_voted_block_id将从votes表中找到所有自己投票过的记录，如果一条都没有，则直接返回创世区块的id。若是找到的话，创建一个hashmap，map的key为前一个区块，value为后一个区块，所以实际上记录了区块与区块之间的关系。之后取出hashmap中的第一个value，依次从hashmap中找该区块的子区块，直到无法找到为止。此时返回的将是最后一个本节点投票过的节点 获取反馈 当找到最后一个投票过的区块之后，反馈的基准线即已经建立，之后所以时间戳比该区块新的区块都应该进行投票 get_new_blocks_feed的最终实现也在bigchaindb/backend/mongodb/query.py中。首先从oplog中查找到最后一个投票过的区块的时间戳，然后调用run_changefeed函数 @register_query(MongoDBConnection) def get_new_blocks_feed(conn, start_block_id): namespace = conn.dbname + &#39;.bigchain&#39; match = {&#39;o.id&#39;: start_block_id, &#39;op&#39;: &#39;i&#39;, &#39;ns&#39;: namespace} # Neccesary to find in descending order since tests may write same block id several times query = conn.query().local.oplog.rs.find(match).sort(&#39;$natural&#39;, -1).next()[&#39;ts&#39;] last_ts = conn.run(query) feed = run_changefeed(conn, &#39;bigchain&#39;, last_ts) return (evt[&#39;o&#39;] for evt in feed if evt[&#39;op&#39;] == &#39;i&#39;) run_changefeed的代码在源码分析（六）已经进行了介绍，该函数是一个无限循环，不断从oplog中查找比输入的last_ts更新时间戳的记录，对这些记录通过yield关键进行抛出，同时将新记录的时间戳赋值给last_ts。如此循环，使得其能够监听所有bigchain表中新增的区块记录，当有新增区块时，get_new_blocks_feed即会把新区块返回 再看get_changefeed函数，该函数的返回值即为indata。get_new_blocks_feed的返回值是一个生成器（用圆括号而不是中括号）， def get_changefeed(): &quot;&quot;&quot;Create and return ordered changefeed of blocks starting from last voted block&quot;&quot;&quot; b = Bigchain() last_block_id = b.get_last_voted_block().id feed = backend.query.get_new_blocks_feed(b.connection, last_block_id) return Node(feed.__next__, name=&#39;changefeed&#39;) 为了理解这段代码，我们来写个测试例子。可以看到Node类实际上只实例化一次，而每次只要yield抛出数据后，生成器的__next__即将指向新抛出的数据。因此，所有由get_new_blocks_feed抛出的新的区块将会被依次赋值给feed.__next__，而pipeline的Node类是一个无限循环，所有feed.__next__将会被调用，并将返回值放入到该Node的输出队列中，而feed.__next__()本身就为区块记录本身，故而，所有新区块全部放入到了输出队列中。indata的反馈成功建立 class Node(): def __init__(self, target): self.target = target print(&quot;init... &quot;, target) def test1(): for i in range(0, 3): yield i def invoke(): feed = (i for i in test1()) return Node(feed.__next__) indata = invoke() while True: print(indata.target()) 输出结果将为 init... &lt;method-wrapper &#39;__next__&#39; of generator object at 0x7f24338c4938&gt; 0 1 2 Traceback (most recent call last): File &quot;/root/workspace/test/yield.py&quot;, line 20, in &lt;module&gt; print(indata.target()) StopIteration pipeline 我们依旧先来看vote进程的pipeline的节点定义，很明显其pipeline的执行过程为indata-&gt;validate_block-&gt;ungroup-&gt;validate_tx-&gt;vote-&gt;write_vote，所有函数都在bigchaindb/pipelines/vote.py def create_pipeline(): voter = Vote() return Pipeline([ Node(voter.validate_block), Node(voter.ungroup), Node(voter.validate_tx, fraction_of_cores=1), Node(voter.vote), Node(voter.write_vote) ]) validate_block 在进入该函数时，首先判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。否则调用from_db来重构区块，这一步主要是为了更新本区块中所有的asset项，如若重构区块失败，则直接返回一个无效的事务invalid_dummy_tx，使得pipeline依旧生效，同时确保pipeline的最后结果为验证失败。若重构区块成功，则调用_validate_block来验证区块，若验证失败同样返回无效的事务invalid_dummy_tx给pipeline。若重构成功且验证区块成功，则将区块里的所有的事务返回给pipeline的下一个Node，等待更进一步处理 def validate_block(self, block_dict): if not self.bigchain.has_previous_vote(block_dict[&#39;id&#39;]): try: block = Block.from_db(self.bigchain, block_dict, from_dict_kwargs={ &#39;tx_construct&#39;: FastTransaction }) except (exceptions.InvalidHash): return block_dict[&#39;id&#39;], [self.invalid_dummy_tx] try: block._validate_block(self.bigchain) except exceptions.ValidationError: return block.id, [self.invalid_dummy_tx] return block.id, block_dict[&#39;block&#39;][&#39;transactions&#39;] 在判断vote中是否已经投票过的过程分为两步，首先是从vote表中找到本节点对该区块的所有投票记录，然后调用partition_eligible_votes对所查询到的投票记录验证本节点的签名。当存在通过签名验证的记录时，has_previous_vote将会返回真 # bighciandb/core.py def has_previous_vote(self, block_id): votes = list(backend.query.get_votes_by_block_id_and_voter(self.connection, block_id, self.me)) el, _ = self.consensus.voting.partition_eligible_votes(votes, [self.me]) return bool(el) # bigchaindb/backend/mongodb/query.py @register_query(MongoDBConnection) def get_votes_by_block_id_and_voter(conn, block_id, node_pubkey): return conn.run( conn.collection(&#39;votes&#39;) .find({&#39;vote.voting_for_block&#39;: block_id, &#39;node_pubkey&#39;: node_pubkey}, projection={&#39;_id&#39;: False})) # bigchaindb/vote.py def partition_eligible_votes(cls, votes, eligible_voters): eligible, ineligible = ([], []) for vote in votes: voter_eligible = vote.get(&#39;node_pubkey&#39;) in eligible_voters if voter_eligible: try: if cls.verify_vote_signature(vote): eligible.append(vote) continue except ValueError: pass ineligible.append(vote) return eligible, ineligible 对区块的重构实际上在于对区块中所有事务的asset的更新。首先从区块中提取到所有asset的id，然后从assets表中找到这些id所对应的asset记录，然后调用couple_assets对区块中的CREATE事务（或者创世区块）的asset项更新为assets表中的记录。而TRANSFER事务只要维护着转移的asset的id即可（根据id可以找到asset记录） # bigchaindb/models.py def from_db(cls, bigchain, block_dict, from_dict_kwargs=None): asset_ids = cls.get_asset_ids(block_dict) assets = bigchain.get_assets(asset_ids) block_dict = cls.couple_assets(block_dict, assets) kwargs = from_dict_kwargs or {} return cls.from_dict(block_dict, **kwargs) 最后一步则是验证区块（不包括验证区块里的事务），验证分为三步：1）验证创建区块的节点是否位于联盟之内；2）验证区块的签名是否正确；3）验证区块中的事务是否有重复 def _validate_block(self, bigchain): # Check if the block was created by a federation node if self.node_pubkey not in bigchain.federation: raise SybilError(&#39;Only federation nodes can create blocks&#39;) # Check that the signature is valid if not self.is_signature_valid(): raise InvalidSignature(&#39;Invalid block signature&#39;) # Check that the block contains no duplicated transactions txids = [tx.id for tx in self.transactions] if len(txids) != len(set(txids)): raise DuplicateTransaction(&#39;Block has duplicate transaction&#39;) ungroup pipeline的上一Nodevalidate_block将会返回区块的id与区块中所有的事务给ungroupNode。ungroup操作及其简单，为直接使用生成器的方式将区块中的事务一个个地返回给pipeline的下一Node def ungroup(self, block_id, transactions): num_tx = len(transactions) for tx in transactions: yield tx, block_id, num_tx validate_tx 对于区块中每个事务，validate_tx将会首先判断该事务是否是一个“新的事务”，若是，则验证这个事务的签名。验证事务签名的函数tx.validate(self.bigchain)在之前已经介绍过，这里不再说明 def validate_tx(self, tx_dict, block_id, num_tx): try: tx = Transaction.from_dict(tx_dict) new = self.bigchain.is_new_transaction(tx.id, exclude_block_id=block_id) if not new: raise exceptions.ValidationError(&#39;Tx already exists, %s&#39;, tx.id) tx.validate(self.bigchain) valid = True except exceptions.ValidationError as e: valid = False logger.warning(&#39;Invalid tx: %s&#39;, e) return valid, block_id, num_tx 注意这个“新的事务”并不是指的首次创建的事务，而是，只有先前存在过，且投票不为invalid的事务才不是新的事务。is_new_transaction首先拿到所有包含有该事务的区块的投票状态，只有当存在投票不为invalid的（valid或者undecided）才返回False。简单来说，从未出现过的事务当然为新的事务，此外，还需要让事先投票为invalid的事务有机会来参与到新的投票环节中 def is_new_transaction(self, txid, exclude_block_id=None): block_statuses = self.get_blocks_status_containing_tx(txid) block_statuses.pop(exclude_block_id, None) for status in block_statuses.values(): if status != self.BLOCK_INVALID: return False return True vote Nodevote维护了一个名为counter的计数器，当计数器的数目等于本区块中事务的个数，且每个事务的验证节点都为True时，才构造一个由该投票节点签名的投票记录，将记录返回给pipeline的下一个Node。同时在返回给下一个Node之前，本投票节点实际上已经进行了投票（除了还没有将记录写入vote表中），所以此时要更新本节点最后一个投票的区块的id（每次投票时，投票记录中记录了本节点上一次投票的区块的id） def vote(self, tx_validity, block_id, num_tx): self.counters[block_id] += 1 self.validity[block_id] = tx_validity and self.validity.get(block_id, True) if self.counters[block_id] == num_tx: vote = self.bigchain.vote(block_id, self.last_voted_id, self.validity[block_id]) self.last_voted_id = block_id del self.counters[block_id] del self.validity[block_id] return vote, num_tx write_vote Nodewrite_vote则是将投票写入到vote表中 def write_vote(self, vote): return backend.query.write_vote(self.connection, vote) 至此投票的pipeline结束 总结 pipeline进程的流程为： indata: 找到本节点最后投票的区块，然后对这个最后的区块之后所有bigchain表中添加的区块都使用yield进行抛出到indata的输出队列中 validate_block：判断vote表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。若还未投票，则从assets表中查询该区块中所有事务的资产，并将CREATE事务（以及创世区块）的asset项更新为assets表中的记录。确保所有CREATE事务（以及创世区块）的asset项为完整的资产记录，而TRANSFER区块的asset项为asset的id validate_block：验证写区块节点身份，验证区块签名 validate_tx：对区块中的每个事务进行处理。若包含该事务的区块的投票结果为valid或者undecided，抛出“事务已经存在”的异常，否则验证事务的签名。这样给予了之前投票为invalid的事务再次被投票的机会 vote：当验证完本区块中的所有事务，且验证结果均为True时，构建投票记录，并对投票记录进行签名 write_vote：将投票记录写入votes表中 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/07/16/e37c9a9346b3d8f0dc54ee37b1cb070b.html","headline":"bigchaindb源码分析（七）——投票","dateModified":"2017-07-16T00:00:00+08:00","datePublished":"2017-07-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/07/16/e37c9a9346b3d8f0dc54ee37b1cb070b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>bigchaindb源码分析（七）——投票</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>现在我们来根据源码分析（六）的思路来分析投票进程（votes），vote进程也是一个pipeline</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bigchaindb/pipelines/vote.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">start</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-string">"""Create, start, and return the block pipeline."""</span>
+
+    pipeline = create_pipeline()
+    pipeline.setup(indata=get_changefeed())
+    pipeline.start()
+    <span class="hljs-keyword">return</span> pipeline
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_changefeed</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-string">"""Create and return ordered changefeed of blocks starting from last voted block"""</span>
+    b = Bigchain()
+    last_block_id = b.get_last_voted_block().id
+    feed = backend.query.get_new_blocks_feed(b.connection, last_block_id)
+    <span class="hljs-keyword">return</span> Node(feed.__next__, name=<span class="hljs-string">'changefeed'</span>)</code></pre> 
+  <p>对于一个pipeline，我们还是首先来找到它的indata是什么，根据indata我们会知道什么时候会触发pipeline</p> 
+  <h2 id="indata">indata</h2> 
+  <p>按照<code>get_changefeed</code>函数体字面上的意思与block进程的逻辑，我们先猜测该函数将首先找到最后的投票区块，然后再对于这个最后的区块之后所有添加的区块都使用yield进行抛出到indata的输入队列中</p> 
+  <h3 id="获取最后一个投票过的区块id">获取最后一个投票过的区块id</h3> 
+  <p>先来看如何获取最后一个投票的区块，对应的函数为<code>get_last_voted_block</code></p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bigchaindb/core.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_last_voted_block</span><span class="hljs-params">(self)</span>:</span>
+    <span class="hljs-string">"""Returns the last block that this node voted on."""</span>
+
+    last_block_id = backend.query.get_last_voted_block_id(self.connection,
+                                                          self.me)
+    <span class="hljs-keyword">return</span> Block.from_dict(self.get_block(last_block_id))</code></pre> 
+  <p><code>backend.query</code>很明显又使用了singledispatch，所以最终实现函数在<code>bigchaindb/backend/mongodb/query.py</code>中，注意第二个参数为本节点（投票节点）的公钥</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bigchaindb/backend/mongodb/query.py</span>
+<span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_last_voted_block_id</span><span class="hljs-params">(conn, node_pubkey)</span>:</span>
+    last_voted = conn.run(
+            conn.collection(<span class="hljs-string">'votes'</span>)
+            .find({<span class="hljs-string">'node_pubkey'</span>: node_pubkey},
+                  sort=[(<span class="hljs-string">'vote.timestamp'</span>, -<span class="hljs-number">1</span>)]))
+
+    <span class="hljs-keyword">if</span> last_voted.count() == <span class="hljs-number">0</span>:
+        <span class="hljs-keyword">return</span> get_genesis_block(conn)[<span class="hljs-string">'id'</span>]
+
+    mapping = {v[<span class="hljs-string">'vote'</span>][<span class="hljs-string">'previous_block'</span>]: v[<span class="hljs-string">'vote'</span>][<span class="hljs-string">'voting_for_block'</span>]
+               <span class="hljs-keyword">for</span> v <span class="hljs-keyword">in</span> last_voted}
+
+    last_block_id = list(mapping.values())[<span class="hljs-number">0</span>]
+
+    explored = set()
+
+    <span class="hljs-keyword">while</span> <span class="hljs-keyword">True</span>:
+        <span class="hljs-keyword">try</span>:
+            <span class="hljs-keyword">if</span> last_block_id <span class="hljs-keyword">in</span> explored:
+                <span class="hljs-keyword">raise</span> CyclicBlockchainError()
+            explored.add(last_block_id)
+            last_block_id = mapping[last_block_id]
+        <span class="hljs-keyword">except</span> KeyError:
+            <span class="hljs-keyword">break</span>
+
+    <span class="hljs-keyword">return</span> last_block_id</code></pre> 
+  <p><code>get_last_voted_block_id</code>将从<code>votes</code>表中找到所有自己投票过的记录，如果一条都没有，则直接返回创世区块的id。若是找到的话，创建一个hashmap，map的key为前一个区块，value为后一个区块，所以实际上记录了区块与区块之间的关系。之后取出hashmap中的第一个value，依次从hashmap中找该区块的子区块，直到无法找到为止。此时返回的将是最后一个本节点投票过的节点</p> 
+  <h2 id="获取反馈">获取反馈</h2> 
+  <p>当找到最后一个投票过的区块之后，反馈的基准线即已经建立，之后所以时间戳比该区块新的区块都应该进行投票</p> 
+  <p><code>get_new_blocks_feed</code>的最终实现也在<code>bigchaindb/backend/mongodb/query.py</code>中。首先从oplog中查找到最后一个投票过的区块的时间戳，然后调用<code>run_changefeed</code>函数</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_new_blocks_feed</span><span class="hljs-params">(conn, start_block_id)</span>:</span>
+    namespace = conn.dbname + <span class="hljs-string">'.bigchain'</span>
+    match = {<span class="hljs-string">'o.id'</span>: start_block_id, <span class="hljs-string">'op'</span>: <span class="hljs-string">'i'</span>, <span class="hljs-string">'ns'</span>: namespace}
+    <span class="hljs-comment"># Neccesary to find in descending order since tests may write same block id several times</span>
+    query = conn.query().local.oplog.rs.find(match).sort(<span class="hljs-string">'$natural'</span>, -<span class="hljs-number">1</span>).next()[<span class="hljs-string">'ts'</span>]
+    last_ts = conn.run(query)
+    feed = run_changefeed(conn, <span class="hljs-string">'bigchain'</span>, last_ts)
+    <span class="hljs-keyword">return</span> (evt[<span class="hljs-string">'o'</span>] <span class="hljs-keyword">for</span> evt <span class="hljs-keyword">in</span> feed <span class="hljs-keyword">if</span> evt[<span class="hljs-string">'op'</span>] == <span class="hljs-string">'i'</span>)</code></pre> 
+  <p><code>run_changefeed</code>的代码在源码分析（六）已经进行了介绍，该函数是一个无限循环，不断从oplog中查找比输入的<code>last_ts</code>更新时间戳的记录，对这些记录通过yield关键进行抛出，同时将新记录的时间戳赋值给<code>last_ts</code>。如此循环，使得其能够监听所有<code>bigchain</code>表中新增的区块记录，当有新增区块时，<code>get_new_blocks_feed</code>即会把新区块返回</p> 
+  <p>再看<code>get_changefeed</code>函数，该函数的返回值即为indata。<code>get_new_blocks_feed</code>的返回值是一个生成器（用圆括号而不是中括号），</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_changefeed</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-string">"""Create and return ordered changefeed of blocks starting from last voted block"""</span>
+    b = Bigchain()
+    last_block_id = b.get_last_voted_block().id
+    feed = backend.query.get_new_blocks_feed(b.connection, last_block_id)
+    <span class="hljs-keyword">return</span> Node(feed.__next__, name=<span class="hljs-string">'changefeed'</span>)</code></pre> 
+  <p>为了理解这段代码，我们来写个测试例子。可以看到Node类实际上只实例化一次，而每次只要yield抛出数据后，生成器的<code>__next__</code>即将指向新抛出的数据。因此，所有由<code>get_new_blocks_feed</code>抛出的新的区块将会被依次赋值给<code>feed.__next__</code>，而pipeline的<code>Node</code>类是一个无限循环，所有<code>feed.__next__</code>将会被调用，并将返回值放入到该Node的输出队列中，而<code>feed.__next__()</code>本身就为区块记录本身，故而，所有新区块全部放入到了输出队列中。indata的反馈成功建立</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Node</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">__init__</span><span class="hljs-params">(self, target)</span>:</span>
+        self.target = target
+        print(<span class="hljs-string">"init... "</span>, target)
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">test1</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> range(<span class="hljs-number">0</span>, <span class="hljs-number">3</span>):
+        <span class="hljs-keyword">yield</span> i
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">invoke</span><span class="hljs-params">()</span>:</span>
+    feed = (i <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> test1())
+    <span class="hljs-keyword">return</span> Node(feed.__next__)
+
+indata = invoke()
+
+<span class="hljs-keyword">while</span> <span class="hljs-keyword">True</span>:
+    print(indata.target())</code></pre> 
+  <p>输出结果将为</p> 
+  <pre class="prettyprint"><code class=" hljs livecodeserver">init...  &lt;method-wrapper <span class="hljs-string">'__next__'</span> <span class="hljs-operator">of</span> generator object <span class="hljs-keyword">at</span> <span class="hljs-number">0x7f24338c4938</span>&gt;
+<span class="hljs-number">0</span>
+<span class="hljs-number">1</span>
+<span class="hljs-number">2</span>
+Traceback (most recent call <span class="hljs-keyword">last</span>):
+  File <span class="hljs-string">"/root/workspace/test/yield.py"</span>, <span class="hljs-built_in">line</span> <span class="hljs-number">20</span>, <span class="hljs-operator">in</span> &lt;module&gt;
+    print(indata.target())
+StopIteration</code></pre> 
+  <h2 id="pipeline">pipeline</h2> 
+  <p>我们依旧先来看vote进程的pipeline的节点定义，很明显其pipeline的执行过程为<code>indata-&gt;validate_block-&gt;ungroup-&gt;validate_tx-&gt;vote-&gt;write_vote</code>，所有函数都在<code>bigchaindb/pipelines/vote.py</code></p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">create_pipeline</span><span class="hljs-params">()</span>:</span>
+
+    voter = Vote()
+
+    <span class="hljs-keyword">return</span> Pipeline([
+        Node(voter.validate_block),
+        Node(voter.ungroup),
+        Node(voter.validate_tx, fraction_of_cores=<span class="hljs-number">1</span>),
+        Node(voter.vote),
+        Node(voter.write_vote)
+    ])</code></pre> 
+  <h3 id="validateblock"><code>validate_block</code></h3> 
+  <p>在进入该函数时，首先判断<code>vote</code>表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。否则调用<code>from_db</code>来重构区块，这一步主要是为了更新本区块中所有的asset项，如若重构区块失败，则直接返回一个无效的事务<code>invalid_dummy_tx</code>，使得pipeline依旧生效，同时确保pipeline的最后结果为验证失败。若重构区块成功，则调用<code>_validate_block</code>来验证区块，若验证失败同样返回无效的事务<code>invalid_dummy_tx</code>给pipeline。若重构成功且验证区块成功，则将区块里的所有的事务返回给pipeline的下一个Node，等待更进一步处理</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">validate_block</span><span class="hljs-params">(self, block_dict)</span>:</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> self.bigchain.has_previous_vote(block_dict[<span class="hljs-string">'id'</span>]):
+        <span class="hljs-keyword">try</span>:
+            block = Block.from_db(self.bigchain, block_dict, from_dict_kwargs={
+                <span class="hljs-string">'tx_construct'</span>: FastTransaction
+            })
+        <span class="hljs-keyword">except</span> (exceptions.InvalidHash):
+            <span class="hljs-keyword">return</span> block_dict[<span class="hljs-string">'id'</span>], [self.invalid_dummy_tx]
+        <span class="hljs-keyword">try</span>:
+            block._validate_block(self.bigchain)
+        <span class="hljs-keyword">except</span> exceptions.ValidationError:
+            <span class="hljs-keyword">return</span> block.id, [self.invalid_dummy_tx]
+        <span class="hljs-keyword">return</span> block.id, block_dict[<span class="hljs-string">'block'</span>][<span class="hljs-string">'transactions'</span>]</code></pre> 
+  <p>在判断<code>vote</code>中是否已经投票过的过程分为两步，首先是从vote表中找到本节点对该区块的所有投票记录，然后调用<code>partition_eligible_votes</code>对所查询到的投票记录验证本节点的签名。当存在通过签名验证的记录时，<code>has_previous_vote</code>将会返回真</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bighciandb/core.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">has_previous_vote</span><span class="hljs-params">(self, block_id)</span>:</span>
+    votes = list(backend.query.get_votes_by_block_id_and_voter(self.connection, block_id, self.me))
+    el, _ = self.consensus.voting.partition_eligible_votes(votes, [self.me])
+    <span class="hljs-keyword">return</span> bool(el)
+
+<span class="hljs-comment"># bigchaindb/backend/mongodb/query.py </span>
+<span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">get_votes_by_block_id_and_voter</span><span class="hljs-params">(conn, block_id, node_pubkey)</span>:</span>
+    <span class="hljs-keyword">return</span> conn.run(
+        conn.collection(<span class="hljs-string">'votes'</span>)
+        .find({<span class="hljs-string">'vote.voting_for_block'</span>: block_id,
+               <span class="hljs-string">'node_pubkey'</span>: node_pubkey},
+              projection={<span class="hljs-string">'_id'</span>: <span class="hljs-keyword">False</span>}))
+
+<span class="hljs-comment"># bigchaindb/vote.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">partition_eligible_votes</span><span class="hljs-params">(cls, votes, eligible_voters)</span>:</span>
+    eligible, ineligible = ([], [])
+
+    <span class="hljs-keyword">for</span> vote <span class="hljs-keyword">in</span> votes:
+        voter_eligible = vote.get(<span class="hljs-string">'node_pubkey'</span>) <span class="hljs-keyword">in</span> eligible_voters
+        <span class="hljs-keyword">if</span> voter_eligible:
+            <span class="hljs-keyword">try</span>:
+                <span class="hljs-keyword">if</span> cls.verify_vote_signature(vote):
+                    eligible.append(vote)
+                    <span class="hljs-keyword">continue</span>
+            <span class="hljs-keyword">except</span> ValueError:
+                <span class="hljs-keyword">pass</span>
+        ineligible.append(vote)
+    <span class="hljs-keyword">return</span> eligible, ineligible</code></pre> 
+  <p>对区块的重构实际上在于对区块中所有事务的<code>asset</code>的更新。首先从区块中提取到所有asset的id，然后从<code>assets</code>表中找到这些id所对应的asset记录，然后调用<code>couple_assets</code>对区块中的CREATE事务（或者创世区块）的<code>asset</code>项更新为<code>assets</code>表中的记录。而TRANSFER事务只要维护着转移的asset的id即可（根据id可以找到asset记录）</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bigchaindb/models.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">from_db</span><span class="hljs-params">(cls, bigchain, block_dict, from_dict_kwargs=None)</span>:</span>
+    asset_ids = cls.get_asset_ids(block_dict)
+    assets = bigchain.get_assets(asset_ids)
+    block_dict = cls.couple_assets(block_dict, assets)
+    kwargs = from_dict_kwargs <span class="hljs-keyword">or</span> {}
+    <span class="hljs-keyword">return</span> cls.from_dict(block_dict, **kwargs)</code></pre> 
+  <p>最后一步则是验证区块（不包括验证区块里的事务），验证分为三步：1）验证创建区块的节点是否位于联盟之内；2）验证区块的签名是否正确；3）验证区块中的事务是否有重复</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">_validate_block</span><span class="hljs-params">(self, bigchain)</span>:</span>
+    <span class="hljs-comment"># Check if the block was created by a federation node</span>
+    <span class="hljs-keyword">if</span> self.node_pubkey <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> bigchain.federation:
+        <span class="hljs-keyword">raise</span> SybilError(<span class="hljs-string">'Only federation nodes can create blocks'</span>)
+
+    <span class="hljs-comment"># Check that the signature is valid</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> self.is_signature_valid():
+        <span class="hljs-keyword">raise</span> InvalidSignature(<span class="hljs-string">'Invalid block signature'</span>)
+
+    <span class="hljs-comment"># Check that the block contains no duplicated transactions</span>
+    txids = [tx.id <span class="hljs-keyword">for</span> tx <span class="hljs-keyword">in</span> self.transactions]
+    <span class="hljs-keyword">if</span> len(txids) != len(set(txids)):
+        <span class="hljs-keyword">raise</span> DuplicateTransaction(<span class="hljs-string">'Block has duplicate transaction'</span>)</code></pre> 
+  <h3 id="ungroup"><code>ungroup</code></h3> 
+  <p>pipeline的上一Node<code>validate_block</code>将会返回区块的id与区块中所有的事务给<code>ungroup</code>Node。<code>ungroup</code>操作及其简单，为直接使用生成器的方式将区块中的事务一个个地返回给pipeline的下一Node</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">ungroup</span><span class="hljs-params">(self, block_id, transactions)</span>:</span>
+    num_tx = len(transactions)
+    <span class="hljs-keyword">for</span> tx <span class="hljs-keyword">in</span> transactions:
+        <span class="hljs-keyword">yield</span> tx, block_id, num_tx</code></pre> 
+  <h3 id="validatetx"><code>validate_tx</code></h3> 
+  <p>对于区块中每个事务，<code>validate_tx</code>将会首先判断该事务是否是一个“新的事务”，若是，则验证这个事务的签名。验证事务签名的函数<code>tx.validate(self.bigchain)</code>在之前已经介绍过，这里不再说明</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">validate_tx</span><span class="hljs-params">(self, tx_dict, block_id, num_tx)</span>:</span>
+    <span class="hljs-keyword">try</span>:
+        tx = Transaction.from_dict(tx_dict)
+        new = self.bigchain.is_new_transaction(tx.id, exclude_block_id=block_id)
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> new:
+            <span class="hljs-keyword">raise</span> exceptions.ValidationError(<span class="hljs-string">'Tx already exists, %s'</span>, tx.id)
+        tx.validate(self.bigchain)
+        valid = <span class="hljs-keyword">True</span>
+    <span class="hljs-keyword">except</span> exceptions.ValidationError <span class="hljs-keyword">as</span> e:
+        valid = <span class="hljs-keyword">False</span>
+        logger.warning(<span class="hljs-string">'Invalid tx: %s'</span>, e)
+
+    <span class="hljs-keyword">return</span> valid, block_id, num_tx</code></pre> 
+  <p>注意这个“新的事务”并不是指的首次创建的事务，而是，只有先前存在过，且投票不为invalid的事务才不是新的事务。<code>is_new_transaction</code>首先拿到所有包含有该事务的区块的投票状态，只有当存在投票不为<code>invalid</code>的（<code>valid</code>或者<code>undecided</code>）才返回False。简单来说，从未出现过的事务当然为新的事务，此外，还需要让事先投票为invalid的事务有机会来参与到新的投票环节中</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">is_new_transaction</span><span class="hljs-params">(self, txid, exclude_block_id=None)</span>:</span>
+    block_statuses = self.get_blocks_status_containing_tx(txid)
+    block_statuses.pop(exclude_block_id, <span class="hljs-keyword">None</span>)
+    <span class="hljs-keyword">for</span> status <span class="hljs-keyword">in</span> block_statuses.values():
+        <span class="hljs-keyword">if</span> status != self.BLOCK_INVALID:
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">False</span>
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">True</span></code></pre> 
+  <h3 id="vote"><code>vote</code></h3> 
+  <p>Node<code>vote</code>维护了一个名为<code>counter</code>的计数器，当计数器的数目等于本区块中事务的个数，且每个事务的验证节点都为True时，才构造一个由该投票节点签名的投票记录，将记录返回给pipeline的下一个Node。同时在返回给下一个Node之前，本投票节点实际上已经进行了投票（除了还没有将记录写入vote表中），所以此时要更新本节点最后一个投票的区块的id（每次投票时，投票记录中记录了本节点上一次投票的区块的id）</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">vote</span><span class="hljs-params">(self, tx_validity, block_id, num_tx)</span>:</span>
+    self.counters[block_id] += <span class="hljs-number">1</span>
+    self.validity[block_id] = tx_validity <span class="hljs-keyword">and</span> self.validity.get(block_id,
+                                                                <span class="hljs-keyword">True</span>)
+
+    <span class="hljs-keyword">if</span> self.counters[block_id] == num_tx:
+        vote = self.bigchain.vote(block_id,
+                                  self.last_voted_id,
+                                  self.validity[block_id])
+        self.last_voted_id = block_id
+        <span class="hljs-keyword">del</span> self.counters[block_id]
+        <span class="hljs-keyword">del</span> self.validity[block_id]
+        <span class="hljs-keyword">return</span> vote, num_tx</code></pre> 
+  <h3 id="writevote"><code>write_vote</code></h3> 
+  <p>Node<code>write_vote</code>则是将投票写入到vote表中</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">write_vote</span><span class="hljs-params">(self, vote)</span>:</span>
+    <span class="hljs-keyword">return</span> backend.query.write_vote(self.connection, vote)</code></pre> 
+  <p>至此投票的pipeline结束</p> 
+  <h2 id="总结">总结</h2> 
+  <p>pipeline进程的流程为：</p> 
+  <ul> 
+   <li><code>indata</code>: 找到本节点最后投票的区块，然后对这个最后的区块之后所有<code>bigchain</code>表中添加的区块都使用yield进行抛出到indata的输出队列中</li> 
+   <li><code>validate_block</code>：判断<code>vote</code>表中是否已经有了本投票节点对该区块的投票，如果有则直接退出。若还未投票，则从<code>assets</code>表中查询该区块中所有事务的资产，并将CREATE事务（以及创世区块）的asset项更新为<code>assets</code>表中的记录。确保所有CREATE事务（以及创世区块）的asset项为完整的资产记录，而TRANSFER区块的asset项为asset的id</li> 
+   <li><code>validate_block</code>：验证写区块节点身份，验证区块签名</li> 
+   <li><code>validate_tx</code>：对区块中的每个事务进行处理。若包含该事务的区块的投票结果为valid或者undecided，抛出“事务已经存在”的异常，否则验证事务的签名。这样给予了之前投票为invalid的事务再次被投票的机会</li> 
+   <li><code>vote</code>：当验证完本区块中的所有事务，且验证结果均为True时，构建投票记录，并对投票记录进行签名</li> 
+   <li><code>write_vote</code>：将投票记录写入<code>votes</code>表中</li> 
+  </ul> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/lwyeluo/article/details/75208164,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/lwyeluo/article/details/75208164,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

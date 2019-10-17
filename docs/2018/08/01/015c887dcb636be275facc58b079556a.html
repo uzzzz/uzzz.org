@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>利用openssl中的sha3生成以太坊账户地址 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="利用openssl中的sha3生成以太坊账户地址" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊账户地址 众所周知，区块链是一种基于密码学的技术，以太坊的账户等规则都是使用EC（椭圆曲线）这一体系来进行的，以太坊使用的EC是著名的secp256k1曲线，从本质来说以太坊账户其实就是一个ECDSA的私钥，因为掌握某一私钥就可以使用私钥对交易进行签名，可以说，就完整的掌握了该账户。而EC的私钥就是一个范围内的随机数，对于secp256k1曲线，其最大值为0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141。账户的地址就是使用该私钥生成的公钥的hash。EC的公钥是椭圆曲线某个私钥对应的点。公钥和私钥的关系简单的说就是Publickey=Privatekey*G，G是某条椭圆曲线的基点，这里的*并不是传统意义上的乘，具体内容请参考椭圆曲线椭圆域的相关知识。所幸的是OpenSSL库提供了完整的椭圆曲线相关计算，所以我们并不需要关注椭圆曲线具体的实现细节。 简单地说，从一个私钥到一个地址需要经过3步： 生成公钥 生成Hash 裁剪Hash 以太坊使用的是Keccak256算法生成Hash，它生成的Hash会有32字节，但是以太坊的地址只取了后20字节作为地址。 SHA3和Keccak 从以太坊的源代码中可以看到，以太坊账户地址的Hash算法使用的是Keccak256，而Keccak算法在2015年成为了SHA3标准算法。但是以太坊使用的Keccak256并不等于SHA3 256，在成为SHA3算法时NIST还是对Keccak进行了改动的。以太坊中其实实现了标准的SHA3算法，但是并没有使用。 // NewKeccak256 creates a new Keccak-256 hash. func NewKeccak256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x01} } // New256 creates a new SHA3-256 hash. // Its generic security strength is 256 bits against preimage attacks, // and 128 bits against collision attacks. func New256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x06} } 可以看到其实这两种算法只差了一个dsbyte，而这个dsbyte在这里 // Pad with this instance&#39;s domain-separator bits. We know that there&#39;s // at least one byte of space in d.buf because, if it were full, // permute would have been called to empty it. dsbyte also contains the // first one bit for the padding. See the comment in the state struct. d.buf = append(d.buf, dsbyte) 被用到了，看注释发现，这个dsbyte就是pad。 OpenSSL的最新版本1.1.1中并没有非标准的Keccak256，而是只有SHA3 256 typedef struct { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[KECCAK1600_WIDTH / 8 - 32]; unsigned char pad; } KECCAK1600_CTX; static int init(EVP_MD_CTX *evp_ctx, unsigned char pad) { KECCAK1600_CTX *ctx = evp_ctx-&gt;md_data; 看OpenSSL的SHA3实现可以发现，其实它的pad被存在了KECCAK1600_CTX中，而KECCAK1600_CTX则是在sha3初始化时存在了EVP_MD_CTX中，因此，使用OpenSSL实现Keccak256就需要利用一些手段把SHA3 256的pad改掉。 使用OpenSSL生成地址 首先是初始化EC相关内容，以及生成公钥和私钥 BIGNUM* privatekey = BN_new(); BIGNUM* n = BN_new(); BN_CTX *bn_ctx = BN_CTX_new(); const EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_secp256k1); EC_GROUP_get_order(group, n, bn_ctx); BN_rand_range(privatekey, n); EC_POINT *publickey = EC_POINT_new(group); EC_POINT_mul(group, publickey, privatekey, nullptr, nullptr, bn_ctx); unsigned char **buf = (unsigned char **)malloc(8); size_t size = EC_POINT_point2buf(group, publickey, POINT_CONVERSION_UNCOMPRESSED, buf, bn_ctx); 然后是初始化EVP相关 const EVP_MD* evp_md = EVP_sha3_256(); EVP_MD_CTX *evp_md_ctx = EVP_MD_CTX_new(); EVP_DigestInit(evp_md_ctx, evp_md); 接下来更改pad，由于OpenSSL的头文件中并没有我们需要修改的结构体的定义，所以我们需要从源代码啊中找出它们复制到这里 struct EVP_MD_CTX_t { const EVP_MD *digest; ENGINE *engine; /* functional reference if &#39;digest&#39; is * ENGINE-provided */ unsigned long flags; void *md_data; /* Public key context for sign/verify */ EVP_PKEY_CTX *pctx; /* Update function: usually copied from EVP_MD */ int(*update) (EVP_MD_CTX *ctx, const void *data, size_t count); } /* EVP_MD_CTX */; struct KECCAK1600_CTX { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[1600 / 8 - 32]; unsigned char pad; }; 修改pad并将公钥传给EVP //change the sha3 pad 0x06 to keccak pad 0x01 KECCAK1600_CTX* keccak256 = reinterpret_cast&lt;KECCAK1600_CTX*&gt;((reinterpret_cast&lt;EVP_MD_CTX_t*&gt;(evp_md_ctx))-&gt;md_data); keccak256-&gt;pad = 0x01; EVP_DigestUpdate(evp_md_ctx, (*buf) + 1, size - 1); 需要注意的是，使用POINT_CONVERSION_UNCOMPRESSED方式生成的buf的第一位为曲线类型，后面则是XY的坐标，因此，需要把曲线类型排除掉。 最后就可以获得结果 unsigned int * len = new unsigned[10]; unsigned char* result = (unsigned char*)malloc(32); EVP_DigestFinal(evp_md_ctx, result, len); 生成的内容与以太坊生成的地址一致。最后取其后20字节就为以太坊的账户地址了。 阅读更多" />
+<meta property="og:description" content="以太坊账户地址 众所周知，区块链是一种基于密码学的技术，以太坊的账户等规则都是使用EC（椭圆曲线）这一体系来进行的，以太坊使用的EC是著名的secp256k1曲线，从本质来说以太坊账户其实就是一个ECDSA的私钥，因为掌握某一私钥就可以使用私钥对交易进行签名，可以说，就完整的掌握了该账户。而EC的私钥就是一个范围内的随机数，对于secp256k1曲线，其最大值为0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141。账户的地址就是使用该私钥生成的公钥的hash。EC的公钥是椭圆曲线某个私钥对应的点。公钥和私钥的关系简单的说就是Publickey=Privatekey*G，G是某条椭圆曲线的基点，这里的*并不是传统意义上的乘，具体内容请参考椭圆曲线椭圆域的相关知识。所幸的是OpenSSL库提供了完整的椭圆曲线相关计算，所以我们并不需要关注椭圆曲线具体的实现细节。 简单地说，从一个私钥到一个地址需要经过3步： 生成公钥 生成Hash 裁剪Hash 以太坊使用的是Keccak256算法生成Hash，它生成的Hash会有32字节，但是以太坊的地址只取了后20字节作为地址。 SHA3和Keccak 从以太坊的源代码中可以看到，以太坊账户地址的Hash算法使用的是Keccak256，而Keccak算法在2015年成为了SHA3标准算法。但是以太坊使用的Keccak256并不等于SHA3 256，在成为SHA3算法时NIST还是对Keccak进行了改动的。以太坊中其实实现了标准的SHA3算法，但是并没有使用。 // NewKeccak256 creates a new Keccak-256 hash. func NewKeccak256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x01} } // New256 creates a new SHA3-256 hash. // Its generic security strength is 256 bits against preimage attacks, // and 128 bits against collision attacks. func New256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x06} } 可以看到其实这两种算法只差了一个dsbyte，而这个dsbyte在这里 // Pad with this instance&#39;s domain-separator bits. We know that there&#39;s // at least one byte of space in d.buf because, if it were full, // permute would have been called to empty it. dsbyte also contains the // first one bit for the padding. See the comment in the state struct. d.buf = append(d.buf, dsbyte) 被用到了，看注释发现，这个dsbyte就是pad。 OpenSSL的最新版本1.1.1中并没有非标准的Keccak256，而是只有SHA3 256 typedef struct { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[KECCAK1600_WIDTH / 8 - 32]; unsigned char pad; } KECCAK1600_CTX; static int init(EVP_MD_CTX *evp_ctx, unsigned char pad) { KECCAK1600_CTX *ctx = evp_ctx-&gt;md_data; 看OpenSSL的SHA3实现可以发现，其实它的pad被存在了KECCAK1600_CTX中，而KECCAK1600_CTX则是在sha3初始化时存在了EVP_MD_CTX中，因此，使用OpenSSL实现Keccak256就需要利用一些手段把SHA3 256的pad改掉。 使用OpenSSL生成地址 首先是初始化EC相关内容，以及生成公钥和私钥 BIGNUM* privatekey = BN_new(); BIGNUM* n = BN_new(); BN_CTX *bn_ctx = BN_CTX_new(); const EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_secp256k1); EC_GROUP_get_order(group, n, bn_ctx); BN_rand_range(privatekey, n); EC_POINT *publickey = EC_POINT_new(group); EC_POINT_mul(group, publickey, privatekey, nullptr, nullptr, bn_ctx); unsigned char **buf = (unsigned char **)malloc(8); size_t size = EC_POINT_point2buf(group, publickey, POINT_CONVERSION_UNCOMPRESSED, buf, bn_ctx); 然后是初始化EVP相关 const EVP_MD* evp_md = EVP_sha3_256(); EVP_MD_CTX *evp_md_ctx = EVP_MD_CTX_new(); EVP_DigestInit(evp_md_ctx, evp_md); 接下来更改pad，由于OpenSSL的头文件中并没有我们需要修改的结构体的定义，所以我们需要从源代码啊中找出它们复制到这里 struct EVP_MD_CTX_t { const EVP_MD *digest; ENGINE *engine; /* functional reference if &#39;digest&#39; is * ENGINE-provided */ unsigned long flags; void *md_data; /* Public key context for sign/verify */ EVP_PKEY_CTX *pctx; /* Update function: usually copied from EVP_MD */ int(*update) (EVP_MD_CTX *ctx, const void *data, size_t count); } /* EVP_MD_CTX */; struct KECCAK1600_CTX { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[1600 / 8 - 32]; unsigned char pad; }; 修改pad并将公钥传给EVP //change the sha3 pad 0x06 to keccak pad 0x01 KECCAK1600_CTX* keccak256 = reinterpret_cast&lt;KECCAK1600_CTX*&gt;((reinterpret_cast&lt;EVP_MD_CTX_t*&gt;(evp_md_ctx))-&gt;md_data); keccak256-&gt;pad = 0x01; EVP_DigestUpdate(evp_md_ctx, (*buf) + 1, size - 1); 需要注意的是，使用POINT_CONVERSION_UNCOMPRESSED方式生成的buf的第一位为曲线类型，后面则是XY的坐标，因此，需要把曲线类型排除掉。 最后就可以获得结果 unsigned int * len = new unsigned[10]; unsigned char* result = (unsigned char*)malloc(32); EVP_DigestFinal(evp_md_ctx, result, len); 生成的内容与以太坊生成的地址一致。最后取其后20字节就为以太坊的账户地址了。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/01/015c887dcb636be275facc58b079556a.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/01/015c887dcb636be275facc58b079556a.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-01T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊账户地址 众所周知，区块链是一种基于密码学的技术，以太坊的账户等规则都是使用EC（椭圆曲线）这一体系来进行的，以太坊使用的EC是著名的secp256k1曲线，从本质来说以太坊账户其实就是一个ECDSA的私钥，因为掌握某一私钥就可以使用私钥对交易进行签名，可以说，就完整的掌握了该账户。而EC的私钥就是一个范围内的随机数，对于secp256k1曲线，其最大值为0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141。账户的地址就是使用该私钥生成的公钥的hash。EC的公钥是椭圆曲线某个私钥对应的点。公钥和私钥的关系简单的说就是Publickey=Privatekey*G，G是某条椭圆曲线的基点，这里的*并不是传统意义上的乘，具体内容请参考椭圆曲线椭圆域的相关知识。所幸的是OpenSSL库提供了完整的椭圆曲线相关计算，所以我们并不需要关注椭圆曲线具体的实现细节。 简单地说，从一个私钥到一个地址需要经过3步： 生成公钥 生成Hash 裁剪Hash 以太坊使用的是Keccak256算法生成Hash，它生成的Hash会有32字节，但是以太坊的地址只取了后20字节作为地址。 SHA3和Keccak 从以太坊的源代码中可以看到，以太坊账户地址的Hash算法使用的是Keccak256，而Keccak算法在2015年成为了SHA3标准算法。但是以太坊使用的Keccak256并不等于SHA3 256，在成为SHA3算法时NIST还是对Keccak进行了改动的。以太坊中其实实现了标准的SHA3算法，但是并没有使用。 // NewKeccak256 creates a new Keccak-256 hash. func NewKeccak256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x01} } // New256 creates a new SHA3-256 hash. // Its generic security strength is 256 bits against preimage attacks, // and 128 bits against collision attacks. func New256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x06} } 可以看到其实这两种算法只差了一个dsbyte，而这个dsbyte在这里 // Pad with this instance&#39;s domain-separator bits. We know that there&#39;s // at least one byte of space in d.buf because, if it were full, // permute would have been called to empty it. dsbyte also contains the // first one bit for the padding. See the comment in the state struct. d.buf = append(d.buf, dsbyte) 被用到了，看注释发现，这个dsbyte就是pad。 OpenSSL的最新版本1.1.1中并没有非标准的Keccak256，而是只有SHA3 256 typedef struct { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[KECCAK1600_WIDTH / 8 - 32]; unsigned char pad; } KECCAK1600_CTX; static int init(EVP_MD_CTX *evp_ctx, unsigned char pad) { KECCAK1600_CTX *ctx = evp_ctx-&gt;md_data; 看OpenSSL的SHA3实现可以发现，其实它的pad被存在了KECCAK1600_CTX中，而KECCAK1600_CTX则是在sha3初始化时存在了EVP_MD_CTX中，因此，使用OpenSSL实现Keccak256就需要利用一些手段把SHA3 256的pad改掉。 使用OpenSSL生成地址 首先是初始化EC相关内容，以及生成公钥和私钥 BIGNUM* privatekey = BN_new(); BIGNUM* n = BN_new(); BN_CTX *bn_ctx = BN_CTX_new(); const EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_secp256k1); EC_GROUP_get_order(group, n, bn_ctx); BN_rand_range(privatekey, n); EC_POINT *publickey = EC_POINT_new(group); EC_POINT_mul(group, publickey, privatekey, nullptr, nullptr, bn_ctx); unsigned char **buf = (unsigned char **)malloc(8); size_t size = EC_POINT_point2buf(group, publickey, POINT_CONVERSION_UNCOMPRESSED, buf, bn_ctx); 然后是初始化EVP相关 const EVP_MD* evp_md = EVP_sha3_256(); EVP_MD_CTX *evp_md_ctx = EVP_MD_CTX_new(); EVP_DigestInit(evp_md_ctx, evp_md); 接下来更改pad，由于OpenSSL的头文件中并没有我们需要修改的结构体的定义，所以我们需要从源代码啊中找出它们复制到这里 struct EVP_MD_CTX_t { const EVP_MD *digest; ENGINE *engine; /* functional reference if &#39;digest&#39; is * ENGINE-provided */ unsigned long flags; void *md_data; /* Public key context for sign/verify */ EVP_PKEY_CTX *pctx; /* Update function: usually copied from EVP_MD */ int(*update) (EVP_MD_CTX *ctx, const void *data, size_t count); } /* EVP_MD_CTX */; struct KECCAK1600_CTX { uint64_t A[5][5]; size_t block_size; /* cached ctx-&gt;digest-&gt;block_size */ size_t md_size; /* output length, variable in XOF */ size_t num; /* used bytes in below buffer */ unsigned char buf[1600 / 8 - 32]; unsigned char pad; }; 修改pad并将公钥传给EVP //change the sha3 pad 0x06 to keccak pad 0x01 KECCAK1600_CTX* keccak256 = reinterpret_cast&lt;KECCAK1600_CTX*&gt;((reinterpret_cast&lt;EVP_MD_CTX_t*&gt;(evp_md_ctx))-&gt;md_data); keccak256-&gt;pad = 0x01; EVP_DigestUpdate(evp_md_ctx, (*buf) + 1, size - 1); 需要注意的是，使用POINT_CONVERSION_UNCOMPRESSED方式生成的buf的第一位为曲线类型，后面则是XY的坐标，因此，需要把曲线类型排除掉。 最后就可以获得结果 unsigned int * len = new unsigned[10]; unsigned char* result = (unsigned char*)malloc(32); EVP_DigestFinal(evp_md_ctx, result, len); 生成的内容与以太坊生成的地址一致。最后取其后20字节就为以太坊的账户地址了。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/01/015c887dcb636be275facc58b079556a.html","headline":"利用openssl中的sha3生成以太坊账户地址","dateModified":"2018-08-01T00:00:00+08:00","datePublished":"2018-08-01T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/01/015c887dcb636be275facc58b079556a.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>利用openssl中的sha3生成以太坊账户地址</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h1>以太坊账户地址</h1> 
+  <p>众所周知，区块链是一种基于密码学的技术，以太坊的账户等规则都是使用EC（椭圆曲线）这一体系来进行的，以太坊使用的EC是著名的secp256k1曲线，从本质来说以太坊账户其实就是一个ECDSA的私钥，因为掌握某一私钥就可以使用私钥对交易进行签名，可以说，就完整的掌握了该账户。而EC的私钥就是一个范围内的随机数，对于secp256k1曲线，其最大值为0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141。账户的地址就是使用该私钥生成的公钥的hash。EC的公钥是椭圆曲线某个私钥对应的点。公钥和私钥的关系简单的说就是Publickey=Privatekey*G，G是某条椭圆曲线的基点，这里的*并不是传统意义上的乘，具体内容请参考椭圆曲线椭圆域的相关知识。所幸的是OpenSSL库提供了完整的椭圆曲线相关计算，所以我们并不需要关注椭圆曲线具体的实现细节。</p> 
+  <p>简单地说，从一个私钥到一个地址需要经过3步：</p> 
+  <ol>
+   <li>生成公钥</li> 
+   <li>生成Hash</li> 
+   <li>裁剪Hash</li> 
+  </ol>
+  <p>以太坊使用的是Keccak256算法生成Hash，它生成的Hash会有32字节，但是以太坊的地址只取了后20字节作为地址。</p> 
+  <h1>SHA3和Keccak</h1> 
+  <p>从以太坊的源代码中可以看到，以太坊账户地址的Hash算法使用的是Keccak256，而Keccak算法在2015年成为了SHA3标准算法。但是以太坊使用的Keccak256并不等于SHA3 256，在成为SHA3算法时NIST还是对Keccak进行了改动的。以太坊中其实实现了标准的SHA3算法，但是并没有使用。</p> 
+  <pre class="has">
+<code class="language-Go">// NewKeccak256 creates a new Keccak-256 hash.
+func NewKeccak256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x01} }
+// New256 creates a new SHA3-256 hash.
+// Its generic security strength is 256 bits against preimage attacks,
+// and 128 bits against collision attacks.
+func New256() hash.Hash { return &amp;state{rate: 136, outputLen: 32, dsbyte: 0x06} }</code></pre> 
+  <p>可以看到其实这两种算法只差了一个dsbyte，而这个dsbyte在这里</p> 
+  <pre class="has">
+<code>	// Pad with this instance's domain-separator bits. We know that there's
+	// at least one byte of space in d.buf because, if it were full,
+	// permute would have been called to empty it. dsbyte also contains the
+	// first one bit for the padding. See the comment in the state struct.
+	d.buf = append(d.buf, dsbyte)</code></pre> 
+  <p>被用到了，看注释发现，这个dsbyte就是pad。</p> 
+  <p>OpenSSL的最新版本1.1.1中并没有非标准的Keccak256，而是只有SHA3 256</p> 
+  <pre class="has">
+<code class="language-cpp">typedef struct {
+    uint64_t A[5][5];
+    size_t block_size;          /* cached ctx-&gt;digest-&gt;block_size */
+    size_t md_size;             /* output length, variable in XOF */
+    size_t num;                 /* used bytes in below buffer */
+    unsigned char buf[KECCAK1600_WIDTH / 8 - 32];
+    unsigned char pad;
+} KECCAK1600_CTX;
+
+static int init(EVP_MD_CTX *evp_ctx, unsigned char pad)
+{
+    KECCAK1600_CTX *ctx = evp_ctx-&gt;md_data;</code></pre> 
+  <p>看OpenSSL的SHA3实现可以发现，其实它的pad被存在了KECCAK1600_CTX中，而KECCAK1600_CTX则是在sha3初始化时存在了EVP_MD_CTX中，因此，使用OpenSSL实现Keccak256就需要利用一些手段把SHA3 256的pad改掉。</p> 
+  <h1>使用OpenSSL生成地址</h1> 
+  <p>首先是初始化EC相关内容，以及生成公钥和私钥</p> 
+  <pre class="has">
+<code class="language-cpp">	BIGNUM* privatekey = BN_new();
+	BIGNUM* n = BN_new();
+	BN_CTX *bn_ctx = BN_CTX_new();
+	const EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_secp256k1);
+	EC_GROUP_get_order(group, n, bn_ctx);
+    BN_rand_range(privatekey, n);
+	EC_POINT *publickey = EC_POINT_new(group);
+	EC_POINT_mul(group, publickey, privatekey, nullptr, nullptr, bn_ctx);
+	unsigned char **buf = (unsigned char **)malloc(8);
+	size_t size = EC_POINT_point2buf(group, publickey, POINT_CONVERSION_UNCOMPRESSED, buf, bn_ctx);</code></pre> 
+  <p>然后是初始化EVP相关</p> 
+  <pre class="has">
+<code class="language-cpp">	const EVP_MD* evp_md = EVP_sha3_256();
+	EVP_MD_CTX *evp_md_ctx = EVP_MD_CTX_new();
+    EVP_DigestInit(evp_md_ctx, evp_md);</code></pre> 
+  <p>接下来更改pad，由于OpenSSL的头文件中并没有我们需要修改的结构体的定义，所以我们需要从源代码啊中找出它们复制到这里</p> 
+  <pre class="has">
+<code class="language-cpp">struct EVP_MD_CTX_t {
+	const EVP_MD *digest;
+	ENGINE *engine;             /* functional reference if 'digest' is
+								            * ENGINE-provided */
+	unsigned long flags;
+	void *md_data;
+	/* Public key context for sign/verify */
+	EVP_PKEY_CTX *pctx;
+	/* Update function: usually copied from EVP_MD */
+	int(*update) (EVP_MD_CTX *ctx, const void *data, size_t count);
+} /* EVP_MD_CTX */;
+
+struct KECCAK1600_CTX {
+	uint64_t A[5][5];
+	size_t block_size;          /* cached ctx-&gt;digest-&gt;block_size */
+	size_t md_size;             /* output length, variable in XOF */
+	size_t num;                 /* used bytes in below buffer */
+	unsigned char buf[1600 / 8 - 32];
+	unsigned char pad;
+};</code></pre> 
+  <p>修改pad并将公钥传给EVP</p> 
+  <pre class="has">
+<code class="language-cpp">	//change the sha3 pad 0x06 to keccak pad 0x01
+	KECCAK1600_CTX* keccak256 = reinterpret_cast&lt;KECCAK1600_CTX*&gt;((reinterpret_cast&lt;EVP_MD_CTX_t*&gt;(evp_md_ctx))-&gt;md_data);
+	keccak256-&gt;pad = 0x01;
+	EVP_DigestUpdate(evp_md_ctx, (*buf) + 1, size - 1);</code></pre> 
+  <p>需要注意的是，使用POINT_CONVERSION_UNCOMPRESSED方式生成的buf的第一位为曲线类型，后面则是XY的坐标，因此，需要把曲线类型排除掉。</p> 
+  <p>最后就可以获得结果</p> 
+  <pre class="has">
+<code class="language-cpp">	unsigned int * len = new unsigned[10];
+	unsigned char* result = (unsigned char*)malloc(32);
+	EVP_DigestFinal(evp_md_ctx, result, len);</code></pre> 
+  <p>生成的内容与以太坊生成的地址一致。最后取其后20字节就为以太坊的账户地址了。</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/hnlylyb/article/details/81335862,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/hnlylyb/article/details/81335862,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

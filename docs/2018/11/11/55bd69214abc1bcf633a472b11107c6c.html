@@ -1,0 +1,921 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>深入区块链以太坊源码之挖矿 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="深入区块链以太坊源码之挖矿" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961285 // Miner creates blocks and searches for proof-of-work values. type Miner struct { mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine exitCh chan struct{} canStart int32 // can start indicates whether we can start the mining operation shouldStart int32 // should start indicates whether we should start after sync } //挖矿开始前需要创建新的miner func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(block *types.Block) bool) *Miner { miner := &amp;Miner{ eth: eth, mux: mux, engine: engine, exitCh: make(chan struct{}), //具体详情见下面newWorker方法 worker: newWorker(config, engine, eth, mux, recommit, gasFloor, gasCeil, isLocalBlock), canStart: 1, } //启动一个线程执行update /*可以看到如果当前处于 区块的同步中，则挖矿的操作需要停止， 直到同步操作结束（同步成功或是失败）， 如果原来已经执行了挖矿操作的，则继续开启挖矿操作*/ go miner.update() return miner } func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(*types.Block) bool) *worker { //构造worker worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, chain: eth.BlockChain(), gasFloor: gasFloor, gasCeil: gasCeil, isLocalBlock: isLocalBlock, localUncles: make(map[common.Hash]*types.Block), remoteUncles: make(map[common.Hash]*types.Block), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), pendingTasks: make(map[common.Hash]*task), txsCh: make(chan core.NewTxsEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), //新版本的worker中更新了下面几个通道 newWorkCh: make(chan *newWorkReq), taskCh: make(chan *task), resultCh: make(chan *types.Block, resultQueueSize), exitCh: make(chan struct{}), startCh: make(chan struct{}, 1), resubmitIntervalCh: make(chan time.Duration), resubmitAdjustCh: make(chan *intervalAdjust, resubmitAdjustChanSize), } // Subscribe NewTxsEvent for tx pool //注册TxsEvent事件到tx pool交易池 worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) // 注册事件到tx pool交易池 worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) // Sanitize recommit interval if the user-specified one is too short. //如果用户指定的间隔太短，则重新设置间隔。 if recommit &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, recommit, &quot;updated&quot;, minRecommitInterval) recommit = minRecommitInterval } go worker.mainLoop() //newWorkLoop 是一个一直监听 startCh 中是否有挖矿信号 //(startCh的信号由 start函数放置进去的，见下面的start方法) go worker.newWorkLoop(recommit) go worker.resultLoop() go worker.taskLoop() // Submit first work to initialize pending state. worker.startCh &lt;- struct{}{} return worker } // start sets the running status as 1 and triggers new work submitting. func (w *worker) start() { atomic.StoreInt32(&amp;w.running, 1) w.startCh &lt;- struct{}{} } // newWorkLoop is a standalone goroutine to submit new mining work upon received events. //newWorkLoop是一个去基于事件接收再提交新挖矿工作的线程 func (w *worker) newWorkLoop(recommit time.Duration) { var ( interrupt *int32 minRecommit = recommit // minimal resubmit interval specified by user. timestamp int64 // timestamp for each round of mining. ) // The Timer type represents a single event. // When the Timer expires, the current time will be sent on C, timer := time.NewTimer(0) &lt;-timer.C // discard the initial tick // commit aborts in-flight transaction execution with given signal and resubmits a new one. //提交挖矿请求通过w.newWorkCh处理，而newWorkCh的初始化在四个协程之一的 worker.mainLoop()中执行 //具体可以看mainLoop中的case commit := func(noempty bool, s int32) { if interrupt != nil { atomic.StoreInt32(interrupt, s) } interrupt = new(int32) w.newWorkCh &lt;- &amp;newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp} timer.Reset(recommit) atomic.StoreInt32(&amp;w.newTxs, 0) } // recalcRecommit recalculates the resubmitting interval upon feedback. //重新计算 重提交间隔反馈时间 recalcRecommit := func(target float64, inc bool) { var ( prev = float64(recommit.Nanoseconds()) next float64 ) if inc { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target+intervalAdjustBias) // Recap if interval is larger than the maximum time interval if next &gt; float64(maxRecommitInterval.Nanoseconds()) { next = float64(maxRecommitInterval.Nanoseconds()) } } else { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target-intervalAdjustBias) // Recap if interval is less than the user specified minimum if next &lt; float64(minRecommit.Nanoseconds()) { next = float64(minRecommit.Nanoseconds()) } } recommit = time.Duration(int64(next)) } // clearPending cleans the stale pending tasks. //清除过期的pending交易 clearPending := func(number uint64) { w.pendingMu.Lock() for h, t := range w.pendingTasks { if t.block.NumberU64()+staleThreshold &lt;= number { delete(w.pendingTasks, h) } } w.pendingMu.Unlock() } for { select { //得到挖矿启动事件就提交一个挖矿作业 方法 commit case &lt;-w.startCh: clearPending(w.chain.CurrentBlock().NumberU64()) timestamp = time.Now().Unix() //commit请求实体主要是通过 w.newWorkCh 进行事件的传递 commit(false, commitInterruptNewHead) case head := &lt;-w.chainHeadCh: clearPending(head.Block.NumberU64()) timestamp = time.Now().Unix() commit(false, commitInterruptNewHead) case &lt;-timer.C: // If mining is running resubmit a new work cycle periodically to pull in // higher priced transactions. Disable this overhead for pending blocks. if w.isRunning() &amp;&amp; (w.config.Clique == nil || w.config.Clique.Period &gt; 0) { // Short circuit if no new transaction arrives. if atomic.LoadInt32(&amp;w.newTxs) == 0 { timer.Reset(recommit) continue } commit(true, commitInterruptResubmit) } case interval := &lt;-w.resubmitIntervalCh: // Adjust resubmit interval explicitly by user. if interval &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, interval, &quot;updated&quot;, minRecommitInterval) interval = minRecommitInterval } log.Info(&quot;Miner recommit interval update&quot;, &quot;from&quot;, minRecommit, &quot;to&quot;, interval) minRecommit, recommit = interval, interval if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case adjust := &lt;-w.resubmitAdjustCh: // Adjust resubmit interval by feedback. if adjust.inc { before := recommit recalcRecommit(float64(recommit.Nanoseconds())/adjust.ratio, true) log.Trace(&quot;Increase miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } else { before := recommit recalcRecommit(float64(minRecommit.Nanoseconds()), false) log.Trace(&quot;Decrease miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case &lt;-w.exitCh: return } } } //newWorker中的第一个协程 // mainLoop is a standalone goroutine to regenerate the sealing task based on the received event. func (w *worker) mainLoop() { defer w.txsSub.Unsubscribe() defer w.chainHeadSub.Unsubscribe() defer w.chainSideSub.Unsubscribe() for { select { //w.newWorkCh在里头做实时的监听，一发现有内容就会把它提交给一个叫做 //w.commitNewWork(req.interrupt, req.noempty) 挖矿作业提交函数 case req := &lt;-w.newWorkCh: //commitNewWork方法发布work任务，将worker对象中的当前的挖矿任务发布到管道队列中 //再具体可以看下面commitNewWork方法的执行过程 w.commitNewWork(req.interrupt, req.noempty, req.timestamp) case ev := &lt;-w.chainSideCh: // Short circuit for duplicate side blocks if _, exist := w.localUncles[ev.Block.Hash()]; exist { continue } if _, exist := w.remoteUncles[ev.Block.Hash()]; exist { continue } // Add side block to possible uncle block set depending on the author. if w.isLocalBlock != nil &amp;&amp; w.isLocalBlock(ev.Block) { w.localUncles[ev.Block.Hash()] = ev.Block } else { w.remoteUncles[ev.Block.Hash()] = ev.Block } // If our mining block contains less than 2 uncle blocks, // add the new uncle block if valid and regenerate a mining block. if w.isRunning() &amp;&amp; w.current != nil &amp;&amp; w.current.uncles.Cardinality() &lt; 2 { start := time.Now() if err := w.commitUncle(w.current, ev.Block.Header()); err == nil { var uncles []*types.Header w.current.uncles.Each(func(item interface{}) bool { hash, ok := item.(common.Hash) if !ok { return false } uncle, exist := w.localUncles[hash] if !exist { uncle, exist = w.remoteUncles[hash] } if !exist { return false } uncles = append(uncles, uncle.Header()) return false }) w.commit(uncles, nil, true, start) } } case ev := &lt;-w.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if !w.isRunning() &amp;&amp; w.current != nil { w.mu.RLock() coinbase := w.coinbase w.mu.RUnlock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(w.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs) w.commitTransactions(txset, coinbase, nil) w.updateSnapshot() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if w.config.Clique != nil &amp;&amp; w.config.Clique.Period == 0 { w.commitNewWork(nil, false, time.Now().Unix()) } } atomic.AddInt32(&amp;w.newTxs, int32(len(ev.Txs))) // System stopped case &lt;-w.exitCh: return case &lt;-w.txsSub.Err(): return case &lt;-w.chainHeadSub.Err(): return case &lt;-w.chainSideSub.Err(): return } } } // commitNewWork generates several new sealing tasks based on the parent block. //做各种各样的 block 预处理工作，到方法的末尾 交付给了 //w.commit(uncles, w.fullTaskHook, true, tstart) func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) { ...//block 处理工作 //w.commit里面是先对收据数据先做一些处理然后把 构造好的 收据 receipts //状态 state 及预先打包好的block (里头有些内容需要真正挖矿来回填的， //比如 随机数等) &nbsp;构造成一个任务实体 task 对象并提交给 w.taskCh 通道 w.commit(uncles, w.fullTaskHook, true, tstart) } // commit runs any post-transaction state modifications, assembles the final block // and commits new work if consensus engine is running. // 组装receipts数据，并且Finalize 函数打包封装区块填充其中部分数据 func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error { // Deep copy receipts here to avoid interaction between different tasks. receipts := make([]*types.Receipt, len(w.current.receipts)) for i, l := range w.current.receipts { receipts[i] = new(types.Receipt) *receipts[i] = *l } s := w.current.state.Copy() block, err := w.engine.Finalize(w.chain, w.current.header, s, w.current.txs, uncles, w.current.receipts) if err != nil { return err } if w.isRunning() { if interval != nil { interval() } select { //给出区块相关的数据构造一个task实体，交给w.taskCh case w.taskCh &lt;- &amp;task{receipts: receipts, state: s, block: block, createdAt: time.Now()}: w.unconfirmed.Shift(block.NumberU64() - 1) feesWei := new(big.Int) for i, tx := range block.Transactions() { feesWei.Add(feesWei, new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.GasPrice())) } feesEth := new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether))) log.Info(&quot;Commit new mining work&quot;, &quot;number&quot;, block.Number(), &quot;sealhash&quot;, w.engine.SealHash(block.Header()), &quot;uncles&quot;, len(uncles), &quot;txs&quot;, w.current.tcount, &quot;gas&quot;, block.GasUsed(), &quot;fees&quot;, feesEth, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start))) case &lt;-w.exitCh: log.Info(&quot;Worker has exited&quot;) } } if update { w.updateSnapshot() } return nil } //newWorker方法中的第四个协程 // taskLoop is a standalone goroutine to fetch sealing task from the generator and // push them to consensus engine. func (w *worker) taskLoop() { var ( stopCh chan struct{} prev common.Hash ) // interrupt aborts the in-flight sealing task. interrupt := func() { if stopCh != nil { close(stopCh) stopCh = nil } } for { select { //监听这个taskCh通道过来的 task 实体一有就启动 // seal() 函数把这些信息 交由底层的共识层的实现去 做真正的挖矿 case task := &lt;-w.taskCh: if w.newTaskHook != nil { w.newTaskHook(task) } // Reject duplicate sealing work due to resubmitting. sealHash := w.engine.SealHash(task.block.Header()) if sealHash == prev { continue } // Interrupt previous sealing operation interrupt() stopCh, prev = make(chan struct{}), sealHash if w.skipSealHook != nil &amp;&amp; w.skipSealHook(task) { continue } w.pendingMu.Lock() w.pendingTasks[w.engine.SealHash(task.block.Header())] = task w.pendingMu.Unlock() //使用共识算法授权封印区块 if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil { log.Warn(&quot;Block sealing failed&quot;, &quot;err&quot;, err) } case &lt;-w.exitCh: interrupt() return } } } // Seal implements consensus.Engine, attempting to find a nonce that satisfies // the block&#39;s difficulty requirements. //用Engine.Seal()函数，利用Engine实现体的共识算法对传入的Block进行最终的授权， //如果成功，就将Block同Work一起通过channel发还给worker，那边worker.wait()会接收并处理。 /*Seal()函数可对一个调用过Finalize()的区块进行授权或封印， 并将封印过程产生的一些值赋予区块中剩余尚未赋值的成员(Header.Nonce, Header.MixDigest)。 Seal()成功时返回的区块全部成员齐整，可视为一个正常区块，可被广播到整个网络中， 也可以被插入区块链等。所以，对于挖掘一个新区块来说，所有相关代码里Engine.Seal()是其中最重要， 也是最复杂的一步。*/ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, results chan&lt;- *types.Block, stop &lt;-chan struct{}) error { // If we&#39;re running a fake PoW, simply return a 0 nonce immediately if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake { header := block.Header() header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{} select { //封印区块头 case results &lt;- block.WithSeal(header): default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;fake&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } return nil } // If we&#39;re running a shared PoW, delegate sealing to it if ethash.shared != nil { return ethash.shared.Seal(chain, block, results, stop) } // Create a runner and the multiple search threads it directs abort := make(chan struct{}) ethash.lock.Lock() threads := ethash.threads if ethash.rand == nil { seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64)) if err != nil { ethash.lock.Unlock() return err } ethash.rand = rand.New(rand.NewSource(seed.Int64())) } ethash.lock.Unlock() if threads == 0 { threads = runtime.NumCPU() } if threads &lt; 0 { threads = 0 // Allows disabling local mining without extra logic around local/remote } // Push new work to remote sealer if ethash.workCh != nil { ethash.workCh &lt;- &amp;sealTask{block: block, results: results} } var ( pend sync.WaitGroup locals = make(chan *types.Block) ) /*Ethash.Seal()函数实现中，会以多线程(goroutine)的方式并行调用mine()函数， 线程个数等于Ethash.threads；如果Ethash.threads被设为0， 则Ethash选择以本地CPU中的总核数作为开启线程的个数。*/ for i := 0; i &lt; threads; i++ { pend.Add(1) go func(id int, nonce uint64) { defer pend.Done() ethash.mine(block, id, nonce, abort, locals) }(i, uint64(ethash.rand.Int63())) } // Wait until sealing is terminated or a nonce is found go func() { var result *types.Block select { case &lt;-stop: // Outside abort, stop all miner threads close(abort) case result = &lt;-locals: // One of the threads found a block, abort all others select { //挖出区块后通过通道返回到四个协程中的 worker.resultLoop() ，从w.resultCh取出，results就是其传入的参数 //由此返回成功挖出的区块 case results &lt;- result: default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;local&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } close(abort) case &lt;-ethash.update: // Thread count was changed on user request, restart close(abort) if err := ethash.Seal(chain, block, results, stop); err != nil { log.Error(&quot;Failed to restart sealing after update&quot;, &quot;err&quot;, err) } } // Wait for all miners to terminate and return the block pend.Wait() }() return nil } // mine is the actual proof-of-work miner that searches for a nonce starting from // seed that results in correct final block difficulty. //使用共识算法进行挖矿操作 func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { // Extract some data from the header /* 这里说明一下dataset的由来： dataset是根据Cache生成一个1GB大小的数据集合DAG(有向非循环图)， 它是一个完整的搜索空间，挖矿的过程就是从DAG中随机选择元素 (类似于比特币挖矿中查找合适Nonce)再进行哈希运算， 可以从Cache快速计算DAG指定位置的元素，进而哈希验证，因此cache就是ethash需要的缓存 那么cache又是怎么来的呢？对于每一个块，首先计算一个种子(seed 指的是参数中的seed) ， 这个种子先根据block number以及block header计算出一个seed（种子值） 然后根据种子生成一个32M的随机数据集（cache） cache和DAG每个周期(1000个块)更新一次 */ var ( header = block.Header() hash = ethash.SealHash(header).Bytes() target = new(big.Int).Div(two256, header.Difficulty) number = header.Number.Uint64() //--------------------------------- dataset = ethash.dataset(number, false) ) // Start generating random nonces until we abort or find a good one var ( attempts = int64(0) nonce = seed ) logger := log.New(&quot;miner&quot;, id) logger.Trace(&quot;Started ethash search for new nonces&quot;, &quot;seed&quot;, seed) search: for { select { case &lt;-abort: // Mining terminated, update stats and abort logger.Trace(&quot;Ethash nonce search aborted&quot;, &quot;attempts&quot;, nonce-seed) ethash.hashrate.Mark(attempts) break search default: // We don&#39;t have to update hash rate on every nonce, so update after after 2^X nonces attempts++ if (attempts % (1 &lt;&lt; 15)) == 0 { ethash.hashrate.Mark(attempts) attempts = 0 } // Compute the PoW value of this nonce //进入hashimotoFull，进行具体的挖矿运算 digest, result := hashimotoFull(dataset.dataset, hash, nonce) //这里的target为计算方法是 256/difficulty if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) header.MixDigest = common.BytesToHash(digest) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): logger.Trace(&quot;Ethash nonce found and reported&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) case &lt;-abort: logger.Trace(&quot;Ethash nonce found but discarded&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) } break search } nonce++ } } // Datasets are unmapped in a finalizer. Ensure that the dataset stays live // during sealing so it&#39;s not unmapped while being read. runtime.KeepAlive(dataset) } // hashimotoFull aggregates data from the full dataset (using the full in-memory // dataset) in order to produce our final value for a particular header hash and // nonce. /*hashimotoFull()处于一个循环中调用其进行一系列复杂运算 时传入的hash、nonce、 巨大的辅助数组dataset(也就是我们说的搜索或是匹配空间)，以及结果比较的target； 一旦它的返回值符合条件，就复制Header对象，并赋值Nonce、MixDigest属性， 返回经过授权的区块*/ func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { //定义一个lookup函数，用于在数据集中查找数据 lookup := func(index uint32) []uint32 { offset := index * hashWords //hashWords = 16 return dataset[offset : offset+hashWords] } //dataset数据集进行分割读取，然后传给hashimoto函数 return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } // hashimoto aggregates data from the full dataset in order to produce our final // value for a particular header hash and nonce. //在传入的数据集中通过hash和nonce值计算加密值 func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) { // Calculate the number of theoretical rows (we use one buffer nonetheless) //size = uint64(len(dataset))*4 //计算数据集理论的行数 rows := uint32(size / mixBytes) //mixBytes = 128 // Width of mix // Combine header+nonce into a 64 byte seed //合并header和nonce到一个40bytes的seed seed := make([]byte, 40) copy(seed, hash) binary.LittleEndian.PutUint64(seed[32:], nonce) /// 将seed进行Keccak512加密 seed = crypto.Keccak512(seed) seedHead := binary.LittleEndian.Uint32(seed) // Start the mix with replicated seed //与重新构造的seed混合 mixBytes/4 mix := make([]uint32, mixBytes/4) for i := 0; i &lt; len(mix); i++ { //从seed中取元素到长度为32的mix数组 //mix中以小端格式存储(Little-Endian)，就是低位字节排放在内存的低地址,高位字节排放在内存的高地址端 //一般操作系统都是小端，而通讯协议是大端的 /* unsigned int value = 0x12345678 其中最高位字节为12，最低位为78 大端格式 --------------- buf[3] (0x78) -- 低位 buf[2] (0x56) buf[1] (0x34) buf[0] (0x12) -- 高位 为什么会有大小端模式之分呢？ 这是因为在计算机系统中， 我们是以字节为单位的，每个地址单元都对应着一个字节， 一个字节为8bit。但是在C语言中除了8bit的char之外， 还有16bit的short型，32bit的long型（要看具体的编译器）， 另外，对于位数大于8位的处理器，例如16位或者32位的处理器， 由于寄存器宽度大于一个字节，那么必然存在着一个如果将多个字节安排的问题。 因此就导致了大端存储模式和小端存储模式。 */ mix[i] = binary.LittleEndian.Uint32(seed[i%16*4:]) } // Mix in random dataset nodes //定义tmp，与mix结构相同，长度相同 temp := make([]uint32, len(mix)) //loopAccesses = 64 // Number of accesses in hashimoto loop for i := 0; i &lt; loopAccesses; i++ { parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows for j := uint32(0); j &lt; mixBytes/hashBytes; j++ { copy(temp[j*hashWords:], lookup(2*parent+j)) } //将mix中所有元素都与temp中对应位置的元素进行FNV hash运算 fnvHash(mix, temp) } // Compress mix //混淆mix for i := 0; i &lt; len(mix); i += 4 { // FNV能快速hash大量数据并保持较小的冲突率，它的高度分散使它适用于hash一些非常相近的字符串如url，ip等 // FNV是基于向量“异或”的操作来混淆mix数组 mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3]) } //保留8个长度mix有效数据 mix = mix[:len(mix)/4] //将长度为8的mix分散到32位的digest中去 digest := make([]byte, common.HashLength) for i, val := range mix { binary.LittleEndian.PutUint32(digest[i*4:], val) } return digest, crypto.Keccak256(append(seed, digest...)) } &nbsp; 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961285 // Miner creates blocks and searches for proof-of-work values. type Miner struct { mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine exitCh chan struct{} canStart int32 // can start indicates whether we can start the mining operation shouldStart int32 // should start indicates whether we should start after sync } //挖矿开始前需要创建新的miner func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(block *types.Block) bool) *Miner { miner := &amp;Miner{ eth: eth, mux: mux, engine: engine, exitCh: make(chan struct{}), //具体详情见下面newWorker方法 worker: newWorker(config, engine, eth, mux, recommit, gasFloor, gasCeil, isLocalBlock), canStart: 1, } //启动一个线程执行update /*可以看到如果当前处于 区块的同步中，则挖矿的操作需要停止， 直到同步操作结束（同步成功或是失败）， 如果原来已经执行了挖矿操作的，则继续开启挖矿操作*/ go miner.update() return miner } func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(*types.Block) bool) *worker { //构造worker worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, chain: eth.BlockChain(), gasFloor: gasFloor, gasCeil: gasCeil, isLocalBlock: isLocalBlock, localUncles: make(map[common.Hash]*types.Block), remoteUncles: make(map[common.Hash]*types.Block), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), pendingTasks: make(map[common.Hash]*task), txsCh: make(chan core.NewTxsEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), //新版本的worker中更新了下面几个通道 newWorkCh: make(chan *newWorkReq), taskCh: make(chan *task), resultCh: make(chan *types.Block, resultQueueSize), exitCh: make(chan struct{}), startCh: make(chan struct{}, 1), resubmitIntervalCh: make(chan time.Duration), resubmitAdjustCh: make(chan *intervalAdjust, resubmitAdjustChanSize), } // Subscribe NewTxsEvent for tx pool //注册TxsEvent事件到tx pool交易池 worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) // 注册事件到tx pool交易池 worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) // Sanitize recommit interval if the user-specified one is too short. //如果用户指定的间隔太短，则重新设置间隔。 if recommit &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, recommit, &quot;updated&quot;, minRecommitInterval) recommit = minRecommitInterval } go worker.mainLoop() //newWorkLoop 是一个一直监听 startCh 中是否有挖矿信号 //(startCh的信号由 start函数放置进去的，见下面的start方法) go worker.newWorkLoop(recommit) go worker.resultLoop() go worker.taskLoop() // Submit first work to initialize pending state. worker.startCh &lt;- struct{}{} return worker } // start sets the running status as 1 and triggers new work submitting. func (w *worker) start() { atomic.StoreInt32(&amp;w.running, 1) w.startCh &lt;- struct{}{} } // newWorkLoop is a standalone goroutine to submit new mining work upon received events. //newWorkLoop是一个去基于事件接收再提交新挖矿工作的线程 func (w *worker) newWorkLoop(recommit time.Duration) { var ( interrupt *int32 minRecommit = recommit // minimal resubmit interval specified by user. timestamp int64 // timestamp for each round of mining. ) // The Timer type represents a single event. // When the Timer expires, the current time will be sent on C, timer := time.NewTimer(0) &lt;-timer.C // discard the initial tick // commit aborts in-flight transaction execution with given signal and resubmits a new one. //提交挖矿请求通过w.newWorkCh处理，而newWorkCh的初始化在四个协程之一的 worker.mainLoop()中执行 //具体可以看mainLoop中的case commit := func(noempty bool, s int32) { if interrupt != nil { atomic.StoreInt32(interrupt, s) } interrupt = new(int32) w.newWorkCh &lt;- &amp;newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp} timer.Reset(recommit) atomic.StoreInt32(&amp;w.newTxs, 0) } // recalcRecommit recalculates the resubmitting interval upon feedback. //重新计算 重提交间隔反馈时间 recalcRecommit := func(target float64, inc bool) { var ( prev = float64(recommit.Nanoseconds()) next float64 ) if inc { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target+intervalAdjustBias) // Recap if interval is larger than the maximum time interval if next &gt; float64(maxRecommitInterval.Nanoseconds()) { next = float64(maxRecommitInterval.Nanoseconds()) } } else { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target-intervalAdjustBias) // Recap if interval is less than the user specified minimum if next &lt; float64(minRecommit.Nanoseconds()) { next = float64(minRecommit.Nanoseconds()) } } recommit = time.Duration(int64(next)) } // clearPending cleans the stale pending tasks. //清除过期的pending交易 clearPending := func(number uint64) { w.pendingMu.Lock() for h, t := range w.pendingTasks { if t.block.NumberU64()+staleThreshold &lt;= number { delete(w.pendingTasks, h) } } w.pendingMu.Unlock() } for { select { //得到挖矿启动事件就提交一个挖矿作业 方法 commit case &lt;-w.startCh: clearPending(w.chain.CurrentBlock().NumberU64()) timestamp = time.Now().Unix() //commit请求实体主要是通过 w.newWorkCh 进行事件的传递 commit(false, commitInterruptNewHead) case head := &lt;-w.chainHeadCh: clearPending(head.Block.NumberU64()) timestamp = time.Now().Unix() commit(false, commitInterruptNewHead) case &lt;-timer.C: // If mining is running resubmit a new work cycle periodically to pull in // higher priced transactions. Disable this overhead for pending blocks. if w.isRunning() &amp;&amp; (w.config.Clique == nil || w.config.Clique.Period &gt; 0) { // Short circuit if no new transaction arrives. if atomic.LoadInt32(&amp;w.newTxs) == 0 { timer.Reset(recommit) continue } commit(true, commitInterruptResubmit) } case interval := &lt;-w.resubmitIntervalCh: // Adjust resubmit interval explicitly by user. if interval &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, interval, &quot;updated&quot;, minRecommitInterval) interval = minRecommitInterval } log.Info(&quot;Miner recommit interval update&quot;, &quot;from&quot;, minRecommit, &quot;to&quot;, interval) minRecommit, recommit = interval, interval if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case adjust := &lt;-w.resubmitAdjustCh: // Adjust resubmit interval by feedback. if adjust.inc { before := recommit recalcRecommit(float64(recommit.Nanoseconds())/adjust.ratio, true) log.Trace(&quot;Increase miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } else { before := recommit recalcRecommit(float64(minRecommit.Nanoseconds()), false) log.Trace(&quot;Decrease miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case &lt;-w.exitCh: return } } } //newWorker中的第一个协程 // mainLoop is a standalone goroutine to regenerate the sealing task based on the received event. func (w *worker) mainLoop() { defer w.txsSub.Unsubscribe() defer w.chainHeadSub.Unsubscribe() defer w.chainSideSub.Unsubscribe() for { select { //w.newWorkCh在里头做实时的监听，一发现有内容就会把它提交给一个叫做 //w.commitNewWork(req.interrupt, req.noempty) 挖矿作业提交函数 case req := &lt;-w.newWorkCh: //commitNewWork方法发布work任务，将worker对象中的当前的挖矿任务发布到管道队列中 //再具体可以看下面commitNewWork方法的执行过程 w.commitNewWork(req.interrupt, req.noempty, req.timestamp) case ev := &lt;-w.chainSideCh: // Short circuit for duplicate side blocks if _, exist := w.localUncles[ev.Block.Hash()]; exist { continue } if _, exist := w.remoteUncles[ev.Block.Hash()]; exist { continue } // Add side block to possible uncle block set depending on the author. if w.isLocalBlock != nil &amp;&amp; w.isLocalBlock(ev.Block) { w.localUncles[ev.Block.Hash()] = ev.Block } else { w.remoteUncles[ev.Block.Hash()] = ev.Block } // If our mining block contains less than 2 uncle blocks, // add the new uncle block if valid and regenerate a mining block. if w.isRunning() &amp;&amp; w.current != nil &amp;&amp; w.current.uncles.Cardinality() &lt; 2 { start := time.Now() if err := w.commitUncle(w.current, ev.Block.Header()); err == nil { var uncles []*types.Header w.current.uncles.Each(func(item interface{}) bool { hash, ok := item.(common.Hash) if !ok { return false } uncle, exist := w.localUncles[hash] if !exist { uncle, exist = w.remoteUncles[hash] } if !exist { return false } uncles = append(uncles, uncle.Header()) return false }) w.commit(uncles, nil, true, start) } } case ev := &lt;-w.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if !w.isRunning() &amp;&amp; w.current != nil { w.mu.RLock() coinbase := w.coinbase w.mu.RUnlock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(w.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs) w.commitTransactions(txset, coinbase, nil) w.updateSnapshot() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if w.config.Clique != nil &amp;&amp; w.config.Clique.Period == 0 { w.commitNewWork(nil, false, time.Now().Unix()) } } atomic.AddInt32(&amp;w.newTxs, int32(len(ev.Txs))) // System stopped case &lt;-w.exitCh: return case &lt;-w.txsSub.Err(): return case &lt;-w.chainHeadSub.Err(): return case &lt;-w.chainSideSub.Err(): return } } } // commitNewWork generates several new sealing tasks based on the parent block. //做各种各样的 block 预处理工作，到方法的末尾 交付给了 //w.commit(uncles, w.fullTaskHook, true, tstart) func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) { ...//block 处理工作 //w.commit里面是先对收据数据先做一些处理然后把 构造好的 收据 receipts //状态 state 及预先打包好的block (里头有些内容需要真正挖矿来回填的， //比如 随机数等) &nbsp;构造成一个任务实体 task 对象并提交给 w.taskCh 通道 w.commit(uncles, w.fullTaskHook, true, tstart) } // commit runs any post-transaction state modifications, assembles the final block // and commits new work if consensus engine is running. // 组装receipts数据，并且Finalize 函数打包封装区块填充其中部分数据 func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error { // Deep copy receipts here to avoid interaction between different tasks. receipts := make([]*types.Receipt, len(w.current.receipts)) for i, l := range w.current.receipts { receipts[i] = new(types.Receipt) *receipts[i] = *l } s := w.current.state.Copy() block, err := w.engine.Finalize(w.chain, w.current.header, s, w.current.txs, uncles, w.current.receipts) if err != nil { return err } if w.isRunning() { if interval != nil { interval() } select { //给出区块相关的数据构造一个task实体，交给w.taskCh case w.taskCh &lt;- &amp;task{receipts: receipts, state: s, block: block, createdAt: time.Now()}: w.unconfirmed.Shift(block.NumberU64() - 1) feesWei := new(big.Int) for i, tx := range block.Transactions() { feesWei.Add(feesWei, new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.GasPrice())) } feesEth := new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether))) log.Info(&quot;Commit new mining work&quot;, &quot;number&quot;, block.Number(), &quot;sealhash&quot;, w.engine.SealHash(block.Header()), &quot;uncles&quot;, len(uncles), &quot;txs&quot;, w.current.tcount, &quot;gas&quot;, block.GasUsed(), &quot;fees&quot;, feesEth, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start))) case &lt;-w.exitCh: log.Info(&quot;Worker has exited&quot;) } } if update { w.updateSnapshot() } return nil } //newWorker方法中的第四个协程 // taskLoop is a standalone goroutine to fetch sealing task from the generator and // push them to consensus engine. func (w *worker) taskLoop() { var ( stopCh chan struct{} prev common.Hash ) // interrupt aborts the in-flight sealing task. interrupt := func() { if stopCh != nil { close(stopCh) stopCh = nil } } for { select { //监听这个taskCh通道过来的 task 实体一有就启动 // seal() 函数把这些信息 交由底层的共识层的实现去 做真正的挖矿 case task := &lt;-w.taskCh: if w.newTaskHook != nil { w.newTaskHook(task) } // Reject duplicate sealing work due to resubmitting. sealHash := w.engine.SealHash(task.block.Header()) if sealHash == prev { continue } // Interrupt previous sealing operation interrupt() stopCh, prev = make(chan struct{}), sealHash if w.skipSealHook != nil &amp;&amp; w.skipSealHook(task) { continue } w.pendingMu.Lock() w.pendingTasks[w.engine.SealHash(task.block.Header())] = task w.pendingMu.Unlock() //使用共识算法授权封印区块 if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil { log.Warn(&quot;Block sealing failed&quot;, &quot;err&quot;, err) } case &lt;-w.exitCh: interrupt() return } } } // Seal implements consensus.Engine, attempting to find a nonce that satisfies // the block&#39;s difficulty requirements. //用Engine.Seal()函数，利用Engine实现体的共识算法对传入的Block进行最终的授权， //如果成功，就将Block同Work一起通过channel发还给worker，那边worker.wait()会接收并处理。 /*Seal()函数可对一个调用过Finalize()的区块进行授权或封印， 并将封印过程产生的一些值赋予区块中剩余尚未赋值的成员(Header.Nonce, Header.MixDigest)。 Seal()成功时返回的区块全部成员齐整，可视为一个正常区块，可被广播到整个网络中， 也可以被插入区块链等。所以，对于挖掘一个新区块来说，所有相关代码里Engine.Seal()是其中最重要， 也是最复杂的一步。*/ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, results chan&lt;- *types.Block, stop &lt;-chan struct{}) error { // If we&#39;re running a fake PoW, simply return a 0 nonce immediately if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake { header := block.Header() header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{} select { //封印区块头 case results &lt;- block.WithSeal(header): default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;fake&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } return nil } // If we&#39;re running a shared PoW, delegate sealing to it if ethash.shared != nil { return ethash.shared.Seal(chain, block, results, stop) } // Create a runner and the multiple search threads it directs abort := make(chan struct{}) ethash.lock.Lock() threads := ethash.threads if ethash.rand == nil { seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64)) if err != nil { ethash.lock.Unlock() return err } ethash.rand = rand.New(rand.NewSource(seed.Int64())) } ethash.lock.Unlock() if threads == 0 { threads = runtime.NumCPU() } if threads &lt; 0 { threads = 0 // Allows disabling local mining without extra logic around local/remote } // Push new work to remote sealer if ethash.workCh != nil { ethash.workCh &lt;- &amp;sealTask{block: block, results: results} } var ( pend sync.WaitGroup locals = make(chan *types.Block) ) /*Ethash.Seal()函数实现中，会以多线程(goroutine)的方式并行调用mine()函数， 线程个数等于Ethash.threads；如果Ethash.threads被设为0， 则Ethash选择以本地CPU中的总核数作为开启线程的个数。*/ for i := 0; i &lt; threads; i++ { pend.Add(1) go func(id int, nonce uint64) { defer pend.Done() ethash.mine(block, id, nonce, abort, locals) }(i, uint64(ethash.rand.Int63())) } // Wait until sealing is terminated or a nonce is found go func() { var result *types.Block select { case &lt;-stop: // Outside abort, stop all miner threads close(abort) case result = &lt;-locals: // One of the threads found a block, abort all others select { //挖出区块后通过通道返回到四个协程中的 worker.resultLoop() ，从w.resultCh取出，results就是其传入的参数 //由此返回成功挖出的区块 case results &lt;- result: default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;local&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } close(abort) case &lt;-ethash.update: // Thread count was changed on user request, restart close(abort) if err := ethash.Seal(chain, block, results, stop); err != nil { log.Error(&quot;Failed to restart sealing after update&quot;, &quot;err&quot;, err) } } // Wait for all miners to terminate and return the block pend.Wait() }() return nil } // mine is the actual proof-of-work miner that searches for a nonce starting from // seed that results in correct final block difficulty. //使用共识算法进行挖矿操作 func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { // Extract some data from the header /* 这里说明一下dataset的由来： dataset是根据Cache生成一个1GB大小的数据集合DAG(有向非循环图)， 它是一个完整的搜索空间，挖矿的过程就是从DAG中随机选择元素 (类似于比特币挖矿中查找合适Nonce)再进行哈希运算， 可以从Cache快速计算DAG指定位置的元素，进而哈希验证，因此cache就是ethash需要的缓存 那么cache又是怎么来的呢？对于每一个块，首先计算一个种子(seed 指的是参数中的seed) ， 这个种子先根据block number以及block header计算出一个seed（种子值） 然后根据种子生成一个32M的随机数据集（cache） cache和DAG每个周期(1000个块)更新一次 */ var ( header = block.Header() hash = ethash.SealHash(header).Bytes() target = new(big.Int).Div(two256, header.Difficulty) number = header.Number.Uint64() //--------------------------------- dataset = ethash.dataset(number, false) ) // Start generating random nonces until we abort or find a good one var ( attempts = int64(0) nonce = seed ) logger := log.New(&quot;miner&quot;, id) logger.Trace(&quot;Started ethash search for new nonces&quot;, &quot;seed&quot;, seed) search: for { select { case &lt;-abort: // Mining terminated, update stats and abort logger.Trace(&quot;Ethash nonce search aborted&quot;, &quot;attempts&quot;, nonce-seed) ethash.hashrate.Mark(attempts) break search default: // We don&#39;t have to update hash rate on every nonce, so update after after 2^X nonces attempts++ if (attempts % (1 &lt;&lt; 15)) == 0 { ethash.hashrate.Mark(attempts) attempts = 0 } // Compute the PoW value of this nonce //进入hashimotoFull，进行具体的挖矿运算 digest, result := hashimotoFull(dataset.dataset, hash, nonce) //这里的target为计算方法是 256/difficulty if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) header.MixDigest = common.BytesToHash(digest) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): logger.Trace(&quot;Ethash nonce found and reported&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) case &lt;-abort: logger.Trace(&quot;Ethash nonce found but discarded&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) } break search } nonce++ } } // Datasets are unmapped in a finalizer. Ensure that the dataset stays live // during sealing so it&#39;s not unmapped while being read. runtime.KeepAlive(dataset) } // hashimotoFull aggregates data from the full dataset (using the full in-memory // dataset) in order to produce our final value for a particular header hash and // nonce. /*hashimotoFull()处于一个循环中调用其进行一系列复杂运算 时传入的hash、nonce、 巨大的辅助数组dataset(也就是我们说的搜索或是匹配空间)，以及结果比较的target； 一旦它的返回值符合条件，就复制Header对象，并赋值Nonce、MixDigest属性， 返回经过授权的区块*/ func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { //定义一个lookup函数，用于在数据集中查找数据 lookup := func(index uint32) []uint32 { offset := index * hashWords //hashWords = 16 return dataset[offset : offset+hashWords] } //dataset数据集进行分割读取，然后传给hashimoto函数 return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } // hashimoto aggregates data from the full dataset in order to produce our final // value for a particular header hash and nonce. //在传入的数据集中通过hash和nonce值计算加密值 func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) { // Calculate the number of theoretical rows (we use one buffer nonetheless) //size = uint64(len(dataset))*4 //计算数据集理论的行数 rows := uint32(size / mixBytes) //mixBytes = 128 // Width of mix // Combine header+nonce into a 64 byte seed //合并header和nonce到一个40bytes的seed seed := make([]byte, 40) copy(seed, hash) binary.LittleEndian.PutUint64(seed[32:], nonce) /// 将seed进行Keccak512加密 seed = crypto.Keccak512(seed) seedHead := binary.LittleEndian.Uint32(seed) // Start the mix with replicated seed //与重新构造的seed混合 mixBytes/4 mix := make([]uint32, mixBytes/4) for i := 0; i &lt; len(mix); i++ { //从seed中取元素到长度为32的mix数组 //mix中以小端格式存储(Little-Endian)，就是低位字节排放在内存的低地址,高位字节排放在内存的高地址端 //一般操作系统都是小端，而通讯协议是大端的 /* unsigned int value = 0x12345678 其中最高位字节为12，最低位为78 大端格式 --------------- buf[3] (0x78) -- 低位 buf[2] (0x56) buf[1] (0x34) buf[0] (0x12) -- 高位 为什么会有大小端模式之分呢？ 这是因为在计算机系统中， 我们是以字节为单位的，每个地址单元都对应着一个字节， 一个字节为8bit。但是在C语言中除了8bit的char之外， 还有16bit的short型，32bit的long型（要看具体的编译器）， 另外，对于位数大于8位的处理器，例如16位或者32位的处理器， 由于寄存器宽度大于一个字节，那么必然存在着一个如果将多个字节安排的问题。 因此就导致了大端存储模式和小端存储模式。 */ mix[i] = binary.LittleEndian.Uint32(seed[i%16*4:]) } // Mix in random dataset nodes //定义tmp，与mix结构相同，长度相同 temp := make([]uint32, len(mix)) //loopAccesses = 64 // Number of accesses in hashimoto loop for i := 0; i &lt; loopAccesses; i++ { parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows for j := uint32(0); j &lt; mixBytes/hashBytes; j++ { copy(temp[j*hashWords:], lookup(2*parent+j)) } //将mix中所有元素都与temp中对应位置的元素进行FNV hash运算 fnvHash(mix, temp) } // Compress mix //混淆mix for i := 0; i &lt; len(mix); i += 4 { // FNV能快速hash大量数据并保持较小的冲突率，它的高度分散使它适用于hash一些非常相近的字符串如url，ip等 // FNV是基于向量“异或”的操作来混淆mix数组 mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3]) } //保留8个长度mix有效数据 mix = mix[:len(mix)/4] //将长度为8的mix分散到32位的digest中去 digest := make([]byte, common.HashLength) for i, val := range mix { binary.LittleEndian.PutUint32(digest[i*4:], val) } return digest, crypto.Keccak256(append(seed, digest...)) } &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/11/11/55bd69214abc1bcf633a472b11107c6c.html" />
+<meta property="og:url" content="https://uzzz.org/2018/11/11/55bd69214abc1bcf633a472b11107c6c.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-11-11T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961285 // Miner creates blocks and searches for proof-of-work values. type Miner struct { mux *event.TypeMux worker *worker coinbase common.Address eth Backend engine consensus.Engine exitCh chan struct{} canStart int32 // can start indicates whether we can start the mining operation shouldStart int32 // should start indicates whether we should start after sync } //挖矿开始前需要创建新的miner func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, engine consensus.Engine, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(block *types.Block) bool) *Miner { miner := &amp;Miner{ eth: eth, mux: mux, engine: engine, exitCh: make(chan struct{}), //具体详情见下面newWorker方法 worker: newWorker(config, engine, eth, mux, recommit, gasFloor, gasCeil, isLocalBlock), canStart: 1, } //启动一个线程执行update /*可以看到如果当前处于 区块的同步中，则挖矿的操作需要停止， 直到同步操作结束（同步成功或是失败）， 如果原来已经执行了挖矿操作的，则继续开启挖矿操作*/ go miner.update() return miner } func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(*types.Block) bool) *worker { //构造worker worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, chain: eth.BlockChain(), gasFloor: gasFloor, gasCeil: gasCeil, isLocalBlock: isLocalBlock, localUncles: make(map[common.Hash]*types.Block), remoteUncles: make(map[common.Hash]*types.Block), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), pendingTasks: make(map[common.Hash]*task), txsCh: make(chan core.NewTxsEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), //新版本的worker中更新了下面几个通道 newWorkCh: make(chan *newWorkReq), taskCh: make(chan *task), resultCh: make(chan *types.Block, resultQueueSize), exitCh: make(chan struct{}), startCh: make(chan struct{}, 1), resubmitIntervalCh: make(chan time.Duration), resubmitAdjustCh: make(chan *intervalAdjust, resubmitAdjustChanSize), } // Subscribe NewTxsEvent for tx pool //注册TxsEvent事件到tx pool交易池 worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) // 注册事件到tx pool交易池 worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) // Sanitize recommit interval if the user-specified one is too short. //如果用户指定的间隔太短，则重新设置间隔。 if recommit &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, recommit, &quot;updated&quot;, minRecommitInterval) recommit = minRecommitInterval } go worker.mainLoop() //newWorkLoop 是一个一直监听 startCh 中是否有挖矿信号 //(startCh的信号由 start函数放置进去的，见下面的start方法) go worker.newWorkLoop(recommit) go worker.resultLoop() go worker.taskLoop() // Submit first work to initialize pending state. worker.startCh &lt;- struct{}{} return worker } // start sets the running status as 1 and triggers new work submitting. func (w *worker) start() { atomic.StoreInt32(&amp;w.running, 1) w.startCh &lt;- struct{}{} } // newWorkLoop is a standalone goroutine to submit new mining work upon received events. //newWorkLoop是一个去基于事件接收再提交新挖矿工作的线程 func (w *worker) newWorkLoop(recommit time.Duration) { var ( interrupt *int32 minRecommit = recommit // minimal resubmit interval specified by user. timestamp int64 // timestamp for each round of mining. ) // The Timer type represents a single event. // When the Timer expires, the current time will be sent on C, timer := time.NewTimer(0) &lt;-timer.C // discard the initial tick // commit aborts in-flight transaction execution with given signal and resubmits a new one. //提交挖矿请求通过w.newWorkCh处理，而newWorkCh的初始化在四个协程之一的 worker.mainLoop()中执行 //具体可以看mainLoop中的case commit := func(noempty bool, s int32) { if interrupt != nil { atomic.StoreInt32(interrupt, s) } interrupt = new(int32) w.newWorkCh &lt;- &amp;newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp} timer.Reset(recommit) atomic.StoreInt32(&amp;w.newTxs, 0) } // recalcRecommit recalculates the resubmitting interval upon feedback. //重新计算 重提交间隔反馈时间 recalcRecommit := func(target float64, inc bool) { var ( prev = float64(recommit.Nanoseconds()) next float64 ) if inc { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target+intervalAdjustBias) // Recap if interval is larger than the maximum time interval if next &gt; float64(maxRecommitInterval.Nanoseconds()) { next = float64(maxRecommitInterval.Nanoseconds()) } } else { next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target-intervalAdjustBias) // Recap if interval is less than the user specified minimum if next &lt; float64(minRecommit.Nanoseconds()) { next = float64(minRecommit.Nanoseconds()) } } recommit = time.Duration(int64(next)) } // clearPending cleans the stale pending tasks. //清除过期的pending交易 clearPending := func(number uint64) { w.pendingMu.Lock() for h, t := range w.pendingTasks { if t.block.NumberU64()+staleThreshold &lt;= number { delete(w.pendingTasks, h) } } w.pendingMu.Unlock() } for { select { //得到挖矿启动事件就提交一个挖矿作业 方法 commit case &lt;-w.startCh: clearPending(w.chain.CurrentBlock().NumberU64()) timestamp = time.Now().Unix() //commit请求实体主要是通过 w.newWorkCh 进行事件的传递 commit(false, commitInterruptNewHead) case head := &lt;-w.chainHeadCh: clearPending(head.Block.NumberU64()) timestamp = time.Now().Unix() commit(false, commitInterruptNewHead) case &lt;-timer.C: // If mining is running resubmit a new work cycle periodically to pull in // higher priced transactions. Disable this overhead for pending blocks. if w.isRunning() &amp;&amp; (w.config.Clique == nil || w.config.Clique.Period &gt; 0) { // Short circuit if no new transaction arrives. if atomic.LoadInt32(&amp;w.newTxs) == 0 { timer.Reset(recommit) continue } commit(true, commitInterruptResubmit) } case interval := &lt;-w.resubmitIntervalCh: // Adjust resubmit interval explicitly by user. if interval &lt; minRecommitInterval { log.Warn(&quot;Sanitizing miner recommit interval&quot;, &quot;provided&quot;, interval, &quot;updated&quot;, minRecommitInterval) interval = minRecommitInterval } log.Info(&quot;Miner recommit interval update&quot;, &quot;from&quot;, minRecommit, &quot;to&quot;, interval) minRecommit, recommit = interval, interval if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case adjust := &lt;-w.resubmitAdjustCh: // Adjust resubmit interval by feedback. if adjust.inc { before := recommit recalcRecommit(float64(recommit.Nanoseconds())/adjust.ratio, true) log.Trace(&quot;Increase miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } else { before := recommit recalcRecommit(float64(minRecommit.Nanoseconds()), false) log.Trace(&quot;Decrease miner recommit interval&quot;, &quot;from&quot;, before, &quot;to&quot;, recommit) } if w.resubmitHook != nil { w.resubmitHook(minRecommit, recommit) } case &lt;-w.exitCh: return } } } //newWorker中的第一个协程 // mainLoop is a standalone goroutine to regenerate the sealing task based on the received event. func (w *worker) mainLoop() { defer w.txsSub.Unsubscribe() defer w.chainHeadSub.Unsubscribe() defer w.chainSideSub.Unsubscribe() for { select { //w.newWorkCh在里头做实时的监听，一发现有内容就会把它提交给一个叫做 //w.commitNewWork(req.interrupt, req.noempty) 挖矿作业提交函数 case req := &lt;-w.newWorkCh: //commitNewWork方法发布work任务，将worker对象中的当前的挖矿任务发布到管道队列中 //再具体可以看下面commitNewWork方法的执行过程 w.commitNewWork(req.interrupt, req.noempty, req.timestamp) case ev := &lt;-w.chainSideCh: // Short circuit for duplicate side blocks if _, exist := w.localUncles[ev.Block.Hash()]; exist { continue } if _, exist := w.remoteUncles[ev.Block.Hash()]; exist { continue } // Add side block to possible uncle block set depending on the author. if w.isLocalBlock != nil &amp;&amp; w.isLocalBlock(ev.Block) { w.localUncles[ev.Block.Hash()] = ev.Block } else { w.remoteUncles[ev.Block.Hash()] = ev.Block } // If our mining block contains less than 2 uncle blocks, // add the new uncle block if valid and regenerate a mining block. if w.isRunning() &amp;&amp; w.current != nil &amp;&amp; w.current.uncles.Cardinality() &lt; 2 { start := time.Now() if err := w.commitUncle(w.current, ev.Block.Header()); err == nil { var uncles []*types.Header w.current.uncles.Each(func(item interface{}) bool { hash, ok := item.(common.Hash) if !ok { return false } uncle, exist := w.localUncles[hash] if !exist { uncle, exist = w.remoteUncles[hash] } if !exist { return false } uncles = append(uncles, uncle.Header()) return false }) w.commit(uncles, nil, true, start) } } case ev := &lt;-w.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if !w.isRunning() &amp;&amp; w.current != nil { w.mu.RLock() coinbase := w.coinbase w.mu.RUnlock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(w.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs) w.commitTransactions(txset, coinbase, nil) w.updateSnapshot() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if w.config.Clique != nil &amp;&amp; w.config.Clique.Period == 0 { w.commitNewWork(nil, false, time.Now().Unix()) } } atomic.AddInt32(&amp;w.newTxs, int32(len(ev.Txs))) // System stopped case &lt;-w.exitCh: return case &lt;-w.txsSub.Err(): return case &lt;-w.chainHeadSub.Err(): return case &lt;-w.chainSideSub.Err(): return } } } // commitNewWork generates several new sealing tasks based on the parent block. //做各种各样的 block 预处理工作，到方法的末尾 交付给了 //w.commit(uncles, w.fullTaskHook, true, tstart) func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) { ...//block 处理工作 //w.commit里面是先对收据数据先做一些处理然后把 构造好的 收据 receipts //状态 state 及预先打包好的block (里头有些内容需要真正挖矿来回填的， //比如 随机数等) &nbsp;构造成一个任务实体 task 对象并提交给 w.taskCh 通道 w.commit(uncles, w.fullTaskHook, true, tstart) } // commit runs any post-transaction state modifications, assembles the final block // and commits new work if consensus engine is running. // 组装receipts数据，并且Finalize 函数打包封装区块填充其中部分数据 func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error { // Deep copy receipts here to avoid interaction between different tasks. receipts := make([]*types.Receipt, len(w.current.receipts)) for i, l := range w.current.receipts { receipts[i] = new(types.Receipt) *receipts[i] = *l } s := w.current.state.Copy() block, err := w.engine.Finalize(w.chain, w.current.header, s, w.current.txs, uncles, w.current.receipts) if err != nil { return err } if w.isRunning() { if interval != nil { interval() } select { //给出区块相关的数据构造一个task实体，交给w.taskCh case w.taskCh &lt;- &amp;task{receipts: receipts, state: s, block: block, createdAt: time.Now()}: w.unconfirmed.Shift(block.NumberU64() - 1) feesWei := new(big.Int) for i, tx := range block.Transactions() { feesWei.Add(feesWei, new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.GasPrice())) } feesEth := new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether))) log.Info(&quot;Commit new mining work&quot;, &quot;number&quot;, block.Number(), &quot;sealhash&quot;, w.engine.SealHash(block.Header()), &quot;uncles&quot;, len(uncles), &quot;txs&quot;, w.current.tcount, &quot;gas&quot;, block.GasUsed(), &quot;fees&quot;, feesEth, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start))) case &lt;-w.exitCh: log.Info(&quot;Worker has exited&quot;) } } if update { w.updateSnapshot() } return nil } //newWorker方法中的第四个协程 // taskLoop is a standalone goroutine to fetch sealing task from the generator and // push them to consensus engine. func (w *worker) taskLoop() { var ( stopCh chan struct{} prev common.Hash ) // interrupt aborts the in-flight sealing task. interrupt := func() { if stopCh != nil { close(stopCh) stopCh = nil } } for { select { //监听这个taskCh通道过来的 task 实体一有就启动 // seal() 函数把这些信息 交由底层的共识层的实现去 做真正的挖矿 case task := &lt;-w.taskCh: if w.newTaskHook != nil { w.newTaskHook(task) } // Reject duplicate sealing work due to resubmitting. sealHash := w.engine.SealHash(task.block.Header()) if sealHash == prev { continue } // Interrupt previous sealing operation interrupt() stopCh, prev = make(chan struct{}), sealHash if w.skipSealHook != nil &amp;&amp; w.skipSealHook(task) { continue } w.pendingMu.Lock() w.pendingTasks[w.engine.SealHash(task.block.Header())] = task w.pendingMu.Unlock() //使用共识算法授权封印区块 if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil { log.Warn(&quot;Block sealing failed&quot;, &quot;err&quot;, err) } case &lt;-w.exitCh: interrupt() return } } } // Seal implements consensus.Engine, attempting to find a nonce that satisfies // the block&#39;s difficulty requirements. //用Engine.Seal()函数，利用Engine实现体的共识算法对传入的Block进行最终的授权， //如果成功，就将Block同Work一起通过channel发还给worker，那边worker.wait()会接收并处理。 /*Seal()函数可对一个调用过Finalize()的区块进行授权或封印， 并将封印过程产生的一些值赋予区块中剩余尚未赋值的成员(Header.Nonce, Header.MixDigest)。 Seal()成功时返回的区块全部成员齐整，可视为一个正常区块，可被广播到整个网络中， 也可以被插入区块链等。所以，对于挖掘一个新区块来说，所有相关代码里Engine.Seal()是其中最重要， 也是最复杂的一步。*/ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, results chan&lt;- *types.Block, stop &lt;-chan struct{}) error { // If we&#39;re running a fake PoW, simply return a 0 nonce immediately if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake { header := block.Header() header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{} select { //封印区块头 case results &lt;- block.WithSeal(header): default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;fake&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } return nil } // If we&#39;re running a shared PoW, delegate sealing to it if ethash.shared != nil { return ethash.shared.Seal(chain, block, results, stop) } // Create a runner and the multiple search threads it directs abort := make(chan struct{}) ethash.lock.Lock() threads := ethash.threads if ethash.rand == nil { seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64)) if err != nil { ethash.lock.Unlock() return err } ethash.rand = rand.New(rand.NewSource(seed.Int64())) } ethash.lock.Unlock() if threads == 0 { threads = runtime.NumCPU() } if threads &lt; 0 { threads = 0 // Allows disabling local mining without extra logic around local/remote } // Push new work to remote sealer if ethash.workCh != nil { ethash.workCh &lt;- &amp;sealTask{block: block, results: results} } var ( pend sync.WaitGroup locals = make(chan *types.Block) ) /*Ethash.Seal()函数实现中，会以多线程(goroutine)的方式并行调用mine()函数， 线程个数等于Ethash.threads；如果Ethash.threads被设为0， 则Ethash选择以本地CPU中的总核数作为开启线程的个数。*/ for i := 0; i &lt; threads; i++ { pend.Add(1) go func(id int, nonce uint64) { defer pend.Done() ethash.mine(block, id, nonce, abort, locals) }(i, uint64(ethash.rand.Int63())) } // Wait until sealing is terminated or a nonce is found go func() { var result *types.Block select { case &lt;-stop: // Outside abort, stop all miner threads close(abort) case result = &lt;-locals: // One of the threads found a block, abort all others select { //挖出区块后通过通道返回到四个协程中的 worker.resultLoop() ，从w.resultCh取出，results就是其传入的参数 //由此返回成功挖出的区块 case results &lt;- result: default: log.Warn(&quot;Sealing result is not read by miner&quot;, &quot;mode&quot;, &quot;local&quot;, &quot;sealhash&quot;, ethash.SealHash(block.Header())) } close(abort) case &lt;-ethash.update: // Thread count was changed on user request, restart close(abort) if err := ethash.Seal(chain, block, results, stop); err != nil { log.Error(&quot;Failed to restart sealing after update&quot;, &quot;err&quot;, err) } } // Wait for all miners to terminate and return the block pend.Wait() }() return nil } // mine is the actual proof-of-work miner that searches for a nonce starting from // seed that results in correct final block difficulty. //使用共识算法进行挖矿操作 func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) { // Extract some data from the header /* 这里说明一下dataset的由来： dataset是根据Cache生成一个1GB大小的数据集合DAG(有向非循环图)， 它是一个完整的搜索空间，挖矿的过程就是从DAG中随机选择元素 (类似于比特币挖矿中查找合适Nonce)再进行哈希运算， 可以从Cache快速计算DAG指定位置的元素，进而哈希验证，因此cache就是ethash需要的缓存 那么cache又是怎么来的呢？对于每一个块，首先计算一个种子(seed 指的是参数中的seed) ， 这个种子先根据block number以及block header计算出一个seed（种子值） 然后根据种子生成一个32M的随机数据集（cache） cache和DAG每个周期(1000个块)更新一次 */ var ( header = block.Header() hash = ethash.SealHash(header).Bytes() target = new(big.Int).Div(two256, header.Difficulty) number = header.Number.Uint64() //--------------------------------- dataset = ethash.dataset(number, false) ) // Start generating random nonces until we abort or find a good one var ( attempts = int64(0) nonce = seed ) logger := log.New(&quot;miner&quot;, id) logger.Trace(&quot;Started ethash search for new nonces&quot;, &quot;seed&quot;, seed) search: for { select { case &lt;-abort: // Mining terminated, update stats and abort logger.Trace(&quot;Ethash nonce search aborted&quot;, &quot;attempts&quot;, nonce-seed) ethash.hashrate.Mark(attempts) break search default: // We don&#39;t have to update hash rate on every nonce, so update after after 2^X nonces attempts++ if (attempts % (1 &lt;&lt; 15)) == 0 { ethash.hashrate.Mark(attempts) attempts = 0 } // Compute the PoW value of this nonce //进入hashimotoFull，进行具体的挖矿运算 digest, result := hashimotoFull(dataset.dataset, hash, nonce) //这里的target为计算方法是 256/difficulty if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 { // Correct nonce found, create a new header with it header = types.CopyHeader(header) header.Nonce = types.EncodeNonce(nonce) header.MixDigest = common.BytesToHash(digest) // Seal and return a block (if still needed) select { case found &lt;- block.WithSeal(header): logger.Trace(&quot;Ethash nonce found and reported&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) case &lt;-abort: logger.Trace(&quot;Ethash nonce found but discarded&quot;, &quot;attempts&quot;, nonce-seed, &quot;nonce&quot;, nonce) } break search } nonce++ } } // Datasets are unmapped in a finalizer. Ensure that the dataset stays live // during sealing so it&#39;s not unmapped while being read. runtime.KeepAlive(dataset) } // hashimotoFull aggregates data from the full dataset (using the full in-memory // dataset) in order to produce our final value for a particular header hash and // nonce. /*hashimotoFull()处于一个循环中调用其进行一系列复杂运算 时传入的hash、nonce、 巨大的辅助数组dataset(也就是我们说的搜索或是匹配空间)，以及结果比较的target； 一旦它的返回值符合条件，就复制Header对象，并赋值Nonce、MixDigest属性， 返回经过授权的区块*/ func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) { //定义一个lookup函数，用于在数据集中查找数据 lookup := func(index uint32) []uint32 { offset := index * hashWords //hashWords = 16 return dataset[offset : offset+hashWords] } //dataset数据集进行分割读取，然后传给hashimoto函数 return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup) } // hashimoto aggregates data from the full dataset in order to produce our final // value for a particular header hash and nonce. //在传入的数据集中通过hash和nonce值计算加密值 func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) { // Calculate the number of theoretical rows (we use one buffer nonetheless) //size = uint64(len(dataset))*4 //计算数据集理论的行数 rows := uint32(size / mixBytes) //mixBytes = 128 // Width of mix // Combine header+nonce into a 64 byte seed //合并header和nonce到一个40bytes的seed seed := make([]byte, 40) copy(seed, hash) binary.LittleEndian.PutUint64(seed[32:], nonce) /// 将seed进行Keccak512加密 seed = crypto.Keccak512(seed) seedHead := binary.LittleEndian.Uint32(seed) // Start the mix with replicated seed //与重新构造的seed混合 mixBytes/4 mix := make([]uint32, mixBytes/4) for i := 0; i &lt; len(mix); i++ { //从seed中取元素到长度为32的mix数组 //mix中以小端格式存储(Little-Endian)，就是低位字节排放在内存的低地址,高位字节排放在内存的高地址端 //一般操作系统都是小端，而通讯协议是大端的 /* unsigned int value = 0x12345678 其中最高位字节为12，最低位为78 大端格式 --------------- buf[3] (0x78) -- 低位 buf[2] (0x56) buf[1] (0x34) buf[0] (0x12) -- 高位 为什么会有大小端模式之分呢？ 这是因为在计算机系统中， 我们是以字节为单位的，每个地址单元都对应着一个字节， 一个字节为8bit。但是在C语言中除了8bit的char之外， 还有16bit的short型，32bit的long型（要看具体的编译器）， 另外，对于位数大于8位的处理器，例如16位或者32位的处理器， 由于寄存器宽度大于一个字节，那么必然存在着一个如果将多个字节安排的问题。 因此就导致了大端存储模式和小端存储模式。 */ mix[i] = binary.LittleEndian.Uint32(seed[i%16*4:]) } // Mix in random dataset nodes //定义tmp，与mix结构相同，长度相同 temp := make([]uint32, len(mix)) //loopAccesses = 64 // Number of accesses in hashimoto loop for i := 0; i &lt; loopAccesses; i++ { parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows for j := uint32(0); j &lt; mixBytes/hashBytes; j++ { copy(temp[j*hashWords:], lookup(2*parent+j)) } //将mix中所有元素都与temp中对应位置的元素进行FNV hash运算 fnvHash(mix, temp) } // Compress mix //混淆mix for i := 0; i &lt; len(mix); i += 4 { // FNV能快速hash大量数据并保持较小的冲突率，它的高度分散使它适用于hash一些非常相近的字符串如url，ip等 // FNV是基于向量“异或”的操作来混淆mix数组 mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3]) } //保留8个长度mix有效数据 mix = mix[:len(mix)/4] //将长度为8的mix分散到32位的digest中去 digest := make([]byte, common.HashLength) for i, val := range mix { binary.LittleEndian.PutUint32(digest[i*4:], val) } return digest, crypto.Keccak256(append(seed, digest...)) } &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/11/11/55bd69214abc1bcf633a472b11107c6c.html","headline":"深入区块链以太坊源码之挖矿","dateModified":"2018-11-11T00:00:00+08:00","datePublished":"2018-11-11T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/11/11/55bd69214abc1bcf633a472b11107c6c.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>深入区块链以太坊源码之挖矿</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961285 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-d7e2a68c7c.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <pre class="has">
+<code class="hljs language-Go">// Miner creates blocks and searches for proof-of-work values.
+type Miner struct {
+	mux      *event.TypeMux
+	worker   *worker
+	coinbase common.Address
+	eth      Backend
+	engine   consensus.Engine
+	exitCh   chan struct{}
+
+	canStart    int32 // can start indicates whether we can start the mining operation
+	shouldStart int32 // should start indicates whether we should start after sync
+}
+
+//挖矿开始前需要创建新的miner
+func New(eth Backend, config *params.ChainConfig, mux *event.TypeMux, 
+	engine consensus.Engine, recommit time.Duration, gasFloor, 
+	gasCeil uint64, isLocalBlock func(block *types.Block) bool) *Miner {
+	miner := &amp;Miner{
+		eth:      eth,
+		mux:      mux,
+		engine:   engine,
+		exitCh:   make(chan struct{}),
+		//具体详情见下面newWorker方法
+		worker:   newWorker(config, engine, eth, mux, recommit, gasFloor, gasCeil, isLocalBlock),
+		canStart: 1,
+	}
+	//启动一个线程执行update
+	/*可以看到如果当前处于 区块的同步中，则挖矿的操作需要停止，
+	直到同步操作结束（同步成功或是失败），
+	如果原来已经执行了挖矿操作的，则继续开启挖矿操作*/
+	go miner.update()
+
+	return miner
+}
+
+
+func newWorker(config *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, recommit time.Duration, gasFloor, gasCeil uint64, isLocalBlock func(*types.Block) bool) *worker {
+	//构造worker
+	worker := &amp;worker{
+		config:             config,
+		engine:             engine,
+		eth:                eth,
+		mux:                mux,
+		chain:              eth.BlockChain(),
+		gasFloor:           gasFloor,
+		gasCeil:            gasCeil,
+		isLocalBlock:       isLocalBlock,
+		localUncles:        make(map[common.Hash]*types.Block),
+		remoteUncles:       make(map[common.Hash]*types.Block),
+		unconfirmed:        newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
+		pendingTasks:       make(map[common.Hash]*task),
+		txsCh:              make(chan core.NewTxsEvent, txChanSize),
+		chainHeadCh:        make(chan core.ChainHeadEvent, chainHeadChanSize),
+		chainSideCh:        make(chan core.ChainSideEvent, chainSideChanSize),
+		
+		//新版本的worker中更新了下面几个通道
+		newWorkCh:          make(chan *newWorkReq),
+		taskCh:             make(chan *task),
+		resultCh:           make(chan *types.Block, resultQueueSize),
+		exitCh:             make(chan struct{}),
+		startCh:            make(chan struct{}, 1),
+		resubmitIntervalCh: make(chan time.Duration),
+		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
+	}
+	// Subscribe NewTxsEvent for tx pool
+	//注册TxsEvent事件到tx pool交易池
+	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
+	// 注册事件到tx pool交易池
+	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
+	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
+
+	// Sanitize recommit interval if the user-specified one is too short.
+	//如果用户指定的间隔太短，则重新设置间隔。
+	if recommit &lt; minRecommitInterval {
+		log.Warn("Sanitizing miner recommit interval", "provided", recommit, "updated", minRecommitInterval)
+		recommit = minRecommitInterval
+	}
+	
+	go worker.mainLoop()
+	//newWorkLoop 是一个一直监听 startCh 中是否有挖矿信号
+	//(startCh的信号由 start函数放置进去的，见下面的start方法)
+	go worker.newWorkLoop(recommit)
+	go worker.resultLoop()
+	go worker.taskLoop()
+
+	// Submit first work to initialize pending state.
+	worker.startCh &lt;- struct{}{}
+
+	return worker
+}
+
+// start sets the running status as 1 and triggers new work submitting.
+func (w *worker) start() {
+	atomic.StoreInt32(&amp;w.running, 1)
+	w.startCh &lt;- struct{}{}
+}
+
+
+// newWorkLoop is a standalone goroutine to submit new mining work upon received events.
+//newWorkLoop是一个去基于事件接收再提交新挖矿工作的线程
+func (w *worker) newWorkLoop(recommit time.Duration) {
+	var (
+		interrupt   *int32
+		minRecommit = recommit // minimal resubmit interval specified by user.
+		timestamp   int64      // timestamp for each round of mining.
+	)
+	// The Timer type represents a single event.
+	// When the Timer expires, the current time will be sent on C,
+	timer := time.NewTimer(0)
+	&lt;-timer.C // discard the initial tick
+
+	// commit aborts in-flight transaction execution with given signal and resubmits a new one.
+	
+	//提交挖矿请求通过w.newWorkCh处理，而newWorkCh的初始化在四个协程之一的 worker.mainLoop()中执行
+	//具体可以看mainLoop中的case
+	commit := func(noempty bool, s int32) {
+		if interrupt != nil {
+			atomic.StoreInt32(interrupt, s)
+		}
+		interrupt = new(int32)
+		w.newWorkCh &lt;- &amp;newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp}
+		timer.Reset(recommit)
+		atomic.StoreInt32(&amp;w.newTxs, 0)
+	}
+	// recalcRecommit recalculates the resubmitting interval upon feedback.
+	//重新计算 重提交间隔反馈时间
+	recalcRecommit := func(target float64, inc bool) {
+		var (
+			prev = float64(recommit.Nanoseconds())
+			next float64
+		)
+		if inc {
+			next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target+intervalAdjustBias)
+			// Recap if interval is larger than the maximum time interval
+			if next &gt; float64(maxRecommitInterval.Nanoseconds()) {
+				next = float64(maxRecommitInterval.Nanoseconds())
+			}
+		} else {
+			next = prev*(1-intervalAdjustRatio) + intervalAdjustRatio*(target-intervalAdjustBias)
+			// Recap if interval is less than the user specified minimum
+			if next &lt; float64(minRecommit.Nanoseconds()) {
+				next = float64(minRecommit.Nanoseconds())
+			}
+		}
+		recommit = time.Duration(int64(next))
+	}
+	// clearPending cleans the stale pending tasks.
+	//清除过期的pending交易
+	clearPending := func(number uint64) {
+		w.pendingMu.Lock()
+		for h, t := range w.pendingTasks {
+			if t.block.NumberU64()+staleThreshold &lt;= number {
+				delete(w.pendingTasks, h)
+			}
+		}
+		w.pendingMu.Unlock()
+	}
+
+	for {
+		select {
+		//得到挖矿启动事件就提交一个挖矿作业 方法 commit
+		case &lt;-w.startCh:
+			clearPending(w.chain.CurrentBlock().NumberU64())
+			timestamp = time.Now().Unix()
+			//commit请求实体主要是通过 w.newWorkCh 进行事件的传递
+			commit(false, commitInterruptNewHead)
+
+		case head := &lt;-w.chainHeadCh:
+			clearPending(head.Block.NumberU64())
+			timestamp = time.Now().Unix()
+			commit(false, commitInterruptNewHead)
+
+		case &lt;-timer.C:
+			// If mining is running resubmit a new work cycle periodically to pull in
+			// higher priced transactions. Disable this overhead for pending blocks.
+			if w.isRunning() &amp;&amp; (w.config.Clique == nil || w.config.Clique.Period &gt; 0) {
+				// Short circuit if no new transaction arrives.
+				if atomic.LoadInt32(&amp;w.newTxs) == 0 {
+					timer.Reset(recommit)
+					continue
+				}
+				commit(true, commitInterruptResubmit)
+			}
+
+		case interval := &lt;-w.resubmitIntervalCh:
+			// Adjust resubmit interval explicitly by user.
+			if interval &lt; minRecommitInterval {
+				log.Warn("Sanitizing miner recommit interval", "provided", interval, "updated", minRecommitInterval)
+				interval = minRecommitInterval
+			}
+			log.Info("Miner recommit interval update", "from", minRecommit, "to", interval)
+			minRecommit, recommit = interval, interval
+
+			if w.resubmitHook != nil {
+				w.resubmitHook(minRecommit, recommit)
+			}
+
+		case adjust := &lt;-w.resubmitAdjustCh:
+			// Adjust resubmit interval by feedback.
+			if adjust.inc {
+				before := recommit
+				recalcRecommit(float64(recommit.Nanoseconds())/adjust.ratio, true)
+				log.Trace("Increase miner recommit interval", "from", before, "to", recommit)
+			} else {
+				before := recommit
+				recalcRecommit(float64(minRecommit.Nanoseconds()), false)
+				log.Trace("Decrease miner recommit interval", "from", before, "to", recommit)
+			}
+
+			if w.resubmitHook != nil {
+				w.resubmitHook(minRecommit, recommit)
+			}
+
+		case &lt;-w.exitCh:
+			return
+		}
+	}
+}
+
+
+//newWorker中的第一个协程
+// mainLoop is a standalone goroutine to regenerate the sealing task based on the received event.
+func (w *worker) mainLoop() {
+	defer w.txsSub.Unsubscribe()
+	defer w.chainHeadSub.Unsubscribe()
+	defer w.chainSideSub.Unsubscribe()
+
+	for {
+		select {
+		//w.newWorkCh在里头做实时的监听，一发现有内容就会把它提交给一个叫做  
+		//w.commitNewWork(req.interrupt, req.noempty) 挖矿作业提交函数
+		case req := &lt;-w.newWorkCh:
+			//commitNewWork方法发布work任务，将worker对象中的当前的挖矿任务发布到管道队列中 
+			//再具体可以看下面commitNewWork方法的执行过程
+			w.commitNewWork(req.interrupt, req.noempty, req.timestamp)
+
+		case ev := &lt;-w.chainSideCh:
+			// Short circuit for duplicate side blocks
+			if _, exist := w.localUncles[ev.Block.Hash()]; exist {
+				continue
+			}
+			if _, exist := w.remoteUncles[ev.Block.Hash()]; exist {
+				continue
+			}
+			// Add side block to possible uncle block set depending on the author.
+			if w.isLocalBlock != nil &amp;&amp; w.isLocalBlock(ev.Block) {
+				w.localUncles[ev.Block.Hash()] = ev.Block
+			} else {
+				w.remoteUncles[ev.Block.Hash()] = ev.Block
+			}
+			// If our mining block contains less than 2 uncle blocks,
+			// add the new uncle block if valid and regenerate a mining block.
+			if w.isRunning() &amp;&amp; w.current != nil &amp;&amp; w.current.uncles.Cardinality() &lt; 2 {
+				start := time.Now()
+				if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
+					var uncles []*types.Header
+					w.current.uncles.Each(func(item interface{}) bool {
+						hash, ok := item.(common.Hash)
+						if !ok {
+							return false
+						}
+						uncle, exist := w.localUncles[hash]
+						if !exist {
+							uncle, exist = w.remoteUncles[hash]
+						}
+						if !exist {
+							return false
+						}
+						uncles = append(uncles, uncle.Header())
+						return false
+					})
+					w.commit(uncles, nil, true, start)
+				}
+			}
+
+		case ev := &lt;-w.txsCh:
+			// Apply transactions to the pending state if we're not mining.
+			//
+			// Note all transactions received may not be continuous with transactions
+			// already included in the current mining block. These transactions will
+			// be automatically eliminated.
+			if !w.isRunning() &amp;&amp; w.current != nil {
+				w.mu.RLock()
+				coinbase := w.coinbase
+				w.mu.RUnlock()
+
+				txs := make(map[common.Address]types.Transactions)
+				for _, tx := range ev.Txs {
+					acc, _ := types.Sender(w.current.signer, tx)
+					txs[acc] = append(txs[acc], tx)
+				}
+				txset := types.NewTransactionsByPriceAndNonce(w.current.signer, txs)
+				w.commitTransactions(txset, coinbase, nil)
+				w.updateSnapshot()
+			} else {
+				// If we're mining, but nothing is being processed, wake on new transactions
+				if w.config.Clique != nil &amp;&amp; w.config.Clique.Period == 0 {
+					w.commitNewWork(nil, false, time.Now().Unix())
+				}
+			}
+			atomic.AddInt32(&amp;w.newTxs, int32(len(ev.Txs)))
+
+		// System stopped
+		case &lt;-w.exitCh:
+			return
+		case &lt;-w.txsSub.Err():
+			return
+		case &lt;-w.chainHeadSub.Err():
+			return
+		case &lt;-w.chainSideSub.Err():
+			return
+		}
+	}
+}
+
+
+
+
+// commitNewWork generates several new sealing tasks based on the parent block.
+//做各种各样的 block 预处理工作，到方法的末尾 交付给了
+//w.commit(uncles, w.fullTaskHook, true, tstart)
+func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) {
+	
+	...//block 处理工作
+	
+	//w.commit里面是先对收据数据先做一些处理然后把 构造好的 收据 receipts
+	//状态 state 及预先打包好的block (里头有些内容需要真正挖矿来回填的，
+	//比如 随机数等) &nbsp;构造成一个任务实体 task 对象并提交给 w.taskCh 通道 
+	w.commit(uncles, w.fullTaskHook, true, tstart)
+}
+
+
+// commit runs any post-transaction state modifications, assembles the final block
+// and commits new work if consensus engine is running.
+// 组装receipts数据，并且Finalize 函数打包封装区块填充其中部分数据
+func (w *worker) commit(uncles []*types.Header, interval func(), update bool, start time.Time) error {
+	// Deep copy receipts here to avoid interaction between different tasks.
+	receipts := make([]*types.Receipt, len(w.current.receipts))
+	for i, l := range w.current.receipts {
+		receipts[i] = new(types.Receipt)
+		*receipts[i] = *l
+	}
+	s := w.current.state.Copy()
+	block, err := w.engine.Finalize(w.chain, w.current.header, s, w.current.txs, uncles, w.current.receipts)
+	if err != nil {
+		return err
+	}
+	if w.isRunning() {
+		if interval != nil {
+			interval()
+		}
+		select {
+		//给出区块相关的数据构造一个task实体，交给w.taskCh
+		case w.taskCh &lt;- &amp;task{receipts: receipts, state: s, block: block, createdAt: time.Now()}:
+			w.unconfirmed.Shift(block.NumberU64() - 1)
+
+			feesWei := new(big.Int)
+			for i, tx := range block.Transactions() {
+				feesWei.Add(feesWei, new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.GasPrice()))
+			}
+			feesEth := new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether)))
+
+			log.Info("Commit new mining work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
+				"uncles", len(uncles), "txs", w.current.tcount, "gas", block.GasUsed(), "fees", feesEth, "elapsed", common.PrettyDuration(time.Since(start)))
+
+		case &lt;-w.exitCh:
+			log.Info("Worker has exited")
+		}
+	}
+	if update {
+		w.updateSnapshot()
+	}
+	return nil
+}
+
+
+//newWorker方法中的第四个协程
+
+// taskLoop is a standalone goroutine to fetch sealing task from the generator and
+// push them to consensus engine.
+func (w *worker) taskLoop() {
+	var (
+		stopCh chan struct{}
+		prev   common.Hash
+	)
+
+	// interrupt aborts the in-flight sealing task.
+	interrupt := func() {
+		if stopCh != nil {
+			close(stopCh)
+			stopCh = nil
+		}
+	}
+	for {
+		select {
+		//监听这个taskCh通道过来的 task 实体一有就启动
+		// seal() 函数把这些信息 交由底层的共识层的实现去 做真正的挖矿
+		case task := &lt;-w.taskCh:
+			if w.newTaskHook != nil {
+				w.newTaskHook(task)
+			}
+			// Reject duplicate sealing work due to resubmitting.
+			sealHash := w.engine.SealHash(task.block.Header())
+			if sealHash == prev {
+				continue
+			}
+			// Interrupt previous sealing operation
+			interrupt()
+			stopCh, prev = make(chan struct{}), sealHash
+
+			if w.skipSealHook != nil &amp;&amp; w.skipSealHook(task) {
+				continue
+			}
+			w.pendingMu.Lock()
+			w.pendingTasks[w.engine.SealHash(task.block.Header())] = task
+			w.pendingMu.Unlock()
+			//使用共识算法授权封印区块
+			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
+				log.Warn("Block sealing failed", "err", err)
+			}
+		case &lt;-w.exitCh:
+			interrupt()
+			return
+		}
+	}
+}
+
+
+
+// Seal implements consensus.Engine, attempting to find a nonce that satisfies
+// the block's difficulty requirements.
+
+//用Engine.Seal()函数，利用Engine实现体的共识算法对传入的Block进行最终的授权，
+//如果成功，就将Block同Work一起通过channel发还给worker，那边worker.wait()会接收并处理。
+
+/*Seal()函数可对一个调用过Finalize()的区块进行授权或封印，
+并将封印过程产生的一些值赋予区块中剩余尚未赋值的成员(Header.Nonce, Header.MixDigest)。
+Seal()成功时返回的区块全部成员齐整，可视为一个正常区块，可被广播到整个网络中，
+也可以被插入区块链等。所以，对于挖掘一个新区块来说，所有相关代码里Engine.Seal()是其中最重要，
+也是最复杂的一步。*/
+
+func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, results chan&lt;- *types.Block, stop &lt;-chan struct{}) error {
+	// If we're running a fake PoW, simply return a 0 nonce immediately
+	if ethash.config.PowMode == ModeFake || ethash.config.PowMode == ModeFullFake {
+		header := block.Header()
+		header.Nonce, header.MixDigest = types.BlockNonce{}, common.Hash{}
+		select {
+		//封印区块头
+		case results &lt;- block.WithSeal(header):
+		default:
+			log.Warn("Sealing result is not read by miner", "mode", "fake", "sealhash", ethash.SealHash(block.Header()))
+		}
+		return nil
+	}
+	// If we're running a shared PoW, delegate sealing to it
+	if ethash.shared != nil {
+		return ethash.shared.Seal(chain, block, results, stop)
+	}
+	// Create a runner and the multiple search threads it directs
+	abort := make(chan struct{})
+
+	ethash.lock.Lock()
+	threads := ethash.threads
+	if ethash.rand == nil {
+		seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+		if err != nil {
+			ethash.lock.Unlock()
+			return err
+		}
+		ethash.rand = rand.New(rand.NewSource(seed.Int64()))
+	}
+	ethash.lock.Unlock()
+	if threads == 0 {
+		threads = runtime.NumCPU()
+	}
+	if threads &lt; 0 {
+		threads = 0 // Allows disabling local mining without extra logic around local/remote
+	}
+	// Push new work to remote sealer
+	if ethash.workCh != nil {
+		ethash.workCh &lt;- &amp;sealTask{block: block, results: results}
+	}
+	var (
+		pend   sync.WaitGroup
+		locals = make(chan *types.Block)
+	)
+	/*Ethash.Seal()函数实现中，会以多线程(goroutine)的方式并行调用mine()函数，
+	线程个数等于Ethash.threads；如果Ethash.threads被设为0，
+	则Ethash选择以本地CPU中的总核数作为开启线程的个数。*/
+	for i := 0; i &lt; threads; i++ {
+		pend.Add(1)
+		go func(id int, nonce uint64) {
+			defer pend.Done()
+			ethash.mine(block, id, nonce, abort, locals)
+		}(i, uint64(ethash.rand.Int63()))
+	}
+	// Wait until sealing is terminated or a nonce is found
+	go func() {
+		var result *types.Block
+		select {
+		case &lt;-stop:
+			// Outside abort, stop all miner threads
+			close(abort)
+		case result = &lt;-locals:
+			// One of the threads found a block, abort all others
+			select {
+			//挖出区块后通过通道返回到四个协程中的 worker.resultLoop() ，从w.resultCh取出，results就是其传入的参数
+				//由此返回成功挖出的区块
+			case results &lt;- result:
+			default:
+				log.Warn("Sealing result is not read by miner", "mode", "local", "sealhash", ethash.SealHash(block.Header()))
+			}
+			close(abort)
+		case &lt;-ethash.update:
+			// Thread count was changed on user request, restart
+			close(abort)
+			if err := ethash.Seal(chain, block, results, stop); err != nil {
+				log.Error("Failed to restart sealing after update", "err", err)
+			}
+		}
+		// Wait for all miners to terminate and return the block
+		pend.Wait()
+	}()
+	return nil
+}
+
+
+
+// mine is the actual proof-of-work miner that searches for a nonce starting from
+// seed that results in correct final block difficulty.
+//使用共识算法进行挖矿操作
+func (ethash *Ethash) mine(block *types.Block, id int, seed uint64, abort chan struct{}, found chan *types.Block) {
+	// Extract some data from the header
+	
+	/*
+	这里说明一下dataset的由来：
+	dataset是根据Cache生成一个1GB大小的数据集合DAG(有向非循环图)，
+	它是一个完整的搜索空间，挖矿的过程就是从DAG中随机选择元素
+	(类似于比特币挖矿中查找合适Nonce)再进行哈希运算，
+	可以从Cache快速计算DAG指定位置的元素，进而哈希验证，因此cache就是ethash需要的缓存
+
+	那么cache又是怎么来的呢？对于每一个块，首先计算一个种子(seed 指的是参数中的seed)  ，
+	这个种子先根据block number以及block header计算出一个seed（种子值）
+	然后根据种子生成一个32M的随机数据集（cache）
+
+	cache和DAG每个周期(1000个块)更新一次
+	*/
+	var (
+		header  = block.Header()
+		hash    = ethash.SealHash(header).Bytes()
+		target  = new(big.Int).Div(two256, header.Difficulty)
+		number  = header.Number.Uint64()
+		//---------------------------------
+		dataset = ethash.dataset(number, false)
+	)
+	// Start generating random nonces until we abort or find a good one
+	var (
+		attempts = int64(0)
+		nonce    = seed
+	)
+	logger := log.New("miner", id)
+	logger.Trace("Started ethash search for new nonces", "seed", seed)
+	search:
+	for {
+		select {
+		case &lt;-abort:
+			// Mining terminated, update stats and abort
+			logger.Trace("Ethash nonce search aborted", "attempts", nonce-seed)
+			ethash.hashrate.Mark(attempts)
+			break search
+
+		default:
+			// We don't have to update hash rate on every nonce, so update after after 2^X nonces
+			attempts++
+			if (attempts % (1 &lt;&lt; 15)) == 0 {
+				ethash.hashrate.Mark(attempts)
+				attempts = 0
+			}
+			// Compute the PoW value of this nonce
+			//进入hashimotoFull，进行具体的挖矿运算
+			digest, result := hashimotoFull(dataset.dataset, hash, nonce)
+			//这里的target为计算方法是 256/difficulty 
+			if new(big.Int).SetBytes(result).Cmp(target) &lt;= 0 {
+				// Correct nonce found, create a new header with it
+				header = types.CopyHeader(header)
+				header.Nonce = types.EncodeNonce(nonce)
+				header.MixDigest = common.BytesToHash(digest)
+
+				// Seal and return a block (if still needed)
+				select {
+				case found &lt;- block.WithSeal(header):
+					logger.Trace("Ethash nonce found and reported", "attempts", nonce-seed, "nonce", nonce)
+				case &lt;-abort:
+					logger.Trace("Ethash nonce found but discarded", "attempts", nonce-seed, "nonce", nonce)
+				}
+				break search
+			}
+			nonce++
+		}
+	}
+	// Datasets are unmapped in a finalizer. Ensure that the dataset stays live
+	// during sealing so it's not unmapped while being read.
+	runtime.KeepAlive(dataset)
+}
+
+
+// hashimotoFull aggregates data from the full dataset (using the full in-memory
+// dataset) in order to produce our final value for a particular header hash and
+// nonce.
+/*hashimotoFull()处于一个循环中调用其进行一系列复杂运算 时传入的hash、nonce、
+巨大的辅助数组dataset(也就是我们说的搜索或是匹配空间)，以及结果比较的target；
+一旦它的返回值符合条件，就复制Header对象，并赋值Nonce、MixDigest属性，
+返回经过授权的区块*/
+
+
+func hashimotoFull(dataset []uint32, hash []byte, nonce uint64) ([]byte, []byte) {
+	//定义一个lookup函数，用于在数据集中查找数据
+	lookup := func(index uint32) []uint32 {
+		offset := index * hashWords  //hashWords          = 16 
+		return dataset[offset : offset+hashWords]
+	}
+	//dataset数据集进行分割读取，然后传给hashimoto函数
+	return hashimoto(hash, nonce, uint64(len(dataset))*4, lookup)
+}
+
+
+
+// hashimoto aggregates data from the full dataset in order to produce our final
+// value for a particular header hash and nonce.
+
+//在传入的数据集中通过hash和nonce值计算加密值
+func hashimoto(hash []byte, nonce uint64, size uint64, lookup func(index uint32) []uint32) ([]byte, []byte) {
+	// Calculate the number of theoretical rows (we use one buffer nonetheless)
+	//size = uint64(len(dataset))*4
+	//计算数据集理论的行数
+	rows := uint32(size / mixBytes)   //mixBytes           = 128     // Width of mix
+
+	// Combine header+nonce into a 64 byte seed
+	//合并header和nonce到一个40bytes的seed
+	seed := make([]byte, 40)
+	copy(seed, hash)
+
+	binary.LittleEndian.PutUint64(seed[32:], nonce)
+	/// 将seed进行Keccak512加密
+	seed = crypto.Keccak512(seed)
+	seedHead := binary.LittleEndian.Uint32(seed)
+
+	// Start the mix with replicated seed
+	//与重新构造的seed混合 mixBytes/4 
+	mix := make([]uint32, mixBytes/4)
+	for i := 0; i &lt; len(mix); i++ {
+		//从seed中取元素到长度为32的mix数组
+//mix中以小端格式存储(Little-Endian)，就是低位字节排放在内存的低地址,高位字节排放在内存的高地址端
+		//一般操作系统都是小端，而通讯协议是大端的
+/*
+	unsigned int value = 0x12345678 其中最高位字节为12，最低位为78
+	大端格式
+        ---------------
+        buf[3] (0x78) -- 低位
+        buf[2] (0x56)
+        buf[1] (0x34)
+        buf[0] (0x12) -- 高位
+	
+	为什么会有大小端模式之分呢？ 这是因为在计算机系统中，
+	我们是以字节为单位的，每个地址单元都对应着一个字节，
+	一个字节为8bit。但是在C语言中除了8bit的char之外，
+	还有16bit的short型，32bit的long型（要看具体的编译器），
+	另外，对于位数大于8位的处理器，例如16位或者32位的处理器，
+	由于寄存器宽度大于一个字节，那么必然存在着一个如果将多个字节安排的问题。
+	因此就导致了大端存储模式和小端存储模式。
+
+*/
+
+		mix[i] = binary.LittleEndian.Uint32(seed[i%16*4:])
+	}
+	// Mix in random dataset nodes
+	//定义tmp，与mix结构相同，长度相同
+	temp := make([]uint32, len(mix))
+	//loopAccesses       = 64      // Number of accesses in hashimoto loop
+	for i := 0; i &lt; loopAccesses; i++ {
+		parent := fnv(uint32(i)^seedHead, mix[i%len(mix)]) % rows
+		for j := uint32(0); j &lt; mixBytes/hashBytes; j++ {
+			copy(temp[j*hashWords:], lookup(2*parent+j))
+		}
+		//将mix中所有元素都与temp中对应位置的元素进行FNV hash运算
+		fnvHash(mix, temp)
+	}
+	// Compress mix
+	//混淆mix
+	for i := 0; i &lt; len(mix); i += 4 {
+
+// FNV能快速hash大量数据并保持较小的冲突率，它的高度分散使它适用于hash一些非常相近的字符串如url，ip等
+// FNV是基于向量“异或”的操作来混淆mix数组
+		mix[i/4] = fnv(fnv(fnv(mix[i], mix[i+1]), mix[i+2]), mix[i+3])
+	}
+	//保留8个长度mix有效数据
+	mix = mix[:len(mix)/4]
+
+	//将长度为8的mix分散到32位的digest中去
+	digest := make([]byte, common.HashLength)
+	for i, val := range mix {
+		binary.LittleEndian.PutUint32(digest[i*4:], val)
+	}
+	return digest, crypto.Keccak256(append(seed, digest...))
+}
+</code></pre> 
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Grit_ICPC/article/details/83961285,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Grit_ICPC/article/details/83961285,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										if(typeof window.localStorage === "object" && typeof window.csdn.anonymousUserLimit === "object"){
+											if(!window.csdn.anonymousUserLimit.judgment()){
+												window.csdn.anonymousUserLimit.Jumplogin();
+												return false;
+											}else if(!currentUserName){
+												window.csdn.anonymousUserLimit.updata();
+											}
+										}
+										
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

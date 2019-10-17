@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>贝叶斯全局优化（LightGBM调参） | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="贝叶斯全局优化（LightGBM调参）" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="GridSearchCV调参-----------------太慢，效果也不好 这里结合Kaggle比赛的一个数据集，记录一下使用贝叶斯全局优化和高斯过程来寻找最佳参数的方法步骤。 1.安装贝叶斯全局优化库 从pip安装最新版本 pip install bayesian-optimization 2.加载数据集 import pandas as pd import numpy as np from sklearn.model_selection import StratifiedKFold from scipy.stats import rankdata from sklearn import metrics import lightgbm as lgb import warnings import gc pd.set_option(&#39;display.max_columns&#39;, 200) train_df = pd.read_csv(&#39;../input/train.csv&#39;) test_df = pd.read_csv(&#39;../input/test.csv&#39;) 目标变量的分布 target = &#39;target&#39; predictors = train_df.columns.values.tolist()[2:] train_df.target.value_counts() 问题是不平衡。这里使用50％分层行作为保持行，以便验证集获得最佳参数。 稍后将在最终模型拟合中使用5折交叉验证。 bayesian_tr_index, bayesian_val_index = list(StratifiedKFold(n_splits=2, shuffle=True, random_state=1).split(train_df, train_df.target.values))[0] 这些bayesian_tr_index和bayesian_val_index索引将用于贝叶斯优化，作为训练和验证数据集的索引。 3.黑盒函数优化（LightGBM） 在加载数据时，为LightGBM创建黑盒函数以查找参数。 def LGB_bayesian( num_leaves, # int min_data_in_leaf, # int learning_rate, min_sum_hessian_in_leaf, # int feature_fraction, lambda_l1, lambda_l2, min_gain_to_split, max_depth): # LightGBM expects next three parameters need to be integer. So we make them integer num_leaves = int(num_leaves) min_data_in_leaf = int(min_data_in_leaf) max_depth = int(max_depth) assert type(num_leaves) == int assert type(min_data_in_leaf) == int assert type(max_depth) == int param = { &#39;num_leaves&#39;: num_leaves, &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: min_data_in_leaf, &#39;learning_rate&#39;: learning_rate, &#39;min_sum_hessian_in_leaf&#39;: min_sum_hessian_in_leaf, &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: feature_fraction, &#39;lambda_l1&#39;: lambda_l1, &#39;lambda_l2&#39;: lambda_l2, &#39;min_gain_to_split&#39;: min_gain_to_split, &#39;max_depth&#39;: max_depth, &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } xg_train = lgb.Dataset(train_df.iloc[bayesian_tr_index][predictors].values, label=train_df.iloc[bayesian_tr_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[bayesian_val_index][predictors].values, label=train_df.iloc[bayesian_val_index][target].values, feature_name=predictors, free_raw_data = False ) num_round = 5000 clf = lgb.train(param, xg_train, num_round, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) predictions = clf.predict(train_df.iloc[bayesian_val_index][predictors].values, num_iteration=clf.best_iteration) score = metrics.roc_auc_score(train_df.iloc[bayesian_val_index][target].values, predictions) return score 上面的LGB_bayesian函数将作为贝叶斯优化的黑盒函数。 我已经在LGB_bayesian函数中为LightGBM定义了trainng和validation数据集。 LGB_bayesian函数从贝叶斯优化框架获取num_leaves，min_data_in_leaf，learning_rate，min_sum_hessian_in_leaf，feature_fraction，lambda_l1，lambda_l2，min_gain_to_split，max_depth的值。 请记住，对于LightGBM，num_leaves，min_data_in_leaf和max_depth应该是整数。 但贝叶斯优化会发送连续的函数。 所以我强制它们是整数。 我只会找到它们的最佳参数值。 读者可以增加或减少要优化的参数数量。 现在需要为这些参数提供边界，以便贝叶斯优化仅在边界内搜索。 bounds_LGB = { &#39;num_leaves&#39;: (5, 20), &#39;min_data_in_leaf&#39;: (5, 20), &#39;learning_rate&#39;: (0.01, 0.3), &#39;min_sum_hessian_in_leaf&#39;: (0.00001, 0.01), &#39;feature_fraction&#39;: (0.05, 0.5), &#39;lambda_l1&#39;: (0, 5.0), &#39;lambda_l2&#39;: (0, 5.0), &#39;min_gain_to_split&#39;: (0, 1.0), &#39;max_depth&#39;:(3,15), } 让我们将它们全部放在BayesianOptimization对象中 from bayes_opt import BayesianOptimization LGB_BO = BayesianOptimization(LGB_bayesian, bounds_LGB, random_state=13) 现在，让我们来优化key space (parameters)： print(LGB_BO.space.keys) 我创建了BayesianOptimization对象（LGB_BO），在调用maxime之前它不会工作。在调用之前，解释一下贝叶斯优化对象（LGB_BO）的两个参数，我们可以传递给它们进行最大化： init_points：我们想要执行的随机探索的初始随机运行次数。 在我们的例子中，LGB_bayesian将被运行n_iter次。 n_iter：运行init_points数后，我们要执行多少次贝叶斯优化运行。 现在，是时候从贝叶斯优化框架调用函数来最大化。 我允许LGB_BO对象运行5个init_points和5个n_iter。 init_points = 5 n_iter = 5 print(&#39;-&#39; * 130) with warnings.catch_warnings(): warnings.filterwarnings(&#39;ignore&#39;) LGB_BO.maximize(init_points=init_points, n_iter=n_iter, acq=&#39;ucb&#39;, xi=0.0, alpha=1e-6) 优化完成后，让我们看看我们得到的最大值是多少。 LGB_BO.max[&#39;target&#39;] 参数的验证AUC是0.89， 让我们看看参数: LGB_BO.max[&#39;params&#39;] 现在我们可以将这些参数用于我们的最终模型！ BayesianOptimization库中还有一个很酷的选项。 你可以探测LGB_bayesian函数，如果你对最佳参数有所了解，或者您从其他kernel获取参数。 我将在此复制并粘贴其他内核中的参数。 你可以按照以下方式进行探测： LGB_BO.probe( params={&#39;feature_fraction&#39;: 0.1403, &#39;lambda_l1&#39;: 4.218, &#39;lambda_l2&#39;: 1.734, &#39;learning_rate&#39;: 0.07, &#39;max_depth&#39;: 14, &#39;min_data_in_leaf&#39;: 17, &#39;min_gain_to_split&#39;: 0.1501, &#39;min_sum_hessian_in_leaf&#39;: 0.000446, &#39;num_leaves&#39;: 6}, lazy=True, # ) 好的，默认情况下这些将被懒惰地探索（lazy = True），这意味着只有在你下次调用maxime时才会评估这些点。 让我们对LGB_BO对象进行最大化调用。 LGB_BO.maximize(init_points=0, n_iter=0) # remember no init_points or n_iter 最后，通过属性LGB_BO.res可以获得探测的所有参数列表及其相应的目标值。 for i, res in enumerate(LGB_BO.res): print(&quot;Iteration {}: \n\t{}&quot;.format(i, res)) 我们在调查中获得了更好的验证分数！和以前一样，我只运行LGB_BO 10次。在实践中，我将它增加到100。 LGB_BO.max[&#39;target&#39;] LGB_BO.max[&#39;params&#39;] 让我们一起构建一个模型使用这些参数。 4.训练LightGBM模型 param_lgb = { &#39;num_leaves&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;num_leaves&#39;]), # remember to int here &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;min_data_in_leaf&#39;]), # remember to int here &#39;learning_rate&#39;: LGB_BO.max[&#39;params&#39;][&#39;learning_rate&#39;], &#39;min_sum_hessian_in_leaf&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_sum_hessian_in_leaf&#39;], &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: LGB_BO.max[&#39;params&#39;][&#39;feature_fraction&#39;], &#39;lambda_l1&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l1&#39;], &#39;lambda_l2&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l2&#39;], &#39;min_gain_to_split&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_gain_to_split&#39;], &#39;max_depth&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;max_depth&#39;]), # remember to int here &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } 如您所见，我将LGB_BO的最佳参数保存到param_lgb字典中，它们将用于训练5折的模型。 Kfolds数量： nfold = 5 gc.collect() skf = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=2019) oof = np.zeros(len(train_df)) predictions = np.zeros((len(test_df),nfold)) i = 1 for train_index, valid_index in skf.split(train_df, train_df.target.values): print(&quot;\nfold {}&quot;.format(i)) xg_train = lgb.Dataset(train_df.iloc[train_index][predictors].values, label=train_df.iloc[train_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[valid_index][predictors].values, label=train_df.iloc[valid_index][target].values, feature_name=predictors, free_raw_data = False ) clf = lgb.train(param_lgb, xg_train, 5000, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) oof[valid_index] = clf.predict(train_df.iloc[valid_index][predictors].values, num_iteration=clf.best_iteration) predictions[:,i-1] += clf.predict(test_df[predictors], num_iteration=clf.best_iteration) i = i + 1 print(&quot;\n\nCV AUC: {:&lt;0.2f}&quot;.format(metrics.roc_auc_score(train_df.target.values, oof))) 所以我们在5折交叉验证中获得了0.90 AUC。 让我们对5折预测进行排名平均。 5.排名平均值 print(&quot;Rank averaging on&quot;, nfold, &quot;fold predictions&quot;) rank_predictions = np.zeros((predictions.shape[0],1)) for i in range(nfold): rank_predictions[:, 0] = np.add(rank_predictions[:, 0], rankdata(predictions[:, i].reshape(-1,1))/rank_predictions.shape[0]) rank_predictions /= nfold 6.提交 sub_df = pd.DataFrame({&quot;ID_code&quot;: test_df.ID_code.values}) sub_df[&quot;target&quot;] = rank_predictions sub_df.to_csv(&quot;Customer_Transaction_rank_predictions.csv&quot;, index=False)" />
+<meta property="og:description" content="GridSearchCV调参-----------------太慢，效果也不好 这里结合Kaggle比赛的一个数据集，记录一下使用贝叶斯全局优化和高斯过程来寻找最佳参数的方法步骤。 1.安装贝叶斯全局优化库 从pip安装最新版本 pip install bayesian-optimization 2.加载数据集 import pandas as pd import numpy as np from sklearn.model_selection import StratifiedKFold from scipy.stats import rankdata from sklearn import metrics import lightgbm as lgb import warnings import gc pd.set_option(&#39;display.max_columns&#39;, 200) train_df = pd.read_csv(&#39;../input/train.csv&#39;) test_df = pd.read_csv(&#39;../input/test.csv&#39;) 目标变量的分布 target = &#39;target&#39; predictors = train_df.columns.values.tolist()[2:] train_df.target.value_counts() 问题是不平衡。这里使用50％分层行作为保持行，以便验证集获得最佳参数。 稍后将在最终模型拟合中使用5折交叉验证。 bayesian_tr_index, bayesian_val_index = list(StratifiedKFold(n_splits=2, shuffle=True, random_state=1).split(train_df, train_df.target.values))[0] 这些bayesian_tr_index和bayesian_val_index索引将用于贝叶斯优化，作为训练和验证数据集的索引。 3.黑盒函数优化（LightGBM） 在加载数据时，为LightGBM创建黑盒函数以查找参数。 def LGB_bayesian( num_leaves, # int min_data_in_leaf, # int learning_rate, min_sum_hessian_in_leaf, # int feature_fraction, lambda_l1, lambda_l2, min_gain_to_split, max_depth): # LightGBM expects next three parameters need to be integer. So we make them integer num_leaves = int(num_leaves) min_data_in_leaf = int(min_data_in_leaf) max_depth = int(max_depth) assert type(num_leaves) == int assert type(min_data_in_leaf) == int assert type(max_depth) == int param = { &#39;num_leaves&#39;: num_leaves, &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: min_data_in_leaf, &#39;learning_rate&#39;: learning_rate, &#39;min_sum_hessian_in_leaf&#39;: min_sum_hessian_in_leaf, &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: feature_fraction, &#39;lambda_l1&#39;: lambda_l1, &#39;lambda_l2&#39;: lambda_l2, &#39;min_gain_to_split&#39;: min_gain_to_split, &#39;max_depth&#39;: max_depth, &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } xg_train = lgb.Dataset(train_df.iloc[bayesian_tr_index][predictors].values, label=train_df.iloc[bayesian_tr_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[bayesian_val_index][predictors].values, label=train_df.iloc[bayesian_val_index][target].values, feature_name=predictors, free_raw_data = False ) num_round = 5000 clf = lgb.train(param, xg_train, num_round, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) predictions = clf.predict(train_df.iloc[bayesian_val_index][predictors].values, num_iteration=clf.best_iteration) score = metrics.roc_auc_score(train_df.iloc[bayesian_val_index][target].values, predictions) return score 上面的LGB_bayesian函数将作为贝叶斯优化的黑盒函数。 我已经在LGB_bayesian函数中为LightGBM定义了trainng和validation数据集。 LGB_bayesian函数从贝叶斯优化框架获取num_leaves，min_data_in_leaf，learning_rate，min_sum_hessian_in_leaf，feature_fraction，lambda_l1，lambda_l2，min_gain_to_split，max_depth的值。 请记住，对于LightGBM，num_leaves，min_data_in_leaf和max_depth应该是整数。 但贝叶斯优化会发送连续的函数。 所以我强制它们是整数。 我只会找到它们的最佳参数值。 读者可以增加或减少要优化的参数数量。 现在需要为这些参数提供边界，以便贝叶斯优化仅在边界内搜索。 bounds_LGB = { &#39;num_leaves&#39;: (5, 20), &#39;min_data_in_leaf&#39;: (5, 20), &#39;learning_rate&#39;: (0.01, 0.3), &#39;min_sum_hessian_in_leaf&#39;: (0.00001, 0.01), &#39;feature_fraction&#39;: (0.05, 0.5), &#39;lambda_l1&#39;: (0, 5.0), &#39;lambda_l2&#39;: (0, 5.0), &#39;min_gain_to_split&#39;: (0, 1.0), &#39;max_depth&#39;:(3,15), } 让我们将它们全部放在BayesianOptimization对象中 from bayes_opt import BayesianOptimization LGB_BO = BayesianOptimization(LGB_bayesian, bounds_LGB, random_state=13) 现在，让我们来优化key space (parameters)： print(LGB_BO.space.keys) 我创建了BayesianOptimization对象（LGB_BO），在调用maxime之前它不会工作。在调用之前，解释一下贝叶斯优化对象（LGB_BO）的两个参数，我们可以传递给它们进行最大化： init_points：我们想要执行的随机探索的初始随机运行次数。 在我们的例子中，LGB_bayesian将被运行n_iter次。 n_iter：运行init_points数后，我们要执行多少次贝叶斯优化运行。 现在，是时候从贝叶斯优化框架调用函数来最大化。 我允许LGB_BO对象运行5个init_points和5个n_iter。 init_points = 5 n_iter = 5 print(&#39;-&#39; * 130) with warnings.catch_warnings(): warnings.filterwarnings(&#39;ignore&#39;) LGB_BO.maximize(init_points=init_points, n_iter=n_iter, acq=&#39;ucb&#39;, xi=0.0, alpha=1e-6) 优化完成后，让我们看看我们得到的最大值是多少。 LGB_BO.max[&#39;target&#39;] 参数的验证AUC是0.89， 让我们看看参数: LGB_BO.max[&#39;params&#39;] 现在我们可以将这些参数用于我们的最终模型！ BayesianOptimization库中还有一个很酷的选项。 你可以探测LGB_bayesian函数，如果你对最佳参数有所了解，或者您从其他kernel获取参数。 我将在此复制并粘贴其他内核中的参数。 你可以按照以下方式进行探测： LGB_BO.probe( params={&#39;feature_fraction&#39;: 0.1403, &#39;lambda_l1&#39;: 4.218, &#39;lambda_l2&#39;: 1.734, &#39;learning_rate&#39;: 0.07, &#39;max_depth&#39;: 14, &#39;min_data_in_leaf&#39;: 17, &#39;min_gain_to_split&#39;: 0.1501, &#39;min_sum_hessian_in_leaf&#39;: 0.000446, &#39;num_leaves&#39;: 6}, lazy=True, # ) 好的，默认情况下这些将被懒惰地探索（lazy = True），这意味着只有在你下次调用maxime时才会评估这些点。 让我们对LGB_BO对象进行最大化调用。 LGB_BO.maximize(init_points=0, n_iter=0) # remember no init_points or n_iter 最后，通过属性LGB_BO.res可以获得探测的所有参数列表及其相应的目标值。 for i, res in enumerate(LGB_BO.res): print(&quot;Iteration {}: \n\t{}&quot;.format(i, res)) 我们在调查中获得了更好的验证分数！和以前一样，我只运行LGB_BO 10次。在实践中，我将它增加到100。 LGB_BO.max[&#39;target&#39;] LGB_BO.max[&#39;params&#39;] 让我们一起构建一个模型使用这些参数。 4.训练LightGBM模型 param_lgb = { &#39;num_leaves&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;num_leaves&#39;]), # remember to int here &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;min_data_in_leaf&#39;]), # remember to int here &#39;learning_rate&#39;: LGB_BO.max[&#39;params&#39;][&#39;learning_rate&#39;], &#39;min_sum_hessian_in_leaf&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_sum_hessian_in_leaf&#39;], &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: LGB_BO.max[&#39;params&#39;][&#39;feature_fraction&#39;], &#39;lambda_l1&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l1&#39;], &#39;lambda_l2&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l2&#39;], &#39;min_gain_to_split&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_gain_to_split&#39;], &#39;max_depth&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;max_depth&#39;]), # remember to int here &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } 如您所见，我将LGB_BO的最佳参数保存到param_lgb字典中，它们将用于训练5折的模型。 Kfolds数量： nfold = 5 gc.collect() skf = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=2019) oof = np.zeros(len(train_df)) predictions = np.zeros((len(test_df),nfold)) i = 1 for train_index, valid_index in skf.split(train_df, train_df.target.values): print(&quot;\nfold {}&quot;.format(i)) xg_train = lgb.Dataset(train_df.iloc[train_index][predictors].values, label=train_df.iloc[train_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[valid_index][predictors].values, label=train_df.iloc[valid_index][target].values, feature_name=predictors, free_raw_data = False ) clf = lgb.train(param_lgb, xg_train, 5000, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) oof[valid_index] = clf.predict(train_df.iloc[valid_index][predictors].values, num_iteration=clf.best_iteration) predictions[:,i-1] += clf.predict(test_df[predictors], num_iteration=clf.best_iteration) i = i + 1 print(&quot;\n\nCV AUC: {:&lt;0.2f}&quot;.format(metrics.roc_auc_score(train_df.target.values, oof))) 所以我们在5折交叉验证中获得了0.90 AUC。 让我们对5折预测进行排名平均。 5.排名平均值 print(&quot;Rank averaging on&quot;, nfold, &quot;fold predictions&quot;) rank_predictions = np.zeros((predictions.shape[0],1)) for i in range(nfold): rank_predictions[:, 0] = np.add(rank_predictions[:, 0], rankdata(predictions[:, i].reshape(-1,1))/rank_predictions.shape[0]) rank_predictions /= nfold 6.提交 sub_df = pd.DataFrame({&quot;ID_code&quot;: test_df.ID_code.values}) sub_df[&quot;target&quot;] = rank_predictions sub_df.to_csv(&quot;Customer_Transaction_rank_predictions.csv&quot;, index=False)" />
+<link rel="canonical" href="https://uzzz.org/2019/07/31/792549.html" />
+<meta property="og:url" content="https://uzzz.org/2019/07/31/792549.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-07-31T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"GridSearchCV调参-----------------太慢，效果也不好 这里结合Kaggle比赛的一个数据集，记录一下使用贝叶斯全局优化和高斯过程来寻找最佳参数的方法步骤。 1.安装贝叶斯全局优化库 从pip安装最新版本 pip install bayesian-optimization 2.加载数据集 import pandas as pd import numpy as np from sklearn.model_selection import StratifiedKFold from scipy.stats import rankdata from sklearn import metrics import lightgbm as lgb import warnings import gc pd.set_option(&#39;display.max_columns&#39;, 200) train_df = pd.read_csv(&#39;../input/train.csv&#39;) test_df = pd.read_csv(&#39;../input/test.csv&#39;) 目标变量的分布 target = &#39;target&#39; predictors = train_df.columns.values.tolist()[2:] train_df.target.value_counts() 问题是不平衡。这里使用50％分层行作为保持行，以便验证集获得最佳参数。 稍后将在最终模型拟合中使用5折交叉验证。 bayesian_tr_index, bayesian_val_index = list(StratifiedKFold(n_splits=2, shuffle=True, random_state=1).split(train_df, train_df.target.values))[0] 这些bayesian_tr_index和bayesian_val_index索引将用于贝叶斯优化，作为训练和验证数据集的索引。 3.黑盒函数优化（LightGBM） 在加载数据时，为LightGBM创建黑盒函数以查找参数。 def LGB_bayesian( num_leaves, # int min_data_in_leaf, # int learning_rate, min_sum_hessian_in_leaf, # int feature_fraction, lambda_l1, lambda_l2, min_gain_to_split, max_depth): # LightGBM expects next three parameters need to be integer. So we make them integer num_leaves = int(num_leaves) min_data_in_leaf = int(min_data_in_leaf) max_depth = int(max_depth) assert type(num_leaves) == int assert type(min_data_in_leaf) == int assert type(max_depth) == int param = { &#39;num_leaves&#39;: num_leaves, &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: min_data_in_leaf, &#39;learning_rate&#39;: learning_rate, &#39;min_sum_hessian_in_leaf&#39;: min_sum_hessian_in_leaf, &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: feature_fraction, &#39;lambda_l1&#39;: lambda_l1, &#39;lambda_l2&#39;: lambda_l2, &#39;min_gain_to_split&#39;: min_gain_to_split, &#39;max_depth&#39;: max_depth, &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } xg_train = lgb.Dataset(train_df.iloc[bayesian_tr_index][predictors].values, label=train_df.iloc[bayesian_tr_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[bayesian_val_index][predictors].values, label=train_df.iloc[bayesian_val_index][target].values, feature_name=predictors, free_raw_data = False ) num_round = 5000 clf = lgb.train(param, xg_train, num_round, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) predictions = clf.predict(train_df.iloc[bayesian_val_index][predictors].values, num_iteration=clf.best_iteration) score = metrics.roc_auc_score(train_df.iloc[bayesian_val_index][target].values, predictions) return score 上面的LGB_bayesian函数将作为贝叶斯优化的黑盒函数。 我已经在LGB_bayesian函数中为LightGBM定义了trainng和validation数据集。 LGB_bayesian函数从贝叶斯优化框架获取num_leaves，min_data_in_leaf，learning_rate，min_sum_hessian_in_leaf，feature_fraction，lambda_l1，lambda_l2，min_gain_to_split，max_depth的值。 请记住，对于LightGBM，num_leaves，min_data_in_leaf和max_depth应该是整数。 但贝叶斯优化会发送连续的函数。 所以我强制它们是整数。 我只会找到它们的最佳参数值。 读者可以增加或减少要优化的参数数量。 现在需要为这些参数提供边界，以便贝叶斯优化仅在边界内搜索。 bounds_LGB = { &#39;num_leaves&#39;: (5, 20), &#39;min_data_in_leaf&#39;: (5, 20), &#39;learning_rate&#39;: (0.01, 0.3), &#39;min_sum_hessian_in_leaf&#39;: (0.00001, 0.01), &#39;feature_fraction&#39;: (0.05, 0.5), &#39;lambda_l1&#39;: (0, 5.0), &#39;lambda_l2&#39;: (0, 5.0), &#39;min_gain_to_split&#39;: (0, 1.0), &#39;max_depth&#39;:(3,15), } 让我们将它们全部放在BayesianOptimization对象中 from bayes_opt import BayesianOptimization LGB_BO = BayesianOptimization(LGB_bayesian, bounds_LGB, random_state=13) 现在，让我们来优化key space (parameters)： print(LGB_BO.space.keys) 我创建了BayesianOptimization对象（LGB_BO），在调用maxime之前它不会工作。在调用之前，解释一下贝叶斯优化对象（LGB_BO）的两个参数，我们可以传递给它们进行最大化： init_points：我们想要执行的随机探索的初始随机运行次数。 在我们的例子中，LGB_bayesian将被运行n_iter次。 n_iter：运行init_points数后，我们要执行多少次贝叶斯优化运行。 现在，是时候从贝叶斯优化框架调用函数来最大化。 我允许LGB_BO对象运行5个init_points和5个n_iter。 init_points = 5 n_iter = 5 print(&#39;-&#39; * 130) with warnings.catch_warnings(): warnings.filterwarnings(&#39;ignore&#39;) LGB_BO.maximize(init_points=init_points, n_iter=n_iter, acq=&#39;ucb&#39;, xi=0.0, alpha=1e-6) 优化完成后，让我们看看我们得到的最大值是多少。 LGB_BO.max[&#39;target&#39;] 参数的验证AUC是0.89， 让我们看看参数: LGB_BO.max[&#39;params&#39;] 现在我们可以将这些参数用于我们的最终模型！ BayesianOptimization库中还有一个很酷的选项。 你可以探测LGB_bayesian函数，如果你对最佳参数有所了解，或者您从其他kernel获取参数。 我将在此复制并粘贴其他内核中的参数。 你可以按照以下方式进行探测： LGB_BO.probe( params={&#39;feature_fraction&#39;: 0.1403, &#39;lambda_l1&#39;: 4.218, &#39;lambda_l2&#39;: 1.734, &#39;learning_rate&#39;: 0.07, &#39;max_depth&#39;: 14, &#39;min_data_in_leaf&#39;: 17, &#39;min_gain_to_split&#39;: 0.1501, &#39;min_sum_hessian_in_leaf&#39;: 0.000446, &#39;num_leaves&#39;: 6}, lazy=True, # ) 好的，默认情况下这些将被懒惰地探索（lazy = True），这意味着只有在你下次调用maxime时才会评估这些点。 让我们对LGB_BO对象进行最大化调用。 LGB_BO.maximize(init_points=0, n_iter=0) # remember no init_points or n_iter 最后，通过属性LGB_BO.res可以获得探测的所有参数列表及其相应的目标值。 for i, res in enumerate(LGB_BO.res): print(&quot;Iteration {}: \\n\\t{}&quot;.format(i, res)) 我们在调查中获得了更好的验证分数！和以前一样，我只运行LGB_BO 10次。在实践中，我将它增加到100。 LGB_BO.max[&#39;target&#39;] LGB_BO.max[&#39;params&#39;] 让我们一起构建一个模型使用这些参数。 4.训练LightGBM模型 param_lgb = { &#39;num_leaves&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;num_leaves&#39;]), # remember to int here &#39;max_bin&#39;: 63, &#39;min_data_in_leaf&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;min_data_in_leaf&#39;]), # remember to int here &#39;learning_rate&#39;: LGB_BO.max[&#39;params&#39;][&#39;learning_rate&#39;], &#39;min_sum_hessian_in_leaf&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_sum_hessian_in_leaf&#39;], &#39;bagging_fraction&#39;: 1.0, &#39;bagging_freq&#39;: 5, &#39;feature_fraction&#39;: LGB_BO.max[&#39;params&#39;][&#39;feature_fraction&#39;], &#39;lambda_l1&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l1&#39;], &#39;lambda_l2&#39;: LGB_BO.max[&#39;params&#39;][&#39;lambda_l2&#39;], &#39;min_gain_to_split&#39;: LGB_BO.max[&#39;params&#39;][&#39;min_gain_to_split&#39;], &#39;max_depth&#39;: int(LGB_BO.max[&#39;params&#39;][&#39;max_depth&#39;]), # remember to int here &#39;save_binary&#39;: True, &#39;seed&#39;: 1337, &#39;feature_fraction_seed&#39;: 1337, &#39;bagging_seed&#39;: 1337, &#39;drop_seed&#39;: 1337, &#39;data_random_seed&#39;: 1337, &#39;objective&#39;: &#39;binary&#39;, &#39;boosting_type&#39;: &#39;gbdt&#39;, &#39;verbose&#39;: 1, &#39;metric&#39;: &#39;auc&#39;, &#39;is_unbalance&#39;: True, &#39;boost_from_average&#39;: False, } 如您所见，我将LGB_BO的最佳参数保存到param_lgb字典中，它们将用于训练5折的模型。 Kfolds数量： nfold = 5 gc.collect() skf = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=2019) oof = np.zeros(len(train_df)) predictions = np.zeros((len(test_df),nfold)) i = 1 for train_index, valid_index in skf.split(train_df, train_df.target.values): print(&quot;\\nfold {}&quot;.format(i)) xg_train = lgb.Dataset(train_df.iloc[train_index][predictors].values, label=train_df.iloc[train_index][target].values, feature_name=predictors, free_raw_data = False ) xg_valid = lgb.Dataset(train_df.iloc[valid_index][predictors].values, label=train_df.iloc[valid_index][target].values, feature_name=predictors, free_raw_data = False ) clf = lgb.train(param_lgb, xg_train, 5000, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50) oof[valid_index] = clf.predict(train_df.iloc[valid_index][predictors].values, num_iteration=clf.best_iteration) predictions[:,i-1] += clf.predict(test_df[predictors], num_iteration=clf.best_iteration) i = i + 1 print(&quot;\\n\\nCV AUC: {:&lt;0.2f}&quot;.format(metrics.roc_auc_score(train_df.target.values, oof))) 所以我们在5折交叉验证中获得了0.90 AUC。 让我们对5折预测进行排名平均。 5.排名平均值 print(&quot;Rank averaging on&quot;, nfold, &quot;fold predictions&quot;) rank_predictions = np.zeros((predictions.shape[0],1)) for i in range(nfold): rank_predictions[:, 0] = np.add(rank_predictions[:, 0], rankdata(predictions[:, i].reshape(-1,1))/rank_predictions.shape[0]) rank_predictions /= nfold 6.提交 sub_df = pd.DataFrame({&quot;ID_code&quot;: test_df.ID_code.values}) sub_df[&quot;target&quot;] = rank_predictions sub_df.to_csv(&quot;Customer_Transaction_rank_predictions.csv&quot;, index=False)","@type":"BlogPosting","url":"https://uzzz.org/2019/07/31/792549.html","headline":"贝叶斯全局优化（LightGBM调参）","dateModified":"2019-07-31T00:00:00+08:00","datePublished":"2019-07-31T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/07/31/792549.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>贝叶斯全局优化（LightGBM调参）</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <p><strong>GridSearchCV调参-----------------太慢，效果也不好</strong><br> 这里结合Kaggle比赛的一个数据集，记录一下使用贝叶斯全局优化和高斯过程来寻找最佳参数的方法步骤。</p> 
+  <h2><a id="1_2"></a>1.安装贝叶斯全局优化库</h2> 
+  <p>从pip安装最新版本</p> 
+  <pre><code>pip install bayesian-optimization
+</code></pre> 
+  <h2><a id="2_8"></a>2.加载数据集</h2> 
+  <pre><code>import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from scipy.stats import rankdata
+from sklearn import metrics
+import lightgbm as lgb
+import warnings
+import gc
+pd.set_option('display.max_columns', 200)
+</code></pre> 
+  <pre><code>train_df = pd.read_csv('../input/train.csv')
+test_df = pd.read_csv('../input/test.csv')
+</code></pre> 
+  <p>目标变量的分布</p> 
+  <pre><code>target = 'target'
+predictors = train_df.columns.values.tolist()[2:]
+train_df.target.value_counts()
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307182026117.png" alt="在这里插入图片描述"><br> 问题是不平衡。这里使用50％分层行作为保持行，以便验证集获得最佳参数。 稍后将在最终模型拟合中使用5折交叉验证。</p> 
+  <pre><code>bayesian_tr_index, bayesian_val_index  = list(StratifiedKFold(n_splits=2, 
+shuffle=True, random_state=1).split(train_df, train_df.target.values))[0]
+</code></pre> 
+  <p>这些bayesian_tr_index和bayesian_val_index索引将用于贝叶斯优化，作为训练和验证数据集的索引。</p> 
+  <h2><a id="3LightGBM_41"></a>3.黑盒函数优化（LightGBM）</h2> 
+  <p>在加载数据时，为LightGBM创建黑盒函数以查找参数。</p> 
+  <pre><code>def LGB_bayesian(
+    num_leaves,  # int
+    min_data_in_leaf,  # int
+    learning_rate,
+    min_sum_hessian_in_leaf,    # int  
+    feature_fraction,
+    lambda_l1,
+    lambda_l2,
+    min_gain_to_split,
+    max_depth):
+    
+    # LightGBM expects next three parameters need to be integer. So we make them integer
+    num_leaves = int(num_leaves)
+    min_data_in_leaf = int(min_data_in_leaf)
+    max_depth = int(max_depth)
+
+    assert type(num_leaves) == int
+    assert type(min_data_in_leaf) == int
+    assert type(max_depth) == int
+
+    param = {
+        'num_leaves': num_leaves,
+        'max_bin': 63,
+        'min_data_in_leaf': min_data_in_leaf,
+        'learning_rate': learning_rate,
+        'min_sum_hessian_in_leaf': min_sum_hessian_in_leaf,
+        'bagging_fraction': 1.0,
+        'bagging_freq': 5,
+        'feature_fraction': feature_fraction,
+        'lambda_l1': lambda_l1,
+        'lambda_l2': lambda_l2,
+        'min_gain_to_split': min_gain_to_split,
+        'max_depth': max_depth,
+        'save_binary': True, 
+        'seed': 1337,
+        'feature_fraction_seed': 1337,
+        'bagging_seed': 1337,
+        'drop_seed': 1337,
+        'data_random_seed': 1337,
+        'objective': 'binary',
+        'boosting_type': 'gbdt',
+        'verbose': 1,
+        'metric': 'auc',
+        'is_unbalance': True,
+        'boost_from_average': False,   
+
+    }    
+    
+    
+    xg_train = lgb.Dataset(train_df.iloc[bayesian_tr_index][predictors].values,
+                           label=train_df.iloc[bayesian_tr_index][target].values,
+                           feature_name=predictors,
+                           free_raw_data = False
+                           )
+    xg_valid = lgb.Dataset(train_df.iloc[bayesian_val_index][predictors].values,
+                           label=train_df.iloc[bayesian_val_index][target].values,
+                           feature_name=predictors,
+                           free_raw_data = False
+                           )   
+
+    num_round = 5000
+    clf = lgb.train(param, xg_train, num_round, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50)
+    
+    predictions = clf.predict(train_df.iloc[bayesian_val_index][predictors].values, num_iteration=clf.best_iteration)   
+    
+    score = metrics.roc_auc_score(train_df.iloc[bayesian_val_index][target].values, predictions)
+    
+    return score
+</code></pre> 
+  <p>上面的LGB_bayesian函数将作为贝叶斯优化的黑盒函数。 我已经在LGB_bayesian函数中为LightGBM定义了trainng和validation数据集。</p> 
+  <p>LGB_bayesian函数从贝叶斯优化框架获取num_leaves，min_data_in_leaf，learning_rate，min_sum_hessian_in_leaf，feature_fraction，lambda_l1，lambda_l2，min_gain_to_split，max_depth的值。 请记住，对于LightGBM，num_leaves，min_data_in_leaf和max_depth应该是整数。 但贝叶斯优化会发送连续的函数。 所以我强制它们是整数。 我只会找到它们的最佳参数值。 读者可以增加或减少要优化的参数数量。<br> 现在需要为这些参数提供<strong>边界</strong>，以便贝叶斯优化仅在边界内搜索。</p> 
+  <pre><code>bounds_LGB = {
+    'num_leaves': (5, 20), 
+    'min_data_in_leaf': (5, 20),  
+    'learning_rate': (0.01, 0.3),
+    'min_sum_hessian_in_leaf': (0.00001, 0.01),    
+    'feature_fraction': (0.05, 0.5),
+    'lambda_l1': (0, 5.0), 
+    'lambda_l2': (0, 5.0), 
+    'min_gain_to_split': (0, 1.0),
+    'max_depth':(3,15),
+}
+</code></pre> 
+  <p>让我们将它们全部放在BayesianOptimization对象中</p> 
+  <pre><code>from bayes_opt import BayesianOptimization
+LGB_BO = BayesianOptimization(LGB_bayesian, bounds_LGB, random_state=13)
+</code></pre> 
+  <p>现在，让我们来优化key space (parameters)：</p> 
+  <pre><code>print(LGB_BO.space.keys)
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307183727757.png" alt="在这里插入图片描述"><br> 我创建了BayesianOptimization对象（LGB_BO），在调用maxime之前它不会工作。在调用之前，解释一下贝叶斯优化对象（LGB_BO）的两个参数，我们可以传递给它们进行最大化：<br> <strong>init_points</strong>：我们想要执行的随机探索的初始随机运行次数。 在我们的例子中，LGB_bayesian将被运行n_iter次。<br> <strong>n_iter</strong>：运行init_points数后，我们要执行多少次贝叶斯优化运行。</p> 
+  <p>现在，是时候从贝叶斯优化框架调用函数来最大化。 我允许LGB_BO对象运行5个init_points和5个n_iter。</p> 
+  <pre><code>init_points = 5
+n_iter = 5
+print('-' * 130)
+
+with warnings.catch_warnings():
+    warnings.filterwarnings('ignore')
+    LGB_BO.maximize(init_points=init_points, n_iter=n_iter, acq='ucb', xi=0.0, alpha=1e-6)
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307184352199.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 优化完成后，让我们看看我们得到的最大值是多少。</p> 
+  <pre><code>LGB_BO.max['target']
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307184453251.png" alt="在这里插入图片描述"><br> 参数的验证AUC是0.89， 让我们看看参数:</p> 
+  <pre><code>LGB_BO.max['params']
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307184638136.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 现在我们可以将这些参数用于我们的最终模型！</p> 
+  <p>BayesianOptimization库中还有一个很酷的选项。 你可以探测LGB_bayesian函数，如果你对最佳参数有所了解，或者您从其他kernel获取参数。 我将在此复制并粘贴其他内核中的参数。 你可以按照以下方式进行探测：</p> 
+  <pre><code>LGB_BO.probe(
+    params={'feature_fraction': 0.1403, 
+            'lambda_l1': 4.218, 
+            'lambda_l2': 1.734, 
+            'learning_rate': 0.07, 
+            'max_depth': 14, 
+            'min_data_in_leaf': 17, 
+            'min_gain_to_split': 0.1501, 
+            'min_sum_hessian_in_leaf': 0.000446, 
+            'num_leaves': 6},
+    lazy=True, # 
+)
+</code></pre> 
+  <p>好的，默认情况下这些将被懒惰地探索（lazy = True），这意味着只有在你下次调用maxime时才会评估这些点。 让我们对LGB_BO对象进行最大化调用。</p> 
+  <pre><code>LGB_BO.maximize(init_points=0, n_iter=0) # remember no init_points or n_iter
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307190625813.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 最后，通过属性LGB_BO.res可以获得探测的所有参数列表及其相应的目标值。</p> 
+  <pre><code>for i, res in enumerate(LGB_BO.res):
+    print("Iteration {}: \n\t{}".format(i, res))
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307190751894.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 我们在调查中获得了更好的验证分数！和以前一样，我只运行LGB_BO 10次。在实践中，我将它增加到100。</p> 
+  <pre><code>LGB_BO.max['target']
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307190927615.png" alt="在这里插入图片描述"></p> 
+  <pre><code>LGB_BO.max['params']
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190307190959500.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 让我们一起构建一个模型使用这些参数。</p> 
+  <h2><a id="4LightGBM_215"></a>4.训练LightGBM模型</h2> 
+  <pre><code>param_lgb = {
+        'num_leaves': int(LGB_BO.max['params']['num_leaves']), # remember to int here
+        'max_bin': 63,
+        'min_data_in_leaf': int(LGB_BO.max['params']['min_data_in_leaf']), # remember to int here
+        'learning_rate': LGB_BO.max['params']['learning_rate'],
+        'min_sum_hessian_in_leaf': LGB_BO.max['params']['min_sum_hessian_in_leaf'],
+        'bagging_fraction': 1.0, 
+        'bagging_freq': 5, 
+        'feature_fraction': LGB_BO.max['params']['feature_fraction'],
+        'lambda_l1': LGB_BO.max['params']['lambda_l1'],
+        'lambda_l2': LGB_BO.max['params']['lambda_l2'],
+        'min_gain_to_split': LGB_BO.max['params']['min_gain_to_split'],
+        'max_depth': int(LGB_BO.max['params']['max_depth']), # remember to int here
+        'save_binary': True,
+        'seed': 1337,
+        'feature_fraction_seed': 1337,
+        'bagging_seed': 1337,
+        'drop_seed': 1337,
+        'data_random_seed': 1337,
+        'objective': 'binary',
+        'boosting_type': 'gbdt',
+        'verbose': 1,
+        'metric': 'auc',
+        'is_unbalance': True,
+        'boost_from_average': False,
+    }
+</code></pre> 
+  <p>如您所见，我将LGB_BO的最佳参数保存到param_lgb字典中，它们将用于训练5折的模型。<br> Kfolds数量：</p> 
+  <pre><code>nfold = 5
+gc.collect()
+skf = StratifiedKFold(n_splits=nfold, shuffle=True, random_state=2019)
+</code></pre> 
+  <pre><code>oof = np.zeros(len(train_df))
+predictions = np.zeros((len(test_df),nfold))
+
+i = 1
+for train_index, valid_index in skf.split(train_df, train_df.target.values):
+    print("\nfold {}".format(i))
+    xg_train = lgb.Dataset(train_df.iloc[train_index][predictors].values,
+                           label=train_df.iloc[train_index][target].values,
+                           feature_name=predictors,
+                           free_raw_data = False
+                           )
+    xg_valid = lgb.Dataset(train_df.iloc[valid_index][predictors].values,
+                           label=train_df.iloc[valid_index][target].values,
+                           feature_name=predictors,
+                           free_raw_data = False
+                           )   
+
+    
+    clf = lgb.train(param_lgb, xg_train, 5000, valid_sets = [xg_valid], verbose_eval=250, early_stopping_rounds = 50)
+    oof[valid_index] = clf.predict(train_df.iloc[valid_index][predictors].values, num_iteration=clf.best_iteration) 
+    
+    predictions[:,i-1] += clf.predict(test_df[predictors], num_iteration=clf.best_iteration)
+    i = i + 1
+
+print("\n\nCV AUC: {:&lt;0.2f}".format(metrics.roc_auc_score(train_df.target.values, oof)))
+</code></pre> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/2019030718592498.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQyMjgzOTYw,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 所以我们在5折交叉验证中获得了0.90 AUC。<br> 让我们对5折预测进行排名平均。</p> 
+  <h2><a id="5_284"></a>5.排名平均值</h2> 
+  <pre><code>print("Rank averaging on", nfold, "fold predictions")
+rank_predictions = np.zeros((predictions.shape[0],1))
+for i in range(nfold):
+    rank_predictions[:, 0] = np.add(rank_predictions[:, 0], rankdata(predictions[:, i].reshape(-1,1))/rank_predictions.shape[0]) 
+
+rank_predictions /= nfold
+</code></pre> 
+  <h2><a id="6_294"></a>6.提交</h2> 
+  <pre><code>sub_df = pd.DataFrame({"ID_code": test_df.ID_code.values})
+sub_df["target"] = rank_predictions
+sub_df.to_csv("Customer_Transaction_rank_predictions.csv", index=False)
+</code></pre> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-e44c3c0e64.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

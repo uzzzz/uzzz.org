@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>【比原链】比原启动后去哪里连接别的节点 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="【比原链】比原启动后去哪里连接别的节点" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="作者：freewind 比原项目仓库：https://github.com/Bytom/bytom 最开始我对于这个问题一直有个疑惑：区块链是一个分布式的网络，那么一个节点启动后，它怎么知道去哪里找别的节点从而加入网络呢？ 看到代码之后，我才明白，原来在代码中硬编码了一些种子地址，这样在启动的时候，可以先通过种子地址加入网络。虽然整个网络是分布式的，但是最开始还是需要一定的中心化。 预编码内容 对于配置文件config.toml，比原的代码中硬编码了配置文件内容： config/toml.go#L22-L45 var defaultConfigTmpl = `# This is a TOML config file. # For more information, see https://github.com/toml-lang/toml fast_sync = true db_backend = &quot;leveldb&quot; api_addr = &quot;0.0.0.0:9888&quot; ` var mainNetConfigTmpl = `chain_id = &quot;mainnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46657&quot; seeds = &quot;45.79.213.28:46657,198.74.61.131:46657,212.111.41.245:46657,47.100.214.154:46657,47.100.109.199:46657,47.100.105.165:46657&quot; ` var testNetConfigTmpl = `chain_id = &quot;testnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46656&quot; seeds = &quot;47.96.42.1:46656,172.104.224.219:46656,45.118.132.164:46656&quot; ` var soloNetConfigTmpl = `chain_id = &quot;solonet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46658&quot; seeds = &quot;&quot; ` 可以看出，对于不同的chain_id，预设的种子是不同的。 当然，如果我们自己知道某些节点的地址，也可以在初始化生成config.toml后，手动修改该文件添加进去。 启动syncManager 那么，比原在代码中是使用这些种子地址并连接它们的呢？关键在于，连接的代码位于SyncManager中，所以我们要找到启动syncManager的地方。 首先，当我们使用bytomd node启动后，下面的函数将被调用： cmd/bytomd/commands/run_node.go#L41 func runNode(cmd *cobra.Command, args []string) error { // Create &amp; start node n := node.NewNode(config) if _, err := n.Start(); err != nil { // ... } // ... } 这里调用了n.Start，其中的Start方法，来自于Node所嵌入的cmn.BaseService： node/node.go#L39 type Node struct { cmn.BaseService // ... } 所以n.Start对应的是下面这个方法： vendor/github.com/tendermint/tmlibs/common/service.go#L97 func (bs *BaseService) Start() (bool, error) { // ... err := bs.impl.OnStart() // ... } 在这里，由于bs.impl对应于Node，所以将继续调用Node.OnStart(): node/node.go#L169 func (n *Node) OnStart() error { // ... n.syncManager.Start() // ... } 可以看到，我们终于走到了调用了syncManager.Start()的地方。 syncManager中的处理 然后就是在syncManager内部的一些处理了。 它主要是除了从config.toml中取得种子节点外，还需要把以前连接过并保存在本地的AddressBook.json中的节点也拿出来连接，这样就算预设的种子节点失败了，也还是有可能连接上网络（部分解决了前面提到的中心化的担忧）。 syncManager.Start()对应于： netsync/handle.go#L141 func (sm *SyncManager) Start() { go sm.netStart() // ... } 其中sm.netStart()，对应于： netsync/handle.go#L121 func (sm *SyncManager) netStart() error { // ... // If seeds exist, add them to the address book and dial out if sm.config.P2P.Seeds != &quot;&quot; { // dial out seeds := strings.Split(sm.config.P2P.Seeds, &quot;,&quot;) if err := sm.DialSeeds(seeds); err != nil { return err } } // ... } 其中的sm.config.P2P.Seeds就对应于config.toml中的seeds。关于这两者是怎么对应起来的，会在后面文章中详解。 紧接着，再通过sm.DialSeeds(seeds)去连接这些seed，这个方法对应的代码位于： netsync/handle.go#L229 func (sm *SyncManager) DialSeeds(seeds []string) error { return sm.sw.DialSeeds(sm.addrBook, seeds) } 其实是是调用了sm.sw.DialSeeds，而sm.sw是指Switch。这时可以看到，有一个叫addrBook的东西参与了进来，它保存了该结点之前成功连接过的节点地址，我们这里暂不多做讨论。 Switch.DialSeeds对应于： p2p/switch.go#L311 func (sw *Switch) DialSeeds(addrBook *AddrBook, seeds []string) error { // ... perm := rand.Perm(len(netAddrs)) for i := 0; i &lt; len(perm)/2; i++ { j := perm[i] sw.dialSeed(netAddrs[j]) } // ... } 这里引入了随机数，是为了将发起连接的顺序打乱，这样可以让每个种子都获得公平的连接机会。 sw.dialSeed(netAddrs[j])对应于： p2p/switch.go#L342 func (sw *Switch) dialSeed(addr *NetAddress) { peer, err := sw.DialPeerWithAddress(addr, false) // ... } sw.DialPeerWithAddress(addr, false)又对应于： p2p/switch.go#L351 func (sw *Switch) DialPeerWithAddress(addr *NetAddress, persistent bool) (*Peer, error) { // ... log.WithField(&quot;address&quot;, addr).Info(&quot;Dialing peer&quot;) peer, err := newOutboundPeerWithConfig(addr, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, sw.peerConfig) // ... } 其中的persistent参数如果是true的话，表明这个peer比较重要，在某些情况下如果断开连接后，还会尝试重连。如果persistent为false的，就没有这个待遇。 newOutboundPeerWithConfig对应于： p2p/peer.go#L69 func newOutboundPeerWithConfig(addr *NetAddress, reactorsByCh map[byte]Reactor, chDescs []*ChannelDescriptor, onPeerError func(*Peer, interface{}), ourNodePrivKey crypto.PrivKeyEd25519, config *PeerConfig) (*Peer, error) { conn, err := dial(addr, config) // ... } 继续dial，加入了超时： p2p/peer.go#L284 func dial(addr *NetAddress, config *PeerConfig) (net.Conn, error) { conn, err := addr.DialTimeout(config.DialTimeout * time.Second) if err != nil { return nil, err } return conn, nil } addr.DialTimeout对应于： p2p/netaddress.go#L141 func (na *NetAddress) DialTimeout(timeout time.Duration) (net.Conn, error) { conn, err := net.DialTimeout(&quot;tcp&quot;, na.String(), timeout) if err != nil { return nil, err } return conn, nil } 终于到了net包的调用，开始真正去连接这个种子节点了，到这里，我们可以认为这个问题解决了。 感谢社区用户freewind的辛勤写作 源地址：https://github.com/bytom-win/unwrap-bytom 阅读更多" />
+<meta property="og:description" content="作者：freewind 比原项目仓库：https://github.com/Bytom/bytom 最开始我对于这个问题一直有个疑惑：区块链是一个分布式的网络，那么一个节点启动后，它怎么知道去哪里找别的节点从而加入网络呢？ 看到代码之后，我才明白，原来在代码中硬编码了一些种子地址，这样在启动的时候，可以先通过种子地址加入网络。虽然整个网络是分布式的，但是最开始还是需要一定的中心化。 预编码内容 对于配置文件config.toml，比原的代码中硬编码了配置文件内容： config/toml.go#L22-L45 var defaultConfigTmpl = `# This is a TOML config file. # For more information, see https://github.com/toml-lang/toml fast_sync = true db_backend = &quot;leveldb&quot; api_addr = &quot;0.0.0.0:9888&quot; ` var mainNetConfigTmpl = `chain_id = &quot;mainnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46657&quot; seeds = &quot;45.79.213.28:46657,198.74.61.131:46657,212.111.41.245:46657,47.100.214.154:46657,47.100.109.199:46657,47.100.105.165:46657&quot; ` var testNetConfigTmpl = `chain_id = &quot;testnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46656&quot; seeds = &quot;47.96.42.1:46656,172.104.224.219:46656,45.118.132.164:46656&quot; ` var soloNetConfigTmpl = `chain_id = &quot;solonet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46658&quot; seeds = &quot;&quot; ` 可以看出，对于不同的chain_id，预设的种子是不同的。 当然，如果我们自己知道某些节点的地址，也可以在初始化生成config.toml后，手动修改该文件添加进去。 启动syncManager 那么，比原在代码中是使用这些种子地址并连接它们的呢？关键在于，连接的代码位于SyncManager中，所以我们要找到启动syncManager的地方。 首先，当我们使用bytomd node启动后，下面的函数将被调用： cmd/bytomd/commands/run_node.go#L41 func runNode(cmd *cobra.Command, args []string) error { // Create &amp; start node n := node.NewNode(config) if _, err := n.Start(); err != nil { // ... } // ... } 这里调用了n.Start，其中的Start方法，来自于Node所嵌入的cmn.BaseService： node/node.go#L39 type Node struct { cmn.BaseService // ... } 所以n.Start对应的是下面这个方法： vendor/github.com/tendermint/tmlibs/common/service.go#L97 func (bs *BaseService) Start() (bool, error) { // ... err := bs.impl.OnStart() // ... } 在这里，由于bs.impl对应于Node，所以将继续调用Node.OnStart(): node/node.go#L169 func (n *Node) OnStart() error { // ... n.syncManager.Start() // ... } 可以看到，我们终于走到了调用了syncManager.Start()的地方。 syncManager中的处理 然后就是在syncManager内部的一些处理了。 它主要是除了从config.toml中取得种子节点外，还需要把以前连接过并保存在本地的AddressBook.json中的节点也拿出来连接，这样就算预设的种子节点失败了，也还是有可能连接上网络（部分解决了前面提到的中心化的担忧）。 syncManager.Start()对应于： netsync/handle.go#L141 func (sm *SyncManager) Start() { go sm.netStart() // ... } 其中sm.netStart()，对应于： netsync/handle.go#L121 func (sm *SyncManager) netStart() error { // ... // If seeds exist, add them to the address book and dial out if sm.config.P2P.Seeds != &quot;&quot; { // dial out seeds := strings.Split(sm.config.P2P.Seeds, &quot;,&quot;) if err := sm.DialSeeds(seeds); err != nil { return err } } // ... } 其中的sm.config.P2P.Seeds就对应于config.toml中的seeds。关于这两者是怎么对应起来的，会在后面文章中详解。 紧接着，再通过sm.DialSeeds(seeds)去连接这些seed，这个方法对应的代码位于： netsync/handle.go#L229 func (sm *SyncManager) DialSeeds(seeds []string) error { return sm.sw.DialSeeds(sm.addrBook, seeds) } 其实是是调用了sm.sw.DialSeeds，而sm.sw是指Switch。这时可以看到，有一个叫addrBook的东西参与了进来，它保存了该结点之前成功连接过的节点地址，我们这里暂不多做讨论。 Switch.DialSeeds对应于： p2p/switch.go#L311 func (sw *Switch) DialSeeds(addrBook *AddrBook, seeds []string) error { // ... perm := rand.Perm(len(netAddrs)) for i := 0; i &lt; len(perm)/2; i++ { j := perm[i] sw.dialSeed(netAddrs[j]) } // ... } 这里引入了随机数，是为了将发起连接的顺序打乱，这样可以让每个种子都获得公平的连接机会。 sw.dialSeed(netAddrs[j])对应于： p2p/switch.go#L342 func (sw *Switch) dialSeed(addr *NetAddress) { peer, err := sw.DialPeerWithAddress(addr, false) // ... } sw.DialPeerWithAddress(addr, false)又对应于： p2p/switch.go#L351 func (sw *Switch) DialPeerWithAddress(addr *NetAddress, persistent bool) (*Peer, error) { // ... log.WithField(&quot;address&quot;, addr).Info(&quot;Dialing peer&quot;) peer, err := newOutboundPeerWithConfig(addr, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, sw.peerConfig) // ... } 其中的persistent参数如果是true的话，表明这个peer比较重要，在某些情况下如果断开连接后，还会尝试重连。如果persistent为false的，就没有这个待遇。 newOutboundPeerWithConfig对应于： p2p/peer.go#L69 func newOutboundPeerWithConfig(addr *NetAddress, reactorsByCh map[byte]Reactor, chDescs []*ChannelDescriptor, onPeerError func(*Peer, interface{}), ourNodePrivKey crypto.PrivKeyEd25519, config *PeerConfig) (*Peer, error) { conn, err := dial(addr, config) // ... } 继续dial，加入了超时： p2p/peer.go#L284 func dial(addr *NetAddress, config *PeerConfig) (net.Conn, error) { conn, err := addr.DialTimeout(config.DialTimeout * time.Second) if err != nil { return nil, err } return conn, nil } addr.DialTimeout对应于： p2p/netaddress.go#L141 func (na *NetAddress) DialTimeout(timeout time.Duration) (net.Conn, error) { conn, err := net.DialTimeout(&quot;tcp&quot;, na.String(), timeout) if err != nil { return nil, err } return conn, nil } 终于到了net包的调用，开始真正去连接这个种子节点了，到这里，我们可以认为这个问题解决了。 感谢社区用户freewind的辛勤写作 源地址：https://github.com/bytom-win/unwrap-bytom 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/01/47b07dee95d445e7b10bf5d739571a05.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/01/47b07dee95d445e7b10bf5d739571a05.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-01T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"作者：freewind 比原项目仓库：https://github.com/Bytom/bytom 最开始我对于这个问题一直有个疑惑：区块链是一个分布式的网络，那么一个节点启动后，它怎么知道去哪里找别的节点从而加入网络呢？ 看到代码之后，我才明白，原来在代码中硬编码了一些种子地址，这样在启动的时候，可以先通过种子地址加入网络。虽然整个网络是分布式的，但是最开始还是需要一定的中心化。 预编码内容 对于配置文件config.toml，比原的代码中硬编码了配置文件内容： config/toml.go#L22-L45 var defaultConfigTmpl = `# This is a TOML config file. # For more information, see https://github.com/toml-lang/toml fast_sync = true db_backend = &quot;leveldb&quot; api_addr = &quot;0.0.0.0:9888&quot; ` var mainNetConfigTmpl = `chain_id = &quot;mainnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46657&quot; seeds = &quot;45.79.213.28:46657,198.74.61.131:46657,212.111.41.245:46657,47.100.214.154:46657,47.100.109.199:46657,47.100.105.165:46657&quot; ` var testNetConfigTmpl = `chain_id = &quot;testnet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46656&quot; seeds = &quot;47.96.42.1:46656,172.104.224.219:46656,45.118.132.164:46656&quot; ` var soloNetConfigTmpl = `chain_id = &quot;solonet&quot; [p2p] laddr = &quot;tcp://0.0.0.0:46658&quot; seeds = &quot;&quot; ` 可以看出，对于不同的chain_id，预设的种子是不同的。 当然，如果我们自己知道某些节点的地址，也可以在初始化生成config.toml后，手动修改该文件添加进去。 启动syncManager 那么，比原在代码中是使用这些种子地址并连接它们的呢？关键在于，连接的代码位于SyncManager中，所以我们要找到启动syncManager的地方。 首先，当我们使用bytomd node启动后，下面的函数将被调用： cmd/bytomd/commands/run_node.go#L41 func runNode(cmd *cobra.Command, args []string) error { // Create &amp; start node n := node.NewNode(config) if _, err := n.Start(); err != nil { // ... } // ... } 这里调用了n.Start，其中的Start方法，来自于Node所嵌入的cmn.BaseService： node/node.go#L39 type Node struct { cmn.BaseService // ... } 所以n.Start对应的是下面这个方法： vendor/github.com/tendermint/tmlibs/common/service.go#L97 func (bs *BaseService) Start() (bool, error) { // ... err := bs.impl.OnStart() // ... } 在这里，由于bs.impl对应于Node，所以将继续调用Node.OnStart(): node/node.go#L169 func (n *Node) OnStart() error { // ... n.syncManager.Start() // ... } 可以看到，我们终于走到了调用了syncManager.Start()的地方。 syncManager中的处理 然后就是在syncManager内部的一些处理了。 它主要是除了从config.toml中取得种子节点外，还需要把以前连接过并保存在本地的AddressBook.json中的节点也拿出来连接，这样就算预设的种子节点失败了，也还是有可能连接上网络（部分解决了前面提到的中心化的担忧）。 syncManager.Start()对应于： netsync/handle.go#L141 func (sm *SyncManager) Start() { go sm.netStart() // ... } 其中sm.netStart()，对应于： netsync/handle.go#L121 func (sm *SyncManager) netStart() error { // ... // If seeds exist, add them to the address book and dial out if sm.config.P2P.Seeds != &quot;&quot; { // dial out seeds := strings.Split(sm.config.P2P.Seeds, &quot;,&quot;) if err := sm.DialSeeds(seeds); err != nil { return err } } // ... } 其中的sm.config.P2P.Seeds就对应于config.toml中的seeds。关于这两者是怎么对应起来的，会在后面文章中详解。 紧接着，再通过sm.DialSeeds(seeds)去连接这些seed，这个方法对应的代码位于： netsync/handle.go#L229 func (sm *SyncManager) DialSeeds(seeds []string) error { return sm.sw.DialSeeds(sm.addrBook, seeds) } 其实是是调用了sm.sw.DialSeeds，而sm.sw是指Switch。这时可以看到，有一个叫addrBook的东西参与了进来，它保存了该结点之前成功连接过的节点地址，我们这里暂不多做讨论。 Switch.DialSeeds对应于： p2p/switch.go#L311 func (sw *Switch) DialSeeds(addrBook *AddrBook, seeds []string) error { // ... perm := rand.Perm(len(netAddrs)) for i := 0; i &lt; len(perm)/2; i++ { j := perm[i] sw.dialSeed(netAddrs[j]) } // ... } 这里引入了随机数，是为了将发起连接的顺序打乱，这样可以让每个种子都获得公平的连接机会。 sw.dialSeed(netAddrs[j])对应于： p2p/switch.go#L342 func (sw *Switch) dialSeed(addr *NetAddress) { peer, err := sw.DialPeerWithAddress(addr, false) // ... } sw.DialPeerWithAddress(addr, false)又对应于： p2p/switch.go#L351 func (sw *Switch) DialPeerWithAddress(addr *NetAddress, persistent bool) (*Peer, error) { // ... log.WithField(&quot;address&quot;, addr).Info(&quot;Dialing peer&quot;) peer, err := newOutboundPeerWithConfig(addr, sw.reactorsByCh, sw.chDescs, sw.StopPeerForError, sw.nodePrivKey, sw.peerConfig) // ... } 其中的persistent参数如果是true的话，表明这个peer比较重要，在某些情况下如果断开连接后，还会尝试重连。如果persistent为false的，就没有这个待遇。 newOutboundPeerWithConfig对应于： p2p/peer.go#L69 func newOutboundPeerWithConfig(addr *NetAddress, reactorsByCh map[byte]Reactor, chDescs []*ChannelDescriptor, onPeerError func(*Peer, interface{}), ourNodePrivKey crypto.PrivKeyEd25519, config *PeerConfig) (*Peer, error) { conn, err := dial(addr, config) // ... } 继续dial，加入了超时： p2p/peer.go#L284 func dial(addr *NetAddress, config *PeerConfig) (net.Conn, error) { conn, err := addr.DialTimeout(config.DialTimeout * time.Second) if err != nil { return nil, err } return conn, nil } addr.DialTimeout对应于： p2p/netaddress.go#L141 func (na *NetAddress) DialTimeout(timeout time.Duration) (net.Conn, error) { conn, err := net.DialTimeout(&quot;tcp&quot;, na.String(), timeout) if err != nil { return nil, err } return conn, nil } 终于到了net包的调用，开始真正去连接这个种子节点了，到这里，我们可以认为这个问题解决了。 感谢社区用户freewind的辛勤写作 源地址：https://github.com/bytom-win/unwrap-bytom 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/01/47b07dee95d445e7b10bf5d739571a05.html","headline":"【比原链】比原启动后去哪里连接别的节点","dateModified":"2018-06-01T00:00:00+08:00","datePublished":"2018-06-01T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/01/47b07dee95d445e7b10bf5d739571a05.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>【比原链】比原启动后去哪里连接别的节点</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">作者：freewind</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><span style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';background-color:rgb(255,255,255);">比原项目仓库：https://github.com/Bytom/bytom</span><br></p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">最开始我对于这个问题一直有个疑惑：区块链是一个分布式的网络，那么一个节点启动后，它怎么知道去哪里找别的节点从而加入网络呢？</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">看到代码之后，我才明白，原来在代码中硬编码了一些种子地址，这样在启动的时候，可以先通过种子地址加入网络。虽然整个网络是分布式的，但是最开始还是需要一定的中心化。</p>
+  <h3 style="font-size:1.25em;line-height:1.25;color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a class="anchor" href="https://github.com/bytom-win/unwrap-bytom/blob/master/102.%E5%89%A5%E5%BC%80%E6%AF%94%E5%8E%9F%E7%9C%8B%E4%BB%A3%E7%A0%81-%E6%AF%94%E5%8E%9F%E5%90%AF%E5%8A%A8%E5%90%8E%E5%8E%BB%E5%93%AA%E9%87%8C%E8%BF%9E%E6%8E%A5%E5%88%AB%E7%9A%84%E8%8A%82%E7%82%B9.md#%E9%A2%84%E7%BC%96%E7%A0%81%E5%86%85%E5%AE%B9" rel="nofollow" style="color:rgb(3,102,214);margin-left:-20px;line-height:1;"></a>预编码内容</h3>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">对于配置文件<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">config.toml</code>，比原的代码中硬编码了配置文件内容：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/config/toml.go#L22-L45" rel="nofollow" style="color:rgb(3,102,214);">config/toml.go#L22-L45</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">var</span> <span class="pl-smi" style="color:rgb(36,41,46);">defaultConfigTmpl</span> = <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">`</span># This is a TOML config file.</span>
+<span class="pl-s" style="color:rgb(3,47,98);"># For more information, see https://github.com/toml-lang/toml</span>
+<span class="pl-s" style="color:rgb(3,47,98);">fast_sync = true</span>
+<span class="pl-s" style="color:rgb(3,47,98);">db_backend = "leveldb"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">api_addr = "0.0.0.0:9888"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">`</span>
+
+<span class="pl-k" style="color:rgb(215,58,73);">var</span> <span class="pl-smi" style="color:rgb(36,41,46);">mainNetConfigTmpl</span> = <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">`</span>chain_id = "mainnet"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">[p2p]</span>
+<span class="pl-s" style="color:rgb(3,47,98);">laddr = "tcp://0.0.0.0:46657"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">seeds = "45.79.213.28:46657,198.74.61.131:46657,212.111.41.245:46657,47.100.214.154:46657,47.100.109.199:46657,47.100.105.165:46657"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">`</span>
+
+<span class="pl-k" style="color:rgb(215,58,73);">var</span> <span class="pl-smi" style="color:rgb(36,41,46);">testNetConfigTmpl</span> = <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">`</span>chain_id = "testnet"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">[p2p]</span>
+<span class="pl-s" style="color:rgb(3,47,98);">laddr = "tcp://0.0.0.0:46656"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">seeds = "47.96.42.1:46656,172.104.224.219:46656,45.118.132.164:46656"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">`</span>
+
+<span class="pl-k" style="color:rgb(215,58,73);">var</span> <span class="pl-smi" style="color:rgb(36,41,46);">soloNetConfigTmpl</span> = <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">`</span>chain_id = "solonet"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">[p2p]</span>
+<span class="pl-s" style="color:rgb(3,47,98);">laddr = "tcp://0.0.0.0:46658"</span>
+<span class="pl-s" style="color:rgb(3,47,98);">seeds = ""</span>
+<span class="pl-s" style="color:rgb(3,47,98);">`</span></pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">可以看出，对于不同的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">chain_id</code>，预设的种子是不同的。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">当然，如果我们自己知道某些节点的地址，也可以在初始化生成<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">config.toml</code>后，手动修改该文件添加进去。</p>
+  <h3 style="font-size:1.25em;line-height:1.25;color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a class="anchor" href="https://github.com/bytom-win/unwrap-bytom/blob/master/102.%E5%89%A5%E5%BC%80%E6%AF%94%E5%8E%9F%E7%9C%8B%E4%BB%A3%E7%A0%81-%E6%AF%94%E5%8E%9F%E5%90%AF%E5%8A%A8%E5%90%8E%E5%8E%BB%E5%93%AA%E9%87%8C%E8%BF%9E%E6%8E%A5%E5%88%AB%E7%9A%84%E8%8A%82%E7%82%B9.md#%E5%90%AF%E5%8A%A8syncmanager" rel="nofollow" style="color:rgb(3,102,214);margin-left:-20px;line-height:1;"></a>启动<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;background-color:rgba(27,31,35,.05);">syncManager</code></h3>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">那么，比原在代码中是使用这些种子地址并连接它们的呢？关键在于，连接的代码位于<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">SyncManager</code>中，所以我们要找到启动<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">syncManager</code>的地方。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">首先，当我们使用<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">bytomd node</code>启动后，下面的函数将被调用：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/cmd/bytomd/commands/run_node.go#L41" rel="nofollow" style="color:rgb(3,102,214);">cmd/bytomd/commands/run_node.go#L41</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">runNode</span>(<span class="pl-v" style="color:rgb(227,98,9);">cmd</span> *<span class="pl-v" style="color:rgb(227,98,9);">cobra</span>.<span class="pl-v" style="color:rgb(227,98,9);">Command</span>, <span class="pl-v" style="color:rgb(227,98,9);">args</span> []<span class="pl-v" style="color:rgb(227,98,9);">string</span>) <span class="pl-v" style="color:rgb(227,98,9);">error</span> {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> Create &amp; start node</span>
+    <span class="pl-smi" style="color:rgb(36,41,46);">n</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> node.<span class="pl-c1" style="color:rgb(0,92,197);">NewNode</span>(config)
+    <span class="pl-k" style="color:rgb(215,58,73);">if</span> <span class="pl-smi" style="color:rgb(36,41,46);">_</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> n.<span class="pl-c1" style="color:rgb(0,92,197);">Start</span>(); err != <span class="pl-c1" style="color:rgb(0,92,197);">nil</span> {
+        <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    }
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">这里调用了<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">n.Start</code>，其中的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Start</code>方法，来自于<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Node</code>所嵌入的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">cmn.BaseService</code>：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/node/node.go#L39" rel="nofollow" style="color:rgb(3,102,214);">node/node.go#L39</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">type</span> <span class="pl-v" style="color:rgb(227,98,9);">Node</span> <span class="pl-k" style="color:rgb(215,58,73);">struct</span> {
+    cmn.<span class="pl-smi" style="color:rgb(36,41,46);">BaseService</span>
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">所以<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">n.Start</code>对应的是下面这个方法：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/vendor/github.com/tendermint/tmlibs/common/service.go#L97" rel="nofollow" style="color:rgb(3,102,214);">vendor/github.com/tendermint/tmlibs/common/service.go#L97</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">bs</span> *<span class="pl-v" style="color:rgb(227,98,9);">BaseService</span>) <span class="pl-en">Start</span></span>() (<span class="pl-v" style="color:rgb(227,98,9);">bool</span>, <span class="pl-v" style="color:rgb(227,98,9);">error</span>) {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> bs.<span class="pl-smi" style="color:rgb(36,41,46);">impl</span>.<span class="pl-c1" style="color:rgb(0,92,197);">OnStart</span>()
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">在这里，由于<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">bs.impl</code>对应于<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Node</code>，所以将继续调用<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Node.OnStart()</code>:</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/node/node.go#L169" rel="nofollow" style="color:rgb(3,102,214);">node/node.go#L169</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">n</span> *<span class="pl-v" style="color:rgb(227,98,9);">Node</span>) <span class="pl-en">OnStart</span></span>() <span class="pl-v" style="color:rgb(227,98,9);">error</span> {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    n.<span class="pl-smi" style="color:rgb(36,41,46);">syncManager</span>.<span class="pl-c1" style="color:rgb(0,92,197);">Start</span>()
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">可以看到，我们终于走到了调用了<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">syncManager.Start()</code>的地方。</p>
+  <h3 style="font-size:1.25em;line-height:1.25;color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a class="anchor" href="https://github.com/bytom-win/unwrap-bytom/blob/master/102.%E5%89%A5%E5%BC%80%E6%AF%94%E5%8E%9F%E7%9C%8B%E4%BB%A3%E7%A0%81-%E6%AF%94%E5%8E%9F%E5%90%AF%E5%8A%A8%E5%90%8E%E5%8E%BB%E5%93%AA%E9%87%8C%E8%BF%9E%E6%8E%A5%E5%88%AB%E7%9A%84%E8%8A%82%E7%82%B9.md#syncmanager%E4%B8%AD%E7%9A%84%E5%A4%84%E7%90%86" rel="nofollow" style="color:rgb(3,102,214);margin-left:-20px;line-height:1;"></a><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;background-color:rgba(27,31,35,.05);">syncManager</code>中的处理</h3>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">然后就是在<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">syncManager</code>内部的一些处理了。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">它主要是除了从<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">config.toml</code>中取得种子节点外，还需要把以前连接过并保存在本地的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">AddressBook.json</code>中的节点也拿出来连接，这样就算预设的种子节点失败了，也还是有可能连接上网络（部分解决了前面提到的中心化的担忧）。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">syncManager.Start()</code>对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/netsync/handle.go#L141" rel="nofollow" style="color:rgb(3,102,214);">netsync/handle.go#L141</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sm</span> *<span class="pl-v" style="color:rgb(227,98,9);">SyncManager</span>) <span class="pl-en">Start</span></span>() {
+    <span class="pl-k" style="color:rgb(215,58,73);">go</span> sm.<span class="pl-c1" style="color:rgb(0,92,197);">netStart</span>()
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">其中<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sm.netStart()</code>，对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/netsync/handle.go#L121" rel="nofollow" style="color:rgb(3,102,214);">netsync/handle.go#L121</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sm</span> *<span class="pl-v" style="color:rgb(227,98,9);">SyncManager</span>) <span class="pl-en">netStart</span></span>() <span class="pl-v" style="color:rgb(227,98,9);">error</span> {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> If seeds exist, add them to the address book and dial out</span>
+    <span class="pl-k" style="color:rgb(215,58,73);">if</span> sm.<span class="pl-smi" style="color:rgb(36,41,46);">config</span>.<span class="pl-smi" style="color:rgb(36,41,46);">P2P</span>.<span class="pl-smi" style="color:rgb(36,41,46);">Seeds</span> != <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">"</span><span class="pl-pds">"</span></span> {
+        <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> dial out</span>
+        <span class="pl-smi" style="color:rgb(36,41,46);">seeds</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> strings.<span class="pl-c1" style="color:rgb(0,92,197);">Split</span>(sm.<span class="pl-smi" style="color:rgb(36,41,46);">config</span>.<span class="pl-smi" style="color:rgb(36,41,46);">P2P</span>.<span class="pl-smi" style="color:rgb(36,41,46);">Seeds</span>, <span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">"</span>,<span class="pl-pds">"</span></span>)
+        <span class="pl-k" style="color:rgb(215,58,73);">if</span> <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> sm.<span class="pl-c1" style="color:rgb(0,92,197);">DialSeeds</span>(seeds); err != <span class="pl-c1" style="color:rgb(0,92,197);">nil</span> {
+            <span class="pl-k" style="color:rgb(215,58,73);">return</span> err
+        }
+    }
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">其中的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sm.config.P2P.Seeds</code>就对应于<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">config.toml</code>中的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">seeds</code>。关于这两者是怎么对应起来的，会在后面文章中详解。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">紧接着，再通过<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sm.DialSeeds(seeds)</code>去连接这些seed，这个方法对应的代码位于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/netsync/handle.go#L229" rel="nofollow" style="color:rgb(3,102,214);">netsync/handle.go#L229</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sm</span> *<span class="pl-v" style="color:rgb(227,98,9);">SyncManager</span>) <span class="pl-en">DialSeeds</span></span>(<span class="pl-v" style="color:rgb(227,98,9);">seeds</span> []<span class="pl-v" style="color:rgb(227,98,9);">string</span>) <span class="pl-v" style="color:rgb(227,98,9);">error</span> {
+    <span class="pl-k" style="color:rgb(215,58,73);">return</span> sm.<span class="pl-smi" style="color:rgb(36,41,46);">sw</span>.<span class="pl-c1" style="color:rgb(0,92,197);">DialSeeds</span>(sm.<span class="pl-smi" style="color:rgb(36,41,46);">addrBook</span>, seeds)
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">其实是是调用了<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sm.sw.DialSeeds</code>，而<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sm.sw</code>是指<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Switch</code>。这时可以看到，有一个叫<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">addrBook</code>的东西参与了进来，它保存了该结点之前成功连接过的节点地址，我们这里暂不多做讨论。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">Switch.DialSeeds</code>对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/switch.go#L311" rel="nofollow" style="color:rgb(3,102,214);">p2p/switch.go#L311</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sw</span> *<span class="pl-v" style="color:rgb(227,98,9);">Switch</span>) <span class="pl-en">DialSeeds</span></span>(<span class="pl-v" style="color:rgb(227,98,9);">addrBook</span> *<span class="pl-v" style="color:rgb(227,98,9);">AddrBook</span>, <span class="pl-v" style="color:rgb(227,98,9);">seeds</span> []<span class="pl-v" style="color:rgb(227,98,9);">string</span>) <span class="pl-v" style="color:rgb(227,98,9);">error</span> {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    <span class="pl-smi" style="color:rgb(36,41,46);">perm</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> rand.<span class="pl-c1" style="color:rgb(0,92,197);">Perm</span>(<span class="pl-c1" style="color:rgb(0,92,197);">len</span>(netAddrs))
+    <span class="pl-k" style="color:rgb(215,58,73);">for</span> <span class="pl-smi" style="color:rgb(36,41,46);">i</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> <span class="pl-c1" style="color:rgb(0,92,197);">0</span>; i &lt; <span class="pl-c1" style="color:rgb(0,92,197);">len</span>(perm)/<span class="pl-c1" style="color:rgb(0,92,197);">2</span>; i++ {
+        <span class="pl-smi" style="color:rgb(36,41,46);">j</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> perm[i]
+        sw.<span class="pl-c1" style="color:rgb(0,92,197);">dialSeed</span>(netAddrs[j])
+    }
+   <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">这里引入了随机数，是为了将发起连接的顺序打乱，这样可以让每个种子都获得公平的连接机会。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sw.dialSeed(netAddrs[j])</code>对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/switch.go#L342" rel="nofollow" style="color:rgb(3,102,214);">p2p/switch.go#L342</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sw</span> *<span class="pl-v" style="color:rgb(227,98,9);">Switch</span>) <span class="pl-en">dialSeed</span></span>(<span class="pl-v" style="color:rgb(227,98,9);">addr</span> *<span class="pl-v" style="color:rgb(227,98,9);">NetAddress</span>) {
+    <span class="pl-smi" style="color:rgb(36,41,46);">peer</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> sw.<span class="pl-c1" style="color:rgb(0,92,197);">DialPeerWithAddress</span>(addr, <span class="pl-c1" style="color:rgb(0,92,197);">false</span>)
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">sw.DialPeerWithAddress(addr, false)</code>又对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/switch.go#L351" rel="nofollow" style="color:rgb(3,102,214);">p2p/switch.go#L351</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">sw</span> *<span class="pl-v" style="color:rgb(227,98,9);">Switch</span>) <span class="pl-en">DialPeerWithAddress</span></span>(<span class="pl-v" style="color:rgb(227,98,9);">addr</span> *<span class="pl-v" style="color:rgb(227,98,9);">NetAddress</span>, <span class="pl-v" style="color:rgb(227,98,9);">persistent</span> <span class="pl-v" style="color:rgb(227,98,9);">bool</span>) (*<span class="pl-v" style="color:rgb(227,98,9);">Peer</span>, <span class="pl-v" style="color:rgb(227,98,9);">error</span>) {
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+    log.<span class="pl-c1" style="color:rgb(0,92,197);">WithField</span>(<span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">"</span>address<span class="pl-pds">"</span></span>, addr).<span class="pl-c1" style="color:rgb(0,92,197);">Info</span>(<span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">"</span>Dialing peer<span class="pl-pds">"</span></span>)
+    <span class="pl-smi" style="color:rgb(36,41,46);">peer</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> <span class="pl-c1" style="color:rgb(0,92,197);">newOutboundPeerWithConfig</span>(addr, sw.<span class="pl-smi" style="color:rgb(36,41,46);">reactorsByCh</span>, sw.<span class="pl-smi" style="color:rgb(36,41,46);">chDescs</span>, sw.<span class="pl-smi" style="color:rgb(36,41,46);">StopPeerForError</span>, sw.<span class="pl-smi" style="color:rgb(36,41,46);">nodePrivKey</span>, sw.<span class="pl-smi" style="color:rgb(36,41,46);">peerConfig</span>)
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">其中的<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">persistent</code>参数如果是<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">true</code>的话，表明这个peer比较重要，在某些情况下如果断开连接后，还会尝试重连。如果<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">persistent</code>为<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">false</code>的，就没有这个待遇。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">newOutboundPeerWithConfig</code>对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/peer.go#L69" rel="nofollow" style="color:rgb(3,102,214);">p2p/peer.go#L69</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-c1" style="color:rgb(0,92,197);">newOutboundPeerWithConfig</span>(addr *NetAddress, reactorsByCh <span class="pl-k" style="color:rgb(215,58,73);">map</span>[<span class="pl-k" style="color:rgb(215,58,73);">byte</span>]Reactor, chDescs []*ChannelDescriptor, onPeerError <span class="pl-k" style="color:rgb(215,58,73);">func</span>(*Peer, <span class="pl-k" style="color:rgb(215,58,73);">interface</span>{}), ourNodePrivKey crypto.<span class="pl-smi" style="color:rgb(36,41,46);">PrivKeyEd25519</span>, config *PeerConfig) (*Peer, <span class="pl-k" style="color:rgb(215,58,73);">error</span>) {
+    <span class="pl-smi" style="color:rgb(36,41,46);">conn</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> <span class="pl-c1" style="color:rgb(0,92,197);">dial</span>(addr, config)
+    <span class="pl-c" style="color:rgb(106,115,125);"><span class="pl-c">//</span> ...</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">继续<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">dial</code>，加入了超时：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/peer.go#L284" rel="nofollow" style="color:rgb(3,102,214);">p2p/peer.go#L284</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">dial</span>(<span class="pl-v" style="color:rgb(227,98,9);">addr</span> *<span class="pl-v" style="color:rgb(227,98,9);">NetAddress</span>, <span class="pl-v" style="color:rgb(227,98,9);">config</span> *<span class="pl-v" style="color:rgb(227,98,9);">PeerConfig</span>) (<span class="pl-v" style="color:rgb(227,98,9);">net</span>.<span class="pl-v" style="color:rgb(227,98,9);">Conn</span>, <span class="pl-v" style="color:rgb(227,98,9);">error</span>) {
+    <span class="pl-smi" style="color:rgb(36,41,46);">conn</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> addr.<span class="pl-c1" style="color:rgb(0,92,197);">DialTimeout</span>(config.<span class="pl-smi" style="color:rgb(36,41,46);">DialTimeout</span> * time.<span class="pl-smi" style="color:rgb(36,41,46);">Second</span>)
+    <span class="pl-k" style="color:rgb(215,58,73);">if</span> err != <span class="pl-c1" style="color:rgb(0,92,197);">nil</span> {
+        <span class="pl-k" style="color:rgb(215,58,73);">return</span> <span class="pl-c1" style="color:rgb(0,92,197);">nil</span>, err
+    }
+    <span class="pl-k" style="color:rgb(215,58,73);">return</span> conn, <span class="pl-c1" style="color:rgb(0,92,197);">nil</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">addr.DialTimeout</code>对应于：</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><a href="https://github.com/freewind/bytom/blob/master/p2p/netaddress.go#L141" rel="nofollow" style="color:rgb(3,102,214);">p2p/netaddress.go#L141</a></p>
+  <div class="highlight highlight-source-go" style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">
+   <pre style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;line-height:1.45;background-color:rgb(246,248,250);"><span class="pl-k" style="color:rgb(215,58,73);">func</span> <span class="pl-en" style="color:rgb(111,66,193);">(<span class="pl-v" style="color:rgb(227,98,9);">na</span> *<span class="pl-v" style="color:rgb(227,98,9);">NetAddress</span>) <span class="pl-en">DialTimeout</span></span>(<span class="pl-v" style="color:rgb(227,98,9);">timeout</span> <span class="pl-v" style="color:rgb(227,98,9);">time</span>.<span class="pl-v" style="color:rgb(227,98,9);">Duration</span>) (<span class="pl-v" style="color:rgb(227,98,9);">net</span>.<span class="pl-v" style="color:rgb(227,98,9);">Conn</span>, <span class="pl-v" style="color:rgb(227,98,9);">error</span>) {
+    <span class="pl-smi" style="color:rgb(36,41,46);">conn</span>, <span class="pl-smi" style="color:rgb(36,41,46);">err</span> <span class="pl-k" style="color:rgb(215,58,73);">:=</span> net.<span class="pl-c1" style="color:rgb(0,92,197);">DialTimeout</span>(<span class="pl-s" style="color:rgb(3,47,98);"><span class="pl-pds">"</span>tcp<span class="pl-pds">"</span></span>, na.<span class="pl-c1" style="color:rgb(0,92,197);">String</span>(), timeout)
+    <span class="pl-k" style="color:rgb(215,58,73);">if</span> err != <span class="pl-c1" style="color:rgb(0,92,197);">nil</span> {
+        <span class="pl-k" style="color:rgb(215,58,73);">return</span> <span class="pl-c1" style="color:rgb(0,92,197);">nil</span>, err
+    }
+    <span class="pl-k" style="color:rgb(215,58,73);">return</span> conn, <span class="pl-c1" style="color:rgb(0,92,197);">nil</span>
+}</pre>
+  </div>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">终于到了<code style="font-family:'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;font-size:13.6px;background-color:rgba(27,31,35,.05);">net</code>包的调用，开始真正去连接这个种子节点了，到这里，我们可以认为这个问题解决了。</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"><br></p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';"></p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">感谢社区用户freewind的辛勤写作</p>
+  <p style="color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';">源地址：https://github.com/bytom-win/unwrap-bytom</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/bytom8btc/article/details/80535019,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/bytom8btc/article/details/80535019,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

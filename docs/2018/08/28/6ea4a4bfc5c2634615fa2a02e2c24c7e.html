@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊存储分析（整合） | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊存储分析（整合）" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zxkr777/article/details/82146064 分析背景及概述 更加深入地了解以太坊的内部存储机制，更好地实现自己的区块链，存储是一个不能缺少的模块。但是存储又不是单一的数据保存，它涉及到了以太坊核心的编码、数据结构，中间还有缓存的部分，最后才通过leveldb（一种key-value数据库）保存到硬盘上。其中以太坊实现的代码十分精巧，设计同时考虑效率与优雅的问题，所以有些地方不那么好理解;加上以太坊的源码和结构不断更新，有一些参考资料只能作为参考，最权威的还是以太坊黄皮书，但是理论太多，涉及到一些难懂的数理描述。 以太坊数据存储布局 以太坊MPT结构 &nbsp; 相关数据编码格式 1)RLP RLP（Recursive Length Prefix）编码是以太坊中数据序列化的一个主要编码方式，可以将任意的嵌套二进制数据进行序列化。以太坊中针对RLP的编码规则定义如下： &nbsp; 1. 如果是一个单字节并且其值在[0x00,0x7f]范围内，RLP编码就是自身。 &nbsp; 否则，如果一个数据串的字节长度是0-55字节，那么它的RLP编码是在数据串开头增加一个字节，这个字节的值是0x80加上数据串的字节长度。因此增加的该字节的取值范围为[0x80, 0xb7]。&nbsp;3. 如果一个数据串的字节长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xb7加上数据串字节长度的二进制编码的字节长度，然后依次跟着数据串字节长度部分和内容部分。比如：一个长度为1024字节的数据串，其字节长度用16进制表示为0x0400，长度为2个字节，因此RLP编码头字节的值为0xb9（0xb7 + 0x02），然后跟着两字节为0x0400，后面再加上数据串的具体内容。因此增加的首字节的取值范围为[0xb8, 0xbf]，因此其能编码的最大数据长度为2^56。&nbsp;4. 如果是一个嵌套的列表数据，则需要先将列表中的数据按照单元素的编码规则进行RLP编码后串联得到列表数据的payload。如果一个列表数据的payload的字节长度为0-55，那么列表的RLP编码在其payload前加上一个字节，这个字节的值是0xc0加上payload的字节长度。因此首字节的取值范围为[0xc0, 0xf7]。&nbsp;5. 如果一个列表数据的payload的长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xf7加上列表payload字节长度的二进制编码的字节长度，然后依次跟着payload字节长度部分和payload部分。因此首字节的取值范围为[0xf8, 0xff]，因此一个列表中存储的所有元素的字节长度不能超过2^56。&nbsp;&nbsp;如下是一些RLP编码的参考样例。&nbsp; 原始数据 编码数据 &#39;a&#39; 0x61 1000 0x8203E8 &quot;abc&quot; 0x83616263 &quot;123456789012345678901234567890123456789012345678901234567890&quot; 0xB83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 &quot;&quot; 0x80 [0,1,2,3] 0xC400010203 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;] 0xCC836162638364656683676869 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;,&quot;123456789012345678901234567890123456789012345678901234567890&quot;] 0xF89486162638364656683676869B83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 [] 0xC0 &nbsp; 注意：1000为以太坊整数 &nbsp;以太坊整数256bit &nbsp;256/8 = 32 (byte) &nbsp; 2)hex prefix编码 &nbsp; 可以看出编码方式很简单，重点是理解其中各符合的定义：x是一个nibble（半字节，在计算机中，通常将8位二进制数称为字节，而把4位二进制数称为半字节）数组，t是标志位，用以标志节点类型。 为什么要进行编码? 在以太坊协议中，不管是地址还是hash，都是一个16进制串，如&quot;0x5b3edbcf7d0a97e95e57a4554a29ea66601b71ad&quot;，数据最小的表示单位为一位16进制，2^4=16,用4bit可以表示十六进制所有数字（个人根据上下文理解加上去的，别人没解释这一句），如1、a等，但在编程实现中，数据的最小表示单位往往是byte（8bit，2位16进制数），这样在用byte来表示一串奇数长度的16进制串时会出现问题，如&quot;5b3&quot;和&quot;5b30&quot;，直接转成byte都是5b30。还有一种简单直观的转换方式，&quot;5b3&quot;-&gt;&quot;050b03&quot;，这种方式虽然简单，但是数据量会翻倍，不利于大量hash的计算，同时也会增加tree的大小，降低同步性能。Hex-Prefix Encoding能解决这些问题。 &nbsp; 下面举个具体例子说明编码过程： &nbsp; 对&quot;0x5b3ed&quot;编码（奇数位） &nbsp; &quot;0x5b3ed&quot; = &quot;0005 1011 0003 1110 1101&quot; &nbsp;t=0 时, &quot;0001&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00010005 10110003 11101101&quot;-&gt;&quot;0x15b3ed&quot; &nbsp; t !=0时 &quot;0011&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00110005 10110003 11101101&quot;-&gt;&quot;0x35b3ed&quot; &nbsp; &nbsp; 对&quot;0x5b3e&quot;编码（偶数位） &nbsp; &quot;0x5b3e&quot; = &quot;0005 1011 0003 1110&quot; &nbsp;t=0 时, &quot;0000&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00000005 10110003 11101101&quot;-&gt;&quot;0x005b3e&quot; &nbsp; t !=0时 &quot;0010&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00100005 10110003 11101101&quot;-&gt;&quot;0x205b3e&quot; &nbsp; t=0与t!=0实际用处， t=0是其实是针对拓展节点，t!=0其实是针对叶子节点 odd 奇数 &nbsp;even 偶数 数据结构 Block type Block struct { header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块头 uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//叔节点 transactions Transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//交易数组 hash atomic.Value size atomic.Value td *big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//所有区块Difficulty之和 ReceivedAt &nbsp;&nbsp;time.Time ReceivedFrom interface{} } Block（区块）是Ethereum的核心数据结构之一。所有账户的相关活动，以交易(Transaction)的格式存储，每个Block有一个交易对象的列表；每个交易的执行结果，由一个Receipt对象与其包含的一组Log对象记录；所有交易执行完后生成的Receipt列表，存储在Block中(经过压缩加密)。不同Block之间，通过前向指针ParentHash一个一个串联起来成为一个单向链表，BlockChain 结构体管理着这个链表。 &nbsp; Block结构体基本可分为Header和Body两个部分，其UML关系族如下图所示： &nbsp; Header type Header struct { ParentHash &nbsp;common.Hash &nbsp;&nbsp;&nbsp;//指向父区块的指针 UncleHash &nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//block中叔块数组的RLP哈希值 Coinbase &nbsp;&nbsp;&nbsp;common.Address //挖出该区块的人的地址 Root &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//StateDB中的stat trie的根节点的RLP哈希值 TxHash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//tx trie的根节点的哈希值 ReceiptHash common.Hash &nbsp;&nbsp;&nbsp;//receipt trie的根节点的哈希值 Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//布隆过滤器，用来判断Log对象是否存在 Difficulty &nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//难度系数 Number &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块序号 GasLimit &nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内所有Gas消耗的理论上限 GasUsed &nbsp;&nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内消耗的总Gas Time &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块应该被创建的时间 Nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNonce &nbsp;&nbsp;&nbsp;&nbsp;//挖矿必须的值 } &nbsp; &nbsp; Header是Block的核心，注意到它的成员变量全都是公共的，这使得它可以很方便的向调用者提供关于Block属性的操作。Header的成员变量全都很重要，值得细细理解: &nbsp; ParentHash：指向父区块(parentBlock)的指针。除了创世块(Genesis Block)外，每个区块有且只有一个父区块。 Coinbase：挖掘出这个区块的作者地址。在每次执行交易时系统会给与一定补偿的Ether，这笔金额就是发给这个地址的。 UncleHash：Block结构体的成员uncles的RLP哈希值。uncles是一个Header数组，它的存在，颇具匠心。 Root：StateDB中的“state Trie”的根节点的RLP哈希值。Block中，每个账户以stateObject对象表示，账户以Address为唯一标示，其信息在相关交易(Transaction)的执行中被修改。所有账户对象可以逐个插入一个Merkle-PatricaTrie(MPT)结构里，形成“state Trie”。 TxHash: Block中 “tx Trie”的根节点的RLP哈希值。Block的成员变量transactions中所有的tx对象，被逐个插入一个MPT结构，形成“tx Trie”。 ReceiptHash：Block中的 &quot;Receipt Trie”的根节点的RLP哈希值。Block的所有Transaction执行完后会生成一个Receipt数组，这个数组中的所有Receipt被逐个插入一个MPT结构中，形成&quot;Receipt Trie&quot;。 Bloom：Bloom过滤器(Filter)，用来快速判断一个参数Log对象是否存在于一组已知的Log集合中。 Difficulty：区块的难度。Block的Difficulty由共识算法基于parentBlock的Time和Difficulty计算得出，它会应用在区块的‘挖掘’阶段。 Number：区块的序号。Block的Number等于其父区块Number +1。 Time：区块“应该”被创建的时间。由共识算法确定，一般来说，要么等于parentBlock.Time + 10s，要么等于当前系统时间。 GasLimit：区块内所有Gas消耗的理论上限。该数值在区块创建时设置，与父区块有关。具体来说，根据父区块的GasUsed同GasLimit * 2/3的大小关系来计算得出。 GasUsed：区块内所有Transaction执行时所实际消耗的Gas总和。 Nonce：一个64bit的哈希数，它被应用在区块的&quot;挖掘&quot;阶段，并且在使用中会被修改。 &nbsp; Body type Body struct { Transactions []*Transaction //交易的数组 Uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } 里面主要是交易对象和叔块位置 &nbsp; HeaderChain Header的链表 &nbsp; BlockChain Block的链表 &nbsp; &nbsp; &nbsp; 要介绍MPT树，先要提一下Merkle Tree，通常也被称作Hash Tree，顾名思义，就是存储hash值的一棵树。 它可以是多叉树 &nbsp; 但是比特币中使用的是类似下图的二叉树 &nbsp; &nbsp;如果要验证slice2数据的正确性，只需要拿到hash1, h12, h02这3个hash再加上本地存储的root hash,就可以验证了。需要传输的hash数据量从n变为log2n。 总结，Merkle root(包含在区块头里)是从可信渠道下载的(主链或者可信节点)，接收到数据及这个数据对应的Merkle验证路径即可验证该数据的正确性。 &nbsp; 但是MPT树的Hash Root貌似不像二叉树那么直观（还没完全从以太坊源码中理解）。 MPT节点有个flag字段,flag.hash会保存该节点采用merkle tree类似算法生成的hash,同时会将hash和源数据以&lt;hash, node.rlprawdata&gt;方式保存在leveldb数据库中。这样后面通过hash就可以反推出节点数据。具体结构如下(蓝色的hash部分就是flag.hash字段) &nbsp; 这样一个结构的核心思想是：hash可以还原出节点上的数据，这样只需要保存一个root(hash)，即可还原出完整的树结构，同时还可以按需展开节点数据，比如如果只需要访问&lt;a771355, 45&gt;这个数据，只需展开h00, h10, h20, h30这四个hash对应的节点 &nbsp; &nbsp; trie树介绍 &nbsp; 传统的tire，C++实现范例 /** * 字典树/前缀树Tire */ #include &lt;iostream&gt; #include &lt;cstring&gt; using namespace std; const int branchNum = 26; //26个英文字母 struct TrieNode { bool isStr; TrieNode *next[branchNum]; }; void Insert(TrieNode *root, const char *word); bool Search(TrieNode *root, const char *word); void Delete(TrieNode *node); int main() { TrieNode *root = new TrieNode(); root-&gt;isStr = false; memset(root-&gt;next, NULL, sizeof(root-&gt;next)); //作用是在一段内存块中填充某个给定的值，它是对较大的结构体或数组进行清零操作的一种最快方法 Insert(root, &quot;a&quot;); Insert(root, &quot;bcd&quot;); Insert(root, &quot;xyz&quot;); Insert(root, &quot;abcdef&quot;); if (Search(root, &quot;a&quot;)) { cout &lt;&lt; &quot;a exist&quot; &lt;&lt; endl; } Delete(root); system(&quot;pause&quot;); } void Insert(TrieNode *root, const char *word) { TrieNode *location = root; while (*word) { if (location-&gt;next[*word - &#39;a&#39;] == NULL) { TrieNode *newNode = new TrieNode(); newNode-&gt;isStr = false; memset(newNode-&gt;next, NULL, sizeof(newNode-&gt;next)); location-&gt;next[*word - &#39;a&#39;] = newNode; } location = location-&gt;next[*word - &#39;a&#39;]; word++; } location-&gt;isStr = true; } bool Search(TrieNode *root, const char *word) { TrieNode *location = root; while (*word &amp;&amp; location != NULL) { location = location-&gt;next[*word - &#39;a&#39;]; word++; } return (location != NULL &amp;&amp; location-&gt;isStr); } void Delete(TrieNode *location) { for (int i = 0; i &lt; branchNum; i++) { if (location-&gt;next[i] != NULL) { Delete(location-&gt;next[i]); } } delete location; } 以太坊的MPT树是基于Trie改进而来的，做了很多优化，我们平时的字典树可能是26个字母，以太坊的是长度为17的数组，0 1 2 3 4 5 6 7 8 9 a b c d e f（十六进制的十六位）+ 拓展数据（根据节点的性质功能不一样）；以太坊增加了两个新的节点，称为叶节点和扩展节点，两个节点的形式一样，都是一个[key,value]的组合，原来的节点称为分支节点。 &nbsp; Merkle Patricia Tree有4种类型的节点： 叶子节点（leaf），表示为[key,value]的一个键值对。和前面的英文字母key不一样，这里的key都是16编码出来的字符串，每个字符只有0-f 16种，value是RLP编码的数据 扩展节点（extension），也是[key，value]的一个键值对，但是这里的value是其他节点的hash值，通过hash链接到其他节点 &nbsp;分支节点（branch），因为MPT树中的key被编码成一种特殊的16进制的表示，再加上最后的value，所以分支节点是一个长度为17的list，前16个元素对应着key中的16个可能的十六进制字符，如果有一个[key,value]对在这个分支节点终止，最后一个元素代表一个值，即分支节点既可以搜索路径的终止也可以是路径的中间节点。分支节点的父亲必然是extension node 空节点，代码中用null表示 &nbsp; 直接看代码不好说清楚，还是用一个例子解释 Suppose we want a trie containing four path/value pairs&nbsp;(&#39;do&#39;, &#39;verb&#39;),&nbsp;(&#39;dog&#39;, &#39;puppy&#39;),&nbsp;(&#39;doge&#39;, &#39;coin&#39;),&nbsp;(&#39;horse&#39;, &#39;stallion&#39;). First, we convert both paths and values to&nbsp;bytes. Below, actual byte representations for&nbsp;paths&nbsp;are denoted by&nbsp;&lt;&gt;, although&nbsp;values&nbsp;are still shown as strings, denoted by&nbsp;&#39;&#39;, for easier comprehension (they, too, would actually be&nbsp;bytes): &lt;64 6f&gt; : &#39;verb&#39; &lt;64 6f 67&gt; : &#39;puppy&#39; &lt;64 6f 67 65&gt; : &#39;coin&#39; &lt;68 6f 72 73 65&gt; : &#39;stallion&#39; Now, we build such a trie with the following key/value pairs in the underlying DB: rootHash: [ &lt;16&gt;, hashA ] hashA: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] hashC: &nbsp;&nbsp;&nbsp;[ &lt;20 6f 72 73 65&gt;, &#39;stallion&#39; ] hashB: &nbsp;&nbsp;&nbsp;[ &lt;00 6f&gt;, hashD ] hashD: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;verb&#39; ] hashE: &nbsp;&nbsp;&nbsp;[ &lt;17&gt;, hashF ] hashF: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;puppy&#39; ] hashG: &nbsp;&nbsp;&nbsp;[ &lt;35&gt;, &#39;coin&#39; ] &nbsp; &nbsp; transaction tree（交易树） state tree（状态树&nbsp;主要是Account信息） receipt tree&nbsp;（收据树） &nbsp; &nbsp; &nbsp; &nbsp; 附：跟存储分析相关的源码(version: 1.8.11-stable) core/state/statedb.go core/state/database.go ethdb/interface.go 定义了数据库的接口（key-value接口） ethdb/memory_database.go &nbsp;内存数据库 ethdb/database.go &nbsp;leveldb封装 tire/tire.go tire/trie_test.go （看测试用例是很好的学习方式） core/headerchain.go core/rawdb/accessors_chain.go &nbsp; 数据库体系 &nbsp; 一些常见的键值对（header和body） &nbsp; key value &#39;h&#39; + num + hash header&#39;s RLP raw data &#39;h&#39; + num + hash + &#39;t&#39; td &#39;h&#39; + num + &#39;n&#39; hash &#39;H&#39; + hash num &#39;b&#39; + num + hash body&#39;s RLP raw data &#39;r&#39; + num + hash receipts RLP &#39;l&#39; + hash tx/receipt lookup metadata &quot;LastHeader&quot; hash &quot;LastBlock&quot; hash &quot;LastFast&quot; hash &nbsp;数据库体系UML &nbsp; 附录：levelDB官方网站介绍的特点 特点： key和value都是任意长度的字节数组； entry（即一条K-V记录）默认是按照key的字典顺序存储的，当然开发者也可以重载这个排序函数； 提供的基本操作接口：Put()、Delete()、Get()、Batch()； 支持批量操作以原子操作进行； 可以创建数据全景的snapshot(快照)，并允许在快照中查找数据； 可以通过前向（或后向）迭代器遍历数据（迭代器会隐含的创建一个snapshot）； 自动使用Snappy压缩数据； 可移植性； 限制： 非关系型数据模型（NoSQL），不支持sql语句，也不支持索引； 一次只允许一个进程访问一个特定的数据库； 没有内置的C/S架构，但开发者可以使用LevelDB库自己封装一个server。 &nbsp; Leveldb是一个key-value数据库，所以用法上还是比较简单的；有一点要注意的是，以太坊的分片版本还没上线，因为MPT的特性，海量数据存储账户的更新操作会带来指数级的数据存取，现阶段存储还是问题。 &nbsp; &nbsp; 有待深入研究 以太坊Tire树（MPT）在插入的过程中怎么缓存、计算hash Merkle state transition proof 交易存储分析&nbsp; 参考 https://github.com/ZtesoftCS/go-ethereum-code-analysis https://blog.csdn.net/weixin_41545330/article/details/79394153 https://blog.csdn.net/qq_33935254/article/details/55505472 https://ethfans.org/hpcoder/articles/961 https://blog.csdn.net/Blockchain_lemon/article/details/79308137 https://blog.csdn.net/itleaks/article/details/79992072 https://github.com/ethereum/wiki/wiki/Patricia-Tree http://www.cnblogs.com/fengzhiwu/p/5584809.html https://blog.csdn.net/wsyw126/article/details/61416055&nbsp; &nbsp; 阅读更多 登录后自动展开" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zxkr777/article/details/82146064 分析背景及概述 更加深入地了解以太坊的内部存储机制，更好地实现自己的区块链，存储是一个不能缺少的模块。但是存储又不是单一的数据保存，它涉及到了以太坊核心的编码、数据结构，中间还有缓存的部分，最后才通过leveldb（一种key-value数据库）保存到硬盘上。其中以太坊实现的代码十分精巧，设计同时考虑效率与优雅的问题，所以有些地方不那么好理解;加上以太坊的源码和结构不断更新，有一些参考资料只能作为参考，最权威的还是以太坊黄皮书，但是理论太多，涉及到一些难懂的数理描述。 以太坊数据存储布局 以太坊MPT结构 &nbsp; 相关数据编码格式 1)RLP RLP（Recursive Length Prefix）编码是以太坊中数据序列化的一个主要编码方式，可以将任意的嵌套二进制数据进行序列化。以太坊中针对RLP的编码规则定义如下： &nbsp; 1. 如果是一个单字节并且其值在[0x00,0x7f]范围内，RLP编码就是自身。 &nbsp; 否则，如果一个数据串的字节长度是0-55字节，那么它的RLP编码是在数据串开头增加一个字节，这个字节的值是0x80加上数据串的字节长度。因此增加的该字节的取值范围为[0x80, 0xb7]。&nbsp;3. 如果一个数据串的字节长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xb7加上数据串字节长度的二进制编码的字节长度，然后依次跟着数据串字节长度部分和内容部分。比如：一个长度为1024字节的数据串，其字节长度用16进制表示为0x0400，长度为2个字节，因此RLP编码头字节的值为0xb9（0xb7 + 0x02），然后跟着两字节为0x0400，后面再加上数据串的具体内容。因此增加的首字节的取值范围为[0xb8, 0xbf]，因此其能编码的最大数据长度为2^56。&nbsp;4. 如果是一个嵌套的列表数据，则需要先将列表中的数据按照单元素的编码规则进行RLP编码后串联得到列表数据的payload。如果一个列表数据的payload的字节长度为0-55，那么列表的RLP编码在其payload前加上一个字节，这个字节的值是0xc0加上payload的字节长度。因此首字节的取值范围为[0xc0, 0xf7]。&nbsp;5. 如果一个列表数据的payload的长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xf7加上列表payload字节长度的二进制编码的字节长度，然后依次跟着payload字节长度部分和payload部分。因此首字节的取值范围为[0xf8, 0xff]，因此一个列表中存储的所有元素的字节长度不能超过2^56。&nbsp;&nbsp;如下是一些RLP编码的参考样例。&nbsp; 原始数据 编码数据 &#39;a&#39; 0x61 1000 0x8203E8 &quot;abc&quot; 0x83616263 &quot;123456789012345678901234567890123456789012345678901234567890&quot; 0xB83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 &quot;&quot; 0x80 [0,1,2,3] 0xC400010203 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;] 0xCC836162638364656683676869 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;,&quot;123456789012345678901234567890123456789012345678901234567890&quot;] 0xF89486162638364656683676869B83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 [] 0xC0 &nbsp; 注意：1000为以太坊整数 &nbsp;以太坊整数256bit &nbsp;256/8 = 32 (byte) &nbsp; 2)hex prefix编码 &nbsp; 可以看出编码方式很简单，重点是理解其中各符合的定义：x是一个nibble（半字节，在计算机中，通常将8位二进制数称为字节，而把4位二进制数称为半字节）数组，t是标志位，用以标志节点类型。 为什么要进行编码? 在以太坊协议中，不管是地址还是hash，都是一个16进制串，如&quot;0x5b3edbcf7d0a97e95e57a4554a29ea66601b71ad&quot;，数据最小的表示单位为一位16进制，2^4=16,用4bit可以表示十六进制所有数字（个人根据上下文理解加上去的，别人没解释这一句），如1、a等，但在编程实现中，数据的最小表示单位往往是byte（8bit，2位16进制数），这样在用byte来表示一串奇数长度的16进制串时会出现问题，如&quot;5b3&quot;和&quot;5b30&quot;，直接转成byte都是5b30。还有一种简单直观的转换方式，&quot;5b3&quot;-&gt;&quot;050b03&quot;，这种方式虽然简单，但是数据量会翻倍，不利于大量hash的计算，同时也会增加tree的大小，降低同步性能。Hex-Prefix Encoding能解决这些问题。 &nbsp; 下面举个具体例子说明编码过程： &nbsp; 对&quot;0x5b3ed&quot;编码（奇数位） &nbsp; &quot;0x5b3ed&quot; = &quot;0005 1011 0003 1110 1101&quot; &nbsp;t=0 时, &quot;0001&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00010005 10110003 11101101&quot;-&gt;&quot;0x15b3ed&quot; &nbsp; t !=0时 &quot;0011&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00110005 10110003 11101101&quot;-&gt;&quot;0x35b3ed&quot; &nbsp; &nbsp; 对&quot;0x5b3e&quot;编码（偶数位） &nbsp; &quot;0x5b3e&quot; = &quot;0005 1011 0003 1110&quot; &nbsp;t=0 时, &quot;0000&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00000005 10110003 11101101&quot;-&gt;&quot;0x005b3e&quot; &nbsp; t !=0时 &quot;0010&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00100005 10110003 11101101&quot;-&gt;&quot;0x205b3e&quot; &nbsp; t=0与t!=0实际用处， t=0是其实是针对拓展节点，t!=0其实是针对叶子节点 odd 奇数 &nbsp;even 偶数 数据结构 Block type Block struct { header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块头 uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//叔节点 transactions Transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//交易数组 hash atomic.Value size atomic.Value td *big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//所有区块Difficulty之和 ReceivedAt &nbsp;&nbsp;time.Time ReceivedFrom interface{} } Block（区块）是Ethereum的核心数据结构之一。所有账户的相关活动，以交易(Transaction)的格式存储，每个Block有一个交易对象的列表；每个交易的执行结果，由一个Receipt对象与其包含的一组Log对象记录；所有交易执行完后生成的Receipt列表，存储在Block中(经过压缩加密)。不同Block之间，通过前向指针ParentHash一个一个串联起来成为一个单向链表，BlockChain 结构体管理着这个链表。 &nbsp; Block结构体基本可分为Header和Body两个部分，其UML关系族如下图所示： &nbsp; Header type Header struct { ParentHash &nbsp;common.Hash &nbsp;&nbsp;&nbsp;//指向父区块的指针 UncleHash &nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//block中叔块数组的RLP哈希值 Coinbase &nbsp;&nbsp;&nbsp;common.Address //挖出该区块的人的地址 Root &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//StateDB中的stat trie的根节点的RLP哈希值 TxHash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//tx trie的根节点的哈希值 ReceiptHash common.Hash &nbsp;&nbsp;&nbsp;//receipt trie的根节点的哈希值 Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//布隆过滤器，用来判断Log对象是否存在 Difficulty &nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//难度系数 Number &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块序号 GasLimit &nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内所有Gas消耗的理论上限 GasUsed &nbsp;&nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内消耗的总Gas Time &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块应该被创建的时间 Nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNonce &nbsp;&nbsp;&nbsp;&nbsp;//挖矿必须的值 } &nbsp; &nbsp; Header是Block的核心，注意到它的成员变量全都是公共的，这使得它可以很方便的向调用者提供关于Block属性的操作。Header的成员变量全都很重要，值得细细理解: &nbsp; ParentHash：指向父区块(parentBlock)的指针。除了创世块(Genesis Block)外，每个区块有且只有一个父区块。 Coinbase：挖掘出这个区块的作者地址。在每次执行交易时系统会给与一定补偿的Ether，这笔金额就是发给这个地址的。 UncleHash：Block结构体的成员uncles的RLP哈希值。uncles是一个Header数组，它的存在，颇具匠心。 Root：StateDB中的“state Trie”的根节点的RLP哈希值。Block中，每个账户以stateObject对象表示，账户以Address为唯一标示，其信息在相关交易(Transaction)的执行中被修改。所有账户对象可以逐个插入一个Merkle-PatricaTrie(MPT)结构里，形成“state Trie”。 TxHash: Block中 “tx Trie”的根节点的RLP哈希值。Block的成员变量transactions中所有的tx对象，被逐个插入一个MPT结构，形成“tx Trie”。 ReceiptHash：Block中的 &quot;Receipt Trie”的根节点的RLP哈希值。Block的所有Transaction执行完后会生成一个Receipt数组，这个数组中的所有Receipt被逐个插入一个MPT结构中，形成&quot;Receipt Trie&quot;。 Bloom：Bloom过滤器(Filter)，用来快速判断一个参数Log对象是否存在于一组已知的Log集合中。 Difficulty：区块的难度。Block的Difficulty由共识算法基于parentBlock的Time和Difficulty计算得出，它会应用在区块的‘挖掘’阶段。 Number：区块的序号。Block的Number等于其父区块Number +1。 Time：区块“应该”被创建的时间。由共识算法确定，一般来说，要么等于parentBlock.Time + 10s，要么等于当前系统时间。 GasLimit：区块内所有Gas消耗的理论上限。该数值在区块创建时设置，与父区块有关。具体来说，根据父区块的GasUsed同GasLimit * 2/3的大小关系来计算得出。 GasUsed：区块内所有Transaction执行时所实际消耗的Gas总和。 Nonce：一个64bit的哈希数，它被应用在区块的&quot;挖掘&quot;阶段，并且在使用中会被修改。 &nbsp; Body type Body struct { Transactions []*Transaction //交易的数组 Uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } 里面主要是交易对象和叔块位置 &nbsp; HeaderChain Header的链表 &nbsp; BlockChain Block的链表 &nbsp; &nbsp; &nbsp; 要介绍MPT树，先要提一下Merkle Tree，通常也被称作Hash Tree，顾名思义，就是存储hash值的一棵树。 它可以是多叉树 &nbsp; 但是比特币中使用的是类似下图的二叉树 &nbsp; &nbsp;如果要验证slice2数据的正确性，只需要拿到hash1, h12, h02这3个hash再加上本地存储的root hash,就可以验证了。需要传输的hash数据量从n变为log2n。 总结，Merkle root(包含在区块头里)是从可信渠道下载的(主链或者可信节点)，接收到数据及这个数据对应的Merkle验证路径即可验证该数据的正确性。 &nbsp; 但是MPT树的Hash Root貌似不像二叉树那么直观（还没完全从以太坊源码中理解）。 MPT节点有个flag字段,flag.hash会保存该节点采用merkle tree类似算法生成的hash,同时会将hash和源数据以&lt;hash, node.rlprawdata&gt;方式保存在leveldb数据库中。这样后面通过hash就可以反推出节点数据。具体结构如下(蓝色的hash部分就是flag.hash字段) &nbsp; 这样一个结构的核心思想是：hash可以还原出节点上的数据，这样只需要保存一个root(hash)，即可还原出完整的树结构，同时还可以按需展开节点数据，比如如果只需要访问&lt;a771355, 45&gt;这个数据，只需展开h00, h10, h20, h30这四个hash对应的节点 &nbsp; &nbsp; trie树介绍 &nbsp; 传统的tire，C++实现范例 /** * 字典树/前缀树Tire */ #include &lt;iostream&gt; #include &lt;cstring&gt; using namespace std; const int branchNum = 26; //26个英文字母 struct TrieNode { bool isStr; TrieNode *next[branchNum]; }; void Insert(TrieNode *root, const char *word); bool Search(TrieNode *root, const char *word); void Delete(TrieNode *node); int main() { TrieNode *root = new TrieNode(); root-&gt;isStr = false; memset(root-&gt;next, NULL, sizeof(root-&gt;next)); //作用是在一段内存块中填充某个给定的值，它是对较大的结构体或数组进行清零操作的一种最快方法 Insert(root, &quot;a&quot;); Insert(root, &quot;bcd&quot;); Insert(root, &quot;xyz&quot;); Insert(root, &quot;abcdef&quot;); if (Search(root, &quot;a&quot;)) { cout &lt;&lt; &quot;a exist&quot; &lt;&lt; endl; } Delete(root); system(&quot;pause&quot;); } void Insert(TrieNode *root, const char *word) { TrieNode *location = root; while (*word) { if (location-&gt;next[*word - &#39;a&#39;] == NULL) { TrieNode *newNode = new TrieNode(); newNode-&gt;isStr = false; memset(newNode-&gt;next, NULL, sizeof(newNode-&gt;next)); location-&gt;next[*word - &#39;a&#39;] = newNode; } location = location-&gt;next[*word - &#39;a&#39;]; word++; } location-&gt;isStr = true; } bool Search(TrieNode *root, const char *word) { TrieNode *location = root; while (*word &amp;&amp; location != NULL) { location = location-&gt;next[*word - &#39;a&#39;]; word++; } return (location != NULL &amp;&amp; location-&gt;isStr); } void Delete(TrieNode *location) { for (int i = 0; i &lt; branchNum; i++) { if (location-&gt;next[i] != NULL) { Delete(location-&gt;next[i]); } } delete location; } 以太坊的MPT树是基于Trie改进而来的，做了很多优化，我们平时的字典树可能是26个字母，以太坊的是长度为17的数组，0 1 2 3 4 5 6 7 8 9 a b c d e f（十六进制的十六位）+ 拓展数据（根据节点的性质功能不一样）；以太坊增加了两个新的节点，称为叶节点和扩展节点，两个节点的形式一样，都是一个[key,value]的组合，原来的节点称为分支节点。 &nbsp; Merkle Patricia Tree有4种类型的节点： 叶子节点（leaf），表示为[key,value]的一个键值对。和前面的英文字母key不一样，这里的key都是16编码出来的字符串，每个字符只有0-f 16种，value是RLP编码的数据 扩展节点（extension），也是[key，value]的一个键值对，但是这里的value是其他节点的hash值，通过hash链接到其他节点 &nbsp;分支节点（branch），因为MPT树中的key被编码成一种特殊的16进制的表示，再加上最后的value，所以分支节点是一个长度为17的list，前16个元素对应着key中的16个可能的十六进制字符，如果有一个[key,value]对在这个分支节点终止，最后一个元素代表一个值，即分支节点既可以搜索路径的终止也可以是路径的中间节点。分支节点的父亲必然是extension node 空节点，代码中用null表示 &nbsp; 直接看代码不好说清楚，还是用一个例子解释 Suppose we want a trie containing four path/value pairs&nbsp;(&#39;do&#39;, &#39;verb&#39;),&nbsp;(&#39;dog&#39;, &#39;puppy&#39;),&nbsp;(&#39;doge&#39;, &#39;coin&#39;),&nbsp;(&#39;horse&#39;, &#39;stallion&#39;). First, we convert both paths and values to&nbsp;bytes. Below, actual byte representations for&nbsp;paths&nbsp;are denoted by&nbsp;&lt;&gt;, although&nbsp;values&nbsp;are still shown as strings, denoted by&nbsp;&#39;&#39;, for easier comprehension (they, too, would actually be&nbsp;bytes): &lt;64 6f&gt; : &#39;verb&#39; &lt;64 6f 67&gt; : &#39;puppy&#39; &lt;64 6f 67 65&gt; : &#39;coin&#39; &lt;68 6f 72 73 65&gt; : &#39;stallion&#39; Now, we build such a trie with the following key/value pairs in the underlying DB: rootHash: [ &lt;16&gt;, hashA ] hashA: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] hashC: &nbsp;&nbsp;&nbsp;[ &lt;20 6f 72 73 65&gt;, &#39;stallion&#39; ] hashB: &nbsp;&nbsp;&nbsp;[ &lt;00 6f&gt;, hashD ] hashD: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;verb&#39; ] hashE: &nbsp;&nbsp;&nbsp;[ &lt;17&gt;, hashF ] hashF: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;puppy&#39; ] hashG: &nbsp;&nbsp;&nbsp;[ &lt;35&gt;, &#39;coin&#39; ] &nbsp; &nbsp; transaction tree（交易树） state tree（状态树&nbsp;主要是Account信息） receipt tree&nbsp;（收据树） &nbsp; &nbsp; &nbsp; &nbsp; 附：跟存储分析相关的源码(version: 1.8.11-stable) core/state/statedb.go core/state/database.go ethdb/interface.go 定义了数据库的接口（key-value接口） ethdb/memory_database.go &nbsp;内存数据库 ethdb/database.go &nbsp;leveldb封装 tire/tire.go tire/trie_test.go （看测试用例是很好的学习方式） core/headerchain.go core/rawdb/accessors_chain.go &nbsp; 数据库体系 &nbsp; 一些常见的键值对（header和body） &nbsp; key value &#39;h&#39; + num + hash header&#39;s RLP raw data &#39;h&#39; + num + hash + &#39;t&#39; td &#39;h&#39; + num + &#39;n&#39; hash &#39;H&#39; + hash num &#39;b&#39; + num + hash body&#39;s RLP raw data &#39;r&#39; + num + hash receipts RLP &#39;l&#39; + hash tx/receipt lookup metadata &quot;LastHeader&quot; hash &quot;LastBlock&quot; hash &quot;LastFast&quot; hash &nbsp;数据库体系UML &nbsp; 附录：levelDB官方网站介绍的特点 特点： key和value都是任意长度的字节数组； entry（即一条K-V记录）默认是按照key的字典顺序存储的，当然开发者也可以重载这个排序函数； 提供的基本操作接口：Put()、Delete()、Get()、Batch()； 支持批量操作以原子操作进行； 可以创建数据全景的snapshot(快照)，并允许在快照中查找数据； 可以通过前向（或后向）迭代器遍历数据（迭代器会隐含的创建一个snapshot）； 自动使用Snappy压缩数据； 可移植性； 限制： 非关系型数据模型（NoSQL），不支持sql语句，也不支持索引； 一次只允许一个进程访问一个特定的数据库； 没有内置的C/S架构，但开发者可以使用LevelDB库自己封装一个server。 &nbsp; Leveldb是一个key-value数据库，所以用法上还是比较简单的；有一点要注意的是，以太坊的分片版本还没上线，因为MPT的特性，海量数据存储账户的更新操作会带来指数级的数据存取，现阶段存储还是问题。 &nbsp; &nbsp; 有待深入研究 以太坊Tire树（MPT）在插入的过程中怎么缓存、计算hash Merkle state transition proof 交易存储分析&nbsp; 参考 https://github.com/ZtesoftCS/go-ethereum-code-analysis https://blog.csdn.net/weixin_41545330/article/details/79394153 https://blog.csdn.net/qq_33935254/article/details/55505472 https://ethfans.org/hpcoder/articles/961 https://blog.csdn.net/Blockchain_lemon/article/details/79308137 https://blog.csdn.net/itleaks/article/details/79992072 https://github.com/ethereum/wiki/wiki/Patricia-Tree http://www.cnblogs.com/fengzhiwu/p/5584809.html https://blog.csdn.net/wsyw126/article/details/61416055&nbsp; &nbsp; 阅读更多 登录后自动展开" />
+<link rel="canonical" href="https://uzzz.org/2018/08/28/6ea4a4bfc5c2634615fa2a02e2c24c7e.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/28/6ea4a4bfc5c2634615fa2a02e2c24c7e.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-28T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zxkr777/article/details/82146064 分析背景及概述 更加深入地了解以太坊的内部存储机制，更好地实现自己的区块链，存储是一个不能缺少的模块。但是存储又不是单一的数据保存，它涉及到了以太坊核心的编码、数据结构，中间还有缓存的部分，最后才通过leveldb（一种key-value数据库）保存到硬盘上。其中以太坊实现的代码十分精巧，设计同时考虑效率与优雅的问题，所以有些地方不那么好理解;加上以太坊的源码和结构不断更新，有一些参考资料只能作为参考，最权威的还是以太坊黄皮书，但是理论太多，涉及到一些难懂的数理描述。 以太坊数据存储布局 以太坊MPT结构 &nbsp; 相关数据编码格式 1)RLP RLP（Recursive Length Prefix）编码是以太坊中数据序列化的一个主要编码方式，可以将任意的嵌套二进制数据进行序列化。以太坊中针对RLP的编码规则定义如下： &nbsp; 1. 如果是一个单字节并且其值在[0x00,0x7f]范围内，RLP编码就是自身。 &nbsp; 否则，如果一个数据串的字节长度是0-55字节，那么它的RLP编码是在数据串开头增加一个字节，这个字节的值是0x80加上数据串的字节长度。因此增加的该字节的取值范围为[0x80, 0xb7]。&nbsp;3. 如果一个数据串的字节长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xb7加上数据串字节长度的二进制编码的字节长度，然后依次跟着数据串字节长度部分和内容部分。比如：一个长度为1024字节的数据串，其字节长度用16进制表示为0x0400，长度为2个字节，因此RLP编码头字节的值为0xb9（0xb7 + 0x02），然后跟着两字节为0x0400，后面再加上数据串的具体内容。因此增加的首字节的取值范围为[0xb8, 0xbf]，因此其能编码的最大数据长度为2^56。&nbsp;4. 如果是一个嵌套的列表数据，则需要先将列表中的数据按照单元素的编码规则进行RLP编码后串联得到列表数据的payload。如果一个列表数据的payload的字节长度为0-55，那么列表的RLP编码在其payload前加上一个字节，这个字节的值是0xc0加上payload的字节长度。因此首字节的取值范围为[0xc0, 0xf7]。&nbsp;5. 如果一个列表数据的payload的长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xf7加上列表payload字节长度的二进制编码的字节长度，然后依次跟着payload字节长度部分和payload部分。因此首字节的取值范围为[0xf8, 0xff]，因此一个列表中存储的所有元素的字节长度不能超过2^56。&nbsp;&nbsp;如下是一些RLP编码的参考样例。&nbsp; 原始数据 编码数据 &#39;a&#39; 0x61 1000 0x8203E8 &quot;abc&quot; 0x83616263 &quot;123456789012345678901234567890123456789012345678901234567890&quot; 0xB83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 &quot;&quot; 0x80 [0,1,2,3] 0xC400010203 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;] 0xCC836162638364656683676869 [&quot;abc&quot;,&quot;def&quot;,&quot;ghi&quot;,&quot;123456789012345678901234567890123456789012345678901234567890&quot;] 0xF89486162638364656683676869B83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930 [] 0xC0 &nbsp; 注意：1000为以太坊整数 &nbsp;以太坊整数256bit &nbsp;256/8 = 32 (byte) &nbsp; 2)hex prefix编码 &nbsp; 可以看出编码方式很简单，重点是理解其中各符合的定义：x是一个nibble（半字节，在计算机中，通常将8位二进制数称为字节，而把4位二进制数称为半字节）数组，t是标志位，用以标志节点类型。 为什么要进行编码? 在以太坊协议中，不管是地址还是hash，都是一个16进制串，如&quot;0x5b3edbcf7d0a97e95e57a4554a29ea66601b71ad&quot;，数据最小的表示单位为一位16进制，2^4=16,用4bit可以表示十六进制所有数字（个人根据上下文理解加上去的，别人没解释这一句），如1、a等，但在编程实现中，数据的最小表示单位往往是byte（8bit，2位16进制数），这样在用byte来表示一串奇数长度的16进制串时会出现问题，如&quot;5b3&quot;和&quot;5b30&quot;，直接转成byte都是5b30。还有一种简单直观的转换方式，&quot;5b3&quot;-&gt;&quot;050b03&quot;，这种方式虽然简单，但是数据量会翻倍，不利于大量hash的计算，同时也会增加tree的大小，降低同步性能。Hex-Prefix Encoding能解决这些问题。 &nbsp; 下面举个具体例子说明编码过程： &nbsp; 对&quot;0x5b3ed&quot;编码（奇数位） &nbsp; &quot;0x5b3ed&quot; = &quot;0005 1011 0003 1110 1101&quot; &nbsp;t=0 时, &quot;0001&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00010005 10110003 11101101&quot;-&gt;&quot;0x15b3ed&quot; &nbsp; t !=0时 &quot;0011&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00110005 10110003 11101101&quot;-&gt;&quot;0x35b3ed&quot; &nbsp; &nbsp; 对&quot;0x5b3e&quot;编码（偶数位） &nbsp; &quot;0x5b3e&quot; = &quot;0005 1011 0003 1110&quot; &nbsp;t=0 时, &quot;0000&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00000005 10110003 11101101&quot;-&gt;&quot;0x005b3e&quot; &nbsp; t !=0时 &quot;0010&quot;+&quot;0005 1011 0003 1110 1101&quot;-&gt;&quot;00100005 10110003 11101101&quot;-&gt;&quot;0x205b3e&quot; &nbsp; t=0与t!=0实际用处， t=0是其实是针对拓展节点，t!=0其实是针对叶子节点 odd 奇数 &nbsp;even 偶数 数据结构 Block type Block struct { header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块头 uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//叔节点 transactions Transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//交易数组 hash atomic.Value size atomic.Value td *big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//所有区块Difficulty之和 ReceivedAt &nbsp;&nbsp;time.Time ReceivedFrom interface{} } Block（区块）是Ethereum的核心数据结构之一。所有账户的相关活动，以交易(Transaction)的格式存储，每个Block有一个交易对象的列表；每个交易的执行结果，由一个Receipt对象与其包含的一组Log对象记录；所有交易执行完后生成的Receipt列表，存储在Block中(经过压缩加密)。不同Block之间，通过前向指针ParentHash一个一个串联起来成为一个单向链表，BlockChain 结构体管理着这个链表。 &nbsp; Block结构体基本可分为Header和Body两个部分，其UML关系族如下图所示： &nbsp; Header type Header struct { ParentHash &nbsp;common.Hash &nbsp;&nbsp;&nbsp;//指向父区块的指针 UncleHash &nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//block中叔块数组的RLP哈希值 Coinbase &nbsp;&nbsp;&nbsp;common.Address //挖出该区块的人的地址 Root &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//StateDB中的stat trie的根节点的RLP哈希值 TxHash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//tx trie的根节点的哈希值 ReceiptHash common.Hash &nbsp;&nbsp;&nbsp;//receipt trie的根节点的哈希值 Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//布隆过滤器，用来判断Log对象是否存在 Difficulty &nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//难度系数 Number &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块序号 GasLimit &nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内所有Gas消耗的理论上限 GasUsed &nbsp;&nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内消耗的总Gas Time &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块应该被创建的时间 Nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNonce &nbsp;&nbsp;&nbsp;&nbsp;//挖矿必须的值 } &nbsp; &nbsp; Header是Block的核心，注意到它的成员变量全都是公共的，这使得它可以很方便的向调用者提供关于Block属性的操作。Header的成员变量全都很重要，值得细细理解: &nbsp; ParentHash：指向父区块(parentBlock)的指针。除了创世块(Genesis Block)外，每个区块有且只有一个父区块。 Coinbase：挖掘出这个区块的作者地址。在每次执行交易时系统会给与一定补偿的Ether，这笔金额就是发给这个地址的。 UncleHash：Block结构体的成员uncles的RLP哈希值。uncles是一个Header数组，它的存在，颇具匠心。 Root：StateDB中的“state Trie”的根节点的RLP哈希值。Block中，每个账户以stateObject对象表示，账户以Address为唯一标示，其信息在相关交易(Transaction)的执行中被修改。所有账户对象可以逐个插入一个Merkle-PatricaTrie(MPT)结构里，形成“state Trie”。 TxHash: Block中 “tx Trie”的根节点的RLP哈希值。Block的成员变量transactions中所有的tx对象，被逐个插入一个MPT结构，形成“tx Trie”。 ReceiptHash：Block中的 &quot;Receipt Trie”的根节点的RLP哈希值。Block的所有Transaction执行完后会生成一个Receipt数组，这个数组中的所有Receipt被逐个插入一个MPT结构中，形成&quot;Receipt Trie&quot;。 Bloom：Bloom过滤器(Filter)，用来快速判断一个参数Log对象是否存在于一组已知的Log集合中。 Difficulty：区块的难度。Block的Difficulty由共识算法基于parentBlock的Time和Difficulty计算得出，它会应用在区块的‘挖掘’阶段。 Number：区块的序号。Block的Number等于其父区块Number +1。 Time：区块“应该”被创建的时间。由共识算法确定，一般来说，要么等于parentBlock.Time + 10s，要么等于当前系统时间。 GasLimit：区块内所有Gas消耗的理论上限。该数值在区块创建时设置，与父区块有关。具体来说，根据父区块的GasUsed同GasLimit * 2/3的大小关系来计算得出。 GasUsed：区块内所有Transaction执行时所实际消耗的Gas总和。 Nonce：一个64bit的哈希数，它被应用在区块的&quot;挖掘&quot;阶段，并且在使用中会被修改。 &nbsp; Body type Body struct { Transactions []*Transaction //交易的数组 Uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } 里面主要是交易对象和叔块位置 &nbsp; HeaderChain Header的链表 &nbsp; BlockChain Block的链表 &nbsp; &nbsp; &nbsp; 要介绍MPT树，先要提一下Merkle Tree，通常也被称作Hash Tree，顾名思义，就是存储hash值的一棵树。 它可以是多叉树 &nbsp; 但是比特币中使用的是类似下图的二叉树 &nbsp; &nbsp;如果要验证slice2数据的正确性，只需要拿到hash1, h12, h02这3个hash再加上本地存储的root hash,就可以验证了。需要传输的hash数据量从n变为log2n。 总结，Merkle root(包含在区块头里)是从可信渠道下载的(主链或者可信节点)，接收到数据及这个数据对应的Merkle验证路径即可验证该数据的正确性。 &nbsp; 但是MPT树的Hash Root貌似不像二叉树那么直观（还没完全从以太坊源码中理解）。 MPT节点有个flag字段,flag.hash会保存该节点采用merkle tree类似算法生成的hash,同时会将hash和源数据以&lt;hash, node.rlprawdata&gt;方式保存在leveldb数据库中。这样后面通过hash就可以反推出节点数据。具体结构如下(蓝色的hash部分就是flag.hash字段) &nbsp; 这样一个结构的核心思想是：hash可以还原出节点上的数据，这样只需要保存一个root(hash)，即可还原出完整的树结构，同时还可以按需展开节点数据，比如如果只需要访问&lt;a771355, 45&gt;这个数据，只需展开h00, h10, h20, h30这四个hash对应的节点 &nbsp; &nbsp; trie树介绍 &nbsp; 传统的tire，C++实现范例 /** * 字典树/前缀树Tire */ #include &lt;iostream&gt; #include &lt;cstring&gt; using namespace std; const int branchNum = 26; //26个英文字母 struct TrieNode { bool isStr; TrieNode *next[branchNum]; }; void Insert(TrieNode *root, const char *word); bool Search(TrieNode *root, const char *word); void Delete(TrieNode *node); int main() { TrieNode *root = new TrieNode(); root-&gt;isStr = false; memset(root-&gt;next, NULL, sizeof(root-&gt;next)); //作用是在一段内存块中填充某个给定的值，它是对较大的结构体或数组进行清零操作的一种最快方法 Insert(root, &quot;a&quot;); Insert(root, &quot;bcd&quot;); Insert(root, &quot;xyz&quot;); Insert(root, &quot;abcdef&quot;); if (Search(root, &quot;a&quot;)) { cout &lt;&lt; &quot;a exist&quot; &lt;&lt; endl; } Delete(root); system(&quot;pause&quot;); } void Insert(TrieNode *root, const char *word) { TrieNode *location = root; while (*word) { if (location-&gt;next[*word - &#39;a&#39;] == NULL) { TrieNode *newNode = new TrieNode(); newNode-&gt;isStr = false; memset(newNode-&gt;next, NULL, sizeof(newNode-&gt;next)); location-&gt;next[*word - &#39;a&#39;] = newNode; } location = location-&gt;next[*word - &#39;a&#39;]; word++; } location-&gt;isStr = true; } bool Search(TrieNode *root, const char *word) { TrieNode *location = root; while (*word &amp;&amp; location != NULL) { location = location-&gt;next[*word - &#39;a&#39;]; word++; } return (location != NULL &amp;&amp; location-&gt;isStr); } void Delete(TrieNode *location) { for (int i = 0; i &lt; branchNum; i++) { if (location-&gt;next[i] != NULL) { Delete(location-&gt;next[i]); } } delete location; } 以太坊的MPT树是基于Trie改进而来的，做了很多优化，我们平时的字典树可能是26个字母，以太坊的是长度为17的数组，0 1 2 3 4 5 6 7 8 9 a b c d e f（十六进制的十六位）+ 拓展数据（根据节点的性质功能不一样）；以太坊增加了两个新的节点，称为叶节点和扩展节点，两个节点的形式一样，都是一个[key,value]的组合，原来的节点称为分支节点。 &nbsp; Merkle Patricia Tree有4种类型的节点： 叶子节点（leaf），表示为[key,value]的一个键值对。和前面的英文字母key不一样，这里的key都是16编码出来的字符串，每个字符只有0-f 16种，value是RLP编码的数据 扩展节点（extension），也是[key，value]的一个键值对，但是这里的value是其他节点的hash值，通过hash链接到其他节点 &nbsp;分支节点（branch），因为MPT树中的key被编码成一种特殊的16进制的表示，再加上最后的value，所以分支节点是一个长度为17的list，前16个元素对应着key中的16个可能的十六进制字符，如果有一个[key,value]对在这个分支节点终止，最后一个元素代表一个值，即分支节点既可以搜索路径的终止也可以是路径的中间节点。分支节点的父亲必然是extension node 空节点，代码中用null表示 &nbsp; 直接看代码不好说清楚，还是用一个例子解释 Suppose we want a trie containing four path/value pairs&nbsp;(&#39;do&#39;, &#39;verb&#39;),&nbsp;(&#39;dog&#39;, &#39;puppy&#39;),&nbsp;(&#39;doge&#39;, &#39;coin&#39;),&nbsp;(&#39;horse&#39;, &#39;stallion&#39;). First, we convert both paths and values to&nbsp;bytes. Below, actual byte representations for&nbsp;paths&nbsp;are denoted by&nbsp;&lt;&gt;, although&nbsp;values&nbsp;are still shown as strings, denoted by&nbsp;&#39;&#39;, for easier comprehension (they, too, would actually be&nbsp;bytes): &lt;64 6f&gt; : &#39;verb&#39; &lt;64 6f 67&gt; : &#39;puppy&#39; &lt;64 6f 67 65&gt; : &#39;coin&#39; &lt;68 6f 72 73 65&gt; : &#39;stallion&#39; Now, we build such a trie with the following key/value pairs in the underlying DB: rootHash: [ &lt;16&gt;, hashA ] hashA: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] hashC: &nbsp;&nbsp;&nbsp;[ &lt;20 6f 72 73 65&gt;, &#39;stallion&#39; ] hashB: &nbsp;&nbsp;&nbsp;[ &lt;00 6f&gt;, hashD ] hashD: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;verb&#39; ] hashE: &nbsp;&nbsp;&nbsp;[ &lt;17&gt;, hashF ] hashF: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &#39;puppy&#39; ] hashG: &nbsp;&nbsp;&nbsp;[ &lt;35&gt;, &#39;coin&#39; ] &nbsp; &nbsp; transaction tree（交易树） state tree（状态树&nbsp;主要是Account信息） receipt tree&nbsp;（收据树） &nbsp; &nbsp; &nbsp; &nbsp; 附：跟存储分析相关的源码(version: 1.8.11-stable) core/state/statedb.go core/state/database.go ethdb/interface.go 定义了数据库的接口（key-value接口） ethdb/memory_database.go &nbsp;内存数据库 ethdb/database.go &nbsp;leveldb封装 tire/tire.go tire/trie_test.go （看测试用例是很好的学习方式） core/headerchain.go core/rawdb/accessors_chain.go &nbsp; 数据库体系 &nbsp; 一些常见的键值对（header和body） &nbsp; key value &#39;h&#39; + num + hash header&#39;s RLP raw data &#39;h&#39; + num + hash + &#39;t&#39; td &#39;h&#39; + num + &#39;n&#39; hash &#39;H&#39; + hash num &#39;b&#39; + num + hash body&#39;s RLP raw data &#39;r&#39; + num + hash receipts RLP &#39;l&#39; + hash tx/receipt lookup metadata &quot;LastHeader&quot; hash &quot;LastBlock&quot; hash &quot;LastFast&quot; hash &nbsp;数据库体系UML &nbsp; 附录：levelDB官方网站介绍的特点 特点： key和value都是任意长度的字节数组； entry（即一条K-V记录）默认是按照key的字典顺序存储的，当然开发者也可以重载这个排序函数； 提供的基本操作接口：Put()、Delete()、Get()、Batch()； 支持批量操作以原子操作进行； 可以创建数据全景的snapshot(快照)，并允许在快照中查找数据； 可以通过前向（或后向）迭代器遍历数据（迭代器会隐含的创建一个snapshot）； 自动使用Snappy压缩数据； 可移植性； 限制： 非关系型数据模型（NoSQL），不支持sql语句，也不支持索引； 一次只允许一个进程访问一个特定的数据库； 没有内置的C/S架构，但开发者可以使用LevelDB库自己封装一个server。 &nbsp; Leveldb是一个key-value数据库，所以用法上还是比较简单的；有一点要注意的是，以太坊的分片版本还没上线，因为MPT的特性，海量数据存储账户的更新操作会带来指数级的数据存取，现阶段存储还是问题。 &nbsp; &nbsp; 有待深入研究 以太坊Tire树（MPT）在插入的过程中怎么缓存、计算hash Merkle state transition proof 交易存储分析&nbsp; 参考 https://github.com/ZtesoftCS/go-ethereum-code-analysis https://blog.csdn.net/weixin_41545330/article/details/79394153 https://blog.csdn.net/qq_33935254/article/details/55505472 https://ethfans.org/hpcoder/articles/961 https://blog.csdn.net/Blockchain_lemon/article/details/79308137 https://blog.csdn.net/itleaks/article/details/79992072 https://github.com/ethereum/wiki/wiki/Patricia-Tree http://www.cnblogs.com/fengzhiwu/p/5584809.html https://blog.csdn.net/wsyw126/article/details/61416055&nbsp; &nbsp; 阅读更多 登录后自动展开","@type":"BlogPosting","url":"https://uzzz.org/2018/08/28/6ea4a4bfc5c2634615fa2a02e2c24c7e.html","headline":"以太坊存储分析（整合）","dateModified":"2018-08-28T00:00:00+08:00","datePublished":"2018-08-28T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/28/6ea4a4bfc5c2634615fa2a02e2c24c7e.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊存储分析（整合）</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zxkr777/article/details/82146064 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <ul>
+   <li><span style="color:#000000;"><strong><strong>分析背景及概述</strong></strong></span></li> 
+  </ul>
+  <p style="margin-left:0pt;"><span style="color:#000000;">更加深入地了解以太坊的内部存储机制，更好地实现自己的区块链，存储是一个不能缺少的模块。但是存储又不是单一的数据保存，它涉及到了以太坊核心的编码、数据结构，中间还有缓存的部分，最后才通过leveldb（一种key-value数据库）保存到硬盘上。其中以太坊实现的代码十分精巧，设计同时考虑效率与优雅的问题，所以有些地方不那么好理解;加上以太坊的源码和结构不断更新，有一些参考资料只能作为参考，最权威的还是以太坊黄皮书，但是理论太多，涉及到一些难懂的数理描述。</span></p> 
+  <p style="margin-left:0pt;"><em><span style="color:#000000;"><em>以太坊数据存储布局</em></span></em></p> 
+  <p style="margin-left:0pt;"><img alt="以太坊数据存储布局" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018082812490326?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;"><em><em><span style="color:#000000;">以太坊</span><span style="color:#000000;">MPT结构</span></em></em></p> 
+  <p style="margin-left:0pt;"><img alt="以太坊MPT系统" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125112220?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <ul>
+   <li><span style="color:#000000;"><strong><strong>相关数据编码格式</strong></strong></span></li> 
+  </ul>
+  <h2 style="margin-left:0pt;"><strong><strong><span style="color:#000000;">1)RLP</span></strong></strong></h2> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">RLP（Recursive Length Prefix）编码是以太坊中数据序列化的一个主要编码方式，可以将任意的嵌套二进制数据进行序列化。以太坊中针对RLP的编码规则定义如下：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">1. 如果是一个单字节并且其值在[0x00,0x7f]范围内，RLP编码就是自身。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <ol>
+   <li>否则，如果一个数据串的字节长度是0-55字节，那么它的RLP编码是在数据串开头增加一个字节，这个字节的值是0x80加上数据串的字节长度。因此增加的该字节的取值范围为[0x80, 0xb7]。<br><span style="color:#000000;">&nbsp;</span><br><span style="color:#000000;">3. 如果一个数据串的字节长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xb7加上数据串字节长度的二进制编码的字节长度，然后依次跟着数据串字节长度部分和内容部分。比如：一个长度为1024字节的数据串，其字节长度用16进制表示为0x0400，长度为2个字节，因此RLP编码头字节的值为0xb9（0xb7 + 0x02），然后跟着两字节为0x0400，后面再加上数据串的具体内容。因此增加的首字节的取值范围为[0xb8, 0xbf]，因此其能编码的最大数据长度为2^56。</span><br><span style="color:#000000;">&nbsp;</span><br><span style="color:#000000;">4. 如果是一个嵌套的列表数据，则需要先将列表中的数据按照单元素的编码规则进行RLP编码后串联得到列表数据的payload。如果一个列表数据的payload的字节长度为0-55，那么列表的RLP编码在其payload前加上一个字节，这个字节的值是0xc0加上payload的字节长度。因此首字节的取值范围为[0xc0, 0xf7]。</span><br><span style="color:#000000;">&nbsp;</span><br><span style="color:#000000;">5. 如果一个列表数据的payload的长度大于55，那么它的RLP编码是在开头增加一个字节，这个字节的值等于0xf7加上列表payload字节长度的二进制编码的字节长度，然后依次跟着payload字节长度部分和payload部分。因此首字节的取值范围为[0xf8, 0xff]，因此一个列表中存储的所有元素的字节长度不能超过2^56。</span><br><span style="color:#000000;">&nbsp;</span><br><span style="color:#000000;">&nbsp;如下是一些RLP编码的参考样例。</span><br><span style="color:#000000;">&nbsp;</span> 
+    <table align="center" border="1" cellspacing="0" style="width:433.05pt;">
+     <thead>
+      <tr>
+       <th scope="col" style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">原始数据</p> </th> 
+       <th scope="col" style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">编码数据</p> </th> 
+      </tr>
+     </thead>
+     <tbody>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">'a'</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0x61</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">1000</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0x8203E8</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">"abc"</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0x83616263</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">"123456789012345678901234567890123456789012345678901234567890"</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0xB83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">""</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0x80</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">[0,1,2,3]</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0xC400010203</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">["abc","def","ghi"]</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0xCC836162638364656683676869</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">["abc","def","ghi","123456789012345678901234567890123456789012345678901234567890"]</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0xF89486162638364656683676869B83C313233343536373839303132333435363738393031323334353637383930313233343536373839303132333435363738393031323334353637383930</p> </td> 
+      </tr>
+      <tr>
+       <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;">[]</p> </td> 
+       <td style="vertical-align:top;width:220pt;"> <p style="margin-left:0pt;">0xC0</p> </td> 
+      </tr>
+     </tbody>
+    </table></li> 
+  </ol>
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">注意：</span><span style="color:#000000;">1000</span><span style="color:#000000;">为以太坊整数 &nbsp;以太坊整数256bit &nbsp;256/8 = 32 (byte)</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><strong><strong><span style="color:#000000;">2)hex prefix编码</span></strong></strong></p> 
+  <p style="margin-left:0pt;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125353316?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125435746?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">可以看出</span><span style="color:#000000;">编码方式很简单，重点是理解其中各符合的定义：</span><span style="color:#000000;">x</span><span style="color:#000000;">是一个nibble</span><span style="color:#000000;">（</span><span style="color:#333333;">半字节，在计算机中，通常将8位二进制数称为字节，而把4位二进制数称为半字节</span><span style="color:#000000;">）</span><span style="color:#000000;">数组，</span><span style="color:#000000;">t</span><span style="color:#000000;">是标志位，用以标志节点类型。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">为什么要进行编码</span><span style="color:#000000;">?</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">在以太坊协议中，不管是地址还是</span><span style="color:#000000;">hash</span><span style="color:#000000;">，都是一个16进制串，如"0x5b3edbcf7d0a97e95e57a4554a29ea66601b71ad"，数据最小的表示单位为一位16进制，</span><span style="color:#ff0000;">2^4=16,用4bit可以表示十六进制所有数字（个人根据上下文理解加上去的，别人没解释这一句）</span><span style="color:#000000;">，</span><span style="color:#000000;">如</span><span style="color:#000000;">1</span><span style="color:#000000;">、a等，但在编程实现中，数据的最小表示单位往往是byte（8bit，2位16进制数），这样在用byte来表示一串奇数长度的16进制串时会出现问题，如"5b3"和"5b30"，直接转成byte都是5b30。还有一种简单直观的转换方式，"5b3"-&gt;"050b03"，这种方式虽然简单，但是数据量会翻倍，不利于大量hash的计算，同时也会增加tree的大小，降低同步性能。Hex-Prefix Encoding能解决这些问题。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">下面举个具体例子说明编码过程：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">对</span><span style="color:#000000;">"0x5b3ed"</span><span style="color:#000000;">编码（奇数位）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">"0x5b3ed" = "0005 1011 0003 1110 1101"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;t=0 时, "0001"+"0005 1011 0003 1110 1101"-&gt;"00010005 10110003 11101101"-&gt;"0x15b3ed"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">t !=0时 "0011"+"0005 1011 0003 1110 1101"-&gt;"00110005 10110003 11101101"-&gt;"0x35b3ed"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">对</span><span style="color:#000000;">"0x5b3e"</span><span style="color:#000000;">编码（偶数位）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">"0x5b3e" = "0005 1011 0003 1110"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;t=0 时, "0000"+"0005 1011 0003 1110 1101"-&gt;"00000005 10110003 11101101"-&gt;"0x005b3e"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">t !=0时 "0010"+"0005 1011 0003 1110 1101"-&gt;"00100005 10110003 11101101"-&gt;"0x205b3e"</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#c00000;">t=0与t!=0实际用处， t=0是其实是针对拓展节点，t!=0其实是针对叶子节点</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#c00000;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125548405?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;"><span style="color:#c00000;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018082812561376?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">odd 奇数 &nbsp;even 偶数</span></p> 
+  <ul>
+   <li><span style="color:#000000;"><strong><strong>数据结构</strong></strong></span></li> 
+  </ul>
+  <p style="margin-left:0pt;"><span style="color:#000000;">Block</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">type Block struct {</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块头</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//叔节点</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">transactions Transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//交易数组</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">hash atomic.Value</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">size atomic.Value</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">td *big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//所有区块Difficulty之和</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ReceivedAt &nbsp;&nbsp;time.Time</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ReceivedFrom interface{}</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">}</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Block（区块）是Ethereum的核心数据结构之一。所有账户的相关活动，以交易(Transaction)的格式存储，每个Block有一个交易对象的列表；每个交易的执行结果，由一个Receipt对象与其包含的一组Log对象记录；所有交易执行完后生成的Receipt列表，存储在Block中(经过压缩加密)。不同Block之间，通过前向指针ParentHash一个一个串联起来成为一个单向链表，BlockChain 结构体管理着这个链表。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Block结构体基本可分为Header和Body两个部分，其UML关系族如下图所示：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125714126?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Header</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">type Header struct {</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ParentHash &nbsp;common.Hash &nbsp;&nbsp;&nbsp;//指向父区块的指针</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">UncleHash &nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//block中叔块数组的RLP哈希值</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Coinbase &nbsp;&nbsp;&nbsp;common.Address //挖出该区块的人的地址</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Root &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//StateDB中的stat trie的根节点的RLP哈希值</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">TxHash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;common.Hash &nbsp;&nbsp;&nbsp;//tx trie的根节点的哈希值</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ReceiptHash common.Hash &nbsp;&nbsp;&nbsp;//receipt trie的根节点的哈希值</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bloom &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//布隆过滤器，用来判断Log对象是否存在</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Difficulty &nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//难度系数</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Number &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块序号</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">GasLimit &nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内所有Gas消耗的理论上限</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">GasUsed &nbsp;&nbsp;&nbsp;&nbsp;uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块内消耗的总Gas</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Time &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;*big.Int &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//区块应该被创建的时间</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNonce &nbsp;&nbsp;&nbsp;&nbsp;//挖矿必须的值</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">}</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Header是Block的核心，注意到它的成员变量全都是公共的，这使得它可以很方便的向调用者提供关于Block属性的操作。Header的成员变量全都很重要，值得细细理解:</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ParentHash：指向父区块(parentBlock)的指针。除了创世块(Genesis Block)外，每个区块有且只有一个父区块。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Coinbase：挖掘出这个区块的作者地址。在每次执行交易时系统会给与一定补偿的Ether，这笔金额就是发给这个地址的。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">UncleHash：Block结构体的成员uncles的RLP哈希值。uncles是一个Header数组，它的存在，颇具匠心。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Root：StateDB中的“state Trie”的根节点的RLP哈希值。Block中，每个账户以stateObject对象表示，账户以Address为唯一标示，其信息在相关交易(Transaction)的执行中被修改。所有账户对象可以逐个插入一个Merkle-PatricaTrie(MPT)结构里，形成“state Trie”。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">TxHash: Block中 “tx Trie”的根节点的RLP哈希值。Block的成员变量transactions中所有的tx对象，被逐个插入一个MPT结构，形成“tx Trie”。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ReceiptHash：Block中的 "Receipt Trie”的根节点的RLP哈希值。Block的所有Transaction执行完后会生成一个Receipt数组，这个数组中的所有Receipt被逐个插入一个MPT结构中，形成"Receipt Trie"。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Bloom：Bloom过滤器(Filter)，用来快速判断一个参数Log对象是否存在于一组已知的Log集合中。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Difficulty：区块的难度。Block的Difficulty由共识算法基于parentBlock的Time和Difficulty计算得出，它会应用在区块的‘挖掘’阶段。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Number：区块的序号。Block的Number等于其父区块Number +1。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Time：区块“应该”被创建的时间。由共识算法确定，一般来说，要么等于parentBlock.Time + 10s，要么等于当前系统时间。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">GasLimit：区块内所有Gas消耗的理论上限。该数值在区块创建时设置，与父区块有关。具体来说，根据父区块的GasUsed同GasLimit * 2/3的大小关系来计算得出。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">GasUsed：区块内所有Transaction执行时所实际消耗的Gas总和。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Nonce：一个64bit的哈希数，它被应用在区块的"挖掘"阶段，并且在使用中会被修改。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Body</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">type Body struct {</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Transactions []*Transaction //交易的数组</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Uncles &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[]*Header &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">}</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">里面主要是交易对象和叔块位置</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">HeaderChain</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Header的链表</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">BlockChain</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Block的链表</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">要介绍</span><span style="color:#000000;">MPT</span><span style="color:#000000;">树，先要提一下Merkle Tree，通常也被称作Hash Tree，顾名思义，就是存储hash值的一棵树。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">它可以是多叉树</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125820289?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;"><span style="color:#4f4f4f;">但是比特币中使用的是类似下图的二叉树</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#4f4f4f;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125919462?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;"><span style="color:#4f4f4f;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828125952970?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">&nbsp;如果要验证slice2数据的正确性，只需要拿到hash1, h12, h02这3个hash再加上本地存储的root hash,就可以验证了。需要传输的hash数据量从n变为log2n</span><span style="color:#333333;">。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">总结，Merkle root(包含在区块头里)是从可信渠道下载的(主链或者可信节点)，接收到数据及这个数据对应的Merkle验证路径即可验证该数据的正确性。</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">但是MPT树的Hash Root貌似不像二叉树那么直观（还没完全从以太坊源码中理解）。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">MPT节点有个flag字段,flag.hash会保存该节点采用merkle tree类似算法生成的hash,同时会将hash和源数据以&lt;hash, node.rlprawdata&gt;方式保存在leveldb数据库中。这样后面通过hash就可以反推出节点数据。具体结构如下(蓝色的hash部分就是flag.hash字段)</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828130036725?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">这样一个结构的核心思想是：hash可以还原出节点上的数据，这样只需要保存一个root(hash)，即可还原出完整的树结构，同时还可以按需展开节点数据，比如如果只需要访问&lt;a771355, 45&gt;这个数据，只需展开h00, h10, h20, h30这四个hash对应的节点</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828130106654?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><a href="https://github.com/ZtesoftCS/go-ethereum-code-analysis/blob/master/trie%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90.md" rel="nofollow"><u><span style="color:#0066cc;">trie树介绍</span></u></a></p> 
+  <p style="margin-left:0pt;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828130214767?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828130229630?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <pre class="has">
+<code>传统的tire，C++实现范例
+/**
+* 字典树/前缀树Tire
+*/
+
+#include &lt;iostream&gt;
+#include &lt;cstring&gt;
+
+using namespace std;
+const int branchNum = 26; //26个英文字母
+
+struct TrieNode
+{
+	bool isStr;
+	TrieNode *next[branchNum];
+};
+
+void Insert(TrieNode *root, const char *word);
+bool Search(TrieNode *root, const char *word);
+void Delete(TrieNode *node);
+
+
+int main()
+{
+	TrieNode *root = new TrieNode();
+	root-&gt;isStr = false;
+
+	memset(root-&gt;next, NULL, sizeof(root-&gt;next)); //作用是在一段内存块中填充某个给定的值，它是对较大的结构体或数组进行清零操作的一种最快方法
+
+	Insert(root, "a");
+	Insert(root, "bcd");
+	Insert(root, "xyz");
+	Insert(root, "abcdef");
+
+	if (Search(root, "a"))
+	{
+		cout &lt;&lt; "a exist" &lt;&lt; endl;
+	}
+
+	Delete(root);
+	system("pause");
+}
+
+
+void Insert(TrieNode *root, const char *word)
+{
+	TrieNode *location = root;
+	while (*word)
+	{
+		if (location-&gt;next[*word - 'a'] == NULL)
+		{
+			TrieNode *newNode = new TrieNode();
+			newNode-&gt;isStr = false;
+			memset(newNode-&gt;next, NULL, sizeof(newNode-&gt;next));
+
+			location-&gt;next[*word - 'a'] = newNode;
+		}
+
+		location = location-&gt;next[*word - 'a'];
+		word++;
+	}
+	location-&gt;isStr = true;
+}
+
+bool Search(TrieNode *root, const char *word)
+{
+	TrieNode *location = root;
+	while (*word &amp;&amp; location != NULL)
+	{
+		location = location-&gt;next[*word - 'a'];
+		word++;
+	}
+
+	return (location != NULL &amp;&amp; location-&gt;isStr);
+}
+
+void Delete(TrieNode *location)
+{
+	for (int i = 0; i &lt; branchNum; i++)
+	{
+		if (location-&gt;next[i] != NULL)
+		{
+			Delete(location-&gt;next[i]);
+		}
+	}
+	delete location;
+}</code></pre> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">以太坊的</span><span style="color:#000000;">MPT</span><span style="color:#000000;">树是基于Trie改进而来的，做了很多优化，我们平时的字典树可能是26个字母，以太坊的是长度为17的数组，0 1 2 3 4 5 6 7 8 9 a b c d e f（十六进制的十六位）+ 拓展数据（根据节点的性质功能不一样）；以太坊增加了两个新的节点，称为叶节点和扩展节点，两个节点的形式一样，都是一个[key,value]的组合，原来的节点称为分支节点。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Merkle Patricia Tree有4种类型的节点：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">叶子节点（</span><span style="color:#000000;">leaf</span><span style="color:#000000;">），表示为[key,value]的一个键值对。和前面的英文字母key不一样，这里的key都是16编码出来的字符串，每个字符只有0-f 16种，value是RLP编码的数据</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">扩展节点（</span><span style="color:#000000;">extension</span><span style="color:#000000;">），也是[key，value]的一个键值对，但是这里的value是其他节点的hash值，通过hash链接到其他节点</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;分支节点（</span><span style="color:#000000;">branch</span><span style="color:#000000;">），因为MPT树中的key被编码成一种特殊的16进制的表示，再加上最后的value，所以分支节点是一个长度为17的list，前16个元素对应着key中的16个可能的十六进制字符，如果有一个[key,value]对在这个分支节点终止，最后一个元素代表一个值，即分支节点既可以搜索路径的终止也可以是路径的中间节点。分支节点的父亲必然是extension node</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">空节点，代码中用</span><span style="color:#000000;">null</span><span style="color:#000000;">表示</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">直接看代码不好说清楚，还是用一个例子解释</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">Suppose we want a trie containing four path/value pairs&nbsp;</span><span style="color:#24292e;">('do', 'verb')</span><span style="color:#24292e;">,&nbsp;</span><span style="color:#24292e;">('dog', 'puppy')</span><span style="color:#24292e;">,&nbsp;</span><span style="color:#24292e;">('doge', 'coin')</span><span style="color:#24292e;">,&nbsp;</span><span style="color:#24292e;">('horse', 'stallion')</span><span style="color:#24292e;">.</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">First, we convert both paths and values to&nbsp;</span><span style="color:#24292e;">bytes</span><span style="color:#24292e;">. Below, actual byte representations for&nbsp;</span><span style="color:#24292e;">paths</span><span style="color:#24292e;">&nbsp;are denoted by&nbsp;</span><span style="color:#24292e;">&lt;&gt;</span><span style="color:#24292e;">, although&nbsp;</span><span style="color:#24292e;">values</span><span style="color:#24292e;">&nbsp;are still shown as strings, denoted by&nbsp;</span><span style="color:#24292e;">''</span><span style="color:#24292e;">, for easier comprehension (they, too, would actually be&nbsp;</span><span style="color:#24292e;">bytes</span><span style="color:#24292e;">):</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">&lt;64 6f&gt; : 'verb'</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">&lt;64 6f 67&gt; : 'puppy'</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">&lt;64 6f 67 65&gt; : 'coin'</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">&lt;68 6f 72 73 65&gt; : 'stallion'</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">Now, we build such a trie with the following key/value pairs in the underlying DB:</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">rootHash: [ &lt;16&gt;, hashA ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashA: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashC: &nbsp;&nbsp;&nbsp;[ &lt;20 6f 72 73 65&gt;, 'stallion' ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashB: &nbsp;&nbsp;&nbsp;[ &lt;00 6f&gt;, hashD ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashD: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, 'verb' ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashE: &nbsp;&nbsp;&nbsp;[ &lt;17&gt;, hashF ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashF: &nbsp;&nbsp;&nbsp;[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, 'puppy' ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#24292e;">hashG: &nbsp;&nbsp;&nbsp;[ &lt;35&gt;, 'coin' ]</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">transaction tree</span><span style="color:#333333;">（交易树）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">state tree</span><span style="color:#333333;">（状态树</span>&nbsp;<span style="color:#333333;">主要是</span><span style="color:#333333;">Account信息</span><span style="color:#333333;">）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#333333;">receipt tree</span><span style="color:#333333;">&nbsp;（收据树）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">附：跟存储分析相关的源码(version: 1.8.11-stable)</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">core/state/statedb.go</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">core/state/database.go</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ethdb/interface.go </span><span style="color:#000000;">定义了数据库的接口（</span><span style="color:#000000;">key-value</span><span style="color:#000000;">接口）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ethdb/memory_database.go &nbsp;内存数据库</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">ethdb/database.go &nbsp;leveldb封装</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">tire/tire.go</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">tire/trie_test.go （看测试用例是很好的学习方式）</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">core/headerchain.go</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">core/rawdb/accessors_chain.go</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <ul>
+   <li><span style="color:#000000;"><strong><strong>数据库体系</strong></strong></span></li> 
+  </ul>
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">一些常见的键值对（</span><span style="color:#000000;">header</span><span style="color:#000000;">和body）</span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <table border="1" cellspacing="0" style="width:426.1pt;">
+   <thead>
+    <tr>
+     <th scope="col" style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">key</span></p> </th> 
+     <th scope="col" style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">value</span></p> </th> 
+    </tr>
+   </thead>
+   <tbody>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'h' + num + hash</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">header's RLP raw data</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'h' + num + hash + 't'</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">td</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'h' + num + 'n'</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">hash</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'H' + hash</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">num</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'b' + num + hash</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">body's RLP raw data</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'r' + num + hash</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">receipts RLP</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">'l' + hash</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">tx/receipt lookup metadata</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">"LastHeader"</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">hash</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">"LastBlock"</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">hash</span></p> </td> 
+    </tr>
+    <tr>
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">"LastFast"</span></p> </td> 
+     <td style="vertical-align:top;width:213.05pt;"> <p style="margin-left:0pt;"><span style="color:#4f4f4f;">hash</span></p> </td> 
+    </tr>
+   </tbody>
+  </table>
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;数据库体系</span><span style="color:#000000;">UML</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;"><img alt="" class="has" src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180828130409183?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3p4a3I3Nzc=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70"></span></p> 
+  <p style="margin-left:0pt;">&nbsp;</p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">附录：</span><span style="color:#000000;">levelDB</span><span style="color:#000000;">官方网站介绍的特点</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">特点：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">key和value都是任意长度的字节数组；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">entry（即一条K-V记录）默认是按照key的字典顺序存储的，当然开发者也可以重载这个排序函数；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">提供的基本操作接口：</span><span style="color:#000000;">Put()</span><span style="color:#000000;">、Delete()、Get()、Batch()；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">支持批量操作以原子操作进行；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">可以创建数据全景的</span><span style="color:#000000;">snapshot(</span><span style="color:#000000;">快照)，并允许在快照中查找数据；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">可以通过前向（或后向）迭代器遍历数据（迭代器会隐含的创建一个</span><span style="color:#000000;">snapshot</span><span style="color:#000000;">）；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">自动使用</span><span style="color:#000000;">Snappy</span><span style="color:#000000;">压缩数据；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">可移植性；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">限制：</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">非关系型数据模型（</span><span style="color:#000000;">NoSQL</span><span style="color:#000000;">），不支持sql语句，也不支持索引；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">一次只允许一个进程访问一个特定的数据库；</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">没有内置的</span><span style="color:#000000;">C/S</span><span style="color:#000000;">架构，但开发者可以使用LevelDB库自己封装一个server。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">Leveldb是一个key-value数据库，所以用法上还是比较简单的；有一点要注意的是，以太坊的分片版本还没上线，因为MPT的特性，海量数据存储账户的更新操作会带来指数级的数据存取，现阶段存储还是问题。</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <p style="margin-left:0pt;"><span style="color:#000000;">&nbsp;</span></p> 
+  <ul>
+   <li><a name="_Toc9140_WPSOffice_Level1"></a><span style="color:#000000;"><strong><strong>有待深入研究</strong></strong></span></li> 
+  </ul>
+  <ol>
+   <li>以太坊Tire树（MPT）在插入的过程中怎么缓存、计算hash</li> 
+   <li><span style="color:#000000;">Merkle state transition proof</span></li> 
+   <li><span style="color:#000000;">交易存储分析</span><br><span style="color:#000000;">&nbsp;</span></li> 
+  </ol>
+  <ul>
+   <li><a name="_Toc6865_WPSOffice_Level1"></a><span style="color:#000000;"><strong><strong>参考</strong></strong></span></li> 
+  </ul>
+  <ol>
+   <li><a href="https://github.com/ZtesoftCS/go-ethereum-code-analysis" rel="nofollow"><span style="color:#333333;"><u>https://github.com/ZtesoftCS/go-ethereum-code-analysis</u></span></a></li> 
+   <li><span style="color:#000000;"><a href="https://blog.csdn.net/weixin_41545330/article/details/79394153" rel="nofollow"><span style="color:#333333;"><u>https://blog.csdn.net/weixin_41545330/article/details/79394153</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://blog.csdn.net/qq_33935254/article/details/55505472" rel="nofollow"><span style="color:#333333;"><u>https://blog.csdn.net/qq_33935254/article/details/55505472</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://ethfans.org/hpcoder/articles/961" rel="nofollow"><span style="color:#333333;"><u>https://ethfans.org/hpcoder/articles/961</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://blog.csdn.net/Blockchain_lemon/article/details/79308137" rel="nofollow"><span style="color:#333333;"><u>https://blog.csdn.net/Blockchain_lemon/article/details/79308137</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://blog.csdn.net/itleaks/article/details/79992072" rel="nofollow"><span style="color:#333333;"><u>https://blog.csdn.net/itleaks/article/details/79992072</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://github.com/ethereum/wiki/wiki/Patricia-Tree" rel="nofollow"><span style="color:#333333;"><u>https://github.com/ethereum/wiki/wiki/Patricia-Tree</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="http://www.cnblogs.com/fengzhiwu/p/5584809.html" rel="nofollow"><span style="color:#333333;"><u>http://www.cnblogs.com/fengzhiwu/p/5584809.html</u></span></a></span></li> 
+   <li><span style="color:#000000;"><a href="https://blog.csdn.net/wsyw126/article/details/61416055" rel="nofollow"><span style="color:#333333;"><u>https://blog.csdn.net/wsyw126/article/details/61416055</u></span></a></span><br><span style="color:#000000;">&nbsp;</span></li> 
+  </ol>
+  <p style="margin-left:0pt;">&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zxkr777/article/details/82146064,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zxkr777/article/details/82146064,&quot;}">阅读更多</a> 
+ <a class="btn" href="https://passport.csdn.net/account/login?utm_source=csdn_blog_pc_more_login" target="_self" id="btn-lobinreadmore" data-track-view="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zxkr777/article/details/82146064,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zxkr777/article/details/82146064,&quot;}">登录后自动展开</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

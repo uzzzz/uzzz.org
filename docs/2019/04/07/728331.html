@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>hadoop之数据分片（split）详解以及map数量控制 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="hadoop之数据分片（split）详解以及map数量控制" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1.分片（splits）相关概念 由InputFormat这个接口来定义的，其中有个getSplits方法。这里有一个新的概念：fileSplit。每个map处理一个fileSplit，所以有多少个fileSplit就有多少个map（map数并不是单纯的由用户设置决定的）。 我们来看一下hadoop分片splits的源码： long goalSize = totalSize / (numSplits == 0 ? 1 : numSplits); long minSize = Math.max(job.getLong(&quot;mapred.min.split.size&quot;, 1), minSplitSize); for (FileStatus file: files) { Path path = file.getPath(); FileSystem fs = path.getFileSystem(job); if ((length != 0) &amp;&amp; isSplitable(fs, path)) { long blockSize = file.getBlockSize(); long splitSize = computeSplitSize(goalSize, minSize, blockSize); long bytesRemaining = length; while (((double) bytesRemaining)/splitSize &gt; SPLIT_SLOP) { String[] splitHosts = getSplitHosts(blkLocations,length-bytesRemaining, splitSize, clusterMap); splits.add(new FileSplit(path, length-bytesRemaining, splitSize, splitHosts)); bytesRemaining -= splitSize; } if (bytesRemaining != 0) { splits.add(new FileSplit(path, length-bytesRemaining, bytesRemaining, blkLocations[blkLocations.length-1].getHosts())); } } else if (length != 0) { String[] splitHosts = getSplitHosts(blkLocations,0,length,clusterMap); splits.add(new FileSplit(path, 0, length, splitHosts)); } else { //Create empty hosts array for zero length files splits.add(new FileSplit(path, 0, length, new String[0])); } } return splits.toArray(new FileSplit[splits.size()]); protected long computeSplitSize(long goalSize, long minSize, long blockSize) { return Math.max(minSize, Math.min(goalSize, blockSize)); } totalSize：是整个Map-Reduce job所有输入的总大小。 numSplits：来自job.getNumMapTasks()，即在job启动时用org.apache.hadoop.mapred.JobConf.setNumMapTasks(int n)设置的值，给M-R框架的Map数量的提示。 goalSize：是输入总大小与提示Map task数量的比值，即期望每个Mapper处理多少的数据，仅仅是期望，具体处理的数据数由下面的computeSplitSize决定。 minSplitSize：默认为1，可由子类复写函数protected void setMinSplitSize(long minSplitSize) 重新设置。一般情况下，都为1，特殊情况除外。 minSize：取的1和mapred.min.split.size中较大的一个。 blockSize：HDFS的块大小，默认为64M，一般大的HDFS都设置成128M。 splitSize：就是最终每个Split的大小，那么Map的数量基本上就是totalSize/splitSize。 接下来看看computeSplitSize的逻辑：首先在goalSize（期望每个Mapper处理的数据量）和HDFS的block size中取较小的，然后与mapred.min.split.size相比取较大的。 2.分片的逻辑策略 一个片为一个splits，即一个map，只要搞清楚片的大小，就能计算出运行时的map数。而一个split的大小是由goalSize, minSize, blockSize这三个值决定的。computeSplitSize的逻辑是，先从goalSize和blockSize两个值中选出最小的那个（比如一般不设置map数，这时blockSize为当前文件的块size，而goalSize是文件大小除以用户设置的map数得到的，如果没设置的话，默认是1），在默认的大多数情况下，blockSize比较小。然后再取blockSize和minSize中最大的那个。而minSize如果不通过”mapred.min.split.size”设置的话（”mapred.min.split.size”默认为0），minSize为1，这样得出的一个splits的size就是blockSize，即一个块一个map，有多少块就有多少map。 input_file_num : 输入文件的个数 （1）默认map个数 如果不进行任何设置，默认的map个数是和blcok_size相关的。 default_num = total_size / block_size; （2）期望map数量 可以通过参数mapred.map.tasks来设置程序员期望的map个数，但是这个个数只有在大于default_num的时候，才会生效。 goal_num =mapred.map.tasks; （3）设置处理的文件大小 可以通过mapred.min.split.size 设置每个task处理的文件大小，但是这个大小只有在大于 block_size的时候才会生效。 split_size = max( mapred.min.split.size, block_size);split_num = total_size / split_size; （4）计算的map个数 compute_map_num = min(split_num, max(default_num, goal_num)) 除了这些配置以外，mapreduce还要遵循一些原则。 mapreduce的每一个map处理的数据是不能跨越文件的，也就是说max_map_num &lt;= input_file_num。 所以，最终的map个数应该为： final_map_num = min(compute_map_num, input_file_num) 经过以上的分析，在设置map个数的时候，可以简单的总结为以下几点： i）如果想增加map个数，则设置mapred.map.tasks 为一个较大的值。 ii）如果想减小map个数，则设置mapred.min.split.size 为一个较大的值。 3.Map数量优化调整方法 有了上述分析，如何调整map的数量就显而易见了。 减小Map-Reduce job 启动时创建的Mapper数量 当处理大批量的大数据时，一种常见的情况是job启动的mapper数量太多而超出了系统限制，导致Hadoop抛出异常终止执行。解决这种异常的思路是减少mapper的数量。具体如下： 输入文件size巨大，但不是小文件 这种情况可以通过增大每个mapper的input size，即增大minSize或者增大blockSize来减少所需的mapper的数量。增大blockSize通常不可行，因为当HDFS被hadoop namenode -format之后，blockSize就已经确定了（由格式化时dfs.block.size决定），如果要更改blockSize，需要重新格式化HDFS，这样当然会丢失已有的数据。所以通常情况下只能通过增大minSize，即增大mapred.min.split.size的值。 输入文件数量巨大，且都是小文件 所谓小文件，就是单个文件的size小于blockSize。这种情况通过增大mapred.min.split.size不可行，需要使用FileInputFormat衍生的CombineFileInputFormat将多个input path合并成一个InputSplit送给mapper处理，从而减少mapper的数量。 　　 增加Map-Reduce job 启动时创建的Mapper数量 增加mapper的数量，可以通过减小每个mapper的输入做到，即减小blockSize或者减小mapred.min.split.size的值。通常情况下都是通过减小minSize，即减小mapred.min.split.size的值。 注意: 1、若文件是压缩文件且压缩的格式并不支持文件分割（无法从文件任意地方读取文件），则该文件不管多大都是一个分片 2、map job数最终是由分片数决定，程序员只能给一个期望map数。" />
+<meta property="og:description" content="1.分片（splits）相关概念 由InputFormat这个接口来定义的，其中有个getSplits方法。这里有一个新的概念：fileSplit。每个map处理一个fileSplit，所以有多少个fileSplit就有多少个map（map数并不是单纯的由用户设置决定的）。 我们来看一下hadoop分片splits的源码： long goalSize = totalSize / (numSplits == 0 ? 1 : numSplits); long minSize = Math.max(job.getLong(&quot;mapred.min.split.size&quot;, 1), minSplitSize); for (FileStatus file: files) { Path path = file.getPath(); FileSystem fs = path.getFileSystem(job); if ((length != 0) &amp;&amp; isSplitable(fs, path)) { long blockSize = file.getBlockSize(); long splitSize = computeSplitSize(goalSize, minSize, blockSize); long bytesRemaining = length; while (((double) bytesRemaining)/splitSize &gt; SPLIT_SLOP) { String[] splitHosts = getSplitHosts(blkLocations,length-bytesRemaining, splitSize, clusterMap); splits.add(new FileSplit(path, length-bytesRemaining, splitSize, splitHosts)); bytesRemaining -= splitSize; } if (bytesRemaining != 0) { splits.add(new FileSplit(path, length-bytesRemaining, bytesRemaining, blkLocations[blkLocations.length-1].getHosts())); } } else if (length != 0) { String[] splitHosts = getSplitHosts(blkLocations,0,length,clusterMap); splits.add(new FileSplit(path, 0, length, splitHosts)); } else { //Create empty hosts array for zero length files splits.add(new FileSplit(path, 0, length, new String[0])); } } return splits.toArray(new FileSplit[splits.size()]); protected long computeSplitSize(long goalSize, long minSize, long blockSize) { return Math.max(minSize, Math.min(goalSize, blockSize)); } totalSize：是整个Map-Reduce job所有输入的总大小。 numSplits：来自job.getNumMapTasks()，即在job启动时用org.apache.hadoop.mapred.JobConf.setNumMapTasks(int n)设置的值，给M-R框架的Map数量的提示。 goalSize：是输入总大小与提示Map task数量的比值，即期望每个Mapper处理多少的数据，仅仅是期望，具体处理的数据数由下面的computeSplitSize决定。 minSplitSize：默认为1，可由子类复写函数protected void setMinSplitSize(long minSplitSize) 重新设置。一般情况下，都为1，特殊情况除外。 minSize：取的1和mapred.min.split.size中较大的一个。 blockSize：HDFS的块大小，默认为64M，一般大的HDFS都设置成128M。 splitSize：就是最终每个Split的大小，那么Map的数量基本上就是totalSize/splitSize。 接下来看看computeSplitSize的逻辑：首先在goalSize（期望每个Mapper处理的数据量）和HDFS的block size中取较小的，然后与mapred.min.split.size相比取较大的。 2.分片的逻辑策略 一个片为一个splits，即一个map，只要搞清楚片的大小，就能计算出运行时的map数。而一个split的大小是由goalSize, minSize, blockSize这三个值决定的。computeSplitSize的逻辑是，先从goalSize和blockSize两个值中选出最小的那个（比如一般不设置map数，这时blockSize为当前文件的块size，而goalSize是文件大小除以用户设置的map数得到的，如果没设置的话，默认是1），在默认的大多数情况下，blockSize比较小。然后再取blockSize和minSize中最大的那个。而minSize如果不通过”mapred.min.split.size”设置的话（”mapred.min.split.size”默认为0），minSize为1，这样得出的一个splits的size就是blockSize，即一个块一个map，有多少块就有多少map。 input_file_num : 输入文件的个数 （1）默认map个数 如果不进行任何设置，默认的map个数是和blcok_size相关的。 default_num = total_size / block_size; （2）期望map数量 可以通过参数mapred.map.tasks来设置程序员期望的map个数，但是这个个数只有在大于default_num的时候，才会生效。 goal_num =mapred.map.tasks; （3）设置处理的文件大小 可以通过mapred.min.split.size 设置每个task处理的文件大小，但是这个大小只有在大于 block_size的时候才会生效。 split_size = max( mapred.min.split.size, block_size);split_num = total_size / split_size; （4）计算的map个数 compute_map_num = min(split_num, max(default_num, goal_num)) 除了这些配置以外，mapreduce还要遵循一些原则。 mapreduce的每一个map处理的数据是不能跨越文件的，也就是说max_map_num &lt;= input_file_num。 所以，最终的map个数应该为： final_map_num = min(compute_map_num, input_file_num) 经过以上的分析，在设置map个数的时候，可以简单的总结为以下几点： i）如果想增加map个数，则设置mapred.map.tasks 为一个较大的值。 ii）如果想减小map个数，则设置mapred.min.split.size 为一个较大的值。 3.Map数量优化调整方法 有了上述分析，如何调整map的数量就显而易见了。 减小Map-Reduce job 启动时创建的Mapper数量 当处理大批量的大数据时，一种常见的情况是job启动的mapper数量太多而超出了系统限制，导致Hadoop抛出异常终止执行。解决这种异常的思路是减少mapper的数量。具体如下： 输入文件size巨大，但不是小文件 这种情况可以通过增大每个mapper的input size，即增大minSize或者增大blockSize来减少所需的mapper的数量。增大blockSize通常不可行，因为当HDFS被hadoop namenode -format之后，blockSize就已经确定了（由格式化时dfs.block.size决定），如果要更改blockSize，需要重新格式化HDFS，这样当然会丢失已有的数据。所以通常情况下只能通过增大minSize，即增大mapred.min.split.size的值。 输入文件数量巨大，且都是小文件 所谓小文件，就是单个文件的size小于blockSize。这种情况通过增大mapred.min.split.size不可行，需要使用FileInputFormat衍生的CombineFileInputFormat将多个input path合并成一个InputSplit送给mapper处理，从而减少mapper的数量。 　　 增加Map-Reduce job 启动时创建的Mapper数量 增加mapper的数量，可以通过减小每个mapper的输入做到，即减小blockSize或者减小mapred.min.split.size的值。通常情况下都是通过减小minSize，即减小mapred.min.split.size的值。 注意: 1、若文件是压缩文件且压缩的格式并不支持文件分割（无法从文件任意地方读取文件），则该文件不管多大都是一个分片 2、map job数最终是由分片数决定，程序员只能给一个期望map数。" />
+<link rel="canonical" href="https://uzzz.org/2019/04/07/728331.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/07/728331.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-07T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"1.分片（splits）相关概念 由InputFormat这个接口来定义的，其中有个getSplits方法。这里有一个新的概念：fileSplit。每个map处理一个fileSplit，所以有多少个fileSplit就有多少个map（map数并不是单纯的由用户设置决定的）。 我们来看一下hadoop分片splits的源码： long goalSize = totalSize / (numSplits == 0 ? 1 : numSplits); long minSize = Math.max(job.getLong(&quot;mapred.min.split.size&quot;, 1), minSplitSize); for (FileStatus file: files) { Path path = file.getPath(); FileSystem fs = path.getFileSystem(job); if ((length != 0) &amp;&amp; isSplitable(fs, path)) { long blockSize = file.getBlockSize(); long splitSize = computeSplitSize(goalSize, minSize, blockSize); long bytesRemaining = length; while (((double) bytesRemaining)/splitSize &gt; SPLIT_SLOP) { String[] splitHosts = getSplitHosts(blkLocations,length-bytesRemaining, splitSize, clusterMap); splits.add(new FileSplit(path, length-bytesRemaining, splitSize, splitHosts)); bytesRemaining -= splitSize; } if (bytesRemaining != 0) { splits.add(new FileSplit(path, length-bytesRemaining, bytesRemaining, blkLocations[blkLocations.length-1].getHosts())); } } else if (length != 0) { String[] splitHosts = getSplitHosts(blkLocations,0,length,clusterMap); splits.add(new FileSplit(path, 0, length, splitHosts)); } else { //Create empty hosts array for zero length files splits.add(new FileSplit(path, 0, length, new String[0])); } } return splits.toArray(new FileSplit[splits.size()]); protected long computeSplitSize(long goalSize, long minSize, long blockSize) { return Math.max(minSize, Math.min(goalSize, blockSize)); } totalSize：是整个Map-Reduce job所有输入的总大小。 numSplits：来自job.getNumMapTasks()，即在job启动时用org.apache.hadoop.mapred.JobConf.setNumMapTasks(int n)设置的值，给M-R框架的Map数量的提示。 goalSize：是输入总大小与提示Map task数量的比值，即期望每个Mapper处理多少的数据，仅仅是期望，具体处理的数据数由下面的computeSplitSize决定。 minSplitSize：默认为1，可由子类复写函数protected void setMinSplitSize(long minSplitSize) 重新设置。一般情况下，都为1，特殊情况除外。 minSize：取的1和mapred.min.split.size中较大的一个。 blockSize：HDFS的块大小，默认为64M，一般大的HDFS都设置成128M。 splitSize：就是最终每个Split的大小，那么Map的数量基本上就是totalSize/splitSize。 接下来看看computeSplitSize的逻辑：首先在goalSize（期望每个Mapper处理的数据量）和HDFS的block size中取较小的，然后与mapred.min.split.size相比取较大的。 2.分片的逻辑策略 一个片为一个splits，即一个map，只要搞清楚片的大小，就能计算出运行时的map数。而一个split的大小是由goalSize, minSize, blockSize这三个值决定的。computeSplitSize的逻辑是，先从goalSize和blockSize两个值中选出最小的那个（比如一般不设置map数，这时blockSize为当前文件的块size，而goalSize是文件大小除以用户设置的map数得到的，如果没设置的话，默认是1），在默认的大多数情况下，blockSize比较小。然后再取blockSize和minSize中最大的那个。而minSize如果不通过”mapred.min.split.size”设置的话（”mapred.min.split.size”默认为0），minSize为1，这样得出的一个splits的size就是blockSize，即一个块一个map，有多少块就有多少map。 input_file_num : 输入文件的个数 （1）默认map个数 如果不进行任何设置，默认的map个数是和blcok_size相关的。 default_num = total_size / block_size; （2）期望map数量 可以通过参数mapred.map.tasks来设置程序员期望的map个数，但是这个个数只有在大于default_num的时候，才会生效。 goal_num =mapred.map.tasks; （3）设置处理的文件大小 可以通过mapred.min.split.size 设置每个task处理的文件大小，但是这个大小只有在大于 block_size的时候才会生效。 split_size = max( mapred.min.split.size, block_size);split_num = total_size / split_size; （4）计算的map个数 compute_map_num = min(split_num, max(default_num, goal_num)) 除了这些配置以外，mapreduce还要遵循一些原则。 mapreduce的每一个map处理的数据是不能跨越文件的，也就是说max_map_num &lt;= input_file_num。 所以，最终的map个数应该为： final_map_num = min(compute_map_num, input_file_num) 经过以上的分析，在设置map个数的时候，可以简单的总结为以下几点： i）如果想增加map个数，则设置mapred.map.tasks 为一个较大的值。 ii）如果想减小map个数，则设置mapred.min.split.size 为一个较大的值。 3.Map数量优化调整方法 有了上述分析，如何调整map的数量就显而易见了。 减小Map-Reduce job 启动时创建的Mapper数量 当处理大批量的大数据时，一种常见的情况是job启动的mapper数量太多而超出了系统限制，导致Hadoop抛出异常终止执行。解决这种异常的思路是减少mapper的数量。具体如下： 输入文件size巨大，但不是小文件 这种情况可以通过增大每个mapper的input size，即增大minSize或者增大blockSize来减少所需的mapper的数量。增大blockSize通常不可行，因为当HDFS被hadoop namenode -format之后，blockSize就已经确定了（由格式化时dfs.block.size决定），如果要更改blockSize，需要重新格式化HDFS，这样当然会丢失已有的数据。所以通常情况下只能通过增大minSize，即增大mapred.min.split.size的值。 输入文件数量巨大，且都是小文件 所谓小文件，就是单个文件的size小于blockSize。这种情况通过增大mapred.min.split.size不可行，需要使用FileInputFormat衍生的CombineFileInputFormat将多个input path合并成一个InputSplit送给mapper处理，从而减少mapper的数量。 　　 增加Map-Reduce job 启动时创建的Mapper数量 增加mapper的数量，可以通过减小每个mapper的输入做到，即减小blockSize或者减小mapred.min.split.size的值。通常情况下都是通过减小minSize，即减小mapred.min.split.size的值。 注意: 1、若文件是压缩文件且压缩的格式并不支持文件分割（无法从文件任意地方读取文件），则该文件不管多大都是一个分片 2、map job数最终是由分片数决定，程序员只能给一个期望map数。","@type":"BlogPosting","url":"https://uzzz.org/2019/04/07/728331.html","headline":"hadoop之数据分片（split）详解以及map数量控制","dateModified":"2019-04-07T00:00:00+08:00","datePublished":"2019-04-07T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/07/728331.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>hadoop之数据分片（split）详解以及map数量控制</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-tomorrow-night-eighties"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h4><a id="1splits_0"></a>1.分片（splits）相关概念</h4> 
+  <p>由InputFormat这个接口来定义的，其中有个getSplits方法。这里有一个新的概念：fileSplit。每个map处理一个fileSplit，所以有多少个fileSplit就有多少个map（map数并不是单纯的由用户设置决定的）。<br> 我们来看一下hadoop分片splits的源码：</p> 
+  <pre><code class="prism language-java"><span class="token keyword">long</span> goalSize <span class="token operator">=</span> totalSize <span class="token operator">/</span> <span class="token punctuation">(</span>numSplits <span class="token operator">==</span> <span class="token number">0</span> <span class="token operator">?</span> <span class="token number">1</span> <span class="token operator">:</span> numSplits<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token keyword">long</span> minSize <span class="token operator">=</span> Math<span class="token punctuation">.</span><span class="token function">max</span><span class="token punctuation">(</span>job<span class="token punctuation">.</span><span class="token function">getLong</span><span class="token punctuation">(</span><span class="token string">"mapred.min.split.size"</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> minSplitSize<span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token keyword">for</span> <span class="token punctuation">(</span>FileStatus file<span class="token operator">:</span> files<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+  Path path <span class="token operator">=</span> file<span class="token punctuation">.</span><span class="token function">getPath</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  FileSystem fs <span class="token operator">=</span> path<span class="token punctuation">.</span><span class="token function">getFileSystem</span><span class="token punctuation">(</span>job<span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token keyword">if</span> <span class="token punctuation">(</span><span class="token punctuation">(</span>length <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token operator">&amp;&amp;</span> <span class="token function">isSplitable</span><span class="token punctuation">(</span>fs<span class="token punctuation">,</span> path<span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token punctuation">{</span> 
+    <span class="token keyword">long</span> blockSize <span class="token operator">=</span> file<span class="token punctuation">.</span><span class="token function">getBlockSize</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token keyword">long</span> splitSize <span class="token operator">=</span> <span class="token function">computeSplitSize</span><span class="token punctuation">(</span>goalSize<span class="token punctuation">,</span> minSize<span class="token punctuation">,</span> blockSize<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    
+    <span class="token keyword">long</span> bytesRemaining <span class="token operator">=</span> length<span class="token punctuation">;</span>
+    <span class="token keyword">while</span> <span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token punctuation">(</span><span class="token keyword">double</span><span class="token punctuation">)</span> bytesRemaining<span class="token punctuation">)</span><span class="token operator">/</span>splitSize <span class="token operator">&gt;</span> SPLIT_SLOP<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+      String<span class="token punctuation">[</span><span class="token punctuation">]</span> splitHosts <span class="token operator">=</span> <span class="token function">getSplitHosts</span><span class="token punctuation">(</span>blkLocations<span class="token punctuation">,</span>length<span class="token operator">-</span>bytesRemaining<span class="token punctuation">,</span> splitSize<span class="token punctuation">,</span> clusterMap<span class="token punctuation">)</span><span class="token punctuation">;</span>
+      splits<span class="token punctuation">.</span><span class="token function">add</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">FileSplit</span><span class="token punctuation">(</span>path<span class="token punctuation">,</span> length<span class="token operator">-</span>bytesRemaining<span class="token punctuation">,</span> splitSize<span class="token punctuation">,</span> splitHosts<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+      bytesRemaining <span class="token operator">-=</span> splitSize<span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+ 
+    <span class="token keyword">if</span> <span class="token punctuation">(</span>bytesRemaining <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+      splits<span class="token punctuation">.</span><span class="token function">add</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">FileSplit</span><span class="token punctuation">(</span>path<span class="token punctuation">,</span> length<span class="token operator">-</span>bytesRemaining<span class="token punctuation">,</span> bytesRemaining<span class="token punctuation">,</span> blkLocations<span class="token punctuation">[</span>blkLocations<span class="token punctuation">.</span>length<span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">]</span><span class="token punctuation">.</span><span class="token function">getHosts</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+    <span class="token punctuation">}</span>
+  <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token keyword">if</span> <span class="token punctuation">(</span>length <span class="token operator">!=</span> <span class="token number">0</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+    String<span class="token punctuation">[</span><span class="token punctuation">]</span> splitHosts <span class="token operator">=</span> <span class="token function">getSplitHosts</span><span class="token punctuation">(</span>blkLocations<span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">,</span>length<span class="token punctuation">,</span>clusterMap<span class="token punctuation">)</span><span class="token punctuation">;</span>
+    splits<span class="token punctuation">.</span><span class="token function">add</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">FileSplit</span><span class="token punctuation">(</span>path<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> length<span class="token punctuation">,</span> splitHosts<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span> <span class="token keyword">else</span> <span class="token punctuation">{</span> 
+    <span class="token comment">//Create empty hosts array for zero length files</span>
+    splits<span class="token punctuation">.</span><span class="token function">add</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">FileSplit</span><span class="token punctuation">(</span>path<span class="token punctuation">,</span> <span class="token number">0</span><span class="token punctuation">,</span> length<span class="token punctuation">,</span> <span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+ 
+<span class="token keyword">return</span> splits<span class="token punctuation">.</span><span class="token function">toArray</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">FileSplit</span><span class="token punctuation">[</span>splits<span class="token punctuation">.</span><span class="token function">size</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+ 
+<span class="token keyword">protected</span> <span class="token keyword">long</span> <span class="token function">computeSplitSize</span><span class="token punctuation">(</span><span class="token keyword">long</span> goalSize<span class="token punctuation">,</span> <span class="token keyword">long</span> minSize<span class="token punctuation">,</span> <span class="token keyword">long</span> blockSize<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+    <span class="token keyword">return</span> Math<span class="token punctuation">.</span><span class="token function">max</span><span class="token punctuation">(</span>minSize<span class="token punctuation">,</span> Math<span class="token punctuation">.</span><span class="token function">min</span><span class="token punctuation">(</span>goalSize<span class="token punctuation">,</span> blockSize<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+  <p><strong>totalSize</strong>：是整个Map-Reduce job所有输入的总大小。</p> 
+  <p><strong>numSplits</strong>：来自job.getNumMapTasks()，即在job启动时用org.apache.hadoop.mapred.JobConf.setNumMapTasks(int n)设置的值，给M-R框架的Map数量的提示。</p> 
+  <p><strong>goalSize</strong>：是输入总大小与提示Map task数量的比值，即期望每个Mapper处理多少的数据，仅仅是期望，具体处理的数据数由下面的computeSplitSize决定。</p> 
+  <p><strong>minSplitSize</strong>：默认为1，可由子类复写函数protected void setMinSplitSize(long minSplitSize) 重新设置。一般情况下，都为1，特殊情况除外。</p> 
+  <p><strong>minSize</strong>：取的1和mapred.min.split.size中较大的一个。</p> 
+  <p><strong>blockSize</strong>：HDFS的块大小，默认为64M，一般大的HDFS都设置成128M。</p> 
+  <p><strong>splitSize</strong>：就是最终每个Split的大小，那么Map的数量基本上就是totalSize/splitSize。</p> 
+  <p>接下来看看computeSplitSize的逻辑：首先在goalSize（期望每个Mapper处理的数据量）和HDFS的block size中取较小的，然后与mapred.min.split.size相比取较大的。</p> 
+  <h4><a id="2_54"></a>2.分片的逻辑策略</h4> 
+  <p>一个片为一个splits，即一个map，只要搞清楚片的大小，就能计算出运行时的map数。而一个split的大小是由goalSize, minSize, blockSize这三个值决定的。computeSplitSize的逻辑是，先从goalSize和blockSize两个值中选出最小的那个（比如一般不设置map数，这时blockSize为当前文件的块size，而goalSize是文件大小除以用户设置的map数得到的，如果没设置的话，默认是1），在默认的大多数情况下，blockSize比较小。然后再取blockSize和minSize中最大的那个。而minSize如果不通过”mapred.min.split.size”设置的话（”mapred.min.split.size”默认为0），minSize为1，这样得出的一个splits的size就是blockSize，即一个块一个map，有多少块就有多少map。</p> 
+  <p><strong>input_file_num</strong> : 输入文件的个数<br> （1）默认map个数<br> 如果不进行任何设置，默认的map个数是和blcok_size相关的。<br> <strong>default_num</strong> = total_size / block_size;<br> （2）期望map数量<br> 可以通过参数mapred.map.tasks来设置程序员期望的map个数，但是这个个数只有在大于default_num的时候，才会生效。<br> <strong>goal_num</strong> =mapred.map.tasks;<br> （3）设置处理的文件大小<br> 可以通过<strong>mapred.min.split.size</strong> 设置每个task处理的文件大小，但是这个大小只有在大于<br> block_size的时候才会生效。<br> <strong>split_size</strong> = max(<br> mapred.min.split.size,<br> block_size);split_num = total_size / split_size;<br> （4）计算的map个数<br> <strong>compute_map_num</strong> = min(split_num, max(default_num, goal_num))<br> 除了这些配置以外，mapreduce还要遵循一些原则。 mapreduce的每一个map处理的数据是不能跨越文件的，也就是说max_map_num &lt;= input_file_num。 所以，最终的map个数应该为：<br> <strong>final_map_num</strong> = min(compute_map_num, input_file_num)</p> 
+  <p><strong>经过以上的分析，在设置map个数的时候，可以简单的总结为以下几点：</strong><br> i）如果想增加map个数，则设置mapred.map.tasks 为一个较大的值。<br> ii）如果想减小map个数，则设置mapred.min.split.size 为一个较大的值。</p> 
+  <h4><a id="3Map_80"></a>3.Map数量优化调整方法</h4> 
+  <p>有了上述分析，如何调整map的数量就显而易见了。<br> <strong>减小Map-Reduce job 启动时创建的Mapper数量</strong><br> 当处理大批量的大数据时，一种常见的情况是job启动的mapper数量太多而超出了系统限制，导致Hadoop抛出异常终止执行。解决这种异常的思路是减少mapper的数量。具体如下：<br> <strong>输入文件size巨大，但不是小文件</strong><br> 这种情况可以通过增大每个mapper的input size，即增大minSize或者增大blockSize来减少所需的mapper的数量。增大blockSize通常不可行，因为当HDFS被hadoop namenode -format之后，blockSize就已经确定了（由格式化时dfs.block.size决定），如果要更改blockSize，需要重新格式化HDFS，这样当然会丢失已有的数据。所以通常情况下只能通过增大minSize，即增大mapred.min.split.size的值。<br> <strong>输入文件数量巨大，且都是小文件</strong><br> 所谓小文件，就是单个文件的size小于blockSize。这种情况通过增大mapred.min.split.size不可行，需要使用FileInputFormat衍生的CombineFileInputFormat将多个input path合并成一个InputSplit送给mapper处理，从而减少mapper的数量。<br> 　　<br> <strong>增加Map-Reduce job 启动时创建的Mapper数量</strong><br> 增加mapper的数量，可以通过减小每个mapper的输入做到，即减小blockSize或者减小mapred.min.split.size的值。通常情况下都是通过减小minSize，即减小mapred.min.split.size的值。</p> 
+  <p><font color="#FF0000"><strong>注意:</strong></font><br> 1、若文件是压缩文件且压缩的格式并不支持文件分割（无法从文件任意地方读取文件），则该文件不管多大都是一个分片<br> 2、map job数最终是由分片数决定，程序员只能给一个期望map数。</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

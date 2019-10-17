@@ -1,0 +1,1247 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析(23)core-state-process源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析(23)core-state-process源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="## StateTransition 状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;/* &nbsp;&nbsp;&nbsp;&nbsp;The State Transitioning Model &nbsp;&nbsp;&nbsp;&nbsp;状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;A state transition is a change made when a transaction is applied to the current world state &nbsp;&nbsp;&nbsp;&nbsp;状态转换 是指用当前的world state来执行交易，并改变当前的world state &nbsp;&nbsp;&nbsp;&nbsp;The state transitioning model does all all the necessary work to work out a valid new state root. &nbsp;&nbsp;&nbsp;&nbsp;状态转换做了所有所需的工作来产生一个新的有效的state root &nbsp;&nbsp;&nbsp;&nbsp;1) Nonce handling Nonce 处理 &nbsp;&nbsp;&nbsp;&nbsp;2) Pre pay gas 预先支付Gas &nbsp;&nbsp;&nbsp;&nbsp;3) Create a new state object if the recipient is \0*32 如果接收人是空，那么创建一个新的state object &nbsp;&nbsp;&nbsp;&nbsp;4) Value transfer 转账 &nbsp;&nbsp;&nbsp;&nbsp;== If contract creation == &nbsp;&nbsp;&nbsp;&nbsp; 4a) Attempt to run transaction data 尝试运行输入的数据 &nbsp;&nbsp;&nbsp;&nbsp; 4b) If valid, use result as code for the new state object 如果有效，那么用运行的结果作为新的state object的code &nbsp;&nbsp;&nbsp;&nbsp;== end == &nbsp;&nbsp;&nbsp;&nbsp;5) Run Script section 运行脚本部分 &nbsp;&nbsp;&nbsp;&nbsp;6) Derive new state root 导出新的state root &nbsp;&nbsp;&nbsp;&nbsp;*/ &nbsp;&nbsp;&nbsp;&nbsp;type StateTransition struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp *GasPool //用来追踪区块内部的Gas的使用情况 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg Message&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message Call &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// gas的价格 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 最开始的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 转账的值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data []byte&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 输入数据 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state vm.StateDB&nbsp;&nbsp;&nbsp;// StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm *vm.EVM&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 虚拟机 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Message represents a message sent to a contract. &nbsp;&nbsp;&nbsp;&nbsp;type Message interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;From() common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//FromFrontier() (common.Address, error) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;To() *common.Address&nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice() *big.Int // Message 的 GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas() *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//message 的 GasLimit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Value() *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nonce() uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CheckNonce() bool &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Data() []byte &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateTransition initialises and returns a new state transition object. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateTransition{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp: gp, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm: evm, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg: msg, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice: msg.GasPrice(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas: new(big.Int), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value: msg.Value(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data: msg.Data(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state: evm.StateDB, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} 执行Message &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage computes the new state by applying the given message &nbsp;&nbsp;&nbsp;&nbsp;// against the old state within the environment. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage 通过应用给定的Message 和状态来生成新的状态 &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage returns the bytes returned by any EVM execution (if it took place), &nbsp;&nbsp;&nbsp;&nbsp;// the gas used (which includes gas refunds) and an error if it failed. An error always &nbsp;&nbsp;&nbsp;&nbsp;// indicates a core error meaning that the message would always fail for that particular &nbsp;&nbsp;&nbsp;&nbsp;// state and would never be accepted within a block. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage返回由任何EVM执行（如果发生）返回的字节， &nbsp;&nbsp;&nbsp;&nbsp;// 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， &nbsp;&nbsp;&nbsp;&nbsp;// 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 &nbsp;&nbsp;&nbsp;&nbsp;func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, *big.Int, bool, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st := NewStateTransition(evm, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, gasUsed, failed, err := st.TransitionDb() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, gasUsed, failed, err &nbsp;&nbsp;&nbsp;&nbsp;} TransitionDb &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb will transition the state by applying the current message and returning the result &nbsp;&nbsp;&nbsp;&nbsp;// including the required gas for the operation as well as the used gas. It returns an error if it &nbsp;&nbsp;&nbsp;&nbsp;// failed. An error indicates a consensus issue. &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) TransitionDb() (ret []byte, requiredGas, usedGas *big.Int, failed bool, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.preCheck(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err checked in preCheck &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractCreation := msg.To() == nil // 如果msg.To是nil 那么认为是一个合约创建 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Pay intrinsic gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// TODO convert to uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 计算最开始的Gas g0 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;intrinsicGas := IntrinsicGas(st.data, contractCreation, homestead) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if intrinsicGas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.useGas(intrinsicGas.Uint64()); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm = st.evm &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// vm errors do not effect consensus and are therefor &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// not assigned to err, except for insufficient balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// error. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmerr error &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation { //如果是合约创建， 那么调用evm的Create方法 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Increment the nonce for the next transaction &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是方法调用。那么首先设置sender的nonce。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// The only possible consensus-error would be if there wasn&#39;t &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient balance to make the transfer happen. The first &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// balance transfer may never fail. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr == vm.ErrInsufficientBalance { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vmerr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;requiredGas = new(big.Int).Set(st.gasUsed()) // 计算被使用的Gas数量 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.refundGas() //计算Gas的退费 会增加到 st.gas上面。 所以矿工拿到的是退税后的 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(st.gasUsed(), st.gasPrice)) // 给矿工增加收入。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// requiredGas和gasUsed的区别一个是没有退税的， 一个是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 看上面的调用 ApplyMessage直接丢弃了requiredGas, 说明返回的是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, requiredGas, st.gasUsed(), vmerr != nil, err &nbsp;&nbsp;&nbsp;&nbsp;} 关于g0的计算，在黄皮书上由详细的介绍 和黄皮书有一定出入的部分在于if contractCreation &amp;&amp; homestead {igas.SetUint64(params.TxGasContractCreation) 这是因为 Gtxcreate+Gtransaction = TxGasContractCreation &nbsp;&nbsp;&nbsp;&nbsp;func IntrinsicGas(data []byte, contractCreation, homestead bool) *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas := new(big.Int) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation &amp;&amp; homestead { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGasContractCreation) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if len(data) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var nz int64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for _, byt := range data { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if byt != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nz++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m := big.NewInt(nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataNonZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.SetInt64(int64(len(data)) - nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return igas &nbsp;&nbsp;&nbsp;&nbsp;} 执行前的检查 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) preCheck() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure this transaction&#39;s nonce is correct &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.CheckNonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := st.state.GetNonce(sender.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前本地的nonce 需要和 msg的Nonce一样 不然就是状态不同步了。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if nonce &lt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooHigh &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else if nonce &gt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooLow &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return st.buyGas() &nbsp;&nbsp;&nbsp;&nbsp;} buyGas， 实现Gas的预扣费， 首先就扣除你的GasLimit * GasPrice的钱。 然后根据计算完的状态在退还一部分。 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) buyGas() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgas := st.msg.Gas() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if mgas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgval := new(big.Int).Mul(mgas, st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state = st.state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender = st.from() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if state.GetBalance(sender.Address()).Cmp(mgval) &lt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return errInsufficientBalanceForGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err := st.gp.SubGas(mgas); err != nil { // 从区块的gaspool里面减去， 因为区块是由GasLimit限制整个区块的Gas使用的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += mgas.Uint64() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.initialGas.Set(mgas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state.SubBalance(sender.Address(), mgval) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 从账号里面减去 GasLimit * GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 退税，退税是为了奖励大家运行一些能够减轻区块链负担的指令， 比如清空账户的storage. 或者是运行suicide命令来清空账号。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) refundGas() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Return eth for remaining gas to the sender account, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// exchanged at the original rate. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err already checked &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 首先把用户还剩下的Gas还回去。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), remaining) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply refund counter, capped to half of the used gas. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 然后退税的总金额不会超过用户Gas总使用的1/2。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;uhalf := remaining.Div(st.gasUsed(), common.Big2) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;refund := math.BigMin(uhalf, st.state.GetRefund()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += refund.Uint64() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把退税的金额加到用户账户上。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), refund.Mul(refund, st.gasPrice)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Also return remaining gas to the block gas counter so it is &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// available for the next transaction. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 同时也把退税的钱还给gaspool给下个交易腾点Gas空间。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gp.AddGas(new(big.Int).SetUint64(st.gas)) &nbsp;&nbsp;&nbsp;&nbsp;} ## StateProcessor StateTransition是用来处理一个一个的交易的。那么StateProcessor就是用来处理区块级别的交易的。 结构和构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor is a basic Processor, which takes care of transitioning &nbsp;&nbsp;&nbsp;&nbsp;// state from one point to another. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor implements Processor. &nbsp;&nbsp;&nbsp;&nbsp;type StateProcessor struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config *params.ChainConfig // Chain configuration options &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc *BlockChain // Canonical block chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine consensus.Engine // Consensus engine used for block rewards &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateProcessor initialises a new StateProcessor. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateProcessor(config *params.ChainConfig, bc *BlockChain, engine consensus.Engine) *StateProcessor { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateProcessor{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config: config, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc: bc, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine: engine, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} Process，这个方法会被blockchain调用。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Process processes the state changes according to the Ethereum rules by running &nbsp;&nbsp;&nbsp;&nbsp;// the transaction messages using the statedb and applying any rewards to both &nbsp;&nbsp;&nbsp;&nbsp;// the processor (coinbase) and any included uncles. &nbsp;&nbsp;&nbsp;&nbsp;// Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 &nbsp;&nbsp;&nbsp;&nbsp;// Process returns the receipts and logs accumulated during the process and &nbsp;&nbsp;&nbsp;&nbsp;// returns the amount of gas that was used in the process. If any of the &nbsp;&nbsp;&nbsp;&nbsp;// transactions failed to execute due to insufficient gas it will return an error. &nbsp;&nbsp;&nbsp;&nbsp;// Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 &nbsp;&nbsp;&nbsp;&nbsp;func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts types.Receipts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalUsedGas = big.NewInt(0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;header = block.Header() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs []*types.Log &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp = new(GasPool).AddGas(block.GasLimit()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Mutate the the block and state according to any hard-fork specs &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// DAO 事件的硬分叉处理 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if p.config.DAOForkSupport &amp;&amp; p.config.DAOForkBlock != nil &amp;&amp; p.config.DAOForkBlock.Cmp(block.Number()) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;misc.ApplyDAOHardFork(statedb) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Iterate over and process the individual transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Prepare(tx.Hash(), block.Hash(), i) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts = append(receipts, receipt) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs = append(allLogs, receipt.Logs...) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Finalize the block, applying any consensus engine specific extras (e.g. block rewards) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles(), receipts) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 返回收据 日志 总的Gas使用量和nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipts, allLogs, totalUsedGas, nil &nbsp;&nbsp;&nbsp;&nbsp;} ApplyTransaction &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyTransaction attempts to apply a transaction to the given state database &nbsp;&nbsp;&nbsp;&nbsp;// and uses the input parameters for its environment. It returns the receipt &nbsp;&nbsp;&nbsp;&nbsp;// for the transaction, gas used and an error if the transaction failed, &nbsp;&nbsp;&nbsp;&nbsp;// indicating the block was invalid. &nbsp;&nbsp;&nbsp;&nbsp;ApplyTransaction尝试将事务应用于给定的状态数据库，并使用其环境的输入参数。 &nbsp;&nbsp;&nbsp;&nbsp;//它返回事务的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *big.Int, cfg vm.Config) (*types.Receipt, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把交易转换成Message &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 这里如何验证消息确实是Sender发送的。 TODO &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new context to be used in the EVM environment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 每一个交易都创建了新的虚拟机环境。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;context := NewEVMContext(msg, header, bc, author) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new environment which holds all relevant information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// about the transaction and calling mechanisms. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmenv := vm.NewEVM(context, statedb, config, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply the transaction to the current state (included in the env) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_, gas, failed, err := ApplyMessage(vmenv, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Update the state with pending changes &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 求得中间状态 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var root []byte &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if config.IsByzantium(header.Number) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Finalise(true) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;usedGas.Add(usedGas, gas) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new receipt for the transaction, storing the intermediate root and gas used by the tx &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// based on the eip phase, we&#39;re passing wether the root touch-delete accounts. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt := types.NewReceipt(root, failed, usedGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.TxHash = tx.Hash() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.GasUsed = new(big.Int).Set(gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the transaction created a contract, store the creation address in the receipt. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是创建合约的交易.那么我们把创建地址存储到收据里面. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.To() == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Set the receipt logs and create a bloom for filtering &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Logs = statedb.GetLogs(tx.Hash()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 拿到所有的日志并创建日志的布隆过滤器. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipt, gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="## StateTransition 状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;/* &nbsp;&nbsp;&nbsp;&nbsp;The State Transitioning Model &nbsp;&nbsp;&nbsp;&nbsp;状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;A state transition is a change made when a transaction is applied to the current world state &nbsp;&nbsp;&nbsp;&nbsp;状态转换 是指用当前的world state来执行交易，并改变当前的world state &nbsp;&nbsp;&nbsp;&nbsp;The state transitioning model does all all the necessary work to work out a valid new state root. &nbsp;&nbsp;&nbsp;&nbsp;状态转换做了所有所需的工作来产生一个新的有效的state root &nbsp;&nbsp;&nbsp;&nbsp;1) Nonce handling Nonce 处理 &nbsp;&nbsp;&nbsp;&nbsp;2) Pre pay gas 预先支付Gas &nbsp;&nbsp;&nbsp;&nbsp;3) Create a new state object if the recipient is \0*32 如果接收人是空，那么创建一个新的state object &nbsp;&nbsp;&nbsp;&nbsp;4) Value transfer 转账 &nbsp;&nbsp;&nbsp;&nbsp;== If contract creation == &nbsp;&nbsp;&nbsp;&nbsp; 4a) Attempt to run transaction data 尝试运行输入的数据 &nbsp;&nbsp;&nbsp;&nbsp; 4b) If valid, use result as code for the new state object 如果有效，那么用运行的结果作为新的state object的code &nbsp;&nbsp;&nbsp;&nbsp;== end == &nbsp;&nbsp;&nbsp;&nbsp;5) Run Script section 运行脚本部分 &nbsp;&nbsp;&nbsp;&nbsp;6) Derive new state root 导出新的state root &nbsp;&nbsp;&nbsp;&nbsp;*/ &nbsp;&nbsp;&nbsp;&nbsp;type StateTransition struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp *GasPool //用来追踪区块内部的Gas的使用情况 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg Message&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message Call &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// gas的价格 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 最开始的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 转账的值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data []byte&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 输入数据 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state vm.StateDB&nbsp;&nbsp;&nbsp;// StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm *vm.EVM&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 虚拟机 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Message represents a message sent to a contract. &nbsp;&nbsp;&nbsp;&nbsp;type Message interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;From() common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//FromFrontier() (common.Address, error) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;To() *common.Address&nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice() *big.Int // Message 的 GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas() *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//message 的 GasLimit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Value() *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nonce() uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CheckNonce() bool &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Data() []byte &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateTransition initialises and returns a new state transition object. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateTransition{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp: gp, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm: evm, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg: msg, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice: msg.GasPrice(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas: new(big.Int), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value: msg.Value(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data: msg.Data(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state: evm.StateDB, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} 执行Message &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage computes the new state by applying the given message &nbsp;&nbsp;&nbsp;&nbsp;// against the old state within the environment. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage 通过应用给定的Message 和状态来生成新的状态 &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage returns the bytes returned by any EVM execution (if it took place), &nbsp;&nbsp;&nbsp;&nbsp;// the gas used (which includes gas refunds) and an error if it failed. An error always &nbsp;&nbsp;&nbsp;&nbsp;// indicates a core error meaning that the message would always fail for that particular &nbsp;&nbsp;&nbsp;&nbsp;// state and would never be accepted within a block. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage返回由任何EVM执行（如果发生）返回的字节， &nbsp;&nbsp;&nbsp;&nbsp;// 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， &nbsp;&nbsp;&nbsp;&nbsp;// 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 &nbsp;&nbsp;&nbsp;&nbsp;func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, *big.Int, bool, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st := NewStateTransition(evm, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, gasUsed, failed, err := st.TransitionDb() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, gasUsed, failed, err &nbsp;&nbsp;&nbsp;&nbsp;} TransitionDb &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb will transition the state by applying the current message and returning the result &nbsp;&nbsp;&nbsp;&nbsp;// including the required gas for the operation as well as the used gas. It returns an error if it &nbsp;&nbsp;&nbsp;&nbsp;// failed. An error indicates a consensus issue. &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) TransitionDb() (ret []byte, requiredGas, usedGas *big.Int, failed bool, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.preCheck(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err checked in preCheck &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractCreation := msg.To() == nil // 如果msg.To是nil 那么认为是一个合约创建 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Pay intrinsic gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// TODO convert to uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 计算最开始的Gas g0 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;intrinsicGas := IntrinsicGas(st.data, contractCreation, homestead) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if intrinsicGas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.useGas(intrinsicGas.Uint64()); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm = st.evm &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// vm errors do not effect consensus and are therefor &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// not assigned to err, except for insufficient balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// error. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmerr error &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation { //如果是合约创建， 那么调用evm的Create方法 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Increment the nonce for the next transaction &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是方法调用。那么首先设置sender的nonce。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// The only possible consensus-error would be if there wasn&#39;t &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient balance to make the transfer happen. The first &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// balance transfer may never fail. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr == vm.ErrInsufficientBalance { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vmerr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;requiredGas = new(big.Int).Set(st.gasUsed()) // 计算被使用的Gas数量 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.refundGas() //计算Gas的退费 会增加到 st.gas上面。 所以矿工拿到的是退税后的 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(st.gasUsed(), st.gasPrice)) // 给矿工增加收入。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// requiredGas和gasUsed的区别一个是没有退税的， 一个是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 看上面的调用 ApplyMessage直接丢弃了requiredGas, 说明返回的是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, requiredGas, st.gasUsed(), vmerr != nil, err &nbsp;&nbsp;&nbsp;&nbsp;} 关于g0的计算，在黄皮书上由详细的介绍 和黄皮书有一定出入的部分在于if contractCreation &amp;&amp; homestead {igas.SetUint64(params.TxGasContractCreation) 这是因为 Gtxcreate+Gtransaction = TxGasContractCreation &nbsp;&nbsp;&nbsp;&nbsp;func IntrinsicGas(data []byte, contractCreation, homestead bool) *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas := new(big.Int) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation &amp;&amp; homestead { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGasContractCreation) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if len(data) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var nz int64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for _, byt := range data { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if byt != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nz++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m := big.NewInt(nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataNonZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.SetInt64(int64(len(data)) - nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return igas &nbsp;&nbsp;&nbsp;&nbsp;} 执行前的检查 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) preCheck() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure this transaction&#39;s nonce is correct &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.CheckNonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := st.state.GetNonce(sender.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前本地的nonce 需要和 msg的Nonce一样 不然就是状态不同步了。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if nonce &lt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooHigh &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else if nonce &gt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooLow &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return st.buyGas() &nbsp;&nbsp;&nbsp;&nbsp;} buyGas， 实现Gas的预扣费， 首先就扣除你的GasLimit * GasPrice的钱。 然后根据计算完的状态在退还一部分。 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) buyGas() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgas := st.msg.Gas() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if mgas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgval := new(big.Int).Mul(mgas, st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state = st.state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender = st.from() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if state.GetBalance(sender.Address()).Cmp(mgval) &lt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return errInsufficientBalanceForGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err := st.gp.SubGas(mgas); err != nil { // 从区块的gaspool里面减去， 因为区块是由GasLimit限制整个区块的Gas使用的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += mgas.Uint64() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.initialGas.Set(mgas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state.SubBalance(sender.Address(), mgval) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 从账号里面减去 GasLimit * GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 退税，退税是为了奖励大家运行一些能够减轻区块链负担的指令， 比如清空账户的storage. 或者是运行suicide命令来清空账号。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) refundGas() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Return eth for remaining gas to the sender account, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// exchanged at the original rate. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err already checked &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 首先把用户还剩下的Gas还回去。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), remaining) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply refund counter, capped to half of the used gas. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 然后退税的总金额不会超过用户Gas总使用的1/2。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;uhalf := remaining.Div(st.gasUsed(), common.Big2) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;refund := math.BigMin(uhalf, st.state.GetRefund()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += refund.Uint64() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把退税的金额加到用户账户上。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), refund.Mul(refund, st.gasPrice)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Also return remaining gas to the block gas counter so it is &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// available for the next transaction. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 同时也把退税的钱还给gaspool给下个交易腾点Gas空间。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gp.AddGas(new(big.Int).SetUint64(st.gas)) &nbsp;&nbsp;&nbsp;&nbsp;} ## StateProcessor StateTransition是用来处理一个一个的交易的。那么StateProcessor就是用来处理区块级别的交易的。 结构和构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor is a basic Processor, which takes care of transitioning &nbsp;&nbsp;&nbsp;&nbsp;// state from one point to another. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor implements Processor. &nbsp;&nbsp;&nbsp;&nbsp;type StateProcessor struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config *params.ChainConfig // Chain configuration options &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc *BlockChain // Canonical block chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine consensus.Engine // Consensus engine used for block rewards &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateProcessor initialises a new StateProcessor. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateProcessor(config *params.ChainConfig, bc *BlockChain, engine consensus.Engine) *StateProcessor { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateProcessor{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config: config, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc: bc, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine: engine, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} Process，这个方法会被blockchain调用。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Process processes the state changes according to the Ethereum rules by running &nbsp;&nbsp;&nbsp;&nbsp;// the transaction messages using the statedb and applying any rewards to both &nbsp;&nbsp;&nbsp;&nbsp;// the processor (coinbase) and any included uncles. &nbsp;&nbsp;&nbsp;&nbsp;// Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 &nbsp;&nbsp;&nbsp;&nbsp;// Process returns the receipts and logs accumulated during the process and &nbsp;&nbsp;&nbsp;&nbsp;// returns the amount of gas that was used in the process. If any of the &nbsp;&nbsp;&nbsp;&nbsp;// transactions failed to execute due to insufficient gas it will return an error. &nbsp;&nbsp;&nbsp;&nbsp;// Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 &nbsp;&nbsp;&nbsp;&nbsp;func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts types.Receipts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalUsedGas = big.NewInt(0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;header = block.Header() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs []*types.Log &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp = new(GasPool).AddGas(block.GasLimit()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Mutate the the block and state according to any hard-fork specs &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// DAO 事件的硬分叉处理 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if p.config.DAOForkSupport &amp;&amp; p.config.DAOForkBlock != nil &amp;&amp; p.config.DAOForkBlock.Cmp(block.Number()) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;misc.ApplyDAOHardFork(statedb) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Iterate over and process the individual transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Prepare(tx.Hash(), block.Hash(), i) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts = append(receipts, receipt) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs = append(allLogs, receipt.Logs...) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Finalize the block, applying any consensus engine specific extras (e.g. block rewards) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles(), receipts) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 返回收据 日志 总的Gas使用量和nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipts, allLogs, totalUsedGas, nil &nbsp;&nbsp;&nbsp;&nbsp;} ApplyTransaction &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyTransaction attempts to apply a transaction to the given state database &nbsp;&nbsp;&nbsp;&nbsp;// and uses the input parameters for its environment. It returns the receipt &nbsp;&nbsp;&nbsp;&nbsp;// for the transaction, gas used and an error if the transaction failed, &nbsp;&nbsp;&nbsp;&nbsp;// indicating the block was invalid. &nbsp;&nbsp;&nbsp;&nbsp;ApplyTransaction尝试将事务应用于给定的状态数据库，并使用其环境的输入参数。 &nbsp;&nbsp;&nbsp;&nbsp;//它返回事务的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *big.Int, cfg vm.Config) (*types.Receipt, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把交易转换成Message &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 这里如何验证消息确实是Sender发送的。 TODO &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new context to be used in the EVM environment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 每一个交易都创建了新的虚拟机环境。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;context := NewEVMContext(msg, header, bc, author) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new environment which holds all relevant information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// about the transaction and calling mechanisms. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmenv := vm.NewEVM(context, statedb, config, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply the transaction to the current state (included in the env) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_, gas, failed, err := ApplyMessage(vmenv, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Update the state with pending changes &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 求得中间状态 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var root []byte &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if config.IsByzantium(header.Number) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Finalise(true) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;usedGas.Add(usedGas, gas) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new receipt for the transaction, storing the intermediate root and gas used by the tx &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// based on the eip phase, we&#39;re passing wether the root touch-delete accounts. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt := types.NewReceipt(root, failed, usedGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.TxHash = tx.Hash() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.GasUsed = new(big.Int).Set(gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the transaction created a contract, store the creation address in the receipt. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是创建合约的交易.那么我们把创建地址存储到收据里面. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.To() == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Set the receipt logs and create a bloom for filtering &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Logs = statedb.GetLogs(tx.Hash()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 拿到所有的日志并创建日志的布隆过滤器. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipt, gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/14/95cc81a505229e8d66e98c5f497f689c.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/14/95cc81a505229e8d66e98c5f497f689c.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-14T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"## StateTransition 状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;/* &nbsp;&nbsp;&nbsp;&nbsp;The State Transitioning Model &nbsp;&nbsp;&nbsp;&nbsp;状态转换模型 &nbsp;&nbsp;&nbsp;&nbsp;A state transition is a change made when a transaction is applied to the current world state &nbsp;&nbsp;&nbsp;&nbsp;状态转换 是指用当前的world state来执行交易，并改变当前的world state &nbsp;&nbsp;&nbsp;&nbsp;The state transitioning model does all all the necessary work to work out a valid new state root. &nbsp;&nbsp;&nbsp;&nbsp;状态转换做了所有所需的工作来产生一个新的有效的state root &nbsp;&nbsp;&nbsp;&nbsp;1) Nonce handling Nonce 处理 &nbsp;&nbsp;&nbsp;&nbsp;2) Pre pay gas 预先支付Gas &nbsp;&nbsp;&nbsp;&nbsp;3) Create a new state object if the recipient is \\0*32 如果接收人是空，那么创建一个新的state object &nbsp;&nbsp;&nbsp;&nbsp;4) Value transfer 转账 &nbsp;&nbsp;&nbsp;&nbsp;== If contract creation == &nbsp;&nbsp;&nbsp;&nbsp; 4a) Attempt to run transaction data 尝试运行输入的数据 &nbsp;&nbsp;&nbsp;&nbsp; 4b) If valid, use result as code for the new state object 如果有效，那么用运行的结果作为新的state object的code &nbsp;&nbsp;&nbsp;&nbsp;== end == &nbsp;&nbsp;&nbsp;&nbsp;5) Run Script section 运行脚本部分 &nbsp;&nbsp;&nbsp;&nbsp;6) Derive new state root 导出新的state root &nbsp;&nbsp;&nbsp;&nbsp;*/ &nbsp;&nbsp;&nbsp;&nbsp;type StateTransition struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp *GasPool //用来追踪区块内部的Gas的使用情况 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg Message&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message Call &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// gas的价格 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 最开始的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 转账的值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data []byte&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 输入数据 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state vm.StateDB&nbsp;&nbsp;&nbsp;// StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm *vm.EVM&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 虚拟机 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Message represents a message sent to a contract. &nbsp;&nbsp;&nbsp;&nbsp;type Message interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;From() common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//FromFrontier() (common.Address, error) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;To() *common.Address&nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice() *big.Int // Message 的 GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas() *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//message 的 GasLimit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Value() *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nonce() uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CheckNonce() bool &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Data() []byte &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateTransition initialises and returns a new state transition object. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateTransition{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp: gp, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm: evm, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg: msg, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice: msg.GasPrice(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas: new(big.Int), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value: msg.Value(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data: msg.Data(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state: evm.StateDB, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} 执行Message &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage computes the new state by applying the given message &nbsp;&nbsp;&nbsp;&nbsp;// against the old state within the environment. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage 通过应用给定的Message 和状态来生成新的状态 &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage returns the bytes returned by any EVM execution (if it took place), &nbsp;&nbsp;&nbsp;&nbsp;// the gas used (which includes gas refunds) and an error if it failed. An error always &nbsp;&nbsp;&nbsp;&nbsp;// indicates a core error meaning that the message would always fail for that particular &nbsp;&nbsp;&nbsp;&nbsp;// state and would never be accepted within a block. &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage返回由任何EVM执行（如果发生）返回的字节， &nbsp;&nbsp;&nbsp;&nbsp;// 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， &nbsp;&nbsp;&nbsp;&nbsp;// 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 &nbsp;&nbsp;&nbsp;&nbsp;func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, *big.Int, bool, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st := NewStateTransition(evm, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, gasUsed, failed, err := st.TransitionDb() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, gasUsed, failed, err &nbsp;&nbsp;&nbsp;&nbsp;} TransitionDb &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb will transition the state by applying the current message and returning the result &nbsp;&nbsp;&nbsp;&nbsp;// including the required gas for the operation as well as the used gas. It returns an error if it &nbsp;&nbsp;&nbsp;&nbsp;// failed. An error indicates a consensus issue. &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) TransitionDb() (ret []byte, requiredGas, usedGas *big.Int, failed bool, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.preCheck(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err checked in preCheck &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractCreation := msg.To() == nil // 如果msg.To是nil 那么认为是一个合约创建 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Pay intrinsic gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// TODO convert to uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 计算最开始的Gas g0 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;intrinsicGas := IntrinsicGas(st.data, contractCreation, homestead) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if intrinsicGas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.useGas(intrinsicGas.Uint64()); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm = st.evm &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// vm errors do not effect consensus and are therefor &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// not assigned to err, except for insufficient balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// error. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmerr error &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation { //如果是合约创建， 那么调用evm的Create方法 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Increment the nonce for the next transaction &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是方法调用。那么首先设置sender的nonce。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// The only possible consensus-error would be if there wasn&#39;t &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient balance to make the transfer happen. The first &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// balance transfer may never fail. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr == vm.ErrInsufficientBalance { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vmerr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;requiredGas = new(big.Int).Set(st.gasUsed()) // 计算被使用的Gas数量 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.refundGas() //计算Gas的退费 会增加到 st.gas上面。 所以矿工拿到的是退税后的 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(st.gasUsed(), st.gasPrice)) // 给矿工增加收入。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// requiredGas和gasUsed的区别一个是没有退税的， 一个是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 看上面的调用 ApplyMessage直接丢弃了requiredGas, 说明返回的是退税了的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, requiredGas, st.gasUsed(), vmerr != nil, err &nbsp;&nbsp;&nbsp;&nbsp;} 关于g0的计算，在黄皮书上由详细的介绍 和黄皮书有一定出入的部分在于if contractCreation &amp;&amp; homestead {igas.SetUint64(params.TxGasContractCreation) 这是因为 Gtxcreate+Gtransaction = TxGasContractCreation &nbsp;&nbsp;&nbsp;&nbsp;func IntrinsicGas(data []byte, contractCreation, homestead bool) *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas := new(big.Int) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation &amp;&amp; homestead { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGasContractCreation) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if len(data) &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var nz int64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for _, byt := range data { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if byt != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nz++ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m := big.NewInt(nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataNonZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.SetInt64(int64(len(data)) - nz) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataZeroGas)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return igas &nbsp;&nbsp;&nbsp;&nbsp;} 执行前的检查 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) preCheck() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure this transaction&#39;s nonce is correct &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.CheckNonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := st.state.GetNonce(sender.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前本地的nonce 需要和 msg的Nonce一样 不然就是状态不同步了。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if nonce &lt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooHigh &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else if nonce &gt; msg.Nonce() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooLow &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return st.buyGas() &nbsp;&nbsp;&nbsp;&nbsp;} buyGas， 实现Gas的预扣费， 首先就扣除你的GasLimit * GasPrice的钱。 然后根据计算完的状态在退还一部分。 &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) buyGas() error { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgas := st.msg.Gas() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if mgas.BitLen() &gt; 64 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return vm.ErrOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgval := new(big.Int).Mul(mgas, st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state = st.state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender = st.from() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if state.GetBalance(sender.Address()).Cmp(mgval) &lt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return errInsufficientBalanceForGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err := st.gp.SubGas(mgas); err != nil { // 从区块的gaspool里面减去， 因为区块是由GasLimit限制整个区块的Gas使用的。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += mgas.Uint64() &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.initialGas.Set(mgas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state.SubBalance(sender.Address(), mgval) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 从账号里面减去 GasLimit * GasPrice &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; 退税，退税是为了奖励大家运行一些能够减轻区块链负担的指令， 比如清空账户的storage. 或者是运行suicide命令来清空账号。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) refundGas() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Return eth for remaining gas to the sender account, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// exchanged at the original rate. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err already checked &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 首先把用户还剩下的Gas还回去。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), remaining) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply refund counter, capped to half of the used gas. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 然后退税的总金额不会超过用户Gas总使用的1/2。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;uhalf := remaining.Div(st.gasUsed(), common.Big2) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;refund := math.BigMin(uhalf, st.state.GetRefund()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += refund.Uint64() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把退税的金额加到用户账户上。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), refund.Mul(refund, st.gasPrice)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Also return remaining gas to the block gas counter so it is &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// available for the next transaction. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 同时也把退税的钱还给gaspool给下个交易腾点Gas空间。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gp.AddGas(new(big.Int).SetUint64(st.gas)) &nbsp;&nbsp;&nbsp;&nbsp;} ## StateProcessor StateTransition是用来处理一个一个的交易的。那么StateProcessor就是用来处理区块级别的交易的。 结构和构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor is a basic Processor, which takes care of transitioning &nbsp;&nbsp;&nbsp;&nbsp;// state from one point to another. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor implements Processor. &nbsp;&nbsp;&nbsp;&nbsp;type StateProcessor struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config *params.ChainConfig // Chain configuration options &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc *BlockChain // Canonical block chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine consensus.Engine // Consensus engine used for block rewards &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewStateProcessor initialises a new StateProcessor. &nbsp;&nbsp;&nbsp;&nbsp;func NewStateProcessor(config *params.ChainConfig, bc *BlockChain, engine consensus.Engine) *StateProcessor { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateProcessor{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config: config, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc: bc, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine: engine, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;} Process，这个方法会被blockchain调用。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Process processes the state changes according to the Ethereum rules by running &nbsp;&nbsp;&nbsp;&nbsp;// the transaction messages using the statedb and applying any rewards to both &nbsp;&nbsp;&nbsp;&nbsp;// the processor (coinbase) and any included uncles. &nbsp;&nbsp;&nbsp;&nbsp;// Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 &nbsp;&nbsp;&nbsp;&nbsp;// Process returns the receipts and logs accumulated during the process and &nbsp;&nbsp;&nbsp;&nbsp;// returns the amount of gas that was used in the process. If any of the &nbsp;&nbsp;&nbsp;&nbsp;// transactions failed to execute due to insufficient gas it will return an error. &nbsp;&nbsp;&nbsp;&nbsp;// Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 &nbsp;&nbsp;&nbsp;&nbsp;func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts types.Receipts &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalUsedGas = big.NewInt(0) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;header = block.Header() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs []*types.Log &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp = new(GasPool).AddGas(block.GasLimit()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Mutate the the block and state according to any hard-fork specs &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// DAO 事件的硬分叉处理 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if p.config.DAOForkSupport &amp;&amp; p.config.DAOForkBlock != nil &amp;&amp; p.config.DAOForkBlock.Cmp(block.Number()) == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;misc.ApplyDAOHardFork(statedb) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Iterate over and process the individual transactions &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Prepare(tx.Hash(), block.Hash(), i) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts = append(receipts, receipt) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs = append(allLogs, receipt.Logs...) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Finalize the block, applying any consensus engine specific extras (e.g. block rewards) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles(), receipts) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 返回收据 日志 总的Gas使用量和nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipts, allLogs, totalUsedGas, nil &nbsp;&nbsp;&nbsp;&nbsp;} ApplyTransaction &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ApplyTransaction attempts to apply a transaction to the given state database &nbsp;&nbsp;&nbsp;&nbsp;// and uses the input parameters for its environment. It returns the receipt &nbsp;&nbsp;&nbsp;&nbsp;// for the transaction, gas used and an error if the transaction failed, &nbsp;&nbsp;&nbsp;&nbsp;// indicating the block was invalid. &nbsp;&nbsp;&nbsp;&nbsp;ApplyTransaction尝试将事务应用于给定的状态数据库，并使用其环境的输入参数。 &nbsp;&nbsp;&nbsp;&nbsp;//它返回事务的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *big.Int, cfg vm.Config) (*types.Receipt, *big.Int, error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把交易转换成Message &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 这里如何验证消息确实是Sender发送的。 TODO &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new context to be used in the EVM environment &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 每一个交易都创建了新的虚拟机环境。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;context := NewEVMContext(msg, header, bc, author) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new environment which holds all relevant information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// about the transaction and calling mechanisms. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmenv := vm.NewEVM(context, statedb, config, cfg) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply the transaction to the current state (included in the env) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_, gas, failed, err := ApplyMessage(vmenv, msg, gp) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Update the state with pending changes &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 求得中间状态 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var root []byte &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if config.IsByzantium(header.Number) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Finalise(true) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;usedGas.Add(usedGas, gas) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new receipt for the transaction, storing the intermediate root and gas used by the tx &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// based on the eip phase, we&#39;re passing wether the root touch-delete accounts. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt := types.NewReceipt(root, failed, usedGas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.TxHash = tx.Hash() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.GasUsed = new(big.Int).Set(gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the transaction created a contract, store the creation address in the receipt. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是创建合约的交易.那么我们把创建地址存储到收据里面. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.To() == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Set the receipt logs and create a bloom for filtering &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Logs = statedb.GetLogs(tx.Hash()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 拿到所有的日志并创建日志的布隆过滤器. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipt, gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/14/95cc81a505229e8d66e98c5f497f689c.html","headline":"以太坊源码分析(23)core-state-process源码分析","dateModified":"2018-05-14T00:00:00+08:00","datePublished":"2018-05-14T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/14/95cc81a505229e8d66e98c5f497f689c.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析(23)core-state-process源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+   <div>
+    <span style="color:#569cd6;"><strong>## StateTransition</strong></span>
+   </div>
+   <div>
+    状态转换模型
+   </div>
+   <br>
+   <br>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;/*
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;The State Transitioning Model
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;状态转换模型
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;A state transition is a change made when a transaction is applied to the current world state
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;状态转换 是指用当前的world state来执行交易，并改变当前的world state
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;The state transitioning model does all all the necessary work to work out a valid new state root.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;状态转换做了所有所需的工作来产生一个新的有效的state root
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;1) Nonce handling Nonce 处理
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;2) Pre pay gas 预先支付Gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;3) Create a new state object if the recipient is \0*32 如果接收人是空，那么创建一个新的state object
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;4) Value transfer 转账
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;== If contract creation ==
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp; 4a) Attempt to run transaction data 尝试运行输入的数据
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp; 4b) If valid, use result as code for the new state object 如果有效，那么用运行的结果作为新的state object的code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;== end ==
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;5) Run Script section 运行脚本部分
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;6) Derive new state root 导出新的state root
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;*/
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type StateTransition struct {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp *GasPool //用来追踪区块内部的Gas的使用情况
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg Message&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message Call
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gas uint64
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// gas的价格
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 最开始的gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 转账的值
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data []byte&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 输入数据
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state vm.StateDB&nbsp;&nbsp;&nbsp;// StateDB
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm *vm.EVM&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 虚拟机
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Message represents a message sent to a contract.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type Message interface {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;From() common.Address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//FromFrontier() (common.Address, error)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;To() *common.Address&nbsp;&nbsp;&nbsp;&nbsp;// 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice() *big.Int // Message 的 GasPrice
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas() *big.Int&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//message 的 GasLimit
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Value() *big.Int
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nonce() uint64
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CheckNonce() bool
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Data() []byte
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    构造
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// NewStateTransition initialises and returns a new state transition object.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateTransition{
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp: gp,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm: evm,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg: msg,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gasPrice: msg.GasPrice(),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;initialGas: new(big.Int),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value: msg.Value(),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data: msg.Data(),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state: evm.StateDB,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    执行Message
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage computes the new state by applying the given message
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// against the old state within the environment.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage 通过应用给定的Message 和状态来生成新的状态
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage returns the bytes returned by any EVM execution (if it took place),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the gas used (which includes gas refunds) and an error if it failed. An error always
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// indicates a core error meaning that the message would always fail for that particular
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// state and would never be accepted within a block.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ApplyMessage返回由任何EVM执行（如果发生）返回的字节，
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误，
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, *big.Int, bool, error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st := NewStateTransition(evm, msg, gp)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, gasUsed, failed, err := st.TransitionDb()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, gasUsed, failed, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    TransitionDb
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb will transition the state by applying the current message and returning the result
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// including the required gas for the operation as well as the used gas. It returns an error if it
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// failed. An error indicates a consensus issue.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// TransitionDb 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) TransitionDb() (ret []byte, requiredGas, usedGas *big.Int, failed bool, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.preCheck(); err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err checked in preCheck
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractCreation := msg.To() == nil // 如果msg.To是nil 那么认为是一个合约创建
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Pay intrinsic gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// TODO convert to uint64
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 计算最开始的Gas g0
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;intrinsicGas := IntrinsicGas(st.data, contractCreation, homestead)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if intrinsicGas.BitLen() &gt; 64 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vm.ErrOutOfGas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err = st.useGas(intrinsicGas.Uint64()); err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm = st.evm
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// vm errors do not effect consensus and are therefor
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// not assigned to err, except for insufficient balance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// error.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmerr error
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation { //如果是合约创建， 那么调用evm的Create方法
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Increment the nonce for the next transaction
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是方法调用。那么首先设置sender的nonce。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log.Debug("VM returned with error", "err", vmerr)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// The only possible consensus-error would be if there wasn't
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient balance to make the transfer happen. The first
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// balance transfer may never fail.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if vmerr == vm.ErrInsufficientBalance {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, false, vmerr
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;requiredGas = new(big.Int).Set(st.gasUsed()) // 计算被使用的Gas数量
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.refundGas() //计算Gas的退费 会增加到 st.gas上面。 所以矿工拿到的是退税后的
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(st.gasUsed(), st.gasPrice)) // 给矿工增加收入。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// requiredGas和gasUsed的区别一个是没有退税的， 一个是退税了的。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 看上面的调用 ApplyMessage直接丢弃了requiredGas, 说明返回的是退税了的。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, requiredGas, st.gasUsed(), vmerr != nil, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    关于g0的计算，在黄皮书上由详细的介绍
+   </div>
+   <div>
+    和黄皮书有一定出入的部分在于if contractCreation &amp;&amp; homestead {igas.SetUint64(params.TxGasContractCreation) 这是因为 Gtxcreate+Gtransaction = TxGasContractCreation
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func IntrinsicGas(data []byte, contractCreation, homestead bool) *big.Int {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas := new(big.Int)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contractCreation &amp;&amp; homestead {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGasContractCreation)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.SetUint64(params.TxGas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if len(data) &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var nz int64
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for _, byt := range data {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if byt != 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nz++
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m := big.NewInt(nz)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataNonZeroGas))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.SetInt64(int64(len(data)) - nz)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;m.Mul(m, new(big.Int).SetUint64(params.TxDataZeroGas))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;igas.Add(igas, m)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return igas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    执行前的检查
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) preCheck() error {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg := st.msg
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure this transaction's nonce is correct
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.CheckNonce() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := st.state.GetNonce(sender.Address())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前本地的nonce 需要和 msg的Nonce一样 不然就是状态不同步了。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if nonce &lt; msg.Nonce() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooHigh
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else if nonce &gt; msg.Nonce() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ErrNonceTooLow
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return st.buyGas()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    buyGas， 实现Gas的预扣费， 首先就扣除你的GasLimit * GasPrice的钱。 然后根据计算完的状态在退还一部分。
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) buyGas() error {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgas := st.msg.Gas()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if mgas.BitLen() &gt; 64 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return vm.ErrOutOfGas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mgval := new(big.Int).Mul(mgas, st.gasPrice)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state = st.state
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender = st.from()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if state.GetBalance(sender.Address()).Cmp(mgval) &lt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return errInsufficientBalanceForGas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err := st.gp.SubGas(mgas); err != nil { // 从区块的gaspool里面减去， 因为区块是由GasLimit限制整个区块的Gas使用的。 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += mgas.Uint64()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.initialGas.Set(mgas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;state.SubBalance(sender.Address(), mgval)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 从账号里面减去 GasLimit * GasPrice
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <br>
+   <div>
+    退税，退税是为了奖励大家运行一些能够减轻区块链负担的指令， 比如清空账户的storage. 或者是运行suicide命令来清空账号。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (st *StateTransition) refundGas() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Return eth for remaining gas to the sender account,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// exchanged at the original rate.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;sender := st.from() // err already checked
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 首先把用户还剩下的Gas还回去。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), remaining)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply refund counter, capped to half of the used gas.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 然后退税的总金额不会超过用户Gas总使用的1/2。 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;uhalf := remaining.Div(st.gasUsed(), common.Big2)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;refund := math.BigMin(uhalf, st.state.GetRefund())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gas += refund.Uint64()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把退税的金额加到用户账户上。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.state.AddBalance(sender.Address(), refund.Mul(refund, st.gasPrice))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Also return remaining gas to the block gas counter so it is
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// available for the next transaction.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 同时也把退税的钱还给gaspool给下个交易腾点Gas空间。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;st.gp.AddGas(new(big.Int).SetUint64(st.gas))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>## StateProcessor</strong></span>
+   </div>
+   <div>
+    StateTransition是用来处理一个一个的交易的。那么StateProcessor就是用来处理区块级别的交易的。
+   </div>
+   <br>
+   <div>
+    结构和构造
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor is a basic Processor, which takes care of transitioning
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// state from one point to another.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;//
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// StateProcessor implements Processor.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type StateProcessor struct {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config *params.ChainConfig // Chain configuration options
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc *BlockChain // Canonical block chain
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine consensus.Engine // Consensus engine used for block rewards
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// NewStateProcessor initialises a new StateProcessor.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func NewStateProcessor(config *params.ChainConfig, bc *BlockChain, engine consensus.Engine) *StateProcessor {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return &amp;StateProcessor{
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;config: config,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bc: bc,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;engine: engine,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    Process，这个方法会被blockchain调用。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Process processes the state changes according to the Ethereum rules by running
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the transaction messages using the statedb and applying any rewards to both
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the processor (coinbase) and any included uncles.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Process returns the receipts and logs accumulated during the process and
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// returns the amount of gas that was used in the process. If any of the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// transactions failed to execute due to insufficient gas it will return an error.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, *big.Int, error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts types.Receipts
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;totalUsedGas = big.NewInt(0)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;header = block.Header()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs []*types.Log
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;gp = new(GasPool).AddGas(block.GasLimit())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Mutate the the block and state according to any hard-fork specs
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// DAO 事件的硬分叉处理 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if p.config.DAOForkSupport &amp;&amp; p.config.DAOForkBlock != nil &amp;&amp; p.config.DAOForkBlock.Cmp(block.Number()) == 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;misc.ApplyDAOHardFork(statedb)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Iterate over and process the individual transactions
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for i, tx := range block.Transactions() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Prepare(tx.Hash(), block.Hash(), i)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, totalUsedGas, cfg)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, nil, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipts = append(receipts, receipt)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;allLogs = append(allLogs, receipt.Logs...)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles(), receipts)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 返回收据 日志 总的Gas使用量和nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipts, allLogs, totalUsedGas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    ApplyTransaction
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ApplyTransaction attempts to apply a transaction to the given state database
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// and uses the input parameters for its environment. It returns the receipt
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// for the transaction, gas used and an error if the transaction failed,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// indicating the block was invalid.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;ApplyTransaction尝试将事务应用于给定的状态数据库，并使用其环境的输入参数。 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;//它返回事务的收据，使用的Gas和错误，如果交易失败，表明块是无效的。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *big.Int, cfg vm.Config) (*types.Receipt, *big.Int, error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 把交易转换成Message 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 这里如何验证消息确实是Sender发送的。 TODO
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new context to be used in the EVM environment
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 每一个交易都创建了新的虚拟机环境。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;context := NewEVMContext(msg, header, bc, author)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new environment which holds all relevant information
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// about the transaction and calling mechanisms.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmenv := vm.NewEVM(context, statedb, config, cfg)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Apply the transaction to the current state (included in the env)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, nil, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Update the state with pending changes
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 求得中间状态
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var root []byte
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if config.IsByzantium(header.Number) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;statedb.Finalise(true)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;usedGas.Add(usedGas, gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new receipt for the transaction, storing the intermediate root and gas used by the tx
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// based on the eip phase, we're passing wether the root touch-delete accounts.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt := types.NewReceipt(root, failed, usedGas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.TxHash = tx.Hash()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.GasUsed = new(big.Int).Set(gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the transaction created a contract, store the creation address in the receipt.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是创建合约的交易.那么我们把创建地址存储到收据里面.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if msg.To() == nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Set the receipt logs and create a bloom for filtering
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Logs = statedb.GetLogs(tx.Hash())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 拿到所有的日志并创建日志的布隆过滤器.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return receipt, gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <h2 style="font-family:Consolas, 'Courier New', monospace;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180430224554793?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br><br></h2>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">网址：http://www.qukuailianxueyuan.io/<br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">欲领取造币技术与全套虚拟机资料</p>
+   <p style="font-family:Consolas, 'Courier New', monospace;"><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);background-color:rgb(255,255,255);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">尹成学院微信：备注：CSDN</p>
+   <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+   <div>
+    <br>
+   </div>
+   <br>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80305188,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80305188,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

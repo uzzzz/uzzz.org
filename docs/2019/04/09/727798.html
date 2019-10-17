@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>【Lane Detection】车道线检测的简单实现 (OpenCV) | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="【Lane Detection】车道线检测的简单实现 (OpenCV)" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="目录 1 导入工具库，查看图片 2 图片灰度处理 3 Canny边缘检测 4 划定ROI 5 霍夫变换，直线检测 6 直线拟合，根据端点画出左右&nbsp;lane 7 Pipeline搭建 &amp;&nbsp;Video车道检测 利用OpenCV工具库，采用一些图像处理方法，实现车道线的简单检测。 用到的cv库函数： cv2.fillPoly()&nbsp;for regions selectioncv2.line()&nbsp;to draw lines on an image given endpointscv2.addWeighted()&nbsp;to coadd / overlay two imagescv2.cvtColor()&nbsp;to grayscale or change colorcv2.bitwise_and()&nbsp;to apply a mask to an image 思路： Grayscale将图片灰度化（方便后续的边缘检测） Canny Edge Detection边缘检测（Canny 边缘检测，检测出边缘像素点） Hough Transform 霍夫变换（检测边缘像素点的可能直线） Group Left and Right Lines 根据直线斜率将霍夫变换检测出的直线分组：left or right Fit and Draw 将左右两组的线分别拟合为一条线，并设定&nbsp;y_bottom 和y_top，根据拟合方程分别求出left和right的&nbsp;x_bottom和x_top，完成检测，左线：（left_x_bottom&nbsp;,y_bottom,left_x_top,y_top），右线：（right_x_bottom&nbsp;,y_bottom,right_x_top,y_top） 1 导入工具库，查看图片 import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 # reading in an image image = mpimg.imread(&#39;whiteCarLaneSwitch.jpg&#39;) # printing out some stats and plotting the image print(&#39;This image is:&#39;, type(image), &#39;with dimensions:&#39;, image.shape) plt.imshow(image) plt.show() 2 图片灰度处理 读入的图像是RGB格式，channel=3，后续进行边缘检测时只关注color的强度变化，对于color是什么并不会影响检测结果。所以先将图像灰度化，作为后续边缘检测的预处理。 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) gray_img=grayscale(image) plt.imshow(gray_img) 3 Canny边缘检测 边缘检测的目的，是检测出最类似边缘的像素点，其结果是一些pixels。这些pixels的特点是，像素值变化大，也就是梯度较大。Canny边缘检测基于x y方向的像素梯度来实现检测。 cv2.Canny(img,low_threshold,high_threshold): 大于 high_threshold: &nbsp;edge； 小于 low_threshold: &nbsp;not edge； 中间值（low_threshold，&nbsp;high_threshold）：若与edge相连，则认为是edge,不相连则 not edge def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) canny_img=canny(gray_img) plt.imshow(canny_img) 4 划定ROI 根据行车记录仪图像特点，我们将目标区域缩小为一个三角形（底边在bottom上，顶点大约在图像中心位置），划定该区域为ROI（Region of Interests），将其他区域里的目标进行遮挡（mask 掩膜操作）。 def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32)，match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image ROI_img=region_of_interest(canny_img) plt.imshow(ROI_img) 5 霍夫变换，直线检测 Canny 边缘检测结果，只是一些类似边缘的pixels，利用霍夫变换求出其中可能存在的直线。霍夫变换的原理：将该点映射到霍夫空间（r θ坐标系），该空间的每条线都代表过图像空间中一点的所有直线集合，求空间里线与线的交点，即为图像空间的过某几个点的直线。霍夫变换的结果是多条直线的坐标[ [x1,y1,x2,y2], [x x y y]...] 可以看到，霍夫变换的结果中线可能是不连续的，是由多条线组成的。 def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) plt.imshow(line_img) 6 直线拟合，根据端点画出左右&nbsp;lane Hough 变换的结果是不理想的，因为存在不连续性。所以可以根据这些线的斜率，将这些端点划分为左右两组。分别求出拟合直线，再根据设定的y_top和y_bottom，求出端点的x_top，x_bottom，完美解决！ 根据斜率划分左右组：原点在左上角，所以斜率大于0属于right，小于0属于left。绝对值小于0.5的直接舍去，减小噪声影响。 def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image final_image=group_lines_and_draw(image,lines) plt.imshow(final_image 没有过滤掉slope绝对值小于0.5的结果，在这幅图中影响不大 7 Pipeline搭建 &amp;&nbsp;Video车道检测 先把上述图片中车道检测的操作搭建 pipeline，利用moviepy工具库，读取video，对视频中的每一帧都执行上述图片操作。 （anaconda 安装时如果提示channel中没有相应工具，可以添加工具检索库：conda config --append channels conda-forge，检索更全面） &nbsp;搭建图片车道检测检测的pipeline（此处要返回图片，且图片的通道数和video里的一致） import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 def lane_img_pipeline(image): #import matplotlib.pyplot as plt #import matplotlib.image as mpimg #import numpy as np #import cv2 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) #if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image &quot;&quot;&quot; 函数调用并生成final image &quot;&quot;&quot; gray_img=grayscale(image) #plt.imshow(gray_img) canny_img=canny(gray_img) #plt.imshow(canny_img) ROI_img=region_of_interest(canny_img) #plt.imshow(ROI_img) lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) #plt.imshow(line_img) final_image=group_lines_and_draw(image,lines) #plt.imshow(final_image) return final_image Video 车道检测 #视频lane detection from moviepy.editor import VideoFileClip from IPython.display import HTML white_output=&#39;solidWhiteRight_output.mp4&#39; #output文件名 clip1=VideoFileClip(&#39;solidWhiteRight.mp4&#39;) #读入input video print(clip1.fps) #frames per second 25, 默认传给write white_clip=clip1.fl_image(lane_img_pipeline) #对每一帧都执行lane_img_pipeline函数，函数返回的是操作后的image white_clip.write_videofile(white_output,audio=False) #输出经过处理后的每一帧图片，audio=false,不输出音频 #ipython jupyter notebook网页显示video HTML(&quot;&quot;&quot; &lt;video width=&quot;960&quot; height=&quot;540&quot; controls&gt; &lt;source src=&quot;{0}&quot;&gt; &lt;/video&gt; &quot;&quot;&quot;.format(white_output)) 参考： Simple Lane Detection with&nbsp;OpenCV Udacity: Lane Finding Project for Self-Driving Car ND" />
+<meta property="og:description" content="目录 1 导入工具库，查看图片 2 图片灰度处理 3 Canny边缘检测 4 划定ROI 5 霍夫变换，直线检测 6 直线拟合，根据端点画出左右&nbsp;lane 7 Pipeline搭建 &amp;&nbsp;Video车道检测 利用OpenCV工具库，采用一些图像处理方法，实现车道线的简单检测。 用到的cv库函数： cv2.fillPoly()&nbsp;for regions selectioncv2.line()&nbsp;to draw lines on an image given endpointscv2.addWeighted()&nbsp;to coadd / overlay two imagescv2.cvtColor()&nbsp;to grayscale or change colorcv2.bitwise_and()&nbsp;to apply a mask to an image 思路： Grayscale将图片灰度化（方便后续的边缘检测） Canny Edge Detection边缘检测（Canny 边缘检测，检测出边缘像素点） Hough Transform 霍夫变换（检测边缘像素点的可能直线） Group Left and Right Lines 根据直线斜率将霍夫变换检测出的直线分组：left or right Fit and Draw 将左右两组的线分别拟合为一条线，并设定&nbsp;y_bottom 和y_top，根据拟合方程分别求出left和right的&nbsp;x_bottom和x_top，完成检测，左线：（left_x_bottom&nbsp;,y_bottom,left_x_top,y_top），右线：（right_x_bottom&nbsp;,y_bottom,right_x_top,y_top） 1 导入工具库，查看图片 import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 # reading in an image image = mpimg.imread(&#39;whiteCarLaneSwitch.jpg&#39;) # printing out some stats and plotting the image print(&#39;This image is:&#39;, type(image), &#39;with dimensions:&#39;, image.shape) plt.imshow(image) plt.show() 2 图片灰度处理 读入的图像是RGB格式，channel=3，后续进行边缘检测时只关注color的强度变化，对于color是什么并不会影响检测结果。所以先将图像灰度化，作为后续边缘检测的预处理。 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) gray_img=grayscale(image) plt.imshow(gray_img) 3 Canny边缘检测 边缘检测的目的，是检测出最类似边缘的像素点，其结果是一些pixels。这些pixels的特点是，像素值变化大，也就是梯度较大。Canny边缘检测基于x y方向的像素梯度来实现检测。 cv2.Canny(img,low_threshold,high_threshold): 大于 high_threshold: &nbsp;edge； 小于 low_threshold: &nbsp;not edge； 中间值（low_threshold，&nbsp;high_threshold）：若与edge相连，则认为是edge,不相连则 not edge def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) canny_img=canny(gray_img) plt.imshow(canny_img) 4 划定ROI 根据行车记录仪图像特点，我们将目标区域缩小为一个三角形（底边在bottom上，顶点大约在图像中心位置），划定该区域为ROI（Region of Interests），将其他区域里的目标进行遮挡（mask 掩膜操作）。 def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32)，match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image ROI_img=region_of_interest(canny_img) plt.imshow(ROI_img) 5 霍夫变换，直线检测 Canny 边缘检测结果，只是一些类似边缘的pixels，利用霍夫变换求出其中可能存在的直线。霍夫变换的原理：将该点映射到霍夫空间（r θ坐标系），该空间的每条线都代表过图像空间中一点的所有直线集合，求空间里线与线的交点，即为图像空间的过某几个点的直线。霍夫变换的结果是多条直线的坐标[ [x1,y1,x2,y2], [x x y y]...] 可以看到，霍夫变换的结果中线可能是不连续的，是由多条线组成的。 def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) plt.imshow(line_img) 6 直线拟合，根据端点画出左右&nbsp;lane Hough 变换的结果是不理想的，因为存在不连续性。所以可以根据这些线的斜率，将这些端点划分为左右两组。分别求出拟合直线，再根据设定的y_top和y_bottom，求出端点的x_top，x_bottom，完美解决！ 根据斜率划分左右组：原点在左上角，所以斜率大于0属于right，小于0属于left。绝对值小于0.5的直接舍去，减小噪声影响。 def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image final_image=group_lines_and_draw(image,lines) plt.imshow(final_image 没有过滤掉slope绝对值小于0.5的结果，在这幅图中影响不大 7 Pipeline搭建 &amp;&nbsp;Video车道检测 先把上述图片中车道检测的操作搭建 pipeline，利用moviepy工具库，读取video，对视频中的每一帧都执行上述图片操作。 （anaconda 安装时如果提示channel中没有相应工具，可以添加工具检索库：conda config --append channels conda-forge，检索更全面） &nbsp;搭建图片车道检测检测的pipeline（此处要返回图片，且图片的通道数和video里的一致） import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 def lane_img_pipeline(image): #import matplotlib.pyplot as plt #import matplotlib.image as mpimg #import numpy as np #import cv2 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) #if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image &quot;&quot;&quot; 函数调用并生成final image &quot;&quot;&quot; gray_img=grayscale(image) #plt.imshow(gray_img) canny_img=canny(gray_img) #plt.imshow(canny_img) ROI_img=region_of_interest(canny_img) #plt.imshow(ROI_img) lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) #plt.imshow(line_img) final_image=group_lines_and_draw(image,lines) #plt.imshow(final_image) return final_image Video 车道检测 #视频lane detection from moviepy.editor import VideoFileClip from IPython.display import HTML white_output=&#39;solidWhiteRight_output.mp4&#39; #output文件名 clip1=VideoFileClip(&#39;solidWhiteRight.mp4&#39;) #读入input video print(clip1.fps) #frames per second 25, 默认传给write white_clip=clip1.fl_image(lane_img_pipeline) #对每一帧都执行lane_img_pipeline函数，函数返回的是操作后的image white_clip.write_videofile(white_output,audio=False) #输出经过处理后的每一帧图片，audio=false,不输出音频 #ipython jupyter notebook网页显示video HTML(&quot;&quot;&quot; &lt;video width=&quot;960&quot; height=&quot;540&quot; controls&gt; &lt;source src=&quot;{0}&quot;&gt; &lt;/video&gt; &quot;&quot;&quot;.format(white_output)) 参考： Simple Lane Detection with&nbsp;OpenCV Udacity: Lane Finding Project for Self-Driving Car ND" />
+<link rel="canonical" href="https://uzzz.org/2019/04/09/727798.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/09/727798.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-09T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"目录 1 导入工具库，查看图片 2 图片灰度处理 3 Canny边缘检测 4 划定ROI 5 霍夫变换，直线检测 6 直线拟合，根据端点画出左右&nbsp;lane 7 Pipeline搭建 &amp;&nbsp;Video车道检测 利用OpenCV工具库，采用一些图像处理方法，实现车道线的简单检测。 用到的cv库函数： cv2.fillPoly()&nbsp;for regions selectioncv2.line()&nbsp;to draw lines on an image given endpointscv2.addWeighted()&nbsp;to coadd / overlay two imagescv2.cvtColor()&nbsp;to grayscale or change colorcv2.bitwise_and()&nbsp;to apply a mask to an image 思路： Grayscale将图片灰度化（方便后续的边缘检测） Canny Edge Detection边缘检测（Canny 边缘检测，检测出边缘像素点） Hough Transform 霍夫变换（检测边缘像素点的可能直线） Group Left and Right Lines 根据直线斜率将霍夫变换检测出的直线分组：left or right Fit and Draw 将左右两组的线分别拟合为一条线，并设定&nbsp;y_bottom 和y_top，根据拟合方程分别求出left和right的&nbsp;x_bottom和x_top，完成检测，左线：（left_x_bottom&nbsp;,y_bottom,left_x_top,y_top），右线：（right_x_bottom&nbsp;,y_bottom,right_x_top,y_top） 1 导入工具库，查看图片 import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 # reading in an image image = mpimg.imread(&#39;whiteCarLaneSwitch.jpg&#39;) # printing out some stats and plotting the image print(&#39;This image is:&#39;, type(image), &#39;with dimensions:&#39;, image.shape) plt.imshow(image) plt.show() 2 图片灰度处理 读入的图像是RGB格式，channel=3，后续进行边缘检测时只关注color的强度变化，对于color是什么并不会影响检测结果。所以先将图像灰度化，作为后续边缘检测的预处理。 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) gray_img=grayscale(image) plt.imshow(gray_img) 3 Canny边缘检测 边缘检测的目的，是检测出最类似边缘的像素点，其结果是一些pixels。这些pixels的特点是，像素值变化大，也就是梯度较大。Canny边缘检测基于x y方向的像素梯度来实现检测。 cv2.Canny(img,low_threshold,high_threshold): 大于 high_threshold: &nbsp;edge； 小于 low_threshold: &nbsp;not edge； 中间值（low_threshold，&nbsp;high_threshold）：若与edge相连，则认为是edge,不相连则 not edge def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) canny_img=canny(gray_img) plt.imshow(canny_img) 4 划定ROI 根据行车记录仪图像特点，我们将目标区域缩小为一个三角形（底边在bottom上，顶点大约在图像中心位置），划定该区域为ROI（Region of Interests），将其他区域里的目标进行遮挡（mask 掩膜操作）。 def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32)，match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image ROI_img=region_of_interest(canny_img) plt.imshow(ROI_img) 5 霍夫变换，直线检测 Canny 边缘检测结果，只是一些类似边缘的pixels，利用霍夫变换求出其中可能存在的直线。霍夫变换的原理：将该点映射到霍夫空间（r θ坐标系），该空间的每条线都代表过图像空间中一点的所有直线集合，求空间里线与线的交点，即为图像空间的过某几个点的直线。霍夫变换的结果是多条直线的坐标[ [x1,y1,x2,y2], [x x y y]...] 可以看到，霍夫变换的结果中线可能是不连续的，是由多条线组成的。 def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) plt.imshow(line_img) 6 直线拟合，根据端点画出左右&nbsp;lane Hough 变换的结果是不理想的，因为存在不连续性。所以可以根据这些线的斜率，将这些端点划分为左右两组。分别求出拟合直线，再根据设定的y_top和y_bottom，求出端点的x_top，x_bottom，完美解决！ 根据斜率划分左右组：原点在左上角，所以斜率大于0属于right，小于0属于left。绝对值小于0.5的直接舍去，减小噪声影响。 def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image final_image=group_lines_and_draw(image,lines) plt.imshow(final_image 没有过滤掉slope绝对值小于0.5的结果，在这幅图中影响不大 7 Pipeline搭建 &amp;&nbsp;Video车道检测 先把上述图片中车道检测的操作搭建 pipeline，利用moviepy工具库，读取video，对视频中的每一帧都执行上述图片操作。 （anaconda 安装时如果提示channel中没有相应工具，可以添加工具检索库：conda config --append channels conda-forge，检索更全面） &nbsp;搭建图片车道检测检测的pipeline（此处要返回图片，且图片的通道数和video里的一致） import matplotlib.pyplot as plt import matplotlib.image as mpimg import numpy as np import cv2 def lane_img_pipeline(image): #import matplotlib.pyplot as plt #import matplotlib.image as mpimg #import numpy as np #import cv2 def grayscale(img): &quot;&quot;&quot; 将图像灰度化，作为后续边缘检测的预处理 &quot;&quot;&quot; return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY) def canny(img,low_threshold=100,high_threshold=200): &quot;&quot;&quot; input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度 边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素 &gt;high_threshold: edge &lt;low_threshold:not edge 中间值：若与edge相连，则认为是edge,不相连则not edge &quot;&quot;&quot; return cv2.Canny(img,low_threshold,high_threshold) def region_of_interest(img): &quot;&quot;&quot; 分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡 &quot;&quot;&quot; #draw the polygon with three vertices height=img.shape[0] width=img.shape[1] region_of_interest_vertices = [ (0, height), (width / 2, height / 2), (width, height)] # Define a blank matrix that matches the image height/width. mask = np.zeros_like(img) # Retrieve the number of color channels of the image. #channel_count = img.shape[2] # Create a match color with the same color channel counts. #match_mask_color = (255,) * channel_count #彩色图像时的color match_mask_color = 255 # Fill inside the polygon #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)#多边形填充 cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color) #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零 masked_image = cv2.bitwise_and(img, mask) return masked_image def hough_lines(img,rho=6,theta=np.pi/180,threshold=160, min_line_len=40,max_line_gap=25): &quot;&quot;&quot; 将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片 hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线， 每条线代表个image space中过一点的所有线， lines的交点代表共线，找到交点再返回到image space空间 lines:[[x1,y1,x2,y2],[x x y y]...] &quot;&quot;&quot; lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), minLineLength=min_line_len, maxLineGap=max_line_gap) return lines def draw_lines(img,lines,color=[255,0,0],thickness=3): &quot;&quot;&quot; 生成一个zeros图划线，并与原图混合 &quot;&quot;&quot; if lines is None: return img=np.copy(img) #生成待划线的图,zeros，addweighted混合的时候，0值不会显示 img_channels=img.shape[2] line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8) for line in lines: for x1,y1,x2,y2 in line: cv2.line(line_img,(x1,y1),(x2,y2),color,thickness) #将划线图与原图合并 #cv2.addWeighted(initial_img, α, img, β , γ) #output: initial_img * α + img * β + γ img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致 return img def group_lines_and_draw(img,lines): &quot;&quot;&quot; 根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著） （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines) 设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线： 将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane &quot;&quot;&quot; left_x,left_y,right_x,right_y=[],[],[],[] for line in lines: for x1,y1,x2,y2 in line: slope=(y2-y1)/(x2-x1) #if abs(slope)&lt;0.5: continue if slope&lt;0: left_x.extend([x1,x2]) left_y.extend([y1,y2]) if slope&gt;0: right_x.extend([x1,x2]) right_y.extend([y1,y2]) #设定top 和 bottom的y值，left和right的y值都一样 min_y=int(img.shape[0]*(3/5)) max_y=int(img.shape[0]) #对left的所有点进行线性拟合 poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1)) left_x_start = int(poly_left(max_y)) left_x_end = int(poly_left(min_y)) #对right的所有点进行线性拟合 poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1)) right_x_start = int(poly_right(max_y)) right_x_end = int(poly_right(min_y)) line_image=draw_lines(img,[[ [left_x_start,max_y,left_x_end,min_y], [right_x_start,max_y,right_x_end,min_y], ]],thickness=5) return line_image &quot;&quot;&quot; 函数调用并生成final image &quot;&quot;&quot; gray_img=grayscale(image) #plt.imshow(gray_img) canny_img=canny(gray_img) #plt.imshow(canny_img) ROI_img=region_of_interest(canny_img) #plt.imshow(ROI_img) lines=hough_lines(ROI_img) line_img=draw_lines(image,lines) #plt.imshow(line_img) final_image=group_lines_and_draw(image,lines) #plt.imshow(final_image) return final_image Video 车道检测 #视频lane detection from moviepy.editor import VideoFileClip from IPython.display import HTML white_output=&#39;solidWhiteRight_output.mp4&#39; #output文件名 clip1=VideoFileClip(&#39;solidWhiteRight.mp4&#39;) #读入input video print(clip1.fps) #frames per second 25, 默认传给write white_clip=clip1.fl_image(lane_img_pipeline) #对每一帧都执行lane_img_pipeline函数，函数返回的是操作后的image white_clip.write_videofile(white_output,audio=False) #输出经过处理后的每一帧图片，audio=false,不输出音频 #ipython jupyter notebook网页显示video HTML(&quot;&quot;&quot; &lt;video width=&quot;960&quot; height=&quot;540&quot; controls&gt; &lt;source src=&quot;{0}&quot;&gt; &lt;/video&gt; &quot;&quot;&quot;.format(white_output)) 参考： Simple Lane Detection with&nbsp;OpenCV Udacity: Lane Finding Project for Self-Driving Car ND","@type":"BlogPosting","url":"https://uzzz.org/2019/04/09/727798.html","headline":"【Lane Detection】车道线检测的简单实现 (OpenCV)","dateModified":"2019-04-09T00:00:00+08:00","datePublished":"2019-04-09T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/09/727798.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>【Lane Detection】车道线检测的简单实现 (OpenCV)</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <p id="main-toc"><strong>目录</strong></p> 
+  <p id="1%20%E5%AF%BC%E5%85%A5%E5%B7%A5%E5%85%B7%E5%BA%93%EF%BC%8C%E6%9F%A5%E7%9C%8B%E5%9B%BE%E7%89%87-toc" style="margin-left:0px;"><a href="#1%20%E5%AF%BC%E5%85%A5%E5%B7%A5%E5%85%B7%E5%BA%93%EF%BC%8C%E6%9F%A5%E7%9C%8B%E5%9B%BE%E7%89%87" rel="nofollow">1 导入工具库，查看图片</a></p> 
+  <p style="margin-left:0px;"><a href="#2%20%E5%9B%BE%E7%89%87%E7%81%B0%E5%BA%A6%E5%A4%84%E7%90%86" rel="nofollow">2 图片灰度处理</a></p> 
+  <p id="3%20Canny%E8%BE%B9%E7%BC%98%E6%A3%80%E6%B5%8B-toc" style="margin-left:0px;"><a href="#3%20Canny%E8%BE%B9%E7%BC%98%E6%A3%80%E6%B5%8B" rel="nofollow">3 Canny边缘检测</a></p> 
+  <p id="4%20%E5%88%92%E5%AE%9AROI-toc" style="margin-left:0px;"><a href="#4%20%E5%88%92%E5%AE%9AROI" rel="nofollow">4 划定ROI</a></p> 
+  <p id="5%20%E9%9C%8D%E5%A4%AB%E5%8F%98%E6%8D%A2%EF%BC%8C%E7%9B%B4%E7%BA%BF%E6%A3%80%E6%B5%8B-toc" style="margin-left:0px;"><a href="#5%20%E9%9C%8D%E5%A4%AB%E5%8F%98%E6%8D%A2%EF%BC%8C%E7%9B%B4%E7%BA%BF%E6%A3%80%E6%B5%8B" rel="nofollow">5 霍夫变换，直线检测</a></p> 
+  <p id="6%20%E7%9B%B4%E7%BA%BF%E6%8B%9F%E5%90%88%EF%BC%8C%E6%A0%B9%E6%8D%AE%E7%AB%AF%E7%82%B9%E7%94%BB%E5%87%BA%E5%B7%A6%E5%8F%B3%C2%A0lane-toc" style="margin-left:0px;"><a href="#6%20%E7%9B%B4%E7%BA%BF%E6%8B%9F%E5%90%88%EF%BC%8C%E6%A0%B9%E6%8D%AE%E7%AB%AF%E7%82%B9%E7%94%BB%E5%87%BA%E5%B7%A6%E5%8F%B3%C2%A0lane" rel="nofollow">6 直线拟合，根据端点画出左右&nbsp;lane</a></p> 
+  <p id="7%20Video%E8%BD%A6%E9%81%93%E6%A3%80%E6%B5%8BPipeline%E6%90%AD%E5%BB%BA-toc" style="margin-left:0px;"><a href="#7%20Video%E8%BD%A6%E9%81%93%E6%A3%80%E6%B5%8BPipeline%E6%90%AD%E5%BB%BA" rel="nofollow">7 Pipeline搭建 &amp;&nbsp;Video车道检测</a></p> 
+  <hr id="hr-toc">
+  <blockquote> 
+   <p><strong>利用OpenCV工具库，采用一些图像处理方法，实现车道线的简单检测。</strong></p> 
+   <p>用到的<strong>cv库函数：</strong></p> 
+   <p><code><strong>cv2.fillPoly</strong>()</code>&nbsp;for regions selection<br><code><strong>cv2.line</strong>()</code>&nbsp;to draw lines on an image given endpoints<br><code><strong>cv2.addWeighted</strong>()</code>&nbsp;to coadd / overlay two images<br><code><strong>cv2.cvtColor</strong>()</code>&nbsp;to grayscale or change color<br><code><strong>cv2.bitwise_and</strong>()</code>&nbsp;to apply a mask to an image</p> 
+  </blockquote> 
+  <p>思路：</p> 
+  <ol>
+   <li>Grayscale将图片灰度化（方便后续的边缘检测）</li> 
+   <li>Canny Edge Detection边缘检测（Canny 边缘检测，检测出边缘像素点）</li> 
+   <li>Hough Transform 霍夫变换（检测边缘像素点的可能直线）</li> 
+   <li>Group Left and Right Lines 根据直线斜率将霍夫变换检测出的直线分组：left or right</li> 
+   <li>Fit and Draw 将左右两组的线分别拟合为一条线，并设定&nbsp;y_bottom 和y_top，根据拟合方程分别求出left和right的&nbsp;x_bottom和x_top，完成检测，左线：（left_x_bottom&nbsp;,y_bottom,left_x_top,y_top），右线：（right_x_bottom&nbsp;,y_bottom,right_x_top,y_top）</li> 
+  </ol>
+  <h1 id="1%20%E5%AF%BC%E5%85%A5%E5%B7%A5%E5%85%B7%E5%BA%93%EF%BC%8C%E6%9F%A5%E7%9C%8B%E5%9B%BE%E7%89%87">1 导入工具库，查看图片</h1> 
+  <pre class="has">
+<code class="hljs language-python">import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import numpy as np
+import cv2
+# reading in an image
+image = mpimg.imread('whiteCarLaneSwitch.jpg')
+# printing out some stats and plotting the image
+print('This image is:', type(image), 'with dimensions:', image.shape)
+plt.imshow(image)
+plt.show()</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="285" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409193207176.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="563"></p> 
+  <h2 id="2%20%E5%9B%BE%E7%89%87%E7%81%B0%E5%BA%A6%E5%A4%84%E7%90%86">2 图片灰度处理</h2> 
+  <blockquote> 
+   <p>读入的图像是RGB格式，channel=3，后续进行边缘检测时只关注color的强度变化，对于color是什么并不会影响检测结果。所以先将图像灰度化，作为后续边缘检测的预处理。</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="hljs">def grayscale(img):
+        """
+        将图像灰度化，作为后续边缘检测的预处理
+        """
+        return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY)
+gray_img=grayscale(image)
+plt.imshow(gray_img)</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="213" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409193609768.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="377"></p> 
+  <h1 id="3%20Canny%E8%BE%B9%E7%BC%98%E6%A3%80%E6%B5%8B">3 Canny边缘检测</h1> 
+  <blockquote> 
+   <p>边缘检测的目的，是检测出最类似边缘的像素点，其结果是一些pixels。这些pixels的特点是，像素值变化大，也就是梯度较大。Canny边缘检测基于x y方向的像素梯度来实现检测。</p> 
+  </blockquote> 
+  <blockquote> 
+   <p><strong>cv2.Canny(img,low_threshold,high_threshold)</strong>:</p> 
+   <p>大于 high_threshold: &nbsp;edge；<br> 小于 low_threshold: &nbsp;not edge；<br> 中间值（low_threshold，&nbsp;high_threshold）：若与edge相连，则认为是edge,不相连则 not edge</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="hljs">def canny(img,low_threshold=100,high_threshold=200):
+        """
+        input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度
+        边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素
+        &gt;high_threshold: edge
+        &lt;low_threshold:not edge
+        中间值：若与edge相连，则认为是edge,不相连则not edge
+        """
+        return cv2.Canny(img,low_threshold,high_threshold)
+canny_img=canny(gray_img)
+plt.imshow(canny_img)</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="213" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409194428498.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="378"></p> 
+  <h1 id="4%20%E5%88%92%E5%AE%9AROI">4 划定ROI</h1> 
+  <blockquote> 
+   <p>根据行车记录仪图像特点，我们将目标区域缩小为一个三角形（底边在bottom上，顶点大约在图像中心位置），划定该区域为ROI（Region of Interests），将其他区域里的目标进行遮挡（mask 掩膜操作）。</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="hljs language-python">def region_of_interest(img):
+        """
+        分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡
+        """
+        #draw the polygon with three vertices
+        height=img.shape[0]
+        width=img.shape[1]
+        region_of_interest_vertices = [
+        (0, height),
+        (width / 2, height / 2),
+        (width, height)]
+        # Define a blank matrix that matches the image height/width.
+        mask = np.zeros_like(img)
+        # Retrieve the number of color channels of the image.
+        #channel_count = img.shape[2]
+        # Create a match color with the same color channel counts.
+        #match_mask_color = (255,) * channel_count #彩色图像时的color
+        match_mask_color = 255
+        # Fill inside the polygon
+        #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32)，match_mask_color)#多边形填充
+        cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)
+        #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零
+        masked_image = cv2.bitwise_and(img, mask) 
+        return masked_image
+ROI_img=region_of_interest(canny_img)
+plt.imshow(ROI_img)</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="215" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409194852452.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="365"></p> 
+  <h1 id="5%20%E9%9C%8D%E5%A4%AB%E5%8F%98%E6%8D%A2%EF%BC%8C%E7%9B%B4%E7%BA%BF%E6%A3%80%E6%B5%8B">5 霍夫变换，直线检测</h1> 
+  <blockquote> 
+   <p>Canny 边缘检测结果，只是一些类似边缘的pixels，利用霍夫变换求出其中可能存在的直线。霍夫变换的原理：将该点映射到霍夫空间（r θ坐标系），该空间的每条线都代表过图像空间中一点的所有直线集合，求空间里线与线的交点，即为图像空间的过某几个点的直线。霍夫变换的结果是多条直线的坐标[ [x1,y1,x2,y2], [x x y y]...]</p> 
+   <p>可以看到，霍夫变换的结果中线可能是不连续的，是由多条线组成的。</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="hljs language-python">def hough_lines(img,rho=6,theta=np.pi/180,threshold=160,
+                    min_line_len=40,max_line_gap=25):
+        """
+        将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片
+        hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线，
+        每条线代表个image space中过一点的所有线，
+        lines的交点代表共线，找到交点再返回到image space空间
+        lines:[[x1,y1,x2,y2],[x x y y]...]
+        """
+        lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), 
+                              minLineLength=min_line_len, maxLineGap=max_line_gap)
+        return lines
+    
+def draw_lines(img,lines,color=[255,0,0],thickness=3):
+        """
+        生成一个zeros图划线，并与原图混合
+        """
+        if lines is None:
+            return
+        img=np.copy(img)
+        #生成待划线的图,zeros，addweighted混合的时候，0值不会显示
+        img_channels=img.shape[2]
+        line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8)
+        for line in lines:
+            for x1,y1,x2,y2 in line:
+                cv2.line(line_img,(x1,y1),(x2,y2),color,thickness)
+        #将划线图与原图合并
+        #cv2.addWeighted(initial_img, α, img, β , γ) 
+        #output: initial_img * α + img * β + γ
+        img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致
+        return img
+
+lines=hough_lines(ROI_img)
+line_img=draw_lines(image,lines)
+plt.imshow(line_img)</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="211" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409195823859.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="374"></p> 
+  <h1 id="6%20%E7%9B%B4%E7%BA%BF%E6%8B%9F%E5%90%88%EF%BC%8C%E6%A0%B9%E6%8D%AE%E7%AB%AF%E7%82%B9%E7%94%BB%E5%87%BA%E5%B7%A6%E5%8F%B3%C2%A0lane">6 直线拟合，根据端点画出左右&nbsp;lane</h1> 
+  <blockquote> 
+   <p>Hough 变换的结果是不理想的，因为存在不连续性。所以可以根据这些线的斜率，将这些端点划分为左右两组。分别求出拟合直线，再根据设定的y_top和y_bottom，求出端点的x_top，x_bottom，完美解决！</p> 
+   <p>根据斜率划分左右组：原点在左上角，所以斜率大于0属于right，小于0属于left。绝对值小于0.5的直接舍去，减小噪声影响。</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="hljs language-python">def group_lines_and_draw(img,lines):
+        """
+        根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著）
+        （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines)
+        设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线：
+        将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane
+        """
+        left_x,left_y,right_x,right_y=[],[],[],[]
+        for line in lines:
+            for x1,y1,x2,y2 in line:
+                slope=(y2-y1)/(x2-x1)
+                if abs(slope)&lt;0.5: continue
+                if slope&lt;0:
+                    left_x.extend([x1,x2])
+                    left_y.extend([y1,y2])
+                if slope&gt;0:
+                    right_x.extend([x1,x2])
+                    right_y.extend([y1,y2])
+        #设定top 和 bottom的y值，left和right的y值都一样
+        min_y=int(img.shape[0]*(3/5))
+        max_y=int(img.shape[0])
+        
+        #对left的所有点进行线性拟合
+        poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1))
+        left_x_start = int(poly_left(max_y))
+        left_x_end = int(poly_left(min_y))
+        #对right的所有点进行线性拟合
+        poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1))
+        right_x_start = int(poly_right(max_y))
+        right_x_end = int(poly_right(min_y))
+        
+        line_image=draw_lines(img,[[
+                [left_x_start,max_y,left_x_end,min_y],
+                [right_x_start,max_y,right_x_end,min_y],          
+                ]],thickness=5)
+        return line_image
+
+final_image=group_lines_and_draw(image,lines)
+plt.imshow(final_image</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="208" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409200730715.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="371"></p> 
+  <div style="text-align:center;"> 
+   <figure class="image has">
+    <img alt="" height="214" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409200910437.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3FxXzQzMjQzMDIy,size_16,color_FFFFFF,t_70" width="370">
+    <figcaption>
+     没有过滤掉slope绝对值小于0.5的结果，在这幅图中影响不大
+    </figcaption>
+   </figure>
+  </div> 
+  <h1 id="7%20Video%E8%BD%A6%E9%81%93%E6%A3%80%E6%B5%8BPipeline%E6%90%AD%E5%BB%BA">7 Pipeline搭建 &amp;&nbsp;Video车道检测</h1> 
+  <blockquote> 
+   <p>先把上述图片中车道检测的操作搭建 pipeline，利用moviepy工具库，读取video，对视频中的每一帧都执行上述图片操作。</p> 
+   <p>（anaconda 安装时如果提示channel中没有相应工具，可以添加工具检索库：conda config --append channels conda-forge，检索更全面）</p> 
+  </blockquote> 
+  <p><strong>&nbsp;搭建图片车道检测检测的pipeline（此处要返回图片，且图片的通道数和video里的一致）</strong></p> 
+  <pre class="has">
+<code class="hljs language-python">import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import numpy as np
+import cv2
+
+def lane_img_pipeline(image):
+    #import matplotlib.pyplot as plt
+    #import matplotlib.image as mpimg
+    #import numpy as np
+    #import cv2
+    def grayscale(img):
+        """
+        将图像灰度化，作为后续边缘检测的预处理
+        """
+        return cv2.cvtColor(img,cv2.COLOR_RGB2GRAY)
+    
+    def canny(img,low_threshold=100,high_threshold=200):
+        """
+        input是经过灰度处理的灰度图像，不关注颜色，只关注颜色强度
+        边缘检测，原理：计算颜色值的梯度和方向，找到梯度变化较大的像素
+        &gt;high_threshold: edge
+        &lt;low_threshold:not edge
+        中间值：若与edge相连，则认为是edge,不相连则not edge
+        """
+        return cv2.Canny(img,low_threshold,high_threshold)
+    
+    def region_of_interest(img):
+        """
+        分割出ROI，并填充，再对图像掩膜处理，将其他object遮挡
+        """
+        #draw the polygon with three vertices
+        height=img.shape[0]
+        width=img.shape[1]
+        region_of_interest_vertices = [
+        (0, height),
+        (width / 2, height / 2),
+        (width, height)]
+        # Define a blank matrix that matches the image height/width.
+        mask = np.zeros_like(img)
+        # Retrieve the number of color channels of the image.
+        #channel_count = img.shape[2]
+        # Create a match color with the same color channel counts.
+        #match_mask_color = (255,) * channel_count #彩色图像时的color
+        match_mask_color = 255
+        # Fill inside the polygon
+        #cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)#多边形填充
+        cv2.fillPoly(mask, np.array([region_of_interest_vertices],np.int32), match_mask_color)
+        #按位与操作，对图片进行mask淹膜操作，ROI区域正常显示，其他区域置零
+        masked_image = cv2.bitwise_and(img, mask) 
+        return masked_image
+    
+    def hough_lines(img,rho=6,theta=np.pi/180,threshold=160,
+                    min_line_len=40,max_line_gap=25):
+        """
+        将canny边缘检测后的像素点连接成线，并调用划线函数，返回画线的图片
+        hough transform原理：转换到 hough space,r,θ极坐标，正弦曲线，
+        每条线代表个image space中过一点的所有线，
+        lines的交点代表共线，找到交点再返回到image space空间
+        lines:[[x1,y1,x2,y2],[x x y y]...]
+        """
+        lines=cv2.HoughLinesP(img,rho,theta,threshold, np.array([]), 
+                              minLineLength=min_line_len, maxLineGap=max_line_gap)
+        return lines
+    
+    def draw_lines(img,lines,color=[255,0,0],thickness=3):
+        """
+        生成一个zeros图划线，并与原图混合
+        """
+        if lines is None:
+            return
+        img=np.copy(img)
+        #生成待划线的图,zeros，addweighted混合的时候，0值不会显示
+        img_channels=img.shape[2]
+        line_img=np.zeros((img.shape[0],img.shape[1],img_channels),dtype=np.uint8)
+        for line in lines:
+            for x1,y1,x2,y2 in line:
+                cv2.line(line_img,(x1,y1),(x2,y2),color,thickness)
+        #将划线图与原图合并
+        #cv2.addWeighted(initial_img, α, img, β , γ) 
+        #output: initial_img * α + img * β + γ
+        img=cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0) #叠加的两幅图片尺寸和channel需要一致
+        return img
+    
+    def group_lines_and_draw(img,lines):
+        """
+        根据斜率，将所有的线分为左右两组,斜率绝对值小于0.5的舍去（影响不显著）
+        （因为图像的原点在左上角，slope&lt;0是left lines，slope&gt;0是right lines)
+        设定min_y作为left和right的top线,max_y为bottom线，求出四个x值即可确定直线：
+        将left和right的点分别线性拟合，拟合方程根据y值，求出x值，画出lane
+        """
+        left_x,left_y,right_x,right_y=[],[],[],[]
+        for line in lines:
+            for x1,y1,x2,y2 in line:
+                slope=(y2-y1)/(x2-x1)
+                #if abs(slope)&lt;0.5: continue
+                if slope&lt;0:
+                    left_x.extend([x1,x2])
+                    left_y.extend([y1,y2])
+                if slope&gt;0:
+                    right_x.extend([x1,x2])
+                    right_y.extend([y1,y2])
+        #设定top 和 bottom的y值，left和right的y值都一样
+        min_y=int(img.shape[0]*(3/5))
+        max_y=int(img.shape[0])
+        
+        #对left的所有点进行线性拟合
+        poly_left = np.poly1d(np.polyfit(left_y,left_x,deg=1))
+        left_x_start = int(poly_left(max_y))
+        left_x_end = int(poly_left(min_y))
+        #对right的所有点进行线性拟合
+        poly_right = np.poly1d(np.polyfit(right_y,right_x,deg=1))
+        right_x_start = int(poly_right(max_y))
+        right_x_end = int(poly_right(min_y))
+        
+        line_image=draw_lines(img,[[
+                [left_x_start,max_y,left_x_end,min_y],
+                [right_x_start,max_y,right_x_end,min_y],          
+                ]],thickness=5)
+        return line_image
+    
+    """
+    函数调用并生成final image
+    """
+    gray_img=grayscale(image)
+    #plt.imshow(gray_img)
+    
+    canny_img=canny(gray_img)
+    #plt.imshow(canny_img)
+    ROI_img=region_of_interest(canny_img)
+    #plt.imshow(ROI_img)
+    
+    lines=hough_lines(ROI_img)
+    line_img=draw_lines(image,lines)
+    #plt.imshow(line_img)
+    
+    final_image=group_lines_and_draw(image,lines)
+    #plt.imshow(final_image)
+    
+    return final_image</code></pre> 
+  <p><strong>Video 车道检测</strong></p> 
+  <pre class="has">
+<code class="hljs language-python">#视频lane detection
+from moviepy.editor import VideoFileClip
+from IPython.display import HTML
+white_output='solidWhiteRight_output.mp4' #output文件名
+clip1=VideoFileClip('solidWhiteRight.mp4') #读入input video
+print(clip1.fps) #frames per second 25, 默认传给write
+white_clip=clip1.fl_image(lane_img_pipeline) #对每一帧都执行lane_img_pipeline函数，函数返回的是操作后的image
+white_clip.write_videofile(white_output,audio=False) #输出经过处理后的每一帧图片，audio=false,不输出音频
+
+#ipython jupyter notebook网页显示video
+HTML("""
+&lt;video width="960" height="540" controls&gt;
+  &lt;source src="{0}"&gt;
+&lt;/video&gt;
+""".format(white_output))</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="362" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190409202723648.gif" width="641"></p> 
+  <p>参考：</p> 
+  <p><a href="https://medium.com/@mrhwick/simple-lane-detection-with-opencv-bfeb6ae54ec0" rel="nofollow">Simple Lane Detection with&nbsp;OpenCV</a></p> 
+  <p><a href="https://github.com/udacity/CarND-LaneLines-P1" rel="nofollow">Udacity: Lane Finding Project for Self-Driving Car ND</a></p> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

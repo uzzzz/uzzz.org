@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊虚拟机(EVM)架构和源码简析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊虚拟机(EVM)架构和源码简析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="EVM架构简析和源码分析&nbsp; &nbsp; &nbsp; &nbsp;EVM为以太坊虚拟机。以太坊底层通过EVM模块支持智能合约的执行和调用，调用时根据合约的地址获 取到代码，生成具体的执行环境，然后将代码载入到EVM虚拟机中运行。通常目前开发智能合约的高级 语言为Solidity,在利用solidity实现智能合约逻辑后，通过编译器编译成元数据（字节码）最后发布到以 坊上。 EVM架构概述 EVM本质上是一个堆栈机器，它最直接的的功能是执行智能合约，根据官方给出的设计原理，EVM的主 要的设计目标为如下几点： 简单性 确定性 空间节省 为区块链服务 安全性保证 便于优化 针对以上几点通过对EVM源代码的阅读来了解其具体的设计思想和工程实用性。 EVM存储系统 机器位宽 &nbsp; &nbsp; &nbsp; &nbsp;EVM机器位宽为256位，即32个字节，256位机器字宽不同于我们经常见到主流的64位的机器 字宽，这就标明EVM设计上将考虑一套自己的关于操作，数据，逻辑控制的指令编码。目前主流的处理 器原生的支持的计算数据类型有：8bits整数，16bits整数，32bits整数，64bits整数。一般情况下宽字 节的计算将更加的快一些，因为它可能包含更多的指令被一次性加载到pc寄存器中，同时伴有内存访问 次数的减少。目前在X86的架构中8bits的计算并不是完全的支持（除法和乘法），但基本的数学运算大概 在几个时钟周期内就能完成，也就是说主流的字节宽度基本上处理器能够原生的支持，那为什么EVM要采 用256位的字宽。主要从以下两个方面考虑： 时间，智能合约是否能执行得更快 空间，这样是否整体字节码的大小会有所减少 gas成本 时间上主要体现在执行的效率上，我们以两个整形数相加来对比具体的操作时间消耗。32bits相加的X86 的汇编代码 mov eax, dword [9876ABCD] //将地址9876ABCD中的32位数据放入eax数据寄存器 add eax, dword [1234DCBA] //将1234DCBA地址指向32位数和eax相加,结果保存在eax中 64bits相加的X86汇编代码 mov rax, qword [123456789ABCDEF1] //将地址指向的64位数据放入64位寄存器 add rax, qword [1020304050607080] //计算相加的结果并将结果放入到64位寄存器中下面我们看一下在64bits机器上如何完成256bits的加法 mov rax, qword [9876ABCD] add qword [1234DCBA], rax mov rax, qword [9876ABCD+8] adc qword [1234DCBA+8], rax//这里应用adc带进位的加法指令，影响进位标记CF mov rax, qword [9876ABCD+16] adc qword [1234DCBA+16], rax mov rax, qword [9876ABCD+24] adc qword [1234DCBA+24], rax由上面的的汇编指令我们可以看出256位操作要比系统原生支持的要复杂的多，从时间上考虑采用 256位这样的字节宽度，实际的收益并不大。 空间上，由上面的汇编操作（在实际的EVM中操作类似）我们不难看到，如果直接对地址进行操 作似乎是一种快速的方式，并减少了操作数，进而操作码也有所减少，相应的智能合约的字节流 大小就会小很多，gas花费也会有所下降。但是从另外一个层面来讲，支持宽字节的数据类型势必 会造成在处理低字节宽度的数据时候带来存储上的浪费（如添加标识用来区分类型）或者添加额外 的操作来进行数据的compact。从时间和空间角度来看，仅支持256字节宽度的选择有利有弊，具 体还要看以太坊智能合约的具体应用。可能的几点原因如下: 256位的宽度方便进行密码学方面的计算（sha256），但是成本有些高，场景比较少 仅支持256位的比要支持其他类型的操作要少，单一，实现简单可控 和gas的计算相关，仅支持一种，方便计算，同时也考虑到了安全问题 内存分配 EVM中数据可以在三个地方进行存储，分别是栈，临时存储，永久存储。由于EVM是基于栈的虚拟机， 因此基本上所有的操作都是在栈上进行的，并且EVM中没有寄存器的概念,这样EVM对栈的依赖就更大， 虽然这样的设计使实现比较简单且易于理解，但是带来的问题就是需要更多数据的相关操作。在EVM 中栈是唯一的免费（几乎是）存放数据的地方。栈自然有深度的限制，目前的限制是1024 static constexpr int64_t stackLimit = 1024; 因为栈的限制，因此栈上的临时变量的使用会受限制。临时内存存储在每个VM实例中，并在合约执行完 后消失永久内存存储在区块链的状态层。 EVM代码简析本文分析EVM c++的代码， github地址为 https://github.com/ethereum/cpp-ethereum EVM c++实现了同go版本中的核心的功能，对于快速理解EVM的设计思想比较受用，对于熟悉C++的 可以先通过阅读C++版本的实现，然后对标go版本的实现来进一步了解EVM的设计思路。 EVM代码overview主要代码路径为cpp-ethereum/libevm和libethereum，代码量不大，以下为主要代码。 EVMC.cpp ExtVMFace.cpp Instruction.cpp interpreter.h LegacyVMCalls.cpp VM.cpp VMCalls.cpp VMFactory.cpp VMOpt.cpp VMSIMD.cpp VmValidate.cpp LegacyVM.cpp Executive.cpp ExtVm.cpp下图为EVM中主要类的类图: 以太坊中调用EVM相关代码的入口存在于不同的阶段，我们主要从以下几个角度来看它是如何运作的&lt;/br&gt; 执行环境创建 新合约的创建 合约执行调用、 执行后结果返回 运行过程中的gas消费 执行环境的创建以太坊虚拟中涉及到的虚拟机执行的关键类为 Executive（位于目录libethereum）中，我们先从 创建运行环境入手，关键入口函数call入手，函数声明为： bool call(Address const&amp; _receiveAddress, //接收者地址 Address const&amp; _txSender, //发送者地址 u256 const&amp; _txValue, //transaction的值 u256 const&amp; _gasPrice, //gas的价格 bytesConstRef _txData, //具体的transaction数据 u256 const&amp; _gas); //提供的gas值 bool call(CallParameters const&amp; _cp, //运行参数，由上个函数的相关变量创建 u256 const&amp; _gasPrice, //gas的价格 Address const&amp; _origin); //源地址 两个函数的功能是一样的，只是第一个函数会将参数包装成CallParameters然后在调用第二个函数,现在看 一下call函数的流程图如下： 上述函数的关键点在于在不是预编译合约（以太坊中内部定义好的合约多为签名计算），生成ExtVM 实例，这个对象将在函数go中返回重要的作用。注意函数最后会更改状态指向函数transferBalance: m_s.transferBalance(_p.senderAddress, _p.receiveAddress, _p.valueTransfer); 新合约的创建 如果调用的合约地址在系统中还没有出存在，这个适合涉及到合约的创建，关键函数为create: bool create(Address const&amp; _txSender, //目的地址 u256 const&amp; _endowment, //花费的值 u256 const&amp; _gasPrice, //gas的价钱 u256 const&amp; _gas, //花费的gas数量 bytesConstRef _init, //传入的字节码 Address const&amp; _origin) //源地址 函数将调用createOpcode函数，该函数在获得sender的nonce值后生成合约地址，并且调用函数 executeCreate来完成最后的创建。 u256 nonce = m_s.getNonce(_sender); //注意地址保存在m_newAddress中,这个是否足够灵活 m_newAddress = right160(sha3(rlpList(_sender, nonce))); return executeCreate(_sender, _endowment, _gasPrice, _gas, _init, _origin); 下面看关键的的函数executeCreate,其流程图如下所示: 我们从代码中不难看出，最后和call函数相同生成ExtVM对象，将要执行的字节码放入其中。 这里需要注意的是执行transferBalance时候如果没有账户将创建一个新的账户。 合约执行调用 合约的执行的起始点在函数Executive::go中，函数的流程图如下： 从流程图中我们看到如果m_ext（create或者call函数中创建）不为空的时候通过工厂方法创建VM， 这里要正确的理解m_ext和vm的区别，我们先看工厂方法的实现: std::unique_ptr&lt;VMFace&gt; VMFactory::create(VMKind _kind) { switch (_kind) { #ifdef ETH_EVMJIT case VMKind::JIT: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmjit_create()}); #endif #ifdef ETH_HERA case VMKind::Hera: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_hera()}); #endif case VMKind::Interpreter: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_interpreter()}); case VMKind::DLL: return std::unique_ptr&lt;VMFace&gt;(new EVMC{g_dllEvmcCreate()}); case VMKind::Legacy: default: return std::unique_ptr&lt;VMFace&gt;(new LegacyVM); } }从代码中我们不难看出，会根据虚拟机的类型创建对应的虚拟机对象，无参函数create将默认生成 类型为VMKind::Legacy。在函数create和call中生成的m_ext是虚拟机和外部相关状态进行交互的。 调用VM的exec函数完成虚拟机的执行。LegacyVM的exec函数关键代码如下: // trampoline to minimize depth of call stack when calling out m_bounce = &amp;LegacyVM::initEntry;//初始化m_bounce do (this-&gt;*m_bounce)(); while (m_bounce); 初始化m_bounce的函数使initEntry,我们看下initEntry函数中实现的功能。 m_bounce = &amp;LegacyVM::interpretCases;//设置m_bounce为函数interpreCases initMetrics();//初始化操作，参数和返回值，gas花费矩阵， optimize();//优化，主要针对跳转的优化，后续再做补充，目前程序汇总关闭 经过上面的代码处理，m_bounce设置为下一步将要运行的函数。初始化操作以及花费说明的矩阵， 矩阵关联的Instruction部分相关信息如下： static const std::map&lt;Instruction, InstructionInfo&gt; c_instructionInfo = { // Add, Args, Ret, GasPriceTier { Instruction::STOP, { &quot;STOP&quot;, 0, 0, 0, Tier::Zero } }, { Instruction::ADD, { &quot;ADD&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::SUB, { &quot;SUB&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::MUL, { &quot;MUL&quot;, 0, 2, 1, Tier::Low } }, { Instruction::DIV, { &quot;DIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::SDIV, { &quot;SDIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::MOD, { &quot;MOD&quot;, 0, 2, 1, Tier::Low } }, 经过上面的相关初始化，再运行循环将执行m_bounce指向的interpretCases函数。函数interpretCase 相对来说比较复杂一些，如下所示: void LegacyVM::interpretCases() { INIT_CASES DO_CASES { CASE(CREATE2) { ON_OP(); if (!m_schedule-&gt;haveCreate2) throwBadInstruction(); m_bounce = &amp;LegacyVM::caseCreate; } BREAK CASE(CREATE) ........ 此处省略很多的case ....... NEXT CASE(INVALID) DEFAULT { throwBadInstruction(); } } WHILE_CASES } 上述代码中对应了很多宏，，如果不对宏进行展开，直观理解就是对每种操作执行对应的函数，并将 结果进行中间存储，EVM中定义了相关宏开关，其中一些宏开关，都对应了上述代码中不同的 宏展开,同时对应了不同的代码组织形式。参见文件VMConfing.h,如下代码为相关的宏开关： EIP_615 - 子程序和静态跳转的方式 EIP_616 - 单执行多数据流的方式 EVM_OPTIMIZE - 优化开关，当值为false时，所有的优化全部关掉 EVM_SWITCH_DISPATCH - 通过loop和switch执行代码 EVM_JUMP_DISPATCH - 跳转通过一个跳表来实现，只针对gcc EVM_USE_CONSTANT_POOL - 应用静态数据并在栈上直接赋值操作 EVM_REPLACE_CONST_JUMP - 带预确认的跳转来保证运行时的循环 EVM_TRACE - 提供不同等级的trace操作 下面我们来看一下源代码中是如何设置这些宏开关 首先EIP_615和EIP_616均为关闭状态 #ifndef EIP_615 #define EIP_615 false #endif #ifndef EIP_616 #define EIP_616 false #endif //-------------------------------------------------------------------------- //如果没有定义EVM_JUMP_DISPATCH的情况下,如果是GNU的gcc,则打开EVM_JUMP_DISPATCH //我们一般在linux编译，则这里我们可以得到的结论是开关EVM_JUMP_DISPATCH开关打开 ifndef EVM_JUMP_DISPATCH #ifdef __GNUC__ #define EVM_JUMP_DISPATCH true #else #define EVM_JUMP_DISPATCH false #endif #endif #if EVM_JUMP_DISPATCH #ifndef __GNUC__ #error &quot;address of label extension available only on Gnu&quot; #endif #else #define EVM_SWITCH_DISPATCH true #endif //--------------------------------------------------------------------------- //从下面的宏定义EVM_OPTIMIZE的开关是关闭的，因此开关EVM_REPLACE_CONST_JUMP&lt;/br&gt; //EVM_USE_CONSTANT_POOL EVM_DO_FIRST_PASS_OPTIMIZATION均为false的状态 #ifndef EVM_OPTIMIZE #define EVM_OPTIMIZE false #endif #if EVM_OPTIMIZE #define EVM_REPLACE_CONST_JUMP true #define EVM_USE_CONSTANT_POOL true #define EVM_DO_FIRST_PASS_OPTIMIZATION \ (EVM_REPLACE_CONST_JUMP || EVM_USE_CONSTANT_POOL) #endif 综上宏开关的说明，最后开关EVM_JUMP_DISPATCH是打开的，其他的均处于关闭状态。 在开关EVM_JUMP_DISPATCH打开的情况下对每一个宏展开进行说明，便于理解实际是如何运 行的。具体的参见文件VMConfig.h 宏INIT_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为初始化一个静态的跳转表，代码片段如下: #define INIT_CASES \ \ static const void* const jumpTable[256] = { \ &amp;&amp;STOP, /* 00 */ \ &amp;&amp;ADD, \ &amp;&amp;MUL, \ &amp;&amp;SUB, \ &amp;&amp;DIV, \ &amp;&amp;SDIV, \ &amp;&amp;MOD, \ &amp;&amp;SMOD, \ &amp;&amp;ADDMOD, \ 其中的ADD等定义在文件Instruction.h中，其中枚举了所有的虚拟机执行过程中的字节操作码。 /// Virtual machine bytecode instruction. enum class Instruction: uint8_t { STOP = 0x00, ///&lt; halts execution ADD, ///&lt; addition operation MUL, ///&lt; mulitplication operation SUB, ///&lt; subtraction operation DIV, ///&lt; integer division operation SDIV, ///&lt; signed integer division operation ....... ....... 宏DO_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为如下代码片段： #define DO_CASES \ fetchInstruction(); \ goto* jumpTable[(int)m_OP];由上面的代码可知操作符定义为一个字节，函数fetchInstruction执行后m_OP中存储了当前要 执行的操作，接着switch将根据具体的操作来执行分支中的内容。 宏CASES 在开关EVM_JUMP_DISPATCH打开的情况下CASES展开的内容如下 ： #define CASE(name) \ name: 宏NEXT 在开关EVM_JUMP_DISPATCH打开的情况下NEXT展开的内容如下 ： #define NEXT \ ++m_PC; \ fetchInstruction(); \ goto* jumpTable[(int)m_OP]; 宏CONTINUE 在开关EVM_JUMP_DISPATCH打开的情况下CONTINUE展开的内容如下 ： #define CONTINUE \ fetchInstruction(); \ goto* jumpTable[(int)m_OP];其他的几个控制分支跳转的宏展开如下： #define BREAK return; #define DEFAULT #define WHILE_CASES 关键的执行操作的宏ON_OP展开如下： #define ON_OP() onOperation()通过上面的宏的展开我们可以看出过程主要依赖jumpTable和函数fetchInstructio来完成 执行过程。首先我们看一下函数fetchInstruction的具体执行流程，整个执行将从这里开始 //初始化时m_PC为0，这里先获取第一个操作符 m_OP = Instruction(m_code[m_PC]); //获取操作相关的参数，gas花费等信息 const InstructionMetric&amp; metric = c_metrics[static_cast&lt;size_t&gt;(m_OP)]; //设置SP为最后返回值所在的位置，同时检查参数出栈和返回值入栈没有超过栈的边界 adjustStack(metric.args, metric.ret); //计算运行的费用 m_runGas = toInt63( m_schedule-&gt;tierStepGas[static_cast&lt;unsigned&gt;(metric.gasPriceTier)] ); m_newMemSize = m_mem.size(); m_copyMemSize = 0; 下面我们看程序是如何利用跳表和onOpearion来完成程序的执行，下面我们以ADD操作 为例来进行说明，在进行ADD说明前，先简单介绍一下EVM中栈工作的原理，例如如果我 们要执行一 加法操作，则通常表示为c = a + b，把它翻译成EVM中栈的操作序列伪操作码序列如下： push a into stack push b into stack pop a and b then cal a+b push a+b into stack 我们先看一下ADD的前置操作PUSH是如何实现的,首先注意如下代码： CASE(PUSH2) ......... CASE(PUSH23) CASE(PUSH24) CASE(PUSH25) CASE(PUSH26) CASE(PUSH27) CASE(PUSH28) CASE(PUSH29) CASE(PUSH30) CASE(PUSH31) CASE(PUSH32) { ON_OP(); updateIOGas(); int numBytes = (int)m_OP - (int)Instruction::PUSH1 + 1; m_SPP[0] = 0; for (++m_PC; numBytes--; ++m_PC) //这里主要是处理256位宽的的情况 m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; } CONTINUE EVM中对PUSH1的其他操作均采用上面的代码，PUSH3的含义是将三个输入的字节序列中的宽度 为32字节的数据压入到栈中，如下代码: m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; 上面这段代码主要是将传入的字节流数据转化为256的数据，并放入栈上，同时我们的栈的定义如下： u256 m_stack[1024];这里的设计其实有可以改进的地方，主要是以下几点： 即使编译器部分做了数据紧凑的优化，但是执行的过程中又做了放大，失去了原来的意义。 栈的宽度为256位，抛开加密算法的影响（目前几乎没有栈上运算）,实际有些浪费。 从实际角度讲可以选择小的位宽的栈，数据更加紧密，但是可能会造成操作增加。 通过执行完PUSH操作后，栈上的已经放好了我们要做加法的数据，现在我们看一下ADD操作是如何的。 如下为ADD操作的代码片段： CASE(ADD) { ON_OP(); updateIOGas(); //pops two items and pushes their sum mod 2^256. m_SPP[0] = m_SP[0] + m_SP[1]; } NEXT 上面的代码通过宏展开后代码如下： ADD: { onOperation(); updateIOGas(); m_SPP[0] = m_SP[0] + m_SP[1]; } ++m_PC; fetchInstruction(); goto* jumpTable[(int)m_OP]; 现在step by step的看一下这部分是如何进行处理，首先是opOperaion函数，如下为onOperation 函数的实现： if (m_onOp) (m_onOp)(++m_nSteps, m_PC, m_OP, m_newMemSize &gt; m_mem.size() ? (m_newMemSize - m_mem.size()) / 32 : uint64_t(0), m_runGas, m_io_gas, this, m_ext); 代码中的m_onOp为提供的回调函数，其中其中m_onOp的类型为OnOpFunc,声明如下如下所示： using OnOpFunc = std::function&lt;void(uint64_t /*steps*/, uint64_t /* PC */, Instruction /*instr*/, bigint /*newMemSize*/, bigint /*gasCost*/, bigint /*gas*/, VMFace const*, ExtVMFace const*)&gt;;函数设计主要是在虚拟执行的时候提供一个可以回调的接口，方便进行处理，比如做最简单的tracing 接下来执行函数updateIOGas(),该函数功能主要是查看目前的gas消耗是否已经大于提供的gas, 如果大于，则抛出异常，虚拟机停止运行。代码片段如下： if (m_io_gas &lt; m_runGas) throwOutOfGas(); m_io_gas -= m_runGas; 注意函数中的m_runGas在函数updateGas中被修改，会根据内存的使用来进行计算和消耗。接下来执 行的代码为m_SPP[0] = m_SP[0] + m_SP[1];主要功能是完成两个数的相加计算结果会存储在m_SPP[0] 中，m_SPP的含义是“指向下一个栈中可用的位置”，这里指向m_SP[0]运行初始化开始时m_SPP = m_SP。 接着执行++m_PC,这里将指向代码字节流中的下一个操作。接着执行数fetchInstruction(),这个时候 变量m_OP中存储的是新的操作，继续执行goto* jumpTable[(int)m_OP]，这个时候将跳到下一个操作的 label去执行。综上，EVM虚拟机就是借助栈和基本的操作来完成一个合约字节流的运行的。 执行后的结果返回在操作序列的RETURN和REVERT操作，将栈上的结果数据拷贝到内存中去。以下为RETURN部分代码 CASE(RETURN) { ON_OP(); m_copyMemSize = 0; updateMem(memNeed(m_SP[0], m_SP[1])); updateIOGas(); uint64_t b = (uint64_t)m_SP[0]; uint64_t s = (uint64_t)m_SP[1]; //m_output中存储的就是最后返回的结果 m_output = owning_bytes_ref{std::move(m_mem), b, s}; m_bounce = 0; } BREAK 运行过程中的Gas的消费 上面描述ADD和所涉及到的PUSH操作的时候我们就已经看到会调用updateIOGas函数来计算gas 的消费。从代码中我们可以看到不同的操作对应不同的gas消费具体如下： no gas IO gas 1 IO gas 2 mem gas CREATE2 RETURN REVERT RETURN CREATE SUICIDE STOP REVERT DELEGATECALL MLOAD MSTORE MLOAD STATICCALL MSTORE8 SHA3 MSTORE CALL LOG0 LOG1 MSTORE8 CALLCODE LOG2 LOG3 SHA3 JUMPTO EXP ADD LOG1 JUMPIF MUL SUB LOG2 JUMPV DIV SDIV LOG3 JUMPSUB MOD SMOD CALLDATACOPY JUMPSUBV NOT LT &nbsp; RETURNSUB GT SLT &nbsp; BEGINSUB SGT EQ &nbsp; BEGINDATA ISZERO AND &nbsp; GETLOCAL OR XOR &nbsp; PUTLOCAL BYTE SHL &nbsp; SHR SAR &nbsp; &nbsp; ADDMOD MULMOD &nbsp; &nbsp; SIGNEXTEND ADDRESS &nbsp; &nbsp; ORIGIN BALANCE &nbsp; &nbsp; CALLER CALLVALUE &nbsp; &nbsp; CALLDATALOAD CALLDATASIZE &nbsp; &nbsp; RETURNDATASIZE CODESIZE &nbsp; &nbsp; EXTCODESIZE CALLDATACOPY &nbsp; &nbsp; RETURNDATACOPY RETURNDATACOPY &nbsp; &nbsp; CODECOPY CODECOPY &nbsp; &nbsp; GASPRICE BLOCKHASH &nbsp; &nbsp; COINBASE TIMESTAMP &nbsp; &nbsp; NUMBER DIFFICULTY &nbsp; &nbsp; GASLIMIT POP &nbsp; &nbsp; PUSH JUMP &nbsp; &nbsp; DUP SWAP &nbsp; &nbsp; SLOAD SSTORE &nbsp; &nbsp; PC MSIZE &nbsp; &nbsp; GAS JUMPDEST &nbsp; &nbsp; INVALID &nbsp; 其中 SSTORE是一条比较特殊的指令，他将消耗stack存储的gas 小结 EVM如果精确的定位应该是一个基于栈的自定义字节码解释器，实现上并不复杂，代码过程中遇到 的主要问题有以下几点： 字节宽度的设计，目前看主要是出于实现难度和实际需求（如SHA3的操作) 设计上每次都会生成新的VM对象，出于安全和目前需求这样的设计和实现是可以接受的，数据 共享和多线程处理在智能合约的层面目前还不需要。 EVM整体上实现了基本的操作，但是还需要和语言编译器去结合来做具体的优化，JIT是一个方向。 阅读更多" />
+<meta property="og:description" content="EVM架构简析和源码分析&nbsp; &nbsp; &nbsp; &nbsp;EVM为以太坊虚拟机。以太坊底层通过EVM模块支持智能合约的执行和调用，调用时根据合约的地址获 取到代码，生成具体的执行环境，然后将代码载入到EVM虚拟机中运行。通常目前开发智能合约的高级 语言为Solidity,在利用solidity实现智能合约逻辑后，通过编译器编译成元数据（字节码）最后发布到以 坊上。 EVM架构概述 EVM本质上是一个堆栈机器，它最直接的的功能是执行智能合约，根据官方给出的设计原理，EVM的主 要的设计目标为如下几点： 简单性 确定性 空间节省 为区块链服务 安全性保证 便于优化 针对以上几点通过对EVM源代码的阅读来了解其具体的设计思想和工程实用性。 EVM存储系统 机器位宽 &nbsp; &nbsp; &nbsp; &nbsp;EVM机器位宽为256位，即32个字节，256位机器字宽不同于我们经常见到主流的64位的机器 字宽，这就标明EVM设计上将考虑一套自己的关于操作，数据，逻辑控制的指令编码。目前主流的处理 器原生的支持的计算数据类型有：8bits整数，16bits整数，32bits整数，64bits整数。一般情况下宽字 节的计算将更加的快一些，因为它可能包含更多的指令被一次性加载到pc寄存器中，同时伴有内存访问 次数的减少。目前在X86的架构中8bits的计算并不是完全的支持（除法和乘法），但基本的数学运算大概 在几个时钟周期内就能完成，也就是说主流的字节宽度基本上处理器能够原生的支持，那为什么EVM要采 用256位的字宽。主要从以下两个方面考虑： 时间，智能合约是否能执行得更快 空间，这样是否整体字节码的大小会有所减少 gas成本 时间上主要体现在执行的效率上，我们以两个整形数相加来对比具体的操作时间消耗。32bits相加的X86 的汇编代码 mov eax, dword [9876ABCD] //将地址9876ABCD中的32位数据放入eax数据寄存器 add eax, dword [1234DCBA] //将1234DCBA地址指向32位数和eax相加,结果保存在eax中 64bits相加的X86汇编代码 mov rax, qword [123456789ABCDEF1] //将地址指向的64位数据放入64位寄存器 add rax, qword [1020304050607080] //计算相加的结果并将结果放入到64位寄存器中下面我们看一下在64bits机器上如何完成256bits的加法 mov rax, qword [9876ABCD] add qword [1234DCBA], rax mov rax, qword [9876ABCD+8] adc qword [1234DCBA+8], rax//这里应用adc带进位的加法指令，影响进位标记CF mov rax, qword [9876ABCD+16] adc qword [1234DCBA+16], rax mov rax, qword [9876ABCD+24] adc qword [1234DCBA+24], rax由上面的的汇编指令我们可以看出256位操作要比系统原生支持的要复杂的多，从时间上考虑采用 256位这样的字节宽度，实际的收益并不大。 空间上，由上面的汇编操作（在实际的EVM中操作类似）我们不难看到，如果直接对地址进行操 作似乎是一种快速的方式，并减少了操作数，进而操作码也有所减少，相应的智能合约的字节流 大小就会小很多，gas花费也会有所下降。但是从另外一个层面来讲，支持宽字节的数据类型势必 会造成在处理低字节宽度的数据时候带来存储上的浪费（如添加标识用来区分类型）或者添加额外 的操作来进行数据的compact。从时间和空间角度来看，仅支持256字节宽度的选择有利有弊，具 体还要看以太坊智能合约的具体应用。可能的几点原因如下: 256位的宽度方便进行密码学方面的计算（sha256），但是成本有些高，场景比较少 仅支持256位的比要支持其他类型的操作要少，单一，实现简单可控 和gas的计算相关，仅支持一种，方便计算，同时也考虑到了安全问题 内存分配 EVM中数据可以在三个地方进行存储，分别是栈，临时存储，永久存储。由于EVM是基于栈的虚拟机， 因此基本上所有的操作都是在栈上进行的，并且EVM中没有寄存器的概念,这样EVM对栈的依赖就更大， 虽然这样的设计使实现比较简单且易于理解，但是带来的问题就是需要更多数据的相关操作。在EVM 中栈是唯一的免费（几乎是）存放数据的地方。栈自然有深度的限制，目前的限制是1024 static constexpr int64_t stackLimit = 1024; 因为栈的限制，因此栈上的临时变量的使用会受限制。临时内存存储在每个VM实例中，并在合约执行完 后消失永久内存存储在区块链的状态层。 EVM代码简析本文分析EVM c++的代码， github地址为 https://github.com/ethereum/cpp-ethereum EVM c++实现了同go版本中的核心的功能，对于快速理解EVM的设计思想比较受用，对于熟悉C++的 可以先通过阅读C++版本的实现，然后对标go版本的实现来进一步了解EVM的设计思路。 EVM代码overview主要代码路径为cpp-ethereum/libevm和libethereum，代码量不大，以下为主要代码。 EVMC.cpp ExtVMFace.cpp Instruction.cpp interpreter.h LegacyVMCalls.cpp VM.cpp VMCalls.cpp VMFactory.cpp VMOpt.cpp VMSIMD.cpp VmValidate.cpp LegacyVM.cpp Executive.cpp ExtVm.cpp下图为EVM中主要类的类图: 以太坊中调用EVM相关代码的入口存在于不同的阶段，我们主要从以下几个角度来看它是如何运作的&lt;/br&gt; 执行环境创建 新合约的创建 合约执行调用、 执行后结果返回 运行过程中的gas消费 执行环境的创建以太坊虚拟中涉及到的虚拟机执行的关键类为 Executive（位于目录libethereum）中，我们先从 创建运行环境入手，关键入口函数call入手，函数声明为： bool call(Address const&amp; _receiveAddress, //接收者地址 Address const&amp; _txSender, //发送者地址 u256 const&amp; _txValue, //transaction的值 u256 const&amp; _gasPrice, //gas的价格 bytesConstRef _txData, //具体的transaction数据 u256 const&amp; _gas); //提供的gas值 bool call(CallParameters const&amp; _cp, //运行参数，由上个函数的相关变量创建 u256 const&amp; _gasPrice, //gas的价格 Address const&amp; _origin); //源地址 两个函数的功能是一样的，只是第一个函数会将参数包装成CallParameters然后在调用第二个函数,现在看 一下call函数的流程图如下： 上述函数的关键点在于在不是预编译合约（以太坊中内部定义好的合约多为签名计算），生成ExtVM 实例，这个对象将在函数go中返回重要的作用。注意函数最后会更改状态指向函数transferBalance: m_s.transferBalance(_p.senderAddress, _p.receiveAddress, _p.valueTransfer); 新合约的创建 如果调用的合约地址在系统中还没有出存在，这个适合涉及到合约的创建，关键函数为create: bool create(Address const&amp; _txSender, //目的地址 u256 const&amp; _endowment, //花费的值 u256 const&amp; _gasPrice, //gas的价钱 u256 const&amp; _gas, //花费的gas数量 bytesConstRef _init, //传入的字节码 Address const&amp; _origin) //源地址 函数将调用createOpcode函数，该函数在获得sender的nonce值后生成合约地址，并且调用函数 executeCreate来完成最后的创建。 u256 nonce = m_s.getNonce(_sender); //注意地址保存在m_newAddress中,这个是否足够灵活 m_newAddress = right160(sha3(rlpList(_sender, nonce))); return executeCreate(_sender, _endowment, _gasPrice, _gas, _init, _origin); 下面看关键的的函数executeCreate,其流程图如下所示: 我们从代码中不难看出，最后和call函数相同生成ExtVM对象，将要执行的字节码放入其中。 这里需要注意的是执行transferBalance时候如果没有账户将创建一个新的账户。 合约执行调用 合约的执行的起始点在函数Executive::go中，函数的流程图如下： 从流程图中我们看到如果m_ext（create或者call函数中创建）不为空的时候通过工厂方法创建VM， 这里要正确的理解m_ext和vm的区别，我们先看工厂方法的实现: std::unique_ptr&lt;VMFace&gt; VMFactory::create(VMKind _kind) { switch (_kind) { #ifdef ETH_EVMJIT case VMKind::JIT: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmjit_create()}); #endif #ifdef ETH_HERA case VMKind::Hera: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_hera()}); #endif case VMKind::Interpreter: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_interpreter()}); case VMKind::DLL: return std::unique_ptr&lt;VMFace&gt;(new EVMC{g_dllEvmcCreate()}); case VMKind::Legacy: default: return std::unique_ptr&lt;VMFace&gt;(new LegacyVM); } }从代码中我们不难看出，会根据虚拟机的类型创建对应的虚拟机对象，无参函数create将默认生成 类型为VMKind::Legacy。在函数create和call中生成的m_ext是虚拟机和外部相关状态进行交互的。 调用VM的exec函数完成虚拟机的执行。LegacyVM的exec函数关键代码如下: // trampoline to minimize depth of call stack when calling out m_bounce = &amp;LegacyVM::initEntry;//初始化m_bounce do (this-&gt;*m_bounce)(); while (m_bounce); 初始化m_bounce的函数使initEntry,我们看下initEntry函数中实现的功能。 m_bounce = &amp;LegacyVM::interpretCases;//设置m_bounce为函数interpreCases initMetrics();//初始化操作，参数和返回值，gas花费矩阵， optimize();//优化，主要针对跳转的优化，后续再做补充，目前程序汇总关闭 经过上面的代码处理，m_bounce设置为下一步将要运行的函数。初始化操作以及花费说明的矩阵， 矩阵关联的Instruction部分相关信息如下： static const std::map&lt;Instruction, InstructionInfo&gt; c_instructionInfo = { // Add, Args, Ret, GasPriceTier { Instruction::STOP, { &quot;STOP&quot;, 0, 0, 0, Tier::Zero } }, { Instruction::ADD, { &quot;ADD&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::SUB, { &quot;SUB&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::MUL, { &quot;MUL&quot;, 0, 2, 1, Tier::Low } }, { Instruction::DIV, { &quot;DIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::SDIV, { &quot;SDIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::MOD, { &quot;MOD&quot;, 0, 2, 1, Tier::Low } }, 经过上面的相关初始化，再运行循环将执行m_bounce指向的interpretCases函数。函数interpretCase 相对来说比较复杂一些，如下所示: void LegacyVM::interpretCases() { INIT_CASES DO_CASES { CASE(CREATE2) { ON_OP(); if (!m_schedule-&gt;haveCreate2) throwBadInstruction(); m_bounce = &amp;LegacyVM::caseCreate; } BREAK CASE(CREATE) ........ 此处省略很多的case ....... NEXT CASE(INVALID) DEFAULT { throwBadInstruction(); } } WHILE_CASES } 上述代码中对应了很多宏，，如果不对宏进行展开，直观理解就是对每种操作执行对应的函数，并将 结果进行中间存储，EVM中定义了相关宏开关，其中一些宏开关，都对应了上述代码中不同的 宏展开,同时对应了不同的代码组织形式。参见文件VMConfing.h,如下代码为相关的宏开关： EIP_615 - 子程序和静态跳转的方式 EIP_616 - 单执行多数据流的方式 EVM_OPTIMIZE - 优化开关，当值为false时，所有的优化全部关掉 EVM_SWITCH_DISPATCH - 通过loop和switch执行代码 EVM_JUMP_DISPATCH - 跳转通过一个跳表来实现，只针对gcc EVM_USE_CONSTANT_POOL - 应用静态数据并在栈上直接赋值操作 EVM_REPLACE_CONST_JUMP - 带预确认的跳转来保证运行时的循环 EVM_TRACE - 提供不同等级的trace操作 下面我们来看一下源代码中是如何设置这些宏开关 首先EIP_615和EIP_616均为关闭状态 #ifndef EIP_615 #define EIP_615 false #endif #ifndef EIP_616 #define EIP_616 false #endif //-------------------------------------------------------------------------- //如果没有定义EVM_JUMP_DISPATCH的情况下,如果是GNU的gcc,则打开EVM_JUMP_DISPATCH //我们一般在linux编译，则这里我们可以得到的结论是开关EVM_JUMP_DISPATCH开关打开 ifndef EVM_JUMP_DISPATCH #ifdef __GNUC__ #define EVM_JUMP_DISPATCH true #else #define EVM_JUMP_DISPATCH false #endif #endif #if EVM_JUMP_DISPATCH #ifndef __GNUC__ #error &quot;address of label extension available only on Gnu&quot; #endif #else #define EVM_SWITCH_DISPATCH true #endif //--------------------------------------------------------------------------- //从下面的宏定义EVM_OPTIMIZE的开关是关闭的，因此开关EVM_REPLACE_CONST_JUMP&lt;/br&gt; //EVM_USE_CONSTANT_POOL EVM_DO_FIRST_PASS_OPTIMIZATION均为false的状态 #ifndef EVM_OPTIMIZE #define EVM_OPTIMIZE false #endif #if EVM_OPTIMIZE #define EVM_REPLACE_CONST_JUMP true #define EVM_USE_CONSTANT_POOL true #define EVM_DO_FIRST_PASS_OPTIMIZATION \ (EVM_REPLACE_CONST_JUMP || EVM_USE_CONSTANT_POOL) #endif 综上宏开关的说明，最后开关EVM_JUMP_DISPATCH是打开的，其他的均处于关闭状态。 在开关EVM_JUMP_DISPATCH打开的情况下对每一个宏展开进行说明，便于理解实际是如何运 行的。具体的参见文件VMConfig.h 宏INIT_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为初始化一个静态的跳转表，代码片段如下: #define INIT_CASES \ \ static const void* const jumpTable[256] = { \ &amp;&amp;STOP, /* 00 */ \ &amp;&amp;ADD, \ &amp;&amp;MUL, \ &amp;&amp;SUB, \ &amp;&amp;DIV, \ &amp;&amp;SDIV, \ &amp;&amp;MOD, \ &amp;&amp;SMOD, \ &amp;&amp;ADDMOD, \ 其中的ADD等定义在文件Instruction.h中，其中枚举了所有的虚拟机执行过程中的字节操作码。 /// Virtual machine bytecode instruction. enum class Instruction: uint8_t { STOP = 0x00, ///&lt; halts execution ADD, ///&lt; addition operation MUL, ///&lt; mulitplication operation SUB, ///&lt; subtraction operation DIV, ///&lt; integer division operation SDIV, ///&lt; signed integer division operation ....... ....... 宏DO_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为如下代码片段： #define DO_CASES \ fetchInstruction(); \ goto* jumpTable[(int)m_OP];由上面的代码可知操作符定义为一个字节，函数fetchInstruction执行后m_OP中存储了当前要 执行的操作，接着switch将根据具体的操作来执行分支中的内容。 宏CASES 在开关EVM_JUMP_DISPATCH打开的情况下CASES展开的内容如下 ： #define CASE(name) \ name: 宏NEXT 在开关EVM_JUMP_DISPATCH打开的情况下NEXT展开的内容如下 ： #define NEXT \ ++m_PC; \ fetchInstruction(); \ goto* jumpTable[(int)m_OP]; 宏CONTINUE 在开关EVM_JUMP_DISPATCH打开的情况下CONTINUE展开的内容如下 ： #define CONTINUE \ fetchInstruction(); \ goto* jumpTable[(int)m_OP];其他的几个控制分支跳转的宏展开如下： #define BREAK return; #define DEFAULT #define WHILE_CASES 关键的执行操作的宏ON_OP展开如下： #define ON_OP() onOperation()通过上面的宏的展开我们可以看出过程主要依赖jumpTable和函数fetchInstructio来完成 执行过程。首先我们看一下函数fetchInstruction的具体执行流程，整个执行将从这里开始 //初始化时m_PC为0，这里先获取第一个操作符 m_OP = Instruction(m_code[m_PC]); //获取操作相关的参数，gas花费等信息 const InstructionMetric&amp; metric = c_metrics[static_cast&lt;size_t&gt;(m_OP)]; //设置SP为最后返回值所在的位置，同时检查参数出栈和返回值入栈没有超过栈的边界 adjustStack(metric.args, metric.ret); //计算运行的费用 m_runGas = toInt63( m_schedule-&gt;tierStepGas[static_cast&lt;unsigned&gt;(metric.gasPriceTier)] ); m_newMemSize = m_mem.size(); m_copyMemSize = 0; 下面我们看程序是如何利用跳表和onOpearion来完成程序的执行，下面我们以ADD操作 为例来进行说明，在进行ADD说明前，先简单介绍一下EVM中栈工作的原理，例如如果我 们要执行一 加法操作，则通常表示为c = a + b，把它翻译成EVM中栈的操作序列伪操作码序列如下： push a into stack push b into stack pop a and b then cal a+b push a+b into stack 我们先看一下ADD的前置操作PUSH是如何实现的,首先注意如下代码： CASE(PUSH2) ......... CASE(PUSH23) CASE(PUSH24) CASE(PUSH25) CASE(PUSH26) CASE(PUSH27) CASE(PUSH28) CASE(PUSH29) CASE(PUSH30) CASE(PUSH31) CASE(PUSH32) { ON_OP(); updateIOGas(); int numBytes = (int)m_OP - (int)Instruction::PUSH1 + 1; m_SPP[0] = 0; for (++m_PC; numBytes--; ++m_PC) //这里主要是处理256位宽的的情况 m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; } CONTINUE EVM中对PUSH1的其他操作均采用上面的代码，PUSH3的含义是将三个输入的字节序列中的宽度 为32字节的数据压入到栈中，如下代码: m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; 上面这段代码主要是将传入的字节流数据转化为256的数据，并放入栈上，同时我们的栈的定义如下： u256 m_stack[1024];这里的设计其实有可以改进的地方，主要是以下几点： 即使编译器部分做了数据紧凑的优化，但是执行的过程中又做了放大，失去了原来的意义。 栈的宽度为256位，抛开加密算法的影响（目前几乎没有栈上运算）,实际有些浪费。 从实际角度讲可以选择小的位宽的栈，数据更加紧密，但是可能会造成操作增加。 通过执行完PUSH操作后，栈上的已经放好了我们要做加法的数据，现在我们看一下ADD操作是如何的。 如下为ADD操作的代码片段： CASE(ADD) { ON_OP(); updateIOGas(); //pops two items and pushes their sum mod 2^256. m_SPP[0] = m_SP[0] + m_SP[1]; } NEXT 上面的代码通过宏展开后代码如下： ADD: { onOperation(); updateIOGas(); m_SPP[0] = m_SP[0] + m_SP[1]; } ++m_PC; fetchInstruction(); goto* jumpTable[(int)m_OP]; 现在step by step的看一下这部分是如何进行处理，首先是opOperaion函数，如下为onOperation 函数的实现： if (m_onOp) (m_onOp)(++m_nSteps, m_PC, m_OP, m_newMemSize &gt; m_mem.size() ? (m_newMemSize - m_mem.size()) / 32 : uint64_t(0), m_runGas, m_io_gas, this, m_ext); 代码中的m_onOp为提供的回调函数，其中其中m_onOp的类型为OnOpFunc,声明如下如下所示： using OnOpFunc = std::function&lt;void(uint64_t /*steps*/, uint64_t /* PC */, Instruction /*instr*/, bigint /*newMemSize*/, bigint /*gasCost*/, bigint /*gas*/, VMFace const*, ExtVMFace const*)&gt;;函数设计主要是在虚拟执行的时候提供一个可以回调的接口，方便进行处理，比如做最简单的tracing 接下来执行函数updateIOGas(),该函数功能主要是查看目前的gas消耗是否已经大于提供的gas, 如果大于，则抛出异常，虚拟机停止运行。代码片段如下： if (m_io_gas &lt; m_runGas) throwOutOfGas(); m_io_gas -= m_runGas; 注意函数中的m_runGas在函数updateGas中被修改，会根据内存的使用来进行计算和消耗。接下来执 行的代码为m_SPP[0] = m_SP[0] + m_SP[1];主要功能是完成两个数的相加计算结果会存储在m_SPP[0] 中，m_SPP的含义是“指向下一个栈中可用的位置”，这里指向m_SP[0]运行初始化开始时m_SPP = m_SP。 接着执行++m_PC,这里将指向代码字节流中的下一个操作。接着执行数fetchInstruction(),这个时候 变量m_OP中存储的是新的操作，继续执行goto* jumpTable[(int)m_OP]，这个时候将跳到下一个操作的 label去执行。综上，EVM虚拟机就是借助栈和基本的操作来完成一个合约字节流的运行的。 执行后的结果返回在操作序列的RETURN和REVERT操作，将栈上的结果数据拷贝到内存中去。以下为RETURN部分代码 CASE(RETURN) { ON_OP(); m_copyMemSize = 0; updateMem(memNeed(m_SP[0], m_SP[1])); updateIOGas(); uint64_t b = (uint64_t)m_SP[0]; uint64_t s = (uint64_t)m_SP[1]; //m_output中存储的就是最后返回的结果 m_output = owning_bytes_ref{std::move(m_mem), b, s}; m_bounce = 0; } BREAK 运行过程中的Gas的消费 上面描述ADD和所涉及到的PUSH操作的时候我们就已经看到会调用updateIOGas函数来计算gas 的消费。从代码中我们可以看到不同的操作对应不同的gas消费具体如下： no gas IO gas 1 IO gas 2 mem gas CREATE2 RETURN REVERT RETURN CREATE SUICIDE STOP REVERT DELEGATECALL MLOAD MSTORE MLOAD STATICCALL MSTORE8 SHA3 MSTORE CALL LOG0 LOG1 MSTORE8 CALLCODE LOG2 LOG3 SHA3 JUMPTO EXP ADD LOG1 JUMPIF MUL SUB LOG2 JUMPV DIV SDIV LOG3 JUMPSUB MOD SMOD CALLDATACOPY JUMPSUBV NOT LT &nbsp; RETURNSUB GT SLT &nbsp; BEGINSUB SGT EQ &nbsp; BEGINDATA ISZERO AND &nbsp; GETLOCAL OR XOR &nbsp; PUTLOCAL BYTE SHL &nbsp; SHR SAR &nbsp; &nbsp; ADDMOD MULMOD &nbsp; &nbsp; SIGNEXTEND ADDRESS &nbsp; &nbsp; ORIGIN BALANCE &nbsp; &nbsp; CALLER CALLVALUE &nbsp; &nbsp; CALLDATALOAD CALLDATASIZE &nbsp; &nbsp; RETURNDATASIZE CODESIZE &nbsp; &nbsp; EXTCODESIZE CALLDATACOPY &nbsp; &nbsp; RETURNDATACOPY RETURNDATACOPY &nbsp; &nbsp; CODECOPY CODECOPY &nbsp; &nbsp; GASPRICE BLOCKHASH &nbsp; &nbsp; COINBASE TIMESTAMP &nbsp; &nbsp; NUMBER DIFFICULTY &nbsp; &nbsp; GASLIMIT POP &nbsp; &nbsp; PUSH JUMP &nbsp; &nbsp; DUP SWAP &nbsp; &nbsp; SLOAD SSTORE &nbsp; &nbsp; PC MSIZE &nbsp; &nbsp; GAS JUMPDEST &nbsp; &nbsp; INVALID &nbsp; 其中 SSTORE是一条比较特殊的指令，他将消耗stack存储的gas 小结 EVM如果精确的定位应该是一个基于栈的自定义字节码解释器，实现上并不复杂，代码过程中遇到 的主要问题有以下几点： 字节宽度的设计，目前看主要是出于实现难度和实际需求（如SHA3的操作) 设计上每次都会生成新的VM对象，出于安全和目前需求这样的设计和实现是可以接受的，数据 共享和多线程处理在智能合约的层面目前还不需要。 EVM整体上实现了基本的操作，但是还需要和语言编译器去结合来做具体的优化，JIT是一个方向。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/19/5510e0e778c622d381743b9c47c85bd6.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/19/5510e0e778c622d381743b9c47c85bd6.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-19T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"EVM架构简析和源码分析&nbsp; &nbsp; &nbsp; &nbsp;EVM为以太坊虚拟机。以太坊底层通过EVM模块支持智能合约的执行和调用，调用时根据合约的地址获 取到代码，生成具体的执行环境，然后将代码载入到EVM虚拟机中运行。通常目前开发智能合约的高级 语言为Solidity,在利用solidity实现智能合约逻辑后，通过编译器编译成元数据（字节码）最后发布到以 坊上。 EVM架构概述 EVM本质上是一个堆栈机器，它最直接的的功能是执行智能合约，根据官方给出的设计原理，EVM的主 要的设计目标为如下几点： 简单性 确定性 空间节省 为区块链服务 安全性保证 便于优化 针对以上几点通过对EVM源代码的阅读来了解其具体的设计思想和工程实用性。 EVM存储系统 机器位宽 &nbsp; &nbsp; &nbsp; &nbsp;EVM机器位宽为256位，即32个字节，256位机器字宽不同于我们经常见到主流的64位的机器 字宽，这就标明EVM设计上将考虑一套自己的关于操作，数据，逻辑控制的指令编码。目前主流的处理 器原生的支持的计算数据类型有：8bits整数，16bits整数，32bits整数，64bits整数。一般情况下宽字 节的计算将更加的快一些，因为它可能包含更多的指令被一次性加载到pc寄存器中，同时伴有内存访问 次数的减少。目前在X86的架构中8bits的计算并不是完全的支持（除法和乘法），但基本的数学运算大概 在几个时钟周期内就能完成，也就是说主流的字节宽度基本上处理器能够原生的支持，那为什么EVM要采 用256位的字宽。主要从以下两个方面考虑： 时间，智能合约是否能执行得更快 空间，这样是否整体字节码的大小会有所减少 gas成本 时间上主要体现在执行的效率上，我们以两个整形数相加来对比具体的操作时间消耗。32bits相加的X86 的汇编代码 mov eax, dword [9876ABCD] //将地址9876ABCD中的32位数据放入eax数据寄存器 add eax, dword [1234DCBA] //将1234DCBA地址指向32位数和eax相加,结果保存在eax中 64bits相加的X86汇编代码 mov rax, qword [123456789ABCDEF1] //将地址指向的64位数据放入64位寄存器 add rax, qword [1020304050607080] //计算相加的结果并将结果放入到64位寄存器中下面我们看一下在64bits机器上如何完成256bits的加法 mov rax, qword [9876ABCD] add qword [1234DCBA], rax mov rax, qword [9876ABCD+8] adc qword [1234DCBA+8], rax//这里应用adc带进位的加法指令，影响进位标记CF mov rax, qword [9876ABCD+16] adc qword [1234DCBA+16], rax mov rax, qword [9876ABCD+24] adc qword [1234DCBA+24], rax由上面的的汇编指令我们可以看出256位操作要比系统原生支持的要复杂的多，从时间上考虑采用 256位这样的字节宽度，实际的收益并不大。 空间上，由上面的汇编操作（在实际的EVM中操作类似）我们不难看到，如果直接对地址进行操 作似乎是一种快速的方式，并减少了操作数，进而操作码也有所减少，相应的智能合约的字节流 大小就会小很多，gas花费也会有所下降。但是从另外一个层面来讲，支持宽字节的数据类型势必 会造成在处理低字节宽度的数据时候带来存储上的浪费（如添加标识用来区分类型）或者添加额外 的操作来进行数据的compact。从时间和空间角度来看，仅支持256字节宽度的选择有利有弊，具 体还要看以太坊智能合约的具体应用。可能的几点原因如下: 256位的宽度方便进行密码学方面的计算（sha256），但是成本有些高，场景比较少 仅支持256位的比要支持其他类型的操作要少，单一，实现简单可控 和gas的计算相关，仅支持一种，方便计算，同时也考虑到了安全问题 内存分配 EVM中数据可以在三个地方进行存储，分别是栈，临时存储，永久存储。由于EVM是基于栈的虚拟机， 因此基本上所有的操作都是在栈上进行的，并且EVM中没有寄存器的概念,这样EVM对栈的依赖就更大， 虽然这样的设计使实现比较简单且易于理解，但是带来的问题就是需要更多数据的相关操作。在EVM 中栈是唯一的免费（几乎是）存放数据的地方。栈自然有深度的限制，目前的限制是1024 static constexpr int64_t stackLimit = 1024; 因为栈的限制，因此栈上的临时变量的使用会受限制。临时内存存储在每个VM实例中，并在合约执行完 后消失永久内存存储在区块链的状态层。 EVM代码简析本文分析EVM c++的代码， github地址为 https://github.com/ethereum/cpp-ethereum EVM c++实现了同go版本中的核心的功能，对于快速理解EVM的设计思想比较受用，对于熟悉C++的 可以先通过阅读C++版本的实现，然后对标go版本的实现来进一步了解EVM的设计思路。 EVM代码overview主要代码路径为cpp-ethereum/libevm和libethereum，代码量不大，以下为主要代码。 EVMC.cpp ExtVMFace.cpp Instruction.cpp interpreter.h LegacyVMCalls.cpp VM.cpp VMCalls.cpp VMFactory.cpp VMOpt.cpp VMSIMD.cpp VmValidate.cpp LegacyVM.cpp Executive.cpp ExtVm.cpp下图为EVM中主要类的类图: 以太坊中调用EVM相关代码的入口存在于不同的阶段，我们主要从以下几个角度来看它是如何运作的&lt;/br&gt; 执行环境创建 新合约的创建 合约执行调用、 执行后结果返回 运行过程中的gas消费 执行环境的创建以太坊虚拟中涉及到的虚拟机执行的关键类为 Executive（位于目录libethereum）中，我们先从 创建运行环境入手，关键入口函数call入手，函数声明为： bool call(Address const&amp; _receiveAddress, //接收者地址 Address const&amp; _txSender, //发送者地址 u256 const&amp; _txValue, //transaction的值 u256 const&amp; _gasPrice, //gas的价格 bytesConstRef _txData, //具体的transaction数据 u256 const&amp; _gas); //提供的gas值 bool call(CallParameters const&amp; _cp, //运行参数，由上个函数的相关变量创建 u256 const&amp; _gasPrice, //gas的价格 Address const&amp; _origin); //源地址 两个函数的功能是一样的，只是第一个函数会将参数包装成CallParameters然后在调用第二个函数,现在看 一下call函数的流程图如下： 上述函数的关键点在于在不是预编译合约（以太坊中内部定义好的合约多为签名计算），生成ExtVM 实例，这个对象将在函数go中返回重要的作用。注意函数最后会更改状态指向函数transferBalance: m_s.transferBalance(_p.senderAddress, _p.receiveAddress, _p.valueTransfer); 新合约的创建 如果调用的合约地址在系统中还没有出存在，这个适合涉及到合约的创建，关键函数为create: bool create(Address const&amp; _txSender, //目的地址 u256 const&amp; _endowment, //花费的值 u256 const&amp; _gasPrice, //gas的价钱 u256 const&amp; _gas, //花费的gas数量 bytesConstRef _init, //传入的字节码 Address const&amp; _origin) //源地址 函数将调用createOpcode函数，该函数在获得sender的nonce值后生成合约地址，并且调用函数 executeCreate来完成最后的创建。 u256 nonce = m_s.getNonce(_sender); //注意地址保存在m_newAddress中,这个是否足够灵活 m_newAddress = right160(sha3(rlpList(_sender, nonce))); return executeCreate(_sender, _endowment, _gasPrice, _gas, _init, _origin); 下面看关键的的函数executeCreate,其流程图如下所示: 我们从代码中不难看出，最后和call函数相同生成ExtVM对象，将要执行的字节码放入其中。 这里需要注意的是执行transferBalance时候如果没有账户将创建一个新的账户。 合约执行调用 合约的执行的起始点在函数Executive::go中，函数的流程图如下： 从流程图中我们看到如果m_ext（create或者call函数中创建）不为空的时候通过工厂方法创建VM， 这里要正确的理解m_ext和vm的区别，我们先看工厂方法的实现: std::unique_ptr&lt;VMFace&gt; VMFactory::create(VMKind _kind) { switch (_kind) { #ifdef ETH_EVMJIT case VMKind::JIT: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmjit_create()}); #endif #ifdef ETH_HERA case VMKind::Hera: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_hera()}); #endif case VMKind::Interpreter: return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_interpreter()}); case VMKind::DLL: return std::unique_ptr&lt;VMFace&gt;(new EVMC{g_dllEvmcCreate()}); case VMKind::Legacy: default: return std::unique_ptr&lt;VMFace&gt;(new LegacyVM); } }从代码中我们不难看出，会根据虚拟机的类型创建对应的虚拟机对象，无参函数create将默认生成 类型为VMKind::Legacy。在函数create和call中生成的m_ext是虚拟机和外部相关状态进行交互的。 调用VM的exec函数完成虚拟机的执行。LegacyVM的exec函数关键代码如下: // trampoline to minimize depth of call stack when calling out m_bounce = &amp;LegacyVM::initEntry;//初始化m_bounce do (this-&gt;*m_bounce)(); while (m_bounce); 初始化m_bounce的函数使initEntry,我们看下initEntry函数中实现的功能。 m_bounce = &amp;LegacyVM::interpretCases;//设置m_bounce为函数interpreCases initMetrics();//初始化操作，参数和返回值，gas花费矩阵， optimize();//优化，主要针对跳转的优化，后续再做补充，目前程序汇总关闭 经过上面的代码处理，m_bounce设置为下一步将要运行的函数。初始化操作以及花费说明的矩阵， 矩阵关联的Instruction部分相关信息如下： static const std::map&lt;Instruction, InstructionInfo&gt; c_instructionInfo = { // Add, Args, Ret, GasPriceTier { Instruction::STOP, { &quot;STOP&quot;, 0, 0, 0, Tier::Zero } }, { Instruction::ADD, { &quot;ADD&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::SUB, { &quot;SUB&quot;, 0, 2, 1, Tier::VeryLow } }, { Instruction::MUL, { &quot;MUL&quot;, 0, 2, 1, Tier::Low } }, { Instruction::DIV, { &quot;DIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::SDIV, { &quot;SDIV&quot;, 0, 2, 1, Tier::Low } }, { Instruction::MOD, { &quot;MOD&quot;, 0, 2, 1, Tier::Low } }, 经过上面的相关初始化，再运行循环将执行m_bounce指向的interpretCases函数。函数interpretCase 相对来说比较复杂一些，如下所示: void LegacyVM::interpretCases() { INIT_CASES DO_CASES { CASE(CREATE2) { ON_OP(); if (!m_schedule-&gt;haveCreate2) throwBadInstruction(); m_bounce = &amp;LegacyVM::caseCreate; } BREAK CASE(CREATE) ........ 此处省略很多的case ....... NEXT CASE(INVALID) DEFAULT { throwBadInstruction(); } } WHILE_CASES } 上述代码中对应了很多宏，，如果不对宏进行展开，直观理解就是对每种操作执行对应的函数，并将 结果进行中间存储，EVM中定义了相关宏开关，其中一些宏开关，都对应了上述代码中不同的 宏展开,同时对应了不同的代码组织形式。参见文件VMConfing.h,如下代码为相关的宏开关： EIP_615 - 子程序和静态跳转的方式 EIP_616 - 单执行多数据流的方式 EVM_OPTIMIZE - 优化开关，当值为false时，所有的优化全部关掉 EVM_SWITCH_DISPATCH - 通过loop和switch执行代码 EVM_JUMP_DISPATCH - 跳转通过一个跳表来实现，只针对gcc EVM_USE_CONSTANT_POOL - 应用静态数据并在栈上直接赋值操作 EVM_REPLACE_CONST_JUMP - 带预确认的跳转来保证运行时的循环 EVM_TRACE - 提供不同等级的trace操作 下面我们来看一下源代码中是如何设置这些宏开关 首先EIP_615和EIP_616均为关闭状态 #ifndef EIP_615 #define EIP_615 false #endif #ifndef EIP_616 #define EIP_616 false #endif //-------------------------------------------------------------------------- //如果没有定义EVM_JUMP_DISPATCH的情况下,如果是GNU的gcc,则打开EVM_JUMP_DISPATCH //我们一般在linux编译，则这里我们可以得到的结论是开关EVM_JUMP_DISPATCH开关打开 ifndef EVM_JUMP_DISPATCH #ifdef __GNUC__ #define EVM_JUMP_DISPATCH true #else #define EVM_JUMP_DISPATCH false #endif #endif #if EVM_JUMP_DISPATCH #ifndef __GNUC__ #error &quot;address of label extension available only on Gnu&quot; #endif #else #define EVM_SWITCH_DISPATCH true #endif //--------------------------------------------------------------------------- //从下面的宏定义EVM_OPTIMIZE的开关是关闭的，因此开关EVM_REPLACE_CONST_JUMP&lt;/br&gt; //EVM_USE_CONSTANT_POOL EVM_DO_FIRST_PASS_OPTIMIZATION均为false的状态 #ifndef EVM_OPTIMIZE #define EVM_OPTIMIZE false #endif #if EVM_OPTIMIZE #define EVM_REPLACE_CONST_JUMP true #define EVM_USE_CONSTANT_POOL true #define EVM_DO_FIRST_PASS_OPTIMIZATION \\ (EVM_REPLACE_CONST_JUMP || EVM_USE_CONSTANT_POOL) #endif 综上宏开关的说明，最后开关EVM_JUMP_DISPATCH是打开的，其他的均处于关闭状态。 在开关EVM_JUMP_DISPATCH打开的情况下对每一个宏展开进行说明，便于理解实际是如何运 行的。具体的参见文件VMConfig.h 宏INIT_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为初始化一个静态的跳转表，代码片段如下: #define INIT_CASES \\ \\ static const void* const jumpTable[256] = { \\ &amp;&amp;STOP, /* 00 */ \\ &amp;&amp;ADD, \\ &amp;&amp;MUL, \\ &amp;&amp;SUB, \\ &amp;&amp;DIV, \\ &amp;&amp;SDIV, \\ &amp;&amp;MOD, \\ &amp;&amp;SMOD, \\ &amp;&amp;ADDMOD, \\ 其中的ADD等定义在文件Instruction.h中，其中枚举了所有的虚拟机执行过程中的字节操作码。 /// Virtual machine bytecode instruction. enum class Instruction: uint8_t { STOP = 0x00, ///&lt; halts execution ADD, ///&lt; addition operation MUL, ///&lt; mulitplication operation SUB, ///&lt; subtraction operation DIV, ///&lt; integer division operation SDIV, ///&lt; signed integer division operation ....... ....... 宏DO_CASES 在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为如下代码片段： #define DO_CASES \\ fetchInstruction(); \\ goto* jumpTable[(int)m_OP];由上面的代码可知操作符定义为一个字节，函数fetchInstruction执行后m_OP中存储了当前要 执行的操作，接着switch将根据具体的操作来执行分支中的内容。 宏CASES 在开关EVM_JUMP_DISPATCH打开的情况下CASES展开的内容如下 ： #define CASE(name) \\ name: 宏NEXT 在开关EVM_JUMP_DISPATCH打开的情况下NEXT展开的内容如下 ： #define NEXT \\ ++m_PC; \\ fetchInstruction(); \\ goto* jumpTable[(int)m_OP]; 宏CONTINUE 在开关EVM_JUMP_DISPATCH打开的情况下CONTINUE展开的内容如下 ： #define CONTINUE \\ fetchInstruction(); \\ goto* jumpTable[(int)m_OP];其他的几个控制分支跳转的宏展开如下： #define BREAK return; #define DEFAULT #define WHILE_CASES 关键的执行操作的宏ON_OP展开如下： #define ON_OP() onOperation()通过上面的宏的展开我们可以看出过程主要依赖jumpTable和函数fetchInstructio来完成 执行过程。首先我们看一下函数fetchInstruction的具体执行流程，整个执行将从这里开始 //初始化时m_PC为0，这里先获取第一个操作符 m_OP = Instruction(m_code[m_PC]); //获取操作相关的参数，gas花费等信息 const InstructionMetric&amp; metric = c_metrics[static_cast&lt;size_t&gt;(m_OP)]; //设置SP为最后返回值所在的位置，同时检查参数出栈和返回值入栈没有超过栈的边界 adjustStack(metric.args, metric.ret); //计算运行的费用 m_runGas = toInt63( m_schedule-&gt;tierStepGas[static_cast&lt;unsigned&gt;(metric.gasPriceTier)] ); m_newMemSize = m_mem.size(); m_copyMemSize = 0; 下面我们看程序是如何利用跳表和onOpearion来完成程序的执行，下面我们以ADD操作 为例来进行说明，在进行ADD说明前，先简单介绍一下EVM中栈工作的原理，例如如果我 们要执行一 加法操作，则通常表示为c = a + b，把它翻译成EVM中栈的操作序列伪操作码序列如下： push a into stack push b into stack pop a and b then cal a+b push a+b into stack 我们先看一下ADD的前置操作PUSH是如何实现的,首先注意如下代码： CASE(PUSH2) ......... CASE(PUSH23) CASE(PUSH24) CASE(PUSH25) CASE(PUSH26) CASE(PUSH27) CASE(PUSH28) CASE(PUSH29) CASE(PUSH30) CASE(PUSH31) CASE(PUSH32) { ON_OP(); updateIOGas(); int numBytes = (int)m_OP - (int)Instruction::PUSH1 + 1; m_SPP[0] = 0; for (++m_PC; numBytes--; ++m_PC) //这里主要是处理256位宽的的情况 m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; } CONTINUE EVM中对PUSH1的其他操作均采用上面的代码，PUSH3的含义是将三个输入的字节序列中的宽度 为32字节的数据压入到栈中，如下代码: m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC]; 上面这段代码主要是将传入的字节流数据转化为256的数据，并放入栈上，同时我们的栈的定义如下： u256 m_stack[1024];这里的设计其实有可以改进的地方，主要是以下几点： 即使编译器部分做了数据紧凑的优化，但是执行的过程中又做了放大，失去了原来的意义。 栈的宽度为256位，抛开加密算法的影响（目前几乎没有栈上运算）,实际有些浪费。 从实际角度讲可以选择小的位宽的栈，数据更加紧密，但是可能会造成操作增加。 通过执行完PUSH操作后，栈上的已经放好了我们要做加法的数据，现在我们看一下ADD操作是如何的。 如下为ADD操作的代码片段： CASE(ADD) { ON_OP(); updateIOGas(); //pops two items and pushes their sum mod 2^256. m_SPP[0] = m_SP[0] + m_SP[1]; } NEXT 上面的代码通过宏展开后代码如下： ADD: { onOperation(); updateIOGas(); m_SPP[0] = m_SP[0] + m_SP[1]; } ++m_PC; fetchInstruction(); goto* jumpTable[(int)m_OP]; 现在step by step的看一下这部分是如何进行处理，首先是opOperaion函数，如下为onOperation 函数的实现： if (m_onOp) (m_onOp)(++m_nSteps, m_PC, m_OP, m_newMemSize &gt; m_mem.size() ? (m_newMemSize - m_mem.size()) / 32 : uint64_t(0), m_runGas, m_io_gas, this, m_ext); 代码中的m_onOp为提供的回调函数，其中其中m_onOp的类型为OnOpFunc,声明如下如下所示： using OnOpFunc = std::function&lt;void(uint64_t /*steps*/, uint64_t /* PC */, Instruction /*instr*/, bigint /*newMemSize*/, bigint /*gasCost*/, bigint /*gas*/, VMFace const*, ExtVMFace const*)&gt;;函数设计主要是在虚拟执行的时候提供一个可以回调的接口，方便进行处理，比如做最简单的tracing 接下来执行函数updateIOGas(),该函数功能主要是查看目前的gas消耗是否已经大于提供的gas, 如果大于，则抛出异常，虚拟机停止运行。代码片段如下： if (m_io_gas &lt; m_runGas) throwOutOfGas(); m_io_gas -= m_runGas; 注意函数中的m_runGas在函数updateGas中被修改，会根据内存的使用来进行计算和消耗。接下来执 行的代码为m_SPP[0] = m_SP[0] + m_SP[1];主要功能是完成两个数的相加计算结果会存储在m_SPP[0] 中，m_SPP的含义是“指向下一个栈中可用的位置”，这里指向m_SP[0]运行初始化开始时m_SPP = m_SP。 接着执行++m_PC,这里将指向代码字节流中的下一个操作。接着执行数fetchInstruction(),这个时候 变量m_OP中存储的是新的操作，继续执行goto* jumpTable[(int)m_OP]，这个时候将跳到下一个操作的 label去执行。综上，EVM虚拟机就是借助栈和基本的操作来完成一个合约字节流的运行的。 执行后的结果返回在操作序列的RETURN和REVERT操作，将栈上的结果数据拷贝到内存中去。以下为RETURN部分代码 CASE(RETURN) { ON_OP(); m_copyMemSize = 0; updateMem(memNeed(m_SP[0], m_SP[1])); updateIOGas(); uint64_t b = (uint64_t)m_SP[0]; uint64_t s = (uint64_t)m_SP[1]; //m_output中存储的就是最后返回的结果 m_output = owning_bytes_ref{std::move(m_mem), b, s}; m_bounce = 0; } BREAK 运行过程中的Gas的消费 上面描述ADD和所涉及到的PUSH操作的时候我们就已经看到会调用updateIOGas函数来计算gas 的消费。从代码中我们可以看到不同的操作对应不同的gas消费具体如下： no gas IO gas 1 IO gas 2 mem gas CREATE2 RETURN REVERT RETURN CREATE SUICIDE STOP REVERT DELEGATECALL MLOAD MSTORE MLOAD STATICCALL MSTORE8 SHA3 MSTORE CALL LOG0 LOG1 MSTORE8 CALLCODE LOG2 LOG3 SHA3 JUMPTO EXP ADD LOG1 JUMPIF MUL SUB LOG2 JUMPV DIV SDIV LOG3 JUMPSUB MOD SMOD CALLDATACOPY JUMPSUBV NOT LT &nbsp; RETURNSUB GT SLT &nbsp; BEGINSUB SGT EQ &nbsp; BEGINDATA ISZERO AND &nbsp; GETLOCAL OR XOR &nbsp; PUTLOCAL BYTE SHL &nbsp; SHR SAR &nbsp; &nbsp; ADDMOD MULMOD &nbsp; &nbsp; SIGNEXTEND ADDRESS &nbsp; &nbsp; ORIGIN BALANCE &nbsp; &nbsp; CALLER CALLVALUE &nbsp; &nbsp; CALLDATALOAD CALLDATASIZE &nbsp; &nbsp; RETURNDATASIZE CODESIZE &nbsp; &nbsp; EXTCODESIZE CALLDATACOPY &nbsp; &nbsp; RETURNDATACOPY RETURNDATACOPY &nbsp; &nbsp; CODECOPY CODECOPY &nbsp; &nbsp; GASPRICE BLOCKHASH &nbsp; &nbsp; COINBASE TIMESTAMP &nbsp; &nbsp; NUMBER DIFFICULTY &nbsp; &nbsp; GASLIMIT POP &nbsp; &nbsp; PUSH JUMP &nbsp; &nbsp; DUP SWAP &nbsp; &nbsp; SLOAD SSTORE &nbsp; &nbsp; PC MSIZE &nbsp; &nbsp; GAS JUMPDEST &nbsp; &nbsp; INVALID &nbsp; 其中 SSTORE是一条比较特殊的指令，他将消耗stack存储的gas 小结 EVM如果精确的定位应该是一个基于栈的自定义字节码解释器，实现上并不复杂，代码过程中遇到 的主要问题有以下几点： 字节宽度的设计，目前看主要是出于实现难度和实际需求（如SHA3的操作) 设计上每次都会生成新的VM对象，出于安全和目前需求这样的设计和实现是可以接受的，数据 共享和多线程处理在智能合约的层面目前还不需要。 EVM整体上实现了基本的操作，但是还需要和语言编译器去结合来做具体的优化，JIT是一个方向。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/19/5510e0e778c622d381743b9c47c85bd6.html","headline":"以太坊虚拟机(EVM)架构和源码简析","dateModified":"2018-06-19T00:00:00+08:00","datePublished":"2018-06-19T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/19/5510e0e778c622d381743b9c47c85bd6.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊虚拟机(EVM)架构和源码简析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h1>EVM架构简析和源码分析</h1>&nbsp; &nbsp; &nbsp; &nbsp;EVM为以太坊虚拟机。以太坊底层通过EVM模块支持智能合约的执行和调用，调用时根据合约的地址获
+  <br>取到代码，生成具体的执行环境，然后将代码载入到EVM虚拟机中运行。通常目前开发智能合约的高级
+  <br>语言为Solidity,在利用solidity实现智能合约逻辑后，通过编译器编译成元数据（字节码）最后发布到以
+  <br>坊上。
+  <br>
+  <h2>EVM架构概述</h2>
+  <p>EVM本质上是一个<strong>堆栈机器</strong>，它最直接的的功能是执行智能合约，根据官方给出的设计原理，EVM的主</p>
+  <p>要的设计目标为如下几点：</p>
+  <ul>
+   <li>简单性</li>
+   <li>确定性</li>
+   <li>空间节省</li>
+   <li>为区块链服务</li>
+   <li>安全性保证</li>
+   <li>便于优化</li>
+  </ul>针对以上几点通过对EVM源代码的阅读来了解其具体的设计思想和工程实用性。
+  <br>
+  <h3>EVM存储系统</h3>
+  <h4>机器位宽</h4>
+  <p>&nbsp; &nbsp; &nbsp; &nbsp;EVM机器位宽为<strong>256</strong>位，即32个字节，256位机器字宽不同于我们经常见到主流的64位的机器</p>
+  <p>字宽，这就标明EVM设计上将考虑一套自己的关于操作，数据，逻辑控制的指令编码。目前主流的处理</p>
+  <p>器原生的支持的计算数据类型有：8bits整数，16bits整数，32bits整数，64bits整数。一般情况下宽字</p>
+  <p>节的计算将更加的快一些，因为它可能包含更多的指令被一次性加载到pc寄存器中，同时伴有内存访问</p>
+  <p>次数的减少。目前在X86的架构中8bits的计算并不是完全的支持（除法和乘法），但基本的数学运算大概</p>
+  <p>在几个时钟周期内就能完成，也就是说主流的字节宽度基本上处理器能够原生的支持，那为什么EVM要采</p>
+  <p>用256位的字宽。主要从以下两个方面考虑：</p>
+  <ul>
+   <li>时间，智能合约是否能执行得更快</li>
+   <li>空间，这样是否整体字节码的大小会有所减少</li>
+   <li>gas成本</li>
+  </ul>
+  <p><strong>时间</strong>上主要体现在执行的效率上，我们以两个整形数相加来对比具体的操作时间消耗。<strong><span style="color:#3366ff;">32bits相加的X86</span></strong></p>
+  <p><strong><span style="color:#3366ff;">的汇编代码</span></strong></p>
+  <pre><code class="language-cpp">mov eax, dword [9876ABCD] //将地址9876ABCD中的32位数据放入eax数据寄存器
+add eax, dword [1234DCBA] //将1234DCBA地址指向32位数和eax相加,结果保存在eax中</code></pre>
+  <p><strong><span style="color:#3366ff;">64bits相加的X86汇编代码</span></strong></p>
+  <pre><code class="language-cpp">mov rax, qword [123456789ABCDEF1] //将地址指向的64位数据放入64位寄存器
+add rax, qword [1020304050607080] //计算相加的结果并将结果放入到64位寄存器中</code></pre>下面我们看一下在64bits机器上如何完成256bits的加法
+  <br>
+  <pre><code class="language-cpp">mov rax, qword [9876ABCD]
+add qword [1234DCBA], rax
+mov rax, qword [9876ABCD+8]
+adc qword [1234DCBA+8], rax//这里应用adc带进位的加法指令，影响进位标记CF
+mov rax, qword [9876ABCD+16]
+adc qword [1234DCBA+16], rax
+mov rax, qword [9876ABCD+24]
+adc qword [1234DCBA+24], rax</code></pre>由上面的的汇编指令我们可以看出256位操作要比系统原生支持的要复杂的多，从时间上考虑采用
+  <br>256位这样的字节宽度，实际的收益并不大。
+  <br>
+  <strong>空间</strong>上，由上面的汇编操作（在实际的EVM中操作类似）我们不难看到，如果直接对地址进行操
+  <br>作似乎是一种快速的方式，并减少了操作数，进而操作码也有所减少，相应的智能合约的字节流
+  <br>大小就会小很多，gas花费也会有所下降。但是从另外一个层面来讲，支持宽字节的数据类型势必
+  <br>会造成在处理低字节宽度的数据时候带来存储上的浪费（如添加标识用来区分类型）或者添加额外
+  <br>
+  <p>的操作来进行数据的compact。从时间和空间角度来看，仅支持256字节宽度的选择有利有弊，具</p>
+  <p>体还要看以太坊智能合约的具体应用。可能的几点原因如下:</p>
+  <ul>
+   <li>256位的宽度方便进行密码学方面的计算（sha256），但是成本有些高，场景比较少</li>
+   <li>仅支持256位的比要支持其他类型的操作要少，单一，实现简单可控</li>
+   <li>和gas的计算相关，仅支持一种，方便计算，同时也考虑到了安全问题</li>
+  </ul>
+  <br>
+  <br>
+  <h3>内存分配</h3>
+  <p>EVM中数据可以在三个地方进行存储，分别是<strong><u>栈，临时存储，永久存储</u></strong>。由于EVM是基于栈的虚拟机，</p>
+  <p>因此基本上所有的操作都是在栈上进行的，并且EVM中没有寄存器的概念,这样EVM对栈的依赖就更大，</p>
+  <p>虽然这样的设计使实现比较简单且易于理解，但是带来的问题就是需要更多数据的相关操作。在EVM</p>
+  <p>中栈是唯一的免费（几乎是）存放数据的地方。栈自然有深度的限制，目前的限制是1024</p>
+  <pre><code class="language-cpp">static constexpr int64_t stackLimit = 1024;</code></pre>
+  <p>因为栈的限制，因此栈上的临时变量的使用会受限制。临时内存存储在每个VM实例中，并在合约执行完</p>
+  <p>后消失永久内存存储在区块链的状态层。</p>
+  <h2>EVM代码简析</h2>本文分析EVM c++的代码， github地址为
+  <em>https://github.com/ethereum/cpp-ethereum</em>
+  <br>EVM c++实现了同go版本中的核心的功能，对于快速理解EVM的设计思想比较受用，对于熟悉C++的
+  <br>可以先通过阅读C++版本的实现，然后对标go版本的实现来进一步了解EVM的设计思路。
+  <br>
+  <h4>EVM代码overview</h4>主要代码路径为cpp-ethereum/libevm和libethereum，代码量不大，以下为主要代码。
+  <br>
+  <br>
+  <pre><code class="language-cpp">EVMC.cpp
+ExtVMFace.cpp
+Instruction.cpp
+interpreter.h
+LegacyVMCalls.cpp
+VM.cpp
+VMCalls.cpp
+VMFactory.cpp
+VMOpt.cpp
+VMSIMD.cpp
+VmValidate.cpp
+LegacyVM.cpp
+Executive.cpp
+ExtVm.cpp</code></pre>下图为EVM中主要类的类图:
+  <br>
+  <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180619143753865?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1N1bm55V2Vk/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="">
+  <br>以太坊中调用EVM相关代码的入口存在于不同的阶段，我们主要从以下几个角度来看它是如何运作的&lt;/br&gt;
+  <br>
+  <ul>
+   <li>执行环境创建</li>
+   <li>新合约的创建</li>
+   <li>合约执行调用、</li>
+   <li>执行后结果返回</li>
+   <li>运行过程中的gas消费</li>
+  </ul>
+  <br>
+  <br>
+  <h4>执行环境的创建</h4>以太坊虚拟中涉及到的虚拟机执行的关键类为
+  <strong><span style="color:#993300;">Executive</span></strong>（位于目录libethereum）中，我们先从
+  <br>创建运行环境入手，关键入口函数call入手，函数声明为：
+  <br>
+  <br>
+  <pre><code class="language-cpp">bool call(Address const&amp; _receiveAddress, //接收者地址
+          Address const&amp; _txSender,       //发送者地址
+          u256 const&amp; _txValue,           //transaction的值
+          u256 const&amp; _gasPrice,          //gas的价格
+          bytesConstRef _txData,          //具体的transaction数据
+          u256 const&amp; _gas);              //提供的gas值
+bool call(CallParameters const&amp; _cp,      //运行参数，由上个函数的相关变量创建
+          u256 const&amp; _gasPrice,          //gas的价格
+          Address const&amp; _origin);        //源地址</code></pre>
+  <p>两个函数的功能是一样的，只是第一个函数会将参数包装成CallParameters然后在调用第二个函数,现在看</p>
+  <p>一下call函数的流程图如下：</p>
+  <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180619143913543?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1N1bm55V2Vk/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="">
+  <br>
+  <br>
+  <p>上述函数的关键点在于在不是预编译合约（以太坊中内部定义好的合约多为签名计算），生成<strong>ExtVM</strong></p>
+  <p><strong>实例</strong>，这个对象将在函数go中返回重要的作用。注意函数最后会更改状态指向函数transferBalance:</p>
+  <pre><code class="language-cpp">m_s.transferBalance(_p.senderAddress, _p.receiveAddress, _p.valueTransfer);</code></pre>
+  <h4>新合约的创建</h4>
+  <p>如果调用的合约地址在系统中还没有出存在，这个适合涉及到合约的创建，关键函数为<span style="color:#993300;"><strong>create</strong></span>:</p>
+  <pre><code class="language-cpp">bool create(Address const&amp; _txSender, //目的地址
+            u256 const&amp; _endowment,   //花费的值
+            u256 const&amp; _gasPrice,    //gas的价钱
+            u256 const&amp; _gas,         //花费的gas数量
+            bytesConstRef _init,      //传入的字节码
+            Address const&amp; _origin)   //源地址</code></pre>
+  <p>函数将调用createOpcode函数，该函数在获得sender的nonce值后生成合约地址，并且调用函数</p>
+  <p>executeCreate来完成最后的创建。</p>
+  <pre><code class="language-cpp">u256 nonce = m_s.getNonce(_sender);
+//注意地址保存在m_newAddress中,这个是否足够灵活
+m_newAddress = right160(sha3(rlpList(_sender, nonce)));
+return executeCreate(_sender, _endowment, _gasPrice, _gas, _init, _origin);</code></pre>
+  <p>下面看关键的的函数executeCreate,其流程图如下所示:</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180619144115923?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1N1bm55V2Vk/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+  <p>我们从代码中不难看出，最后和call函数相同生成ExtVM对象，将要执行的字节码放入其中。</p>
+  <p>这里需要注意的是执行transferBalance时候如果没有账户将创建一个新的账户。</p>
+  <h4>合约执行调用</h4>
+  <p>合约的执行的起始点在函数Executive::go中，函数的流程图如下：</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180619144204611?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1N1bm55V2Vk/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+  <br>
+  <p>从流程图中我们看到如果m_ext（create或者call函数中创建）不为空的时候通过工厂方法创建VM，</p>
+  <p>这里要正确的理解m_ext和vm的区别，我们先看工厂方法的实现:</p>
+  <pre><code class="language-cpp">std::unique_ptr&lt;VMFace&gt; VMFactory::create(VMKind _kind)
+{
+    switch (_kind)
+    {
+#ifdef ETH_EVMJIT
+    case VMKind::JIT:
+        return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmjit_create()});
+#endif
+#ifdef ETH_HERA
+    case VMKind::Hera:
+        return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_hera()});
+#endif
+    case VMKind::Interpreter:
+        return std::unique_ptr&lt;VMFace&gt;(new EVMC{evmc_create_interpreter()});
+    case VMKind::DLL:
+        return std::unique_ptr&lt;VMFace&gt;(new EVMC{g_dllEvmcCreate()});
+    case VMKind::Legacy:
+    default:
+        return std::unique_ptr&lt;VMFace&gt;(new LegacyVM);
+    }
+}</code></pre>从代码中我们不难看出，会根据虚拟机的类型创建对应的虚拟机对象，无参函数create将默认生成
+  <br>
+  <p>类型为<strong><span style="color:#cc0000;">VMKind::Legacy</span></strong>。在函数create和call中生成的m_ext是虚拟机和外部相关状态进行交互的。</p>
+  <p>调用VM的exec函数完成虚拟机的执行。LegacyVM的exec函数关键代码如下:</p>
+  <pre><code class="language-cpp">// trampoline to minimize depth of call stack when calling out
+m_bounce = &amp;LegacyVM::initEntry;//初始化m_bounce
+do
+    (this-&gt;*m_bounce)();
+while (m_bounce);</code></pre>
+  <p>初始化m_bounce的函数使initEntry,我们看下<strong><u>initEntry</u></strong>函数中实现的功能。</p>
+  <pre><code class="language-cpp">m_bounce = &amp;LegacyVM::interpretCases;//设置m_bounce为函数interpreCases
+initMetrics();//初始化操作，参数和返回值，gas花费矩阵，
+optimize();//优化，主要针对跳转的优化，后续再做补充，目前程序汇总关闭</code></pre>
+  <p>经过上面的代码处理，<strong>m_bounce</strong>设置为下一步将要运行的函数。初始化操作以及花费说明的矩阵，</p>
+  <p>矩阵关联的Instruction部分相关信息如下：</p>
+  <pre><code class="language-cpp">static const std::map&lt;Instruction,  InstructionInfo&gt; c_instructionInfo =
+{ //                                         Add,  Args,  Ret,  GasPriceTier
+	{ Instruction::STOP,    { "STOP",           0,     0,    0,  Tier::Zero } },
+	{ Instruction::ADD,     { "ADD",            0,     2,    1,  Tier::VeryLow } },
+	{ Instruction::SUB,     { "SUB",            0,     2,    1,  Tier::VeryLow } },
+	{ Instruction::MUL,     { "MUL",            0,     2,    1,  Tier::Low } },
+	{ Instruction::DIV,     { "DIV",            0,     2,    1,  Tier::Low } },
+	{ Instruction::SDIV,    { "SDIV",           0,     2,    1,  Tier::Low } },
+	{ Instruction::MOD,     { "MOD",            0,     2,    1,  Tier::Low } },</code></pre>
+  <p>经过上面的相关初始化，再运行循环将执行m_bounce指向的interpretCases函数。函数interpretCase</p>
+  <p>相对来说比较复杂一些，如下所示:</p>
+  <pre><code class="language-cpp">void LegacyVM::interpretCases()
+{
+  INIT_CASES
+  DO_CASES
+  {
+    CASE(CREATE2)
+    {
+      ON_OP();
+      if (!m_schedule-&gt;haveCreate2)
+          throwBadInstruction();
+          m_bounce = &amp;LegacyVM::caseCreate;
+		}
+		BREAK
+    CASE(CREATE)
+    ........
+    此处省略很多的case
+    .......
+
+
+    NEXT
+
+
+    CASE(INVALID)
+    DEFAULT
+    {
+        throwBadInstruction();
+    }
+	}  
+  WHILE_CASES
+}</code></pre>
+  <br>
+  <p>上述代码中对应了很多宏，，如果不对宏进行展开，直观理解就是对每种操作执行对应的函数，并将</p>
+  <p>结果进行中间存储，EVM中定义了相关宏开关，其中一些宏开关，都对应了上述代码中不同的</p>
+  <p>宏展开,同时对应了不同的代码组织形式。参见文件VMConfing.h,如下代码为相关的宏开关：</p>
+  <pre><code class="language-cpp">EIP_615                - 子程序和静态跳转的方式
+EIP_616                - 单执行多数据流的方式
+EVM_OPTIMIZE           - 优化开关，当值为false时，所有的优化全部关掉
+EVM_SWITCH_DISPATCH    - 通过loop和switch执行代码
+EVM_JUMP_DISPATCH      - 跳转通过一个跳表来实现，只针对gcc
+EVM_USE_CONSTANT_POOL  - 应用静态数据并在栈上直接赋值操作
+EVM_REPLACE_CONST_JUMP - 带预确认的跳转来保证运行时的循环
+EVM_TRACE              - 提供不同等级的trace操作</code></pre>
+  <p>下面我们来看一下源代码中是如何设置这些宏开关</p>
+  <pre><code class="language-cpp">首先EIP_615和EIP_616均为关闭状态
+#ifndef EIP_615
+#define EIP_615 false
+#endif
+
+
+#ifndef EIP_616
+#define EIP_616 false
+#endif
+//--------------------------------------------------------------------------
+//如果没有定义EVM_JUMP_DISPATCH的情况下,如果是GNU的gcc,则打开EVM_JUMP_DISPATCH
+//我们一般在linux编译，则这里我们可以得到的结论是开关EVM_JUMP_DISPATCH开关打开
+ifndef EVM_JUMP_DISPATCH
+#ifdef __GNUC__
+#define EVM_JUMP_DISPATCH true
+#else
+#define EVM_JUMP_DISPATCH false
+#endif
+#endif
+
+
+#if EVM_JUMP_DISPATCH
+#ifndef __GNUC__
+#error "address of label extension available only on Gnu"
+#endif
+#else
+#define EVM_SWITCH_DISPATCH true
+#endif
+//---------------------------------------------------------------------------
+//从下面的宏定义EVM_OPTIMIZE的开关是关闭的，因此开关EVM_REPLACE_CONST_JUMP&lt;/br&gt;
+//EVM_USE_CONSTANT_POOL EVM_DO_FIRST_PASS_OPTIMIZATION均为false的状态
+#ifndef EVM_OPTIMIZE
+#define EVM_OPTIMIZE false
+#endif
+#if EVM_OPTIMIZE
+#define EVM_REPLACE_CONST_JUMP true
+#define EVM_USE_CONSTANT_POOL true
+#define EVM_DO_FIRST_PASS_OPTIMIZATION \
+       (EVM_REPLACE_CONST_JUMP || EVM_USE_CONSTANT_POOL)
+#endif</code></pre>
+  <strong>综上</strong>宏开关的说明，最后开关EVM_JUMP_DISPATCH是打开的，其他的均处于关闭状态。
+  <br>
+  <p>在开关<strong>EVM_JUMP_DISPATCH</strong>打开的情况下对每一个宏展开进行说明，便于理解实际是如何运</p>
+  <p>行的。具体的参见文件VMConfig.h</p>
+  <strong>宏INIT_CASES</strong>
+  <br>在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为初始化一个静态的跳转表，代码片段如下:
+  <pre><code class="language-cpp">#define INIT_CASES                              \
+                                                \
+    static const void* const jumpTable[256] = { \
+        &amp;&amp;STOP, /* 00 */                        \
+        &amp;&amp;ADD,                                  \
+        &amp;&amp;MUL,                                  \
+        &amp;&amp;SUB,                                  \
+        &amp;&amp;DIV,                                  \
+        &amp;&amp;SDIV,                                 \
+        &amp;&amp;MOD,                                  \
+        &amp;&amp;SMOD,                                 \
+        &amp;&amp;ADDMOD,                               \</code></pre>
+  <p>其中的ADD等定义在文件Instruction.h中，其中枚举了所有的虚拟机执行过程中的字节操作码。</p>
+  <pre><code class="language-cpp">/// Virtual machine bytecode instruction.
+enum class Instruction: uint8_t
+{
+	STOP = 0x00,        ///&lt; halts execution
+	ADD,                ///&lt; addition operation
+	MUL,                ///&lt; mulitplication operation
+	SUB,                ///&lt; subtraction operation
+	DIV,                ///&lt; integer division operation
+	SDIV,               ///&lt; signed integer division operation
+  .......
+  .......</code></pre>
+  <br>
+  <strong>宏DO_CASES</strong>
+  <br>
+  <p>在开关EVM_JUMP_DISPATCH打开的情况下该宏展开为如下代码片段：</p>
+  <pre><code class="language-cpp">#define DO_CASES        \
+    fetchInstruction(); \
+    goto* jumpTable[(int)m_OP];</code></pre>由上面的代码可知操作符定义为一个字节，函数fetchInstruction执行后m_OP中存储了当前要
+  <br>执行的操作，接着switch将根据具体的操作来执行分支中的内容。
+  <br>
+  <strong>宏CASES</strong>
+  <br>在开关EVM_JUMP_DISPATCH打开的情况下CASES展开的内容如下 ：
+  <br>
+  <pre><code class="language-cpp">#define CASE(name) \
+    name:</code></pre>
+  <strong>宏NEXT</strong>
+  <br>
+  <p>在开关EVM_JUMP_DISPATCH打开的情况下NEXT展开的内容如下 ：</p>
+  <pre><code class="language-cpp">#define NEXT            \
+    ++m_PC;             \
+    fetchInstruction(); \
+    goto* jumpTable[(int)m_OP];</code></pre>
+  <strong>宏CONTINUE</strong>
+  <br>在开关EVM_JUMP_DISPATCH打开的情况下CONTINUE展开的内容如下 ：
+  <br>
+  <pre><code class="language-cpp">#define CONTINUE        \
+    fetchInstruction(); \
+    goto* jumpTable[(int)m_OP];</code></pre>其他的几个控制分支跳转的宏展开如下：
+  <br>
+  <pre><code class="language-cpp">#define BREAK return;
+#define DEFAULT
+#define WHILE_CASES</code></pre>
+  <p>关键的执行操作的宏ON_OP展开如下：</p>
+  <pre><code class="language-cpp">#define ON_OP() onOperation()</code></pre>通过上面的宏的展开我们可以看出过程主要依赖jumpTable和函数fetchInstructio来完成
+  <br>执行过程。首先我们看一下函数fetchInstruction的具体执行流程，整个执行将从这里开始
+  <br>
+  <pre><code class="language-cpp">//初始化时m_PC为0，这里先获取第一个操作符
+m_OP = Instruction(m_code[m_PC]);
+//获取操作相关的参数，gas花费等信息
+const InstructionMetric&amp; metric = c_metrics[static_cast&lt;size_t&gt;(m_OP)];
+//设置SP为最后返回值所在的位置，同时检查参数出栈和返回值入栈没有超过栈的边界
+adjustStack(metric.args, metric.ret);
+
+
+//计算运行的费用
+m_runGas = toInt63(
+         m_schedule-&gt;tierStepGas[static_cast&lt;unsigned&gt;(metric.gasPriceTier)]
+        );
+m_newMemSize = m_mem.size();
+m_copyMemSize = 0;</code></pre>
+  <p>下面我们看程序是如何利用跳表和onOpearion来完成程序的执行，下面我们以ADD操作</p>
+  <p>为例来进行说明，在进行ADD说明前，先简单介绍一下EVM中栈工作的原理，例如如果我</p>
+  <p>们要执行一</p>
+  <p>加法操作，则通常表示为c = a + b，把它翻译成EVM中栈的操作序列伪操作码序列如下：</p>
+  <pre><code class="language-cpp">push a into stack
+push b into stack
+pop a and b then cal a+b
+push a+b into stack</code></pre>
+  <p>我们先看一下ADD的前置操作PUSH是如何实现的,首先注意如下代码：</p>
+  <pre><code class="language-cpp">CASE(PUSH2)
+    .........
+		CASE(PUSH23)
+		CASE(PUSH24)
+		CASE(PUSH25)
+		CASE(PUSH26)
+		CASE(PUSH27)
+		CASE(PUSH28)
+		CASE(PUSH29)
+		CASE(PUSH30)
+		CASE(PUSH31)
+		CASE(PUSH32)
+		{
+      ON_OP();
+      updateIOGas();
+      int numBytes = (int)m_OP - (int)Instruction::PUSH1 + 1;
+      m_SPP[0] = 0;
+      for (++m_PC; numBytes--; ++m_PC)
+      //这里主要是处理256位宽的的情况
+      m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC];
+		}
+		CONTINUE</code></pre>
+  <p>EVM中对PUSH1的其他操作均采用上面的代码，PUSH3的含义是将三个输入的字节序列中的宽度</p>
+  <p>为32字节的数据压入到栈中，如下代码:</p>
+  <p><span style="background-color:rgb(240,240,240);color:rgb(0,0,0);font-family:Consolas, Inconsolata, Courier, monospace;font-size:12px;">m_SPP[0] = (m_SPP[0] &lt;&lt; 8) | m_code[m_PC];</span></p>
+  <p>上面这段代码主要是将传入的字节流数据转化为256的数据，并放入栈上，同时我们的栈的定义如下：</p>
+  <pre><code class="language-cpp">u256 m_stack[1024];</code></pre>这里的设计其实有可以改进的地方，主要是以下几点：
+  <br>
+  <ul>
+   <li>即使编译器部分做了数据紧凑的优化，但是执行的过程中又做了放大，失去了原来的意义。</li>
+   <li>栈的宽度为256位，抛开加密算法的影响（目前几乎没有栈上运算）,实际有些浪费。</li>
+   <li>从实际角度讲可以选择小的位宽的栈，数据更加紧密，但是可能会造成操作增加。</li>
+  </ul>
+  <p>通过执行完PUSH操作后，栈上的已经放好了我们要做加法的数据，现在我们看一下ADD操作是如何的。</p>
+  <p>如下为ADD操作的代码片段：</p>
+  <pre><code class="language-cpp">CASE(ADD)
+{
+  ON_OP();
+  updateIOGas();
+
+
+  //pops two items and pushes their sum mod 2^256.
+  m_SPP[0] = m_SP[0] + m_SP[1];
+}
+NEXT</code></pre>
+  <p>上面的代码通过宏展开后代码如下：</p>
+  <pre><code class="language-cpp">ADD:
+{
+   onOperation();
+   updateIOGas();
+   m_SPP[0] = m_SP[0] + m_SP[1];
+}
+++m_PC;             
+fetchInstruction();
+goto* jumpTable[(int)m_OP];</code></pre>
+  <p>现在step by step的看一下这部分是如何进行处理，首先是opOperaion函数，如下为onOperation</p>
+  <p>函数的实现：</p>
+  <pre><code class="language-cpp">if (m_onOp)
+  (m_onOp)(++m_nSteps, m_PC, m_OP,
+  m_newMemSize &gt; m_mem.size() ? (m_newMemSize - m_mem.size()) / 32 : uint64_t(0),
+  m_runGas, m_io_gas, this, m_ext);</code></pre>
+  <p>代码中的m_onOp为提供的回调函数，其中其中m_onOp的类型为OnOpFunc,声明如下如下所示：</p>
+  <pre><code class="language-cpp">using OnOpFunc = std::function&lt;void(uint64_t /*steps*/,
+                                    uint64_t /* PC */,
+                                    Instruction /*instr*/,
+                                    bigint /*newMemSize*/,
+                                    bigint /*gasCost*/,
+                                    bigint /*gas*/,
+                                    VMFace const*,
+                                    ExtVMFace const*)&gt;;</code></pre>函数设计主要是在虚拟执行的时候提供一个可以回调的接口，方便进行处理，比如做最简单的tracing
+  <br>
+  <p>接下来执行函数updateIOGas(),该函数功能主要是查看目前的gas消耗是否已经大于提供的gas,</p>
+  <p>如果大于，则抛出异常，虚拟机停止运行。代码片段如下：</p>
+  <pre><code class="language-cpp">if (m_io_gas &lt; m_runGas)
+  throwOutOfGas();
+m_io_gas -= m_runGas;</code></pre>
+  <p>注意函数中的m_runGas在函数updateGas中被修改，会根据内存的使用来进行计算和消耗。接下来执</p>
+  <p>行的代码为<em><strong><u>m_SPP[0] = m_SP[0] + m_SP[1]</u></strong>;</em>主要功能是完成两个数的相加计算结果会存储在m_SPP[0]</p>
+  <p>中，m_SPP的含义是“指向下一个栈中可用的位置”，这里指向m_SP[0]运行初始化开始时<em><strong><u>m_SPP = m_SP</u></strong></em>。</p>
+  <p>接着执行<em><strong><u>++m_PC</u></strong></em>,这里将指向代码字节流中的下一个操作。接着执行数fetchInstruction(),这个时候</p>
+  <p>变量m_OP中存储的是新的操作，继续执行<span style="color:#990000;"><strong>goto* jumpTable[(int)m_OP]</strong></span>，这个时候将跳到下一个操作的</p>
+  <p>label去执行。</p>综上，EVM虚拟机就是借助栈和基本的操作来完成一个合约字节流的运行的。
+  <br>
+  <h4>执行后的结果返回</h4>在操作序列的RETURN和REVERT操作，将栈上的结果数据拷贝到内存中去。以下为RETURN部分代码
+  <br>
+  <pre><code class="language-cpp">CASE(RETURN)
+{
+  ON_OP();
+  m_copyMemSize = 0;
+  updateMem(memNeed(m_SP[0], m_SP[1]));
+  updateIOGas();
+
+
+  uint64_t b = (uint64_t)m_SP[0];
+  uint64_t s = (uint64_t)m_SP[1];
+  //m_output中存储的就是最后返回的结果
+  m_output = owning_bytes_ref{std::move(m_mem), b, s};
+  m_bounce = 0;
+}
+BREAK</code></pre>
+  <h4>运行过程中的Gas的消费</h4>
+  <p>上面描述ADD和所涉及到的PUSH操作的时候我们就已经看到会调用updateIOGas函数来计算gas</p>
+  <p>的消费。从代码中我们可以看到不同的操作对应不同的gas消费具体如下：</p>
+  <p></p>
+  <table style="border-spacing:0px;color:rgb(36,41,46);font-family:'-apple-system', BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';font-size:16px;">
+   <thead>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <th align="left" style="border-color:rgb(223,226,229);">no gas</th>
+     <th align="left" style="border-color:rgb(223,226,229);">IO gas 1</th>
+     <th align="left" style="border-color:rgb(223,226,229);">IO gas 2</th>
+     <th align="left" style="border-color:rgb(223,226,229);">mem gas</th>
+    </tr>
+   </thead>
+   <tbody>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CREATE2</td>
+     <td align="left" style="border-color:rgb(223,226,229);">RETURN</td>
+     <td align="left" style="border-color:rgb(223,226,229);">REVERT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">RETURN</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CREATE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SUICIDE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">STOP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">REVERT</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">DELEGATECALL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MLOAD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MSTORE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MLOAD</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">STATICCALL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MSTORE8</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SHA3</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MSTORE</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CALL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG0</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG1</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MSTORE8</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CALLCODE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG2</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG3</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SHA3</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPTO</td>
+     <td align="left" style="border-color:rgb(223,226,229);">EXP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">ADD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG1</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPIF</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MUL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SUB</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG2</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPV</td>
+     <td align="left" style="border-color:rgb(223,226,229);">DIV</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SDIV</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LOG3</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPSUB</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MOD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SMOD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CALLDATACOPY</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPSUBV</td>
+     <td align="left" style="border-color:rgb(223,226,229);">NOT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">LT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">RETURNSUB</td>
+     <td align="left" style="border-color:rgb(223,226,229);">GT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SLT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">BEGINSUB</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SGT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">EQ</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">BEGINDATA</td>
+     <td align="left" style="border-color:rgb(223,226,229);">ISZERO</td>
+     <td align="left" style="border-color:rgb(223,226,229);">AND</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">GETLOCAL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">OR</td>
+     <td align="left" style="border-color:rgb(223,226,229);">XOR</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">PUTLOCAL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">BYTE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SHL</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">SHR</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SAR</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">ADDMOD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MULMOD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">SIGNEXTEND</td>
+     <td align="left" style="border-color:rgb(223,226,229);">ADDRESS</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">ORIGIN</td>
+     <td align="left" style="border-color:rgb(223,226,229);">BALANCE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CALLER</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CALLVALUE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CALLDATALOAD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CALLDATASIZE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">RETURNDATASIZE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CODESIZE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">EXTCODESIZE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CALLDATACOPY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">RETURNDATACOPY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">RETURNDATACOPY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">CODECOPY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">CODECOPY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">GASPRICE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">BLOCKHASH</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">COINBASE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">TIMESTAMP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">NUMBER</td>
+     <td align="left" style="border-color:rgb(223,226,229);">DIFFICULTY</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">GASLIMIT</td>
+     <td align="left" style="border-color:rgb(223,226,229);">POP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">PUSH</td>
+     <td align="left" style="border-color:rgb(223,226,229);">JUMP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">DUP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SWAP</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">SLOAD</td>
+     <td align="left" style="border-color:rgb(223,226,229);">SSTORE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">PC</td>
+     <td align="left" style="border-color:rgb(223,226,229);">MSIZE</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">GAS</td>
+     <td align="left" style="border-color:rgb(223,226,229);">JUMPDEST</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+    <tr style="background-color:rgb(246,248,250);border-top-color:rgb(198,203,209);">
+     <td align="left" style="border-color:rgb(223,226,229);">INVALID</td>
+     <td align="left" style="border-color:rgb(223,226,229);">&nbsp;</td>
+    </tr>
+   </tbody>
+  </table>其中
+  <strong>SSTORE</strong>是一条比较特殊的指令，他将消耗stack存储的gas
+  <br>
+  <br>
+  <h3>小结</h3>
+  <p>EVM如果精确的定位应该是一个基于栈的自定义字节码解释器，实现上并不复杂，代码过程中遇到</p>
+  <p>的主要问题有以下几点：</p>
+  <ul>
+   <li>字节宽度的设计，目前看主要是出于实现难度和实际需求（如SHA3的操作)</li>
+   <li>设计上每次都会生成新的VM对象，出于安全和目前需求这样的设计和实现是可以接受的，数据</li>
+  </ul>
+  <p>共享和多线程处理在智能合约的层面目前还不需要。</p>
+  <p></p>
+  <ul>
+   <li>EVM整体上实现了基本的操作，但是还需要和语言编译器去结合来做具体的优化，JIT是一个方向。</li>
+  </ul> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/SunnyWed/article/details/80696948,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/SunnyWed/article/details/80696948,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

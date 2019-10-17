@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>《我学区块链》—— 十二、以太坊安全之 Parity 第一次安全事件漏洞分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="《我学区块链》—— 十二、以太坊安全之 Parity 第一次安全事件漏洞分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="十二、以太坊安全之 Parity 第一次安全事件漏洞分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;截止目前，Parity 多重签名钱包共发生过两次安全事件，第一次发生在 2017年07月19日，涉及 Parity 1.5 及以上版本，造成 15万以太币约 3000万美元被盗，第二次发生在 2017年11月07日，致使约 50万枚以太币被锁在合约中无法取出，当时价值大约 1.5亿美元，本篇先对发生于 7月19日的第一次安全漏洞做一下分析，下一篇再分析 2017年11月7日的安全漏洞。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;概括来说，黑客向每个有漏洞的合约发送了两笔交易：第一笔交易用来获取多重签名钱包的拥有权限，第二笔交易是转移合约上的全部资金。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可从官方默认地址 paritytech/parity 检出代码，再切换到 tag v1.5.x 版本，或直接从这里 问题代码 git id 4d08e7b0aec46443bf26547b17d10cb302672835 进入，来查看完整代码。 攻击分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第一步：成为合约的 owner // enhanced-wallet.sol // gets called when no other function matches function() payable { // just being sent some cash? if (msg.value &gt; 0) Deposit(msg.sender, msg.value); else if (msg.data.length &gt; 0) _walletLibrary.delegatecall(msg.data); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过往这个合约地址转账一个value = 0, msg.data.length &gt; 0的交易，以执行_walletLibrary.delegatecall分支。由于通过 json-rpc 调用以太坊智能合约时，to参数为合约地址，而要调用的合约方法会经编码后，放在data参数中，因此代码_walletLibrary.delegatecall(msg.data)理论上能无条件的调用合约内的任何一个函数，本次安全事件就是黑客调用了一个叫做initWallet的函数： // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) { initDaylimit(_daylimit); initMultiowned(_owners, _required); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意参数列表中的_owners，因为是多重签名合约，所以是address[]即地址数组，该函数原本的作用是用多重所有者的地址列表来初始化钱包，函数会继续向底层调用initMultiowned函数： // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;经过这一步，合约的所有者就被改变了，相当于获取了 Linux 系统的 root 权限。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第二步: 转账，以owner身份调用execute函数，提取合约余额到黑客的地址： function execute(address _to, uint _value, bytes _data) external onlyowner returns (bytes32 o_hash) { // first, take the opportunity to check that we&#39;re under the daily limit. if ((_data.length == 0 &amp;&amp; underLimit(_value)) || m_required == 1) { // yes - just execute the call. address created; if (_to == 0) { created = create(_value, _data); } else { if (!_to.call.value(_value)(_data)) throw; } SingleTransact(msg.sender, _value, _to, _data, created); } else { // determine our operation hash. o_hash = sha3(msg.data, block.number); // store if it&#39;s new if (m_txs[o_hash].to == 0 &amp;&amp; m_txs[o_hash].value == 0 &amp;&amp; m_txs[o_hash].data.length == 0) { m_txs[o_hash].to = _to; m_txs[o_hash].value = _value; m_txs[o_hash].data = _data; } if (!confirm(o_hash)) { ConfirmationNeeded(o_hash, msg.sender, _value, _to, _data); } } } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意函数第一行后面的修改器限制为onlyowner，黑客进行上面的动作就是为了突破该限制。 // simple single-sig function modifier. modifier onlyowner { if (isOwner(msg.sender)) _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;因此，问题的关键就在于，上面的initWallet没有检查以防止在合约初始化后再次调用到initMultiowned，进而使得合约的所有者被改成黑客。 解决方案： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过上面的分析可以看到，核心问题在于越权的函数调用，那修复方法便是对initWallet及与之相关的接口方法initDaylimit和initMultiowned重新定义访问权限： // throw unless the contract is not yet initialized. modifier only_uninitialized { if (m_numOwners &gt; 0) throw; _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过检查m_numOwners变量值，若已经初始化，则直接返回(旧版 solidity 中是抛出异常)，不允许再执行initWallet等方法： // constructor - stores initial daily limit and records the present day&#39;s index. function initDaylimit(uint _limit) only_uninitialized { m_dailyLimit = _limit; m_lastDay = today(); } // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) only_uninitialized { initDaylimit(_daylimit); initMultiowned(_owners, _required); } // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) only_uninitialized { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可注意到，每个函数第一行的最后面都添加了限定修改器标识only_uninitialized，这就是 Parity 多重签名钱包，第一次安全事件的漏洞原理和解决办法，该漏洞发生于 2017年07月19日，致使大约 3000万美元资产被盗。下一篇我们分析 Parity 的第二次安全事件。 阅读更多" />
+<meta property="og:description" content="十二、以太坊安全之 Parity 第一次安全事件漏洞分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;截止目前，Parity 多重签名钱包共发生过两次安全事件，第一次发生在 2017年07月19日，涉及 Parity 1.5 及以上版本，造成 15万以太币约 3000万美元被盗，第二次发生在 2017年11月07日，致使约 50万枚以太币被锁在合约中无法取出，当时价值大约 1.5亿美元，本篇先对发生于 7月19日的第一次安全漏洞做一下分析，下一篇再分析 2017年11月7日的安全漏洞。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;概括来说，黑客向每个有漏洞的合约发送了两笔交易：第一笔交易用来获取多重签名钱包的拥有权限，第二笔交易是转移合约上的全部资金。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可从官方默认地址 paritytech/parity 检出代码，再切换到 tag v1.5.x 版本，或直接从这里 问题代码 git id 4d08e7b0aec46443bf26547b17d10cb302672835 进入，来查看完整代码。 攻击分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第一步：成为合约的 owner // enhanced-wallet.sol // gets called when no other function matches function() payable { // just being sent some cash? if (msg.value &gt; 0) Deposit(msg.sender, msg.value); else if (msg.data.length &gt; 0) _walletLibrary.delegatecall(msg.data); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过往这个合约地址转账一个value = 0, msg.data.length &gt; 0的交易，以执行_walletLibrary.delegatecall分支。由于通过 json-rpc 调用以太坊智能合约时，to参数为合约地址，而要调用的合约方法会经编码后，放在data参数中，因此代码_walletLibrary.delegatecall(msg.data)理论上能无条件的调用合约内的任何一个函数，本次安全事件就是黑客调用了一个叫做initWallet的函数： // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) { initDaylimit(_daylimit); initMultiowned(_owners, _required); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意参数列表中的_owners，因为是多重签名合约，所以是address[]即地址数组，该函数原本的作用是用多重所有者的地址列表来初始化钱包，函数会继续向底层调用initMultiowned函数： // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;经过这一步，合约的所有者就被改变了，相当于获取了 Linux 系统的 root 权限。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第二步: 转账，以owner身份调用execute函数，提取合约余额到黑客的地址： function execute(address _to, uint _value, bytes _data) external onlyowner returns (bytes32 o_hash) { // first, take the opportunity to check that we&#39;re under the daily limit. if ((_data.length == 0 &amp;&amp; underLimit(_value)) || m_required == 1) { // yes - just execute the call. address created; if (_to == 0) { created = create(_value, _data); } else { if (!_to.call.value(_value)(_data)) throw; } SingleTransact(msg.sender, _value, _to, _data, created); } else { // determine our operation hash. o_hash = sha3(msg.data, block.number); // store if it&#39;s new if (m_txs[o_hash].to == 0 &amp;&amp; m_txs[o_hash].value == 0 &amp;&amp; m_txs[o_hash].data.length == 0) { m_txs[o_hash].to = _to; m_txs[o_hash].value = _value; m_txs[o_hash].data = _data; } if (!confirm(o_hash)) { ConfirmationNeeded(o_hash, msg.sender, _value, _to, _data); } } } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意函数第一行后面的修改器限制为onlyowner，黑客进行上面的动作就是为了突破该限制。 // simple single-sig function modifier. modifier onlyowner { if (isOwner(msg.sender)) _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;因此，问题的关键就在于，上面的initWallet没有检查以防止在合约初始化后再次调用到initMultiowned，进而使得合约的所有者被改成黑客。 解决方案： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过上面的分析可以看到，核心问题在于越权的函数调用，那修复方法便是对initWallet及与之相关的接口方法initDaylimit和initMultiowned重新定义访问权限： // throw unless the contract is not yet initialized. modifier only_uninitialized { if (m_numOwners &gt; 0) throw; _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过检查m_numOwners变量值，若已经初始化，则直接返回(旧版 solidity 中是抛出异常)，不允许再执行initWallet等方法： // constructor - stores initial daily limit and records the present day&#39;s index. function initDaylimit(uint _limit) only_uninitialized { m_dailyLimit = _limit; m_lastDay = today(); } // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) only_uninitialized { initDaylimit(_daylimit); initMultiowned(_owners, _required); } // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) only_uninitialized { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可注意到，每个函数第一行的最后面都添加了限定修改器标识only_uninitialized，这就是 Parity 多重签名钱包，第一次安全事件的漏洞原理和解决办法，该漏洞发生于 2017年07月19日，致使大约 3000万美元资产被盗。下一篇我们分析 Parity 的第二次安全事件。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/23/4d799e4aa158475a87b21b773a3c1bf3.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/23/4d799e4aa158475a87b21b773a3c1bf3.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-23T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"十二、以太坊安全之 Parity 第一次安全事件漏洞分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;截止目前，Parity 多重签名钱包共发生过两次安全事件，第一次发生在 2017年07月19日，涉及 Parity 1.5 及以上版本，造成 15万以太币约 3000万美元被盗，第二次发生在 2017年11月07日，致使约 50万枚以太币被锁在合约中无法取出，当时价值大约 1.5亿美元，本篇先对发生于 7月19日的第一次安全漏洞做一下分析，下一篇再分析 2017年11月7日的安全漏洞。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;概括来说，黑客向每个有漏洞的合约发送了两笔交易：第一笔交易用来获取多重签名钱包的拥有权限，第二笔交易是转移合约上的全部资金。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可从官方默认地址 paritytech/parity 检出代码，再切换到 tag v1.5.x 版本，或直接从这里 问题代码 git id 4d08e7b0aec46443bf26547b17d10cb302672835 进入，来查看完整代码。 攻击分析 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第一步：成为合约的 owner // enhanced-wallet.sol // gets called when no other function matches function() payable { // just being sent some cash? if (msg.value &gt; 0) Deposit(msg.sender, msg.value); else if (msg.data.length &gt; 0) _walletLibrary.delegatecall(msg.data); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过往这个合约地址转账一个value = 0, msg.data.length &gt; 0的交易，以执行_walletLibrary.delegatecall分支。由于通过 json-rpc 调用以太坊智能合约时，to参数为合约地址，而要调用的合约方法会经编码后，放在data参数中，因此代码_walletLibrary.delegatecall(msg.data)理论上能无条件的调用合约内的任何一个函数，本次安全事件就是黑客调用了一个叫做initWallet的函数： // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) { initDaylimit(_daylimit); initMultiowned(_owners, _required); } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意参数列表中的_owners，因为是多重签名合约，所以是address[]即地址数组，该函数原本的作用是用多重所有者的地址列表来初始化钱包，函数会继续向底层调用initMultiowned函数： // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;经过这一步，合约的所有者就被改变了，相当于获取了 Linux 系统的 root 权限。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第二步: 转账，以owner身份调用execute函数，提取合约余额到黑客的地址： function execute(address _to, uint _value, bytes _data) external onlyowner returns (bytes32 o_hash) { // first, take the opportunity to check that we&#39;re under the daily limit. if ((_data.length == 0 &amp;&amp; underLimit(_value)) || m_required == 1) { // yes - just execute the call. address created; if (_to == 0) { created = create(_value, _data); } else { if (!_to.call.value(_value)(_data)) throw; } SingleTransact(msg.sender, _value, _to, _data, created); } else { // determine our operation hash. o_hash = sha3(msg.data, block.number); // store if it&#39;s new if (m_txs[o_hash].to == 0 &amp;&amp; m_txs[o_hash].value == 0 &amp;&amp; m_txs[o_hash].data.length == 0) { m_txs[o_hash].to = _to; m_txs[o_hash].value = _value; m_txs[o_hash].data = _data; } if (!confirm(o_hash)) { ConfirmationNeeded(o_hash, msg.sender, _value, _to, _data); } } } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意函数第一行后面的修改器限制为onlyowner，黑客进行上面的动作就是为了突破该限制。 // simple single-sig function modifier. modifier onlyowner { if (isOwner(msg.sender)) _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;因此，问题的关键就在于，上面的initWallet没有检查以防止在合约初始化后再次调用到initMultiowned，进而使得合约的所有者被改成黑客。 解决方案： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过上面的分析可以看到，核心问题在于越权的函数调用，那修复方法便是对initWallet及与之相关的接口方法initDaylimit和initMultiowned重新定义访问权限： // throw unless the contract is not yet initialized. modifier only_uninitialized { if (m_numOwners &gt; 0) throw; _; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过检查m_numOwners变量值，若已经初始化，则直接返回(旧版 solidity 中是抛出异常)，不允许再执行initWallet等方法： // constructor - stores initial daily limit and records the present day&#39;s index. function initDaylimit(uint _limit) only_uninitialized { m_dailyLimit = _limit; m_lastDay = today(); } // constructor - just pass on the owner array to the multiowned and // the limit to daylimit function initWallet(address[] _owners, uint _required, uint _daylimit) only_uninitialized { initDaylimit(_daylimit); initMultiowned(_owners, _required); } // constructor is given number of sigs required to do protected &quot;onlymanyowners&quot; transactions // as well as the selection of addresses capable of confirming them. function initMultiowned(address[] _owners, uint _required) only_uninitialized { m_numOwners = _owners.length + 1; m_owners[1] = uint(msg.sender); m_ownerIndex[uint(msg.sender)] = 1; for (uint i = 0; i &lt; _owners.length; ++i) { m_owners[2 + i] = uint(_owners[i]); m_ownerIndex[uint(_owners[i])] = 2 + i; } m_required = _required; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可注意到，每个函数第一行的最后面都添加了限定修改器标识only_uninitialized，这就是 Parity 多重签名钱包，第一次安全事件的漏洞原理和解决办法，该漏洞发生于 2017年07月19日，致使大约 3000万美元资产被盗。下一篇我们分析 Parity 的第二次安全事件。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/23/4d799e4aa158475a87b21b773a3c1bf3.html","headline":"《我学区块链》—— 十二、以太坊安全之 Parity 第一次安全事件漏洞分析","dateModified":"2018-06-23T00:00:00+08:00","datePublished":"2018-06-23T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/23/4d799e4aa158475a87b21b773a3c1bf3.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>《我学区块链》—— 十二、以太坊安全之 Parity 第一次安全事件漏洞分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="十二以太坊安全之-parity-第一次安全事件漏洞分析">十二、以太坊安全之 Parity 第一次安全事件漏洞分析</h1> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;截止目前，Parity 多重签名钱包共发生过两次安全事件，第一次发生在 2017年07月19日，涉及 Parity 1.5 及以上版本，造成 15万以太币约 3000万美元被盗，第二次发生在 2017年11月07日，致使约 50万枚以太币被锁在合约中无法取出，当时价值大约 1.5亿美元，本篇先对发生于 7月19日的第一次安全漏洞做一下分析，下一篇再分析 2017年11月7日的安全漏洞。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;概括来说，黑客向每个有漏洞的合约发送了两笔交易：第一笔交易用来获取多重签名钱包的拥有权限，第二笔交易是转移合约上的全部资金。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可从官方默认地址 <a href="https://github.com/paritytech/parity" rel="nofollow">paritytech/parity</a> 检出代码，再切换到 tag v1.5.x 版本，或直接从这里 <a href="https://github.com/paritytech/parity/blob/4d08e7b0aec46443bf26547b17d10cb302672835/js/src/contracts/snippets/enhanced-wallet.sol" rel="nofollow">问题代码 git id 4d08e7b0aec46443bf26547b17d10cb302672835</a> 进入，来查看完整代码。</p> 
+  <h2 id="攻击分析">攻击分析</h2> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第一步：成为合约的 owner</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// enhanced-wallet.sol</span>
+<span class="hljs-comment">// gets called when no other function matches</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span><span class="hljs-params">()</span> <span class="hljs-title">payable</span> {</span>
+    <span class="hljs-comment">// just being sent some cash?</span>
+    <span class="hljs-keyword">if</span> (msg.value &gt; <span class="hljs-number">0</span>)
+        Deposit(msg.sender, msg.value);
+    <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (msg.data.length &gt; <span class="hljs-number">0</span>)
+        _walletLibrary.delegatecall(msg.data);
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过往这个合约地址转账一个<code>value = 0, msg.data.length &gt; 0</code>的交易，以执行<code>_walletLibrary.delegatecall</code>分支。由于通过 json-rpc 调用以太坊智能合约时，<code>to</code>参数为合约地址，而要调用的合约方法会经编码后，放在<code>data</code>参数中，因此代码<code>_walletLibrary.delegatecall(msg.data)</code>理论上能无条件的调用合约内的任何一个函数，本次安全事件就是黑客调用了一个叫做<code>initWallet</code>的函数：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// constructor - just pass on the owner array to the multiowned and</span>
+<span class="hljs-comment">// the limit to daylimit</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initWallet</span><span class="hljs-params">(address[] _owners, uint _required, uint _daylimit)</span> {</span>
+    initDaylimit(_daylimit);
+    initMultiowned(_owners, _required);
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意参数列表中的<code>_owners</code>，因为是多重签名合约，所以是<code>address[]</code>即地址数组，该函数原本的作用是用多重所有者的地址列表来初始化钱包，函数会继续向底层调用<code>initMultiowned</code>函数：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// constructor is given number of sigs required to do protected "onlymanyowners" transactions</span>
+<span class="hljs-comment">// as well as the selection of addresses capable of confirming them.</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initMultiowned</span><span class="hljs-params">(address[] _owners, uint _required)</span> {</span>
+    m_numOwners = _owners.length + <span class="hljs-number">1</span>;
+    m_owners[<span class="hljs-number">1</span>] = uint(msg.sender);
+    m_ownerIndex[uint(msg.sender)] = <span class="hljs-number">1</span>;
+    <span class="hljs-keyword">for</span> (uint i = <span class="hljs-number">0</span>; i &lt; _owners.length; ++i) {
+        m_owners[<span class="hljs-number">2</span> + i] = uint(_owners[i]);
+        m_ownerIndex[uint(_owners[i])] = <span class="hljs-number">2</span> + i;
+    }
+    m_required = _required;
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;经过这一步，合约的所有者就被改变了，相当于获取了 Linux 系统的 root 权限。</p> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;第二步: 转账，以<code>owner</code>身份调用<code>execute</code>函数，提取合约余额到黑客的地址：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">execute</span><span class="hljs-params">(address _to, uint _value, bytes _data)</span> <span class="hljs-title">external</span> <span class="hljs-title">onlyowner</span> <span class="hljs-title">returns</span> <span class="hljs-params">(bytes32 o_hash)</span> {</span>
+    <span class="hljs-comment">// first, take the opportunity to check that we're under the daily limit.</span>
+    <span class="hljs-keyword">if</span> ((_data.length == <span class="hljs-number">0</span> &amp;&amp; underLimit(_value)) || m_required == <span class="hljs-number">1</span>) {
+        <span class="hljs-comment">// yes - just execute the call.</span>
+        address created;
+        <span class="hljs-keyword">if</span> (_to == <span class="hljs-number">0</span>) {
+            created = create(_value, _data);
+        } <span class="hljs-keyword">else</span> {
+            <span class="hljs-keyword">if</span> (!_to.call.value(_value)(_data))
+                <span class="hljs-keyword">throw</span>;
+        }
+        SingleTransact(msg.sender, _value, _to, _data, created);
+    } <span class="hljs-keyword">else</span> {
+        <span class="hljs-comment">// determine our operation hash.</span>
+        o_hash = sha3(msg.data, block.number);
+        <span class="hljs-comment">// store if it's new</span>
+        <span class="hljs-keyword">if</span> (m_txs[o_hash].to == <span class="hljs-number">0</span> &amp;&amp; m_txs[o_hash].value == <span class="hljs-number">0</span> &amp;&amp; m_txs[o_hash].data.length == <span class="hljs-number">0</span>) {
+            m_txs[o_hash].to = _to;
+            m_txs[o_hash].value = _value;
+            m_txs[o_hash].data = _data;
+        }
+        <span class="hljs-keyword">if</span> (!confirm(o_hash)) {
+            ConfirmationNeeded(o_hash, msg.sender, _value, _to, _data);
+        }
+    }
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;注意函数第一行后面的修改器限制为<code>onlyowner</code>，黑客进行上面的动作就是为了突破该限制。</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// simple single-sig function modifier.</span>
+modifier onlyowner {
+    <span class="hljs-keyword">if</span> (isOwner(msg.sender))
+        _;
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;因此，问题的关键就在于，上面的<code>initWallet</code>没有检查以防止在合约初始化后再次调用到<code>initMultiowned</code>，进而使得合约的所有者被改成黑客。</p> 
+  <h2 id="解决方案">解决方案：</h2> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过上面的分析可以看到，核心问题在于越权的函数调用，那修复方法便是对<code>initWallet</code>及与之相关的接口方法<code>initDaylimit</code>和<code>initMultiowned</code>重新定义访问权限：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// throw unless the contract is not yet initialized.</span>
+modifier only_uninitialized {
+    <span class="hljs-keyword">if</span> (m_numOwners &gt; <span class="hljs-number">0</span>) <span class="hljs-keyword">throw</span>; 
+        _;
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;通过检查<code>m_numOwners</code>变量值，若已经初始化，则直接返回(旧版 solidity 中是抛出异常)，不允许再执行<code>initWallet</code>等方法：</p> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// constructor - stores initial daily limit and records the present day's index.</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initDaylimit</span><span class="hljs-params">(uint _limit)</span> <span class="hljs-title">only_uninitialized</span> {</span>
+    m_dailyLimit = _limit;
+    m_lastDay = today();
+}</code></pre> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// constructor - just pass on the owner array to the multiowned and</span>
+<span class="hljs-comment">// the limit to daylimit</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initWallet</span><span class="hljs-params">(address[] _owners, uint _required, uint _daylimit)</span> <span class="hljs-title">only_uninitialized</span> {</span>
+    initDaylimit(_daylimit);
+    initMultiowned(_owners, _required);
+}</code></pre> 
+  <pre class="prettyprint"><code class="language-js hljs "><span class="hljs-comment">// constructor is given number of sigs required to do protected "onlymanyowners" transactions</span>
+<span class="hljs-comment">// as well as the selection of addresses capable of confirming them.</span>
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">initMultiowned</span><span class="hljs-params">(address[] _owners, uint _required)</span> <span class="hljs-title">only_uninitialized</span> {</span>
+    m_numOwners = _owners.length + <span class="hljs-number">1</span>;
+    m_owners[<span class="hljs-number">1</span>] = uint(msg.sender);
+    m_ownerIndex[uint(msg.sender)] = <span class="hljs-number">1</span>;
+    <span class="hljs-keyword">for</span> (uint i = <span class="hljs-number">0</span>; i &lt; _owners.length; ++i) {
+        m_owners[<span class="hljs-number">2</span> + i] = uint(_owners[i]);
+        m_ownerIndex[uint(_owners[i])] = <span class="hljs-number">2</span> + i;
+    }
+    m_required = _required;
+}</code></pre> 
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;可注意到，每个函数第一行的最后面都添加了限定修改器标识<code>only_uninitialized</code>，这就是 Parity 多重签名钱包，第一次安全事件的漏洞原理和解决办法，该漏洞发生于 2017年07月19日，致使大约 3000万美元资产被盗。下一篇我们分析 Parity 的第二次安全事件。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xuguangyuansh/article/details/80786691,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xuguangyuansh/article/details/80786691,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

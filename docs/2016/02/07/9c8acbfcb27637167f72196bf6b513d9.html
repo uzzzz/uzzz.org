@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>codesign的一些理解 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="codesign的一些理解" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="这两天看了一下ldid的源代码，对codesign的一些理解，简单记录一下。 1、数字签名。简单来说就是HASH算法+私钥加密。从而可以确保文件的来源以及完整性。mac os对于程序的codesign并不只是简单的对整个文件进行数字签名，而是对程序文件以页大小为单位进行数字签名，加上对codesign部分的各个blob进行数字签名（根据ldid的代码，没有对codedirectory blob进行数字签名？）。 2、codesign功能。确保文件的来源以及完整性只是codesign的其中一个（最主要的）功能，签名者还可以加上各种requirement，验证者（操作系统和各个程序）可以按需使用（具体可以查看下面参考文档CodeSigningGuide）。另一个功能就是包含entitlement文件了。 3、codesign数据。如果程序被codesign了，程序会多出一个codesign load command，以及对应的codesgin数据。codesign load command里有表明codesign数据在程序文件里的偏移量（dataoff）和大小（datasize）。codesign数据，简单来说就是由一个“索引块”和多个”功能块“组成，每个“功能块”表示某一种用途。 SuperBlob（索引） –CodeDirectory（程序的bundle id，各个数字签名） –Requirements（这里应该就是苹果文档里对应的internal requirements，各个requirement使用codesign requirement language表示，最终内容是text-&gt;binary的形式，即compiled后的内容） –Entitlements（这里就是entitlement文件了） 具体各个blob的结构表示，可以参考后面的codesign.h。 4、其他一些点。 1）ldid里对各个部分使用sha1的hash，没有使用私钥加密。sha1出来的hash位数为20个字节。 2）ldid里，重签步骤里还会修改__LINKEDIT segment的filesize。这是为什么呢？应该是因为：重签会修改到codesign load command和codesign数据部分。那就说明codesing数据部分是属于linkedit segment的，因此，需要修改linkedit segment的大小。从这里也可以解释为什么codesign load command的结构体是linkedit data command（cmd+cmdsize+dataoff+datasize）了，因为codesing数据就是其中一种linkedit数据。 3）ldid里，重签时的requirement的内容\xfa\xde\x0c\x01\x00\x00\x00\x0c\x00\x00\x00\x00这12个字节是什么意思？当时猜测这个应该是codesign requirement language的compiled后的数据。后来通过使用csreq -r file -t（file内容就为这12个字节），命令可以成功执行，但是，返回/* no requirements in set */，表示没有内容。那么，可能就是最小的没有requirement的表示吧。简单来说，就是4个字节是internal requirements blob的magic，4个字节是blob长度，4个字节是内容（因为没有内容所以全为\x00）。 4）ldid重签，codesgin数据部分只会包括CodeDirectry, Requirements（上面提到的那12个字节）以及entitlement文件（如果有指定的话）。 5）结合codesign.h里的数据结构的定义，ldid的源代码，以及hex编辑器来理解。 5、一些命令。 查看codesign load command otool -l binary | grep -A 5 SIGNATURE 查看签名数据内容 codesign -dvvv binary 查看compiled codesign requirement language的文本内容 csreq -r file -t 查看entitlement内容 ldid -e binary 修改entitlement内容 ldid -S***entitlement.xml*** binary 6、ldid一些代码片段。 1）显示entitlement文件内容。 if (flag_e) { _assert(signature != NULL); uint32_t data = mach_header.Swap(signature-&gt;dataoff); uint8_t *top = reinterpret_cast&lt;uint8_t *&gt;(mach_header.GetBase()); uint8_t *blob = top + data; struct SuperBlob *super = reinterpret_cast&lt;struct SuperBlob *&gt;(blob); for (size_t index(0); index != Swap(super-&gt;count); ++index) if (Swap(super-&gt;index[index].type) == CSSLOT_ENTITLEMENTS) { uint32_t begin = Swap(super-&gt;index[index].offset); struct Blob *entitlements = reinterpret_cast&lt;struct Blob *&gt;(blob + begin); fwrite(entitlements + 1, 1, Swap(entitlements-&gt;length) - sizeof(struct Blob), stdout); } } 2）normal部分的签名（即除去codesign数据部分的文件内容的签名，以页大小的单位签）（属于CodeDirectory部分的数据） // 这里是normal部分的签名！！ if (pages != 1) for (size_t i = 0; i != pages - 1; ++i) sha1(hashes[i], top + 0x1000 * i, 0x1000); if (pages != 0) // 最后一个特殊处理，因为可能不满一个页面大小 sha1(hashes[pages - 1], top + 0x1000 * (pages - 1), ((data - 1) % 0x1000) + 1); 3）special部分的签名（即codesign数据部分的文件内容的签名，以blob为单位签）（属于CodeDirectory部分的数据） for (size_t index(0); index != count; ++index) { uint32_t type = Swap(super-&gt;index[index].type); if (type != 0 &amp;&amp; type &lt;= special) { uint32_t offset = Swap(super-&gt;index[index].offset); struct Blob *local = (struct Blob *) (blob + offset); // 这里是specail部分的签名！！ // 长度为blob的长度 sha1((uint8_t *)(hashes - type), (uint8_t *)local, Swap(local-&gt;length)); } } 4）签名个数（属于CodeDirectory部分的数据） uint32_t special = xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS; // number of special hash slots // special部分的签名slot directory-&gt;nSpecialSlots = Swap(special); uint8_t(*hashes)[20] = reinterpret_cast&lt;uint8_t(*)[20]&gt;(blob + offset); memset(hashes, 0, sizeof(*hashes) * special); offset += sizeof(*hashes) * special; // 注意，签名是normal部分+special部分的！！！！ hashes += special; uint32_t pages = (data + 0x1000 - 1) / 0x1000; // number of ordinary (code) hash slots // normal部分的签名slot directory-&gt;nCodeSlots = Swap(pages); 5）bundle id（属于CodeDirectory部分的数据） // offset of identifier string directory-&gt;identOffset = Swap(offset - begin); strcpy(reinterpret_cast&lt;char *&gt;(blob + offset), name); offset += strlen(name) + 1; 参考： http://gitweb.saurik.com/ldid.git http://www.saurik.com/id/8 http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/sys/codesign.h https://developer.apple.com/library/mac/documentation/Security/Conceptual/CodeSigningGuide/Introduction/Introduction.html 阅读更多" />
+<meta property="og:description" content="这两天看了一下ldid的源代码，对codesign的一些理解，简单记录一下。 1、数字签名。简单来说就是HASH算法+私钥加密。从而可以确保文件的来源以及完整性。mac os对于程序的codesign并不只是简单的对整个文件进行数字签名，而是对程序文件以页大小为单位进行数字签名，加上对codesign部分的各个blob进行数字签名（根据ldid的代码，没有对codedirectory blob进行数字签名？）。 2、codesign功能。确保文件的来源以及完整性只是codesign的其中一个（最主要的）功能，签名者还可以加上各种requirement，验证者（操作系统和各个程序）可以按需使用（具体可以查看下面参考文档CodeSigningGuide）。另一个功能就是包含entitlement文件了。 3、codesign数据。如果程序被codesign了，程序会多出一个codesign load command，以及对应的codesgin数据。codesign load command里有表明codesign数据在程序文件里的偏移量（dataoff）和大小（datasize）。codesign数据，简单来说就是由一个“索引块”和多个”功能块“组成，每个“功能块”表示某一种用途。 SuperBlob（索引） –CodeDirectory（程序的bundle id，各个数字签名） –Requirements（这里应该就是苹果文档里对应的internal requirements，各个requirement使用codesign requirement language表示，最终内容是text-&gt;binary的形式，即compiled后的内容） –Entitlements（这里就是entitlement文件了） 具体各个blob的结构表示，可以参考后面的codesign.h。 4、其他一些点。 1）ldid里对各个部分使用sha1的hash，没有使用私钥加密。sha1出来的hash位数为20个字节。 2）ldid里，重签步骤里还会修改__LINKEDIT segment的filesize。这是为什么呢？应该是因为：重签会修改到codesign load command和codesign数据部分。那就说明codesing数据部分是属于linkedit segment的，因此，需要修改linkedit segment的大小。从这里也可以解释为什么codesign load command的结构体是linkedit data command（cmd+cmdsize+dataoff+datasize）了，因为codesing数据就是其中一种linkedit数据。 3）ldid里，重签时的requirement的内容\xfa\xde\x0c\x01\x00\x00\x00\x0c\x00\x00\x00\x00这12个字节是什么意思？当时猜测这个应该是codesign requirement language的compiled后的数据。后来通过使用csreq -r file -t（file内容就为这12个字节），命令可以成功执行，但是，返回/* no requirements in set */，表示没有内容。那么，可能就是最小的没有requirement的表示吧。简单来说，就是4个字节是internal requirements blob的magic，4个字节是blob长度，4个字节是内容（因为没有内容所以全为\x00）。 4）ldid重签，codesgin数据部分只会包括CodeDirectry, Requirements（上面提到的那12个字节）以及entitlement文件（如果有指定的话）。 5）结合codesign.h里的数据结构的定义，ldid的源代码，以及hex编辑器来理解。 5、一些命令。 查看codesign load command otool -l binary | grep -A 5 SIGNATURE 查看签名数据内容 codesign -dvvv binary 查看compiled codesign requirement language的文本内容 csreq -r file -t 查看entitlement内容 ldid -e binary 修改entitlement内容 ldid -S***entitlement.xml*** binary 6、ldid一些代码片段。 1）显示entitlement文件内容。 if (flag_e) { _assert(signature != NULL); uint32_t data = mach_header.Swap(signature-&gt;dataoff); uint8_t *top = reinterpret_cast&lt;uint8_t *&gt;(mach_header.GetBase()); uint8_t *blob = top + data; struct SuperBlob *super = reinterpret_cast&lt;struct SuperBlob *&gt;(blob); for (size_t index(0); index != Swap(super-&gt;count); ++index) if (Swap(super-&gt;index[index].type) == CSSLOT_ENTITLEMENTS) { uint32_t begin = Swap(super-&gt;index[index].offset); struct Blob *entitlements = reinterpret_cast&lt;struct Blob *&gt;(blob + begin); fwrite(entitlements + 1, 1, Swap(entitlements-&gt;length) - sizeof(struct Blob), stdout); } } 2）normal部分的签名（即除去codesign数据部分的文件内容的签名，以页大小的单位签）（属于CodeDirectory部分的数据） // 这里是normal部分的签名！！ if (pages != 1) for (size_t i = 0; i != pages - 1; ++i) sha1(hashes[i], top + 0x1000 * i, 0x1000); if (pages != 0) // 最后一个特殊处理，因为可能不满一个页面大小 sha1(hashes[pages - 1], top + 0x1000 * (pages - 1), ((data - 1) % 0x1000) + 1); 3）special部分的签名（即codesign数据部分的文件内容的签名，以blob为单位签）（属于CodeDirectory部分的数据） for (size_t index(0); index != count; ++index) { uint32_t type = Swap(super-&gt;index[index].type); if (type != 0 &amp;&amp; type &lt;= special) { uint32_t offset = Swap(super-&gt;index[index].offset); struct Blob *local = (struct Blob *) (blob + offset); // 这里是specail部分的签名！！ // 长度为blob的长度 sha1((uint8_t *)(hashes - type), (uint8_t *)local, Swap(local-&gt;length)); } } 4）签名个数（属于CodeDirectory部分的数据） uint32_t special = xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS; // number of special hash slots // special部分的签名slot directory-&gt;nSpecialSlots = Swap(special); uint8_t(*hashes)[20] = reinterpret_cast&lt;uint8_t(*)[20]&gt;(blob + offset); memset(hashes, 0, sizeof(*hashes) * special); offset += sizeof(*hashes) * special; // 注意，签名是normal部分+special部分的！！！！ hashes += special; uint32_t pages = (data + 0x1000 - 1) / 0x1000; // number of ordinary (code) hash slots // normal部分的签名slot directory-&gt;nCodeSlots = Swap(pages); 5）bundle id（属于CodeDirectory部分的数据） // offset of identifier string directory-&gt;identOffset = Swap(offset - begin); strcpy(reinterpret_cast&lt;char *&gt;(blob + offset), name); offset += strlen(name) + 1; 参考： http://gitweb.saurik.com/ldid.git http://www.saurik.com/id/8 http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/sys/codesign.h https://developer.apple.com/library/mac/documentation/Security/Conceptual/CodeSigningGuide/Introduction/Introduction.html 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2016/02/07/9c8acbfcb27637167f72196bf6b513d9.html" />
+<meta property="og:url" content="https://uzzz.org/2016/02/07/9c8acbfcb27637167f72196bf6b513d9.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2016-02-07T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"这两天看了一下ldid的源代码，对codesign的一些理解，简单记录一下。 1、数字签名。简单来说就是HASH算法+私钥加密。从而可以确保文件的来源以及完整性。mac os对于程序的codesign并不只是简单的对整个文件进行数字签名，而是对程序文件以页大小为单位进行数字签名，加上对codesign部分的各个blob进行数字签名（根据ldid的代码，没有对codedirectory blob进行数字签名？）。 2、codesign功能。确保文件的来源以及完整性只是codesign的其中一个（最主要的）功能，签名者还可以加上各种requirement，验证者（操作系统和各个程序）可以按需使用（具体可以查看下面参考文档CodeSigningGuide）。另一个功能就是包含entitlement文件了。 3、codesign数据。如果程序被codesign了，程序会多出一个codesign load command，以及对应的codesgin数据。codesign load command里有表明codesign数据在程序文件里的偏移量（dataoff）和大小（datasize）。codesign数据，简单来说就是由一个“索引块”和多个”功能块“组成，每个“功能块”表示某一种用途。 SuperBlob（索引） –CodeDirectory（程序的bundle id，各个数字签名） –Requirements（这里应该就是苹果文档里对应的internal requirements，各个requirement使用codesign requirement language表示，最终内容是text-&gt;binary的形式，即compiled后的内容） –Entitlements（这里就是entitlement文件了） 具体各个blob的结构表示，可以参考后面的codesign.h。 4、其他一些点。 1）ldid里对各个部分使用sha1的hash，没有使用私钥加密。sha1出来的hash位数为20个字节。 2）ldid里，重签步骤里还会修改__LINKEDIT segment的filesize。这是为什么呢？应该是因为：重签会修改到codesign load command和codesign数据部分。那就说明codesing数据部分是属于linkedit segment的，因此，需要修改linkedit segment的大小。从这里也可以解释为什么codesign load command的结构体是linkedit data command（cmd+cmdsize+dataoff+datasize）了，因为codesing数据就是其中一种linkedit数据。 3）ldid里，重签时的requirement的内容\\xfa\\xde\\x0c\\x01\\x00\\x00\\x00\\x0c\\x00\\x00\\x00\\x00这12个字节是什么意思？当时猜测这个应该是codesign requirement language的compiled后的数据。后来通过使用csreq -r file -t（file内容就为这12个字节），命令可以成功执行，但是，返回/* no requirements in set */，表示没有内容。那么，可能就是最小的没有requirement的表示吧。简单来说，就是4个字节是internal requirements blob的magic，4个字节是blob长度，4个字节是内容（因为没有内容所以全为\\x00）。 4）ldid重签，codesgin数据部分只会包括CodeDirectry, Requirements（上面提到的那12个字节）以及entitlement文件（如果有指定的话）。 5）结合codesign.h里的数据结构的定义，ldid的源代码，以及hex编辑器来理解。 5、一些命令。 查看codesign load command otool -l binary | grep -A 5 SIGNATURE 查看签名数据内容 codesign -dvvv binary 查看compiled codesign requirement language的文本内容 csreq -r file -t 查看entitlement内容 ldid -e binary 修改entitlement内容 ldid -S***entitlement.xml*** binary 6、ldid一些代码片段。 1）显示entitlement文件内容。 if (flag_e) { _assert(signature != NULL); uint32_t data = mach_header.Swap(signature-&gt;dataoff); uint8_t *top = reinterpret_cast&lt;uint8_t *&gt;(mach_header.GetBase()); uint8_t *blob = top + data; struct SuperBlob *super = reinterpret_cast&lt;struct SuperBlob *&gt;(blob); for (size_t index(0); index != Swap(super-&gt;count); ++index) if (Swap(super-&gt;index[index].type) == CSSLOT_ENTITLEMENTS) { uint32_t begin = Swap(super-&gt;index[index].offset); struct Blob *entitlements = reinterpret_cast&lt;struct Blob *&gt;(blob + begin); fwrite(entitlements + 1, 1, Swap(entitlements-&gt;length) - sizeof(struct Blob), stdout); } } 2）normal部分的签名（即除去codesign数据部分的文件内容的签名，以页大小的单位签）（属于CodeDirectory部分的数据） // 这里是normal部分的签名！！ if (pages != 1) for (size_t i = 0; i != pages - 1; ++i) sha1(hashes[i], top + 0x1000 * i, 0x1000); if (pages != 0) // 最后一个特殊处理，因为可能不满一个页面大小 sha1(hashes[pages - 1], top + 0x1000 * (pages - 1), ((data - 1) % 0x1000) + 1); 3）special部分的签名（即codesign数据部分的文件内容的签名，以blob为单位签）（属于CodeDirectory部分的数据） for (size_t index(0); index != count; ++index) { uint32_t type = Swap(super-&gt;index[index].type); if (type != 0 &amp;&amp; type &lt;= special) { uint32_t offset = Swap(super-&gt;index[index].offset); struct Blob *local = (struct Blob *) (blob + offset); // 这里是specail部分的签名！！ // 长度为blob的长度 sha1((uint8_t *)(hashes - type), (uint8_t *)local, Swap(local-&gt;length)); } } 4）签名个数（属于CodeDirectory部分的数据） uint32_t special = xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS; // number of special hash slots // special部分的签名slot directory-&gt;nSpecialSlots = Swap(special); uint8_t(*hashes)[20] = reinterpret_cast&lt;uint8_t(*)[20]&gt;(blob + offset); memset(hashes, 0, sizeof(*hashes) * special); offset += sizeof(*hashes) * special; // 注意，签名是normal部分+special部分的！！！！ hashes += special; uint32_t pages = (data + 0x1000 - 1) / 0x1000; // number of ordinary (code) hash slots // normal部分的签名slot directory-&gt;nCodeSlots = Swap(pages); 5）bundle id（属于CodeDirectory部分的数据） // offset of identifier string directory-&gt;identOffset = Swap(offset - begin); strcpy(reinterpret_cast&lt;char *&gt;(blob + offset), name); offset += strlen(name) + 1; 参考： http://gitweb.saurik.com/ldid.git http://www.saurik.com/id/8 http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/sys/codesign.h https://developer.apple.com/library/mac/documentation/Security/Conceptual/CodeSigningGuide/Introduction/Introduction.html 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2016/02/07/9c8acbfcb27637167f72196bf6b513d9.html","headline":"codesign的一些理解","dateModified":"2016-02-07T00:00:00+08:00","datePublished":"2016-02-07T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2016/02/07/9c8acbfcb27637167f72196bf6b513d9.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>codesign的一些理解</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>这两天看了一下ldid的源代码，对codesign的一些理解，简单记录一下。</p> 
+  <p>1、数字签名。简单来说就是HASH算法+私钥加密。从而可以确保文件的来源以及完整性。mac os对于程序的codesign并不只是简单的对整个文件进行数字签名，而是对程序文件以页大小为单位进行数字签名，加上对codesign部分的各个blob进行数字签名（根据ldid的代码，没有对codedirectory blob进行数字签名？）。</p> 
+  <p>2、codesign功能。确保文件的来源以及完整性只是codesign的其中一个（最主要的）功能，签名者还可以加上各种requirement，验证者（操作系统和各个程序）可以按需使用（具体可以查看下面参考文档CodeSigningGuide）。另一个功能就是包含entitlement文件了。</p> 
+  <p>3、codesign数据。如果程序被codesign了，程序会多出一个codesign load command，以及对应的codesgin数据。codesign load command里有表明codesign数据在程序文件里的偏移量（dataoff）和大小（datasize）。<strong>codesign数据，简单来说就是由一个“索引块”和多个”功能块“组成，每个“功能块”表示某一种用途。</strong> <br> SuperBlob（索引） <br> –CodeDirectory（程序的bundle id，各个数字签名） <br> –Requirements（这里应该就是苹果文档里对应的internal requirements，各个requirement使用codesign requirement language表示，最终内容是text-&gt;binary的形式，即compiled后的内容） <br> –Entitlements（这里就是entitlement文件了） <br> 具体各个blob的结构表示，可以参考后面的codesign.h。</p> 
+  <p>4、其他一些点。 <br> 1）ldid里对各个部分使用sha1的hash，没有使用私钥加密。sha1出来的hash位数为20个字节。 <br> 2）ldid里，重签步骤里还会修改__LINKEDIT segment的filesize。这是为什么呢？应该是因为：重签会修改到codesign load command和codesign数据部分。那就说明codesing数据部分是属于linkedit segment的，因此，需要修改linkedit segment的大小。从这里也可以解释为什么codesign load command的结构体是linkedit data command（cmd+cmdsize+dataoff+datasize）了，因为codesing数据就是其中一种linkedit数据。 <br> 3）ldid里，重签时的requirement的内容\xfa\xde\x0c\x01\x00\x00\x00\x0c\x00\x00\x00\x00这12个字节是什么意思？当时猜测这个应该是codesign requirement language的compiled后的数据。后来通过使用csreq -r <strong><em>file</em></strong> -t（<strong><em>file</em></strong>内容就为这12个字节），命令可以成功执行，但是，返回/* no requirements in set */，表示没有内容。那么，可能就是最小的没有requirement的表示吧。简单来说，就是4个字节是internal requirements blob的magic，4个字节是blob长度，4个字节是内容（因为没有内容所以全为\x00）。 <br> 4）ldid重签，codesgin数据部分只会包括CodeDirectry, Requirements（上面提到的那12个字节）以及entitlement文件（如果有指定的话）。 <br> 5）结合codesign.h里的数据结构的定义，ldid的源代码，以及hex编辑器来理解。</p> 
+  <p>5、一些命令。 <br> 查看codesign load command <br> otool -l <strong><em>binary</em></strong> | grep -A 5 SIGNATURE</p> 
+  <p>查看签名数据内容 <br> codesign -dvvv <strong><em>binary</em></strong></p> 
+  <p>查看compiled codesign requirement language的文本内容 <br> csreq -r <strong><em>file</em></strong> -t</p> 
+  <p>查看entitlement内容 <br> ldid -e <strong><em>binary</em></strong></p> 
+  <p>修改entitlement内容 <br> ldid -S***entitlement.xml*** <strong><em>binary</em></strong></p> 
+  <p>6、ldid一些代码片段。 <br> 1）显示entitlement文件内容。</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">if</span> (flag_e) {
+    _assert(signature != NULL);
+
+    uint32_t data = mach_header.Swap(signature-&gt;dataoff);
+
+    uint8_t *top = <span class="hljs-keyword">reinterpret_cast</span>&lt;uint8_t *&gt;(mach_header.GetBase());
+    uint8_t *blob = top + data;
+    <span class="hljs-keyword">struct</span> SuperBlob *super = <span class="hljs-keyword">reinterpret_cast</span>&lt;<span class="hljs-keyword">struct</span> SuperBlob *&gt;(blob);
+
+    <span class="hljs-keyword">for</span> (size_t index(<span class="hljs-number">0</span>); index != Swap(super-&gt;count); ++index)
+        <span class="hljs-keyword">if</span> (Swap(super-&gt;index[index].type) == CSSLOT_ENTITLEMENTS) {
+            uint32_t begin = Swap(super-&gt;index[index].offset);
+            <span class="hljs-keyword">struct</span> Blob *entitlements = <span class="hljs-keyword">reinterpret_cast</span>&lt;<span class="hljs-keyword">struct</span> Blob *&gt;(blob + begin);
+            fwrite(entitlements + <span class="hljs-number">1</span>, <span class="hljs-number">1</span>, Swap(entitlements-&gt;length) - <span class="hljs-keyword">sizeof</span>(<span class="hljs-keyword">struct</span> Blob), stdout);
+        }
+}</code></pre> 
+  <p>2）normal部分的签名（即除去codesign数据部分的文件内容的签名，以页大小的单位签）（属于CodeDirectory部分的数据）</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// 这里是normal部分的签名！！</span>
+<span class="hljs-keyword">if</span> (pages != <span class="hljs-number">1</span>)
+    <span class="hljs-keyword">for</span> (size_t i = <span class="hljs-number">0</span>; i != pages - <span class="hljs-number">1</span>; ++i)
+        sha1(hashes[i], top + <span class="hljs-number">0x1000</span> * i, <span class="hljs-number">0x1000</span>);
+<span class="hljs-keyword">if</span> (pages != <span class="hljs-number">0</span>)
+    <span class="hljs-comment">// 最后一个特殊处理，因为可能不满一个页面大小</span>
+    sha1(hashes[pages - <span class="hljs-number">1</span>], top + <span class="hljs-number">0x1000</span> * (pages - <span class="hljs-number">1</span>), ((data - <span class="hljs-number">1</span>) % <span class="hljs-number">0x1000</span>) + <span class="hljs-number">1</span>);</code></pre> 
+  <p>3）special部分的签名（即codesign数据部分的文件内容的签名，以blob为单位签）（属于CodeDirectory部分的数据）</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-keyword">for</span> (size_t index(<span class="hljs-number">0</span>); index != count; ++index) {
+    uint32_t type = Swap(super-&gt;index[index].type);
+    <span class="hljs-keyword">if</span> (type != <span class="hljs-number">0</span> &amp;&amp; type &lt;= special) {
+        uint32_t offset = Swap(super-&gt;index[index].offset);
+        <span class="hljs-keyword">struct</span> Blob *local = (<span class="hljs-keyword">struct</span> Blob *) (blob + offset);
+        <span class="hljs-comment">// 这里是specail部分的签名！！</span>
+        <span class="hljs-comment">// 长度为blob的长度</span>
+        sha1((uint8_t *)(hashes - type), (uint8_t *)local, Swap(local-&gt;length));
+    }
+}</code></pre> 
+  <p>4）签名个数（属于CodeDirectory部分的数据）</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs ">uint32_t special = xmld == NULL ? CSSLOT_REQUIREMENTS : CSSLOT_ENTITLEMENTS;
+<span class="hljs-comment">// number of special hash slots</span>
+<span class="hljs-comment">// special部分的签名slot</span>
+directory-&gt;nSpecialSlots = Swap(special);
+
+uint8_t(*hashes)[<span class="hljs-number">20</span>] = <span class="hljs-keyword">reinterpret_cast</span>&lt;uint8_t(*)[<span class="hljs-number">20</span>]&gt;(blob + offset);
+<span class="hljs-built_in">memset</span>(hashes, <span class="hljs-number">0</span>, <span class="hljs-keyword">sizeof</span>(*hashes) * special);
+
+offset += <span class="hljs-keyword">sizeof</span>(*hashes) * special;
+<span class="hljs-comment">// 注意，签名是normal部分+special部分的！！！！</span>
+hashes += special;
+
+uint32_t pages = (data + <span class="hljs-number">0x1000</span> - <span class="hljs-number">1</span>) / <span class="hljs-number">0x1000</span>;
+<span class="hljs-comment">// number of ordinary (code) hash slots</span>
+<span class="hljs-comment">// normal部分的签名slot</span>
+directory-&gt;nCodeSlots = Swap(pages);</code></pre> 
+  <p>5）bundle id（属于CodeDirectory部分的数据）</p> 
+  <pre class="prettyprint"><code class="language-cpp hljs "><span class="hljs-comment">// offset of identifier string</span>
+directory-&gt;identOffset = Swap(offset - begin);
+<span class="hljs-built_in">strcpy</span>(<span class="hljs-keyword">reinterpret_cast</span>&lt;<span class="hljs-keyword">char</span> *&gt;(blob + offset), name);
+offset += <span class="hljs-built_in">strlen</span>(name) + <span class="hljs-number">1</span>;</code></pre> 
+  <p>参考： <br> <a href="http://gitweb.saurik.com/ldid.git" rel="nofollow">http://gitweb.saurik.com/ldid.git</a> <br> <a href="http://www.saurik.com/id/8" rel="nofollow">http://www.saurik.com/id/8</a> <br> <a href="http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/sys/codesign.h" rel="nofollow">http://www.opensource.apple.com/source/xnu/xnu-3248.20.55/bsd/sys/codesign.h</a> <br> <a href="https://developer.apple.com/library/mac/documentation/Security/Conceptual/CodeSigningGuide/Introduction/Introduction.html" rel="nofollow">https://developer.apple.com/library/mac/documentation/Security/Conceptual/CodeSigningGuide/Introduction/Introduction.html</a></p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/jordanxinwang/article/details/50641929,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/jordanxinwang/article/details/50641929,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

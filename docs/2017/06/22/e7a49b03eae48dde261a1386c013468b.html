@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>python ethereum 代码分析《2》 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="python ethereum 代码分析《2》" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="python ethereum 代码分析 《2》 python 版本以太坊 pyethapp 模块 本章主要介绍pyethapp 模块中的ChainService 和 PoWService 一些关键概念 totalDifficulty 总难度： total difficulty总难度是当前某条链所有区块难度的总和，total difficulty被用来指示最长的那一条链，某个节点如果想从其他节点同步数据的话，他会选择total difficulty最大的那一条链来同步数据。值得注意的是uncle block的difficulty也被计算到totalDifficulty中去，以太坊白皮书中的幽灵协议阐述了为什么这么设计 uncle block 叔叔区块：也是矿工挖出来的区块，它也是合法的，但是发现的稍晚，或者是网络传输稍慢，而没有能成为最长的链上的区块 以太坊十几秒的出块间隔，大大增加了孤块的产生，并且降低了安全性。通过鼓励引用叔块，使引用主链获得更多的安全保证(因为孤块本身也是合法的) 区块可以不引用，或者最多引用两个叔块 叔块必须是区块的前2层~前7层的祖先的直接的子块 被引用过的叔块不能重复引用 引用叔块的区块，可以获得挖矿报酬的1/32，也就是5*1/32=0.15625 Ether。最多获得2*0.15625=0.3125 Ether 参考资料http://blog.csdn.net/superswords/article/details/76445278 https://zhuanlan.zhihu.com/p/28928827 head_candidate 候选头区块: 矿工本地的候选头区块，相当于一个临时区块，head_candidate一直存在并且矿工会一直更新。矿工将交易打包进这个区块，计算出随机数后将次区块作为新区块广播出去。 contract ：合约，本身也是一个账户。每当一个交易指向一个合约账户时，该交易transaction的data属性作为该合约的输入执行该合约。 以太坊基本的一些概念：http://ethdocs.org/en/latest/contracts-and-transactions/index.html ChainService 和 PowService的关系 chain service负责区块链的同步和更新，处理连接的各个节点的eth_protocol数据包，以及交易和区块的广播； pow service是矿工挖矿的服务，计算出’幸运值’后告知chain service，chain service 将区块写入区块链并广播出去。 矿工将交易打包，更新head_candidate @property def head_candidate(self): if self._head_candidate_needs_updating: self._head_candidate_needs_updating = False # Make a copy of self.transaction_queue because # make_head_candidate modifies it. txqueue = copy.deepcopy(self.transaction_queue) #将交易打包，引用uncle区块，执行交易中的合约，更新区块状态 self._head_candidate, self._head_candidate_state = make_head_candidate( self.chain, txqueue, timestamp=int(time.time())) return self._head_candidate chain 实例的_on_new_head回调 def _on_new_head(self, block): log.debug(&#39;new head cbs&#39;, num=len(self.on_new_head_cbs)) self.transaction_queue = self.transaction_queue.diff( block.transactions) self._head_candidate_needs_updating = True #cb是pow service的回调函数mine_head_candidate，更新head_candidate并开始挖矿 for cb in self.on_new_head_cbs: cb(block) powservice的回调 def mine_head_candidate(self, _=None): #打包当前交易队里中的交易并更新head_candidate hc = self.chain.head_candidate if not self.active or self.chain.is_syncing: return elif (hc.transaction_count == 0 and not self.app.config[&#39;pow&#39;][&#39;mine_empty_blocks&#39;]): return log.debug(&#39;mining&#39;, difficulty=hc.difficulty) #开始挖矿 self.ppipe.put((&#39;mine&#39;, dict(mining_hash=hc.mining_hash, block_number=hc.number, difficulty=hc.difficulty))) 计算出幸运值后，调用chain.add_mined_block写入区块链并广播 #成功找到幸运值 def recv_found_nonce(self, bin_nonce, mixhash, mining_hash): log.info(&#39;nonce found&#39;, mining_hash=mining_hash.encode(&#39;hex&#39;)) #再次打包交易，更新head_candidate block = self.chain.head_candidate if block.mining_hash != mining_hash: log.warn(&#39;mining_hash does not match&#39;) return False block.header.mixhash = mixhash block.header.nonce = bin_nonce #添加新块并广播 if self.chain.add_mined_block(block): log.debug(&#39;mined block %d (%s) added to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return True else: log.debug(&#39;failed to add mined block %d (%s) to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return False def add_mined_block(self, block): log.debug(&#39;adding mined block&#39;, block=block) assert isinstance(block, Block) #添加新块 if self.chain.add_block(block): log.debug(&#39;added&#39;, block=block, ts=time.time()) assert block == self.chain.head self.transaction_queue = self.transaction_queue.diff(block.transactions) self._head_candidate_needs_updating = True #广播新块 self.broadcast_newblock(block, chain_difficulty=self.chain.get_score(block)) return True log.debug(&#39;failed to add&#39;, block=block, ts=time.time()) return False 在写入新块完成后，调用new_head_cb回调，再次开始挖矿 至此，整个循环的过程就是矿工不断打包交易挖矿到广播新块的过程 ChainService service start 服务启动 服务启动时将eth_protocol（以太坊协议）中command对应的回调函数添加到eth_protocol实例中 先看看eth_protocol协议 以太坊协议定义eth_protocol.py 每个peer对象都有一个eth_protocol实例。在p2p协议中，当节点收到hello数据包的时候，便初始化所有协议实例，其中包括eth_protocol peer对象receive hello 初始化eth_protocol def connect_service(self, service): assert isinstance(service, WiredService) protocol_class = service.wire_protocol assert issubclass(protocol_class, BaseProtocol) # create protcol instance which connects peer with serivce protocol = protocol_class(self, service) # register protocol assert protocol_class not in self.protocols log.debug(&#39;registering protocol&#39;, protocol=protocol.name, peer=self) self.protocols[protocol_class] = protocol self.mux.add_protocol(protocol.protocol_id) protocol.start()#调用chain_service.on_wire_protocol_start(self) chain service为该实例添加回调函数，并向对方节点发送status数据包 def on_wire_protocol_start(self, proto): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;on_wire_protocol_start&#39;, proto=proto) assert isinstance(proto, self.wire_protocol) # register callbacks proto.receive_status_callbacks.append(self.on_receive_status)#处理status数据包 proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes) proto.receive_transactions_callbacks.append(self.on_receive_transactions) proto.receive_getblockheaders_callbacks.append(self.on_receive_getblockheaders) proto.receive_blockheaders_callbacks.append(self.on_receive_blockheaders) proto.receive_getblockbodies_callbacks.append(self.on_receive_getblockbodies) proto.receive_blockbodies_callbacks.append(self.on_receive_blockbodies) proto.receive_newblock_callbacks.append(self.on_receive_newblock) # send status 一旦连接就向对方发送自己的区块链状态status head = self.chain.head proto.send_status(chain_difficulty=self.chain.get_score(head), chain_head_hash=head.hash, genesis_hash=self.chain.genesis.hash) eth_protocol协议中包括 Status 与新节点建立连接后，互相发送自己的区块链状态 NewBlockHashes 向网络中广播一批新区块的hash Transactions 包含一批交易的数据包 GetBlockHashes 从指定hash开始，请求一批BlockHashes BlockHashes 返回GetBlockHashes请求 GetBlocks 从指定hash开始，请求一批Block Blocks 返回GetBlocks请求 NewBlock 矿工挖矿后广播新区块，节点接到该区块后验证后添加到本地 1.收到status： 某个已经完成握手的peer节点发送他当前的区块链网络状态ethereum state，status数据包是节点之间建立连接后收到的第一个数据包。 通过status数据包来获取网络中最新的区块并更新本地的区块链 class status(BaseProtocol.command): &quot;&quot;&quot; protocolVersion: The version of the Ethereum protocol this peer implements. 30 at present. networkID: The network version of Ethereum for this peer. 0 for the official testnet. totalDifficulty: Total Difficulty of the best chain. Integer, as found in block header. latestHash: The hash of the block with the highest validated total difficulty. GenesisHash: The hash of the Genesis block. &quot;&quot;&quot; cmd_id = 0 sent = False structure = [ (&#39;eth_version&#39;, rlp.sedes.big_endian_int), (&#39;network_id&#39;, rlp.sedes.big_endian_int), (&#39;chain_difficulty&#39;, rlp.sedes.big_endian_int),#totalDifficulty，该链的总难度 (&#39;chain_head_hash&#39;, rlp.sedes.binary),#latestHash，头区块hash (&#39;genesis_hash&#39;, rlp.sedes.binary)]#初始区块hash def create(self, proto, chain_difficulty, chain_head_hash, genesis_hash): self.sent = True network_id = proto.service.app.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id) return [proto.version, network_id, chain_difficulty, chain_head_hash, genesis_hash] receive packet收到数据包 receive status解析数据包定位到status处理函数 之前已注册回调eth_protocol实例初始化时已注册 on receive status receive status处理函数 这里注意一点，这里看的是DAO事件之前的版本，不是分叉过后的版本（还是先按正常逻辑来。。） def on_receive_status(self, proto, eth_version, network_id, chain_difficulty, chain_head_hash, genesis_hash): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;status received&#39;, proto=proto, eth_version=eth_version) assert eth_version == proto.version, (eth_version, proto.version) #必须是同一个networkid if network_id != self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id): log.warn(&quot;invalid network id&quot;, remote_network_id=network_id, expected_network_id=self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id)) raise eth_protocol.ETHProtocolError(&#39;wrong network_id&#39;) # check genesis #初始区块hash必须一致 if genesis_hash != self.chain.genesis.hash: log.warn(&quot;invalid genesis hash&quot;, remote_id=proto, genesis=genesis_hash.encode(&#39;hex&#39;)) raise eth_protocol.ETHProtocolError(&#39;wrong genesis block&#39;) # request chain #调用同步器同步数据 self.synchronizer.receive_status(proto, chain_head_hash, chain_difficulty) # send transactions #获取网络中已知的但尚未被计入区块的交易transactions transactions = self.chain.get_transactions() if transactions: log.debug(&quot;sending transactions&quot;, remote_id=proto) #将这些交易告知对方 proto.send_transactions(*transactions) synchronizer同步器同步数据receive_status： def receive_status(self, proto, blockhash, chain_difficulty): &quot;called if a new peer is connected&quot; log.debug(&#39;status received&#39;, proto=proto, chain_difficulty=chain_difficulty) # memorize proto with difficulty #将改节点区块链总难度记下 self._protocols[proto] = chain_difficulty #对方头区块hash已经在本地存在，则忽略 if self.chainservice.knows_block(blockhash) or self.synctask: log.debug(&#39;existing task or known hash, discarding&#39;) return if self.force_sync: blockhash, chain_difficulty = self.force_sync log.debug(&#39;starting forced syctask&#39;, blockhash=blockhash.encode(&#39;hex&#39;)) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) #如果这条链总难度比自己的大，则认为这条链状态更新一点，并从他给出的头区块hash开始同步区块，同步的时候从已连接节点中总难度chain_difficulty最大的那个开始同步（但是这并不能保证同步的链就一定是主链，后面会分析如果同步的链不是主链的情况） elif chain_difficulty &gt; self.chain.head.chain_difficulty(): log.debug(&#39;sufficient difficulty&#39;) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) fetch_hashchain 向网络请求以指定hash作为头区块的一批区块hash def fetch_hashchain(self): log_st.debug(&#39;fetching hashchain&#39;) blockhashes_chain = [self.blockhash] # youngest to oldest # For testing purposes: skip the hash downoading stage # import ast # blockhashes_chain = ast.literal_eval(open(&#39;/home/vub/blockhashes.pyast&#39;).read())[:299000] blockhash = self.blockhash = blockhashes_chain[-1] assert blockhash not in self.chain # get block hashes until we found a known one max_blockhashes_per_request = self.initial_blockhashes_per_request while blockhash not in self.chain: # proto with highest_difficulty should be the proto we got the newblock from blockhashes_batch = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #这里的protocols是各个已连接节点peer对象的eth_protocol实例，按链总难度大小排序，难度最大在前面 for proto in protocols: log.debug(&#39;syncing with&#39;, proto=proto) if proto.is_stopped: continue # request assert proto not in self.requests deferred = AsyncResult() self.requests[proto] = deferred #从指定hash开始，请求一批BlockHashes proto.send_getblockhashes(blockhash, max_blockhashes_per_request) try: #获取到这批BlockHashes blockhashes_batch = deferred.get(block=True, timeout=self.blockhashes_request_timeout) except gevent.Timeout: log_st.warn(&#39;syncing hashchain timed out&#39;) continue finally: # is also executed &#39;on the way out&#39; when any other clause of the try statement # is left via a break, continue or return statement. del self.requests[proto] if not blockhashes_batch: log_st.warn(&#39;empty getblockhashes result&#39;) continue if not all(isinstance(bh, bytes) for bh in blockhashes_batch): log_st.warn(&#39;got wrong data type&#39;, expected=&#39;bytes&#39;, received=type(blockhashes_batch[0])) continue break if not blockhashes_batch: log_st.warn(&#39;syncing failed with all peers&#39;, num_protos=len(protocols)) return self.exit(success=False) #在获取到的这批blockhashes中直到找到一个blockhash是自己数据库中有的，注意这里只要找到一个自己有的blockhash就可以了，而且这个blockhash不一定是自己本地chain的头区块，因为本地的头区块有可能不是在主链上的区块，上面已经提到过这点。节点总是会去同步最长的那条链，而且可能是从自己本地chain的头区块的父辈区块的某个区块开始同步，这样就提供了一定的纠错机制，让节点可以纠正到主链上去。 for blockhash in blockhashes_batch: # youngest to oldest assert utils.is_string(blockhash) if blockhash not in self.chain: blockhashes_chain.append(blockhash) else: log_st.debug(&#39;found known blockhash&#39;, blockhash=utils.encode_hex(blockhash), is_genesis=bool(blockhash == self.chain.genesis.hash)) break log_st.debug(&#39;downloaded &#39; + str(len(blockhashes_chain)) + &#39; block hashes, ending with %s&#39; % utils.encode_hex(blockhashes_chain[-1])) max_blockhashes_per_request = self.max_blockhashes_per_request #取到最长链的这批blockhash后，开始同步区块 self.fetch_blocks(blockhashes_chain) fetch blocks 向网络请求同步这批区块 def fetch_blocks(self, blockhashes_chain): # fetch blocks (no parallelism here) log_st.debug(&#39;fetching blocks&#39;, num=len(blockhashes_chain)) assert blockhashes_chain blockhashes_chain.reverse() # oldest to youngest num_blocks = len(blockhashes_chain) num_fetched = 0 while blockhashes_chain: blockhashes_batch = blockhashes_chain[:self.max_blocks_per_request] t_blocks = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #向每个节点请求 for proto in protocols: if proto.is_stopped: continue assert proto not in self.requests # request log_st.debug(&#39;requesting blocks&#39;, num=len(blockhashes_batch)) deferred = AsyncResult() self.requests[proto] = deferred #向网络请求这批hash值对应的区块 proto.send_getblocks(*blockhashes_batch) try: t_blocks = deferred.get(block=True, timeout=self.blocks_request_timeout) except gevent.Timeout: log_st.warn(&#39;getblocks timed out, trying next proto&#39;) continue finally: del self.requests[proto] if not t_blocks: log_st.warn(&#39;empty getblocks reply, trying next proto&#39;) continue elif not isinstance(t_blocks[0], TransientBlock): log_st.warn(&#39;received unexpected data&#39;, data=repr(t_blocks)) t_blocks = [] continue # we have results if not [b.header.hash for b in t_blocks] == blockhashes_batch[:len(t_blocks)]: log_st.warn(&#39;received wrong blocks, should ban peer&#39;) t_blocks = [] continue break # add received t_blocks num_fetched += len(t_blocks) log_st.debug(&#39;received blocks&#39;, num=len(t_blocks), num_fetched=num_fetched, total=num_blocks, missing=num_blocks - num_fetched) if not t_blocks: log_st.warn(&#39;failed to fetch blocks&#39;, missing=len(blockhashes_chain)) return self.exit(success=False) ts = time.time() log_st.debug(&#39;adding blocks&#39;, qsize=self.chainservice.block_queue.qsize()) for t_block in t_blocks: b = blockhashes_chain.pop(0) assert t_block.header.hash == b assert t_block.header.hash not in blockhashes_chain #将获取的block添加到队列，最后添加到本地数据库 self.chainservice.add_block(t_block, proto) # this blocks if the queue is full log_st.debug(&#39;adding blocks done&#39;, took=time.time() - ts) # done last_block = t_block assert not len(blockhashes_chain) assert last_block.header.hash == self.blockhash log_st.debug(&#39;syncing finished&#39;) # at this point blocks are not in the chain yet, but in the add_block queue if self.chain_difficulty &gt;= self.chain.head.chain_difficulty(): #广播这批区块最新的那个出去。 self.chainservice.broadcast_newblock(last_block, self.chain_difficulty, origin=proto) self.exit(success=True) 至此，on receive status 函数处理完成，已同步已连接节点的最新区块 2.transactions on_receive_transactions 节点收到transactions数据包后 矿工收到transactions数据包后，校验每笔交易的合法性，将交易打包进head candidate临时区块并广播交易 add_transaction def add_transaction(self, tx, origin=None): if self.is_syncing: #如果正在同步中的话，本地链的状态是过时的 return # we can not evaluate the tx based on outdated state log.debug(&#39;add_transaction&#39;, locked=self.add_transaction_lock.locked(), tx=tx) assert isinstance(tx, Transaction) assert origin is None or isinstance(origin, BaseProtocol) if tx.hash in self.broadcast_filter: log.debug(&#39;discarding known tx&#39;) # discard early return # validate transaction #交易合法性校验 try: #tx签名要正确；交易数nonce要与本地账户nonce一致；gas要足够；本地账户余额足够 validate_transaction(self.chain.head_candidate, tx) log.debug(&#39;valid tx, broadcasting&#39;) self.broadcast_transaction(tx, origin=origin) # asap except InvalidTransaction as e: log.debug(&#39;invalid tx&#39;, error=e) return if origin is not None: # not locally added via jsonrpc if not self.is_mining or self.is_syncing: log.debug(&#39;discarding tx&#39;, syncing=self.is_syncing, mining=self.is_mining) return self.add_transaction_lock.acquire() #向head_candidate临时区块写入交易 success = self.chain.add_transaction(tx) self.add_transaction_lock.release() if success: self._on_new_head_candidate() 3.GetBlockHashes BlockHashes 在向网络同步区块链的时候被调用fetch_hashchain中调用send_getblockhashes来发送GetBlockHashes数据包 其他节点接受到GetBlockHashes数据包后，返回BlockHashes数据包，及指定blockash开始的一批blockhash。 4.GetBlocks Blocks 在向网络同步区块链的时候被调用fetch_blocks中调用send_getblocks来发送GetBlocks数据包 其他节点接受到GetBlocks数据包后，返回Blocks数据包。 5.NewBlock 矿工挖到新块后广播该区块 节点接收到广播的新区块 def receive_newblock(self, proto, t_block, chain_difficulty): &quot;called if there&#39;s a newblock announced on the network&quot; log.debug(&#39;newblock&#39;, proto=proto, block=t_block, chain_difficulty=chain_difficulty, client=proto.peer.remote_client_version) if t_block.header.hash in self.chain: assert chain_difficulty == self.chain.get(t_block.header.hash).chain_difficulty() # memorize proto with difficulty #记住该节点区块链的总难度 self._protocols[proto] = chain_difficulty #如果该区块存在则忽略 if self.chainservice.knows_block(block_hash=t_block.header.hash): log.debug(&#39;known block&#39;) return # check pow if not t_block.header.check_pow(): log.warn(&#39;check pow failed, should ban!&#39;) return #预计的总难度 expected_difficulty = self.chain.head.chain_difficulty() + t_block.header.difficulty #总难度至少比本地链的总难度大 if chain_difficulty &gt;= self.chain.head.chain_difficulty(): # broadcast duplicates filtering is done in eth_service log.debug(&#39;sufficient difficulty, broadcasting&#39;, client=proto.peer.remote_client_version) self.chainservice.broadcast_newblock(t_block, chain_difficulty, origin=proto) else: # any criteria for which blocks/chains not to add? age = self.chain.head.number - t_block.header.number log.debug(&#39;low difficulty&#39;, client=proto.peer.remote_client_version, chain_difficulty=chain_difficulty, expected_difficulty=expected_difficulty, block_age=age) if age &gt; self.MAX_NEWBLOCK_AGE: log.debug(&#39;newblock is too old, not adding&#39;, block_age=age, max_age=self.MAX_NEWBLOCK_AGE) return # unknown and pow check and highest difficulty # check if we have parent #如果有祖先，直接添加 if self.chainservice.knows_block(block_hash=t_block.header.prevhash): log.debug(&#39;adding block&#39;) self.chainservice.add_block(t_block, proto) #没有祖先说明还差一个以上区块，向网络同步区块 else: log.debug(&#39;missing parent&#39;) if not self.synctask: self.synctask = SyncTask(self, proto, t_block.header.hash, chain_difficulty) else: log.debug(&#39;existing task, discarding&#39;) 以上是以太坊节点与节点交互的协议部分 阅读更多" />
+<meta property="og:description" content="python ethereum 代码分析 《2》 python 版本以太坊 pyethapp 模块 本章主要介绍pyethapp 模块中的ChainService 和 PoWService 一些关键概念 totalDifficulty 总难度： total difficulty总难度是当前某条链所有区块难度的总和，total difficulty被用来指示最长的那一条链，某个节点如果想从其他节点同步数据的话，他会选择total difficulty最大的那一条链来同步数据。值得注意的是uncle block的difficulty也被计算到totalDifficulty中去，以太坊白皮书中的幽灵协议阐述了为什么这么设计 uncle block 叔叔区块：也是矿工挖出来的区块，它也是合法的，但是发现的稍晚，或者是网络传输稍慢，而没有能成为最长的链上的区块 以太坊十几秒的出块间隔，大大增加了孤块的产生，并且降低了安全性。通过鼓励引用叔块，使引用主链获得更多的安全保证(因为孤块本身也是合法的) 区块可以不引用，或者最多引用两个叔块 叔块必须是区块的前2层~前7层的祖先的直接的子块 被引用过的叔块不能重复引用 引用叔块的区块，可以获得挖矿报酬的1/32，也就是5*1/32=0.15625 Ether。最多获得2*0.15625=0.3125 Ether 参考资料http://blog.csdn.net/superswords/article/details/76445278 https://zhuanlan.zhihu.com/p/28928827 head_candidate 候选头区块: 矿工本地的候选头区块，相当于一个临时区块，head_candidate一直存在并且矿工会一直更新。矿工将交易打包进这个区块，计算出随机数后将次区块作为新区块广播出去。 contract ：合约，本身也是一个账户。每当一个交易指向一个合约账户时，该交易transaction的data属性作为该合约的输入执行该合约。 以太坊基本的一些概念：http://ethdocs.org/en/latest/contracts-and-transactions/index.html ChainService 和 PowService的关系 chain service负责区块链的同步和更新，处理连接的各个节点的eth_protocol数据包，以及交易和区块的广播； pow service是矿工挖矿的服务，计算出’幸运值’后告知chain service，chain service 将区块写入区块链并广播出去。 矿工将交易打包，更新head_candidate @property def head_candidate(self): if self._head_candidate_needs_updating: self._head_candidate_needs_updating = False # Make a copy of self.transaction_queue because # make_head_candidate modifies it. txqueue = copy.deepcopy(self.transaction_queue) #将交易打包，引用uncle区块，执行交易中的合约，更新区块状态 self._head_candidate, self._head_candidate_state = make_head_candidate( self.chain, txqueue, timestamp=int(time.time())) return self._head_candidate chain 实例的_on_new_head回调 def _on_new_head(self, block): log.debug(&#39;new head cbs&#39;, num=len(self.on_new_head_cbs)) self.transaction_queue = self.transaction_queue.diff( block.transactions) self._head_candidate_needs_updating = True #cb是pow service的回调函数mine_head_candidate，更新head_candidate并开始挖矿 for cb in self.on_new_head_cbs: cb(block) powservice的回调 def mine_head_candidate(self, _=None): #打包当前交易队里中的交易并更新head_candidate hc = self.chain.head_candidate if not self.active or self.chain.is_syncing: return elif (hc.transaction_count == 0 and not self.app.config[&#39;pow&#39;][&#39;mine_empty_blocks&#39;]): return log.debug(&#39;mining&#39;, difficulty=hc.difficulty) #开始挖矿 self.ppipe.put((&#39;mine&#39;, dict(mining_hash=hc.mining_hash, block_number=hc.number, difficulty=hc.difficulty))) 计算出幸运值后，调用chain.add_mined_block写入区块链并广播 #成功找到幸运值 def recv_found_nonce(self, bin_nonce, mixhash, mining_hash): log.info(&#39;nonce found&#39;, mining_hash=mining_hash.encode(&#39;hex&#39;)) #再次打包交易，更新head_candidate block = self.chain.head_candidate if block.mining_hash != mining_hash: log.warn(&#39;mining_hash does not match&#39;) return False block.header.mixhash = mixhash block.header.nonce = bin_nonce #添加新块并广播 if self.chain.add_mined_block(block): log.debug(&#39;mined block %d (%s) added to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return True else: log.debug(&#39;failed to add mined block %d (%s) to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return False def add_mined_block(self, block): log.debug(&#39;adding mined block&#39;, block=block) assert isinstance(block, Block) #添加新块 if self.chain.add_block(block): log.debug(&#39;added&#39;, block=block, ts=time.time()) assert block == self.chain.head self.transaction_queue = self.transaction_queue.diff(block.transactions) self._head_candidate_needs_updating = True #广播新块 self.broadcast_newblock(block, chain_difficulty=self.chain.get_score(block)) return True log.debug(&#39;failed to add&#39;, block=block, ts=time.time()) return False 在写入新块完成后，调用new_head_cb回调，再次开始挖矿 至此，整个循环的过程就是矿工不断打包交易挖矿到广播新块的过程 ChainService service start 服务启动 服务启动时将eth_protocol（以太坊协议）中command对应的回调函数添加到eth_protocol实例中 先看看eth_protocol协议 以太坊协议定义eth_protocol.py 每个peer对象都有一个eth_protocol实例。在p2p协议中，当节点收到hello数据包的时候，便初始化所有协议实例，其中包括eth_protocol peer对象receive hello 初始化eth_protocol def connect_service(self, service): assert isinstance(service, WiredService) protocol_class = service.wire_protocol assert issubclass(protocol_class, BaseProtocol) # create protcol instance which connects peer with serivce protocol = protocol_class(self, service) # register protocol assert protocol_class not in self.protocols log.debug(&#39;registering protocol&#39;, protocol=protocol.name, peer=self) self.protocols[protocol_class] = protocol self.mux.add_protocol(protocol.protocol_id) protocol.start()#调用chain_service.on_wire_protocol_start(self) chain service为该实例添加回调函数，并向对方节点发送status数据包 def on_wire_protocol_start(self, proto): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;on_wire_protocol_start&#39;, proto=proto) assert isinstance(proto, self.wire_protocol) # register callbacks proto.receive_status_callbacks.append(self.on_receive_status)#处理status数据包 proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes) proto.receive_transactions_callbacks.append(self.on_receive_transactions) proto.receive_getblockheaders_callbacks.append(self.on_receive_getblockheaders) proto.receive_blockheaders_callbacks.append(self.on_receive_blockheaders) proto.receive_getblockbodies_callbacks.append(self.on_receive_getblockbodies) proto.receive_blockbodies_callbacks.append(self.on_receive_blockbodies) proto.receive_newblock_callbacks.append(self.on_receive_newblock) # send status 一旦连接就向对方发送自己的区块链状态status head = self.chain.head proto.send_status(chain_difficulty=self.chain.get_score(head), chain_head_hash=head.hash, genesis_hash=self.chain.genesis.hash) eth_protocol协议中包括 Status 与新节点建立连接后，互相发送自己的区块链状态 NewBlockHashes 向网络中广播一批新区块的hash Transactions 包含一批交易的数据包 GetBlockHashes 从指定hash开始，请求一批BlockHashes BlockHashes 返回GetBlockHashes请求 GetBlocks 从指定hash开始，请求一批Block Blocks 返回GetBlocks请求 NewBlock 矿工挖矿后广播新区块，节点接到该区块后验证后添加到本地 1.收到status： 某个已经完成握手的peer节点发送他当前的区块链网络状态ethereum state，status数据包是节点之间建立连接后收到的第一个数据包。 通过status数据包来获取网络中最新的区块并更新本地的区块链 class status(BaseProtocol.command): &quot;&quot;&quot; protocolVersion: The version of the Ethereum protocol this peer implements. 30 at present. networkID: The network version of Ethereum for this peer. 0 for the official testnet. totalDifficulty: Total Difficulty of the best chain. Integer, as found in block header. latestHash: The hash of the block with the highest validated total difficulty. GenesisHash: The hash of the Genesis block. &quot;&quot;&quot; cmd_id = 0 sent = False structure = [ (&#39;eth_version&#39;, rlp.sedes.big_endian_int), (&#39;network_id&#39;, rlp.sedes.big_endian_int), (&#39;chain_difficulty&#39;, rlp.sedes.big_endian_int),#totalDifficulty，该链的总难度 (&#39;chain_head_hash&#39;, rlp.sedes.binary),#latestHash，头区块hash (&#39;genesis_hash&#39;, rlp.sedes.binary)]#初始区块hash def create(self, proto, chain_difficulty, chain_head_hash, genesis_hash): self.sent = True network_id = proto.service.app.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id) return [proto.version, network_id, chain_difficulty, chain_head_hash, genesis_hash] receive packet收到数据包 receive status解析数据包定位到status处理函数 之前已注册回调eth_protocol实例初始化时已注册 on receive status receive status处理函数 这里注意一点，这里看的是DAO事件之前的版本，不是分叉过后的版本（还是先按正常逻辑来。。） def on_receive_status(self, proto, eth_version, network_id, chain_difficulty, chain_head_hash, genesis_hash): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;status received&#39;, proto=proto, eth_version=eth_version) assert eth_version == proto.version, (eth_version, proto.version) #必须是同一个networkid if network_id != self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id): log.warn(&quot;invalid network id&quot;, remote_network_id=network_id, expected_network_id=self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id)) raise eth_protocol.ETHProtocolError(&#39;wrong network_id&#39;) # check genesis #初始区块hash必须一致 if genesis_hash != self.chain.genesis.hash: log.warn(&quot;invalid genesis hash&quot;, remote_id=proto, genesis=genesis_hash.encode(&#39;hex&#39;)) raise eth_protocol.ETHProtocolError(&#39;wrong genesis block&#39;) # request chain #调用同步器同步数据 self.synchronizer.receive_status(proto, chain_head_hash, chain_difficulty) # send transactions #获取网络中已知的但尚未被计入区块的交易transactions transactions = self.chain.get_transactions() if transactions: log.debug(&quot;sending transactions&quot;, remote_id=proto) #将这些交易告知对方 proto.send_transactions(*transactions) synchronizer同步器同步数据receive_status： def receive_status(self, proto, blockhash, chain_difficulty): &quot;called if a new peer is connected&quot; log.debug(&#39;status received&#39;, proto=proto, chain_difficulty=chain_difficulty) # memorize proto with difficulty #将改节点区块链总难度记下 self._protocols[proto] = chain_difficulty #对方头区块hash已经在本地存在，则忽略 if self.chainservice.knows_block(blockhash) or self.synctask: log.debug(&#39;existing task or known hash, discarding&#39;) return if self.force_sync: blockhash, chain_difficulty = self.force_sync log.debug(&#39;starting forced syctask&#39;, blockhash=blockhash.encode(&#39;hex&#39;)) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) #如果这条链总难度比自己的大，则认为这条链状态更新一点，并从他给出的头区块hash开始同步区块，同步的时候从已连接节点中总难度chain_difficulty最大的那个开始同步（但是这并不能保证同步的链就一定是主链，后面会分析如果同步的链不是主链的情况） elif chain_difficulty &gt; self.chain.head.chain_difficulty(): log.debug(&#39;sufficient difficulty&#39;) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) fetch_hashchain 向网络请求以指定hash作为头区块的一批区块hash def fetch_hashchain(self): log_st.debug(&#39;fetching hashchain&#39;) blockhashes_chain = [self.blockhash] # youngest to oldest # For testing purposes: skip the hash downoading stage # import ast # blockhashes_chain = ast.literal_eval(open(&#39;/home/vub/blockhashes.pyast&#39;).read())[:299000] blockhash = self.blockhash = blockhashes_chain[-1] assert blockhash not in self.chain # get block hashes until we found a known one max_blockhashes_per_request = self.initial_blockhashes_per_request while blockhash not in self.chain: # proto with highest_difficulty should be the proto we got the newblock from blockhashes_batch = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #这里的protocols是各个已连接节点peer对象的eth_protocol实例，按链总难度大小排序，难度最大在前面 for proto in protocols: log.debug(&#39;syncing with&#39;, proto=proto) if proto.is_stopped: continue # request assert proto not in self.requests deferred = AsyncResult() self.requests[proto] = deferred #从指定hash开始，请求一批BlockHashes proto.send_getblockhashes(blockhash, max_blockhashes_per_request) try: #获取到这批BlockHashes blockhashes_batch = deferred.get(block=True, timeout=self.blockhashes_request_timeout) except gevent.Timeout: log_st.warn(&#39;syncing hashchain timed out&#39;) continue finally: # is also executed &#39;on the way out&#39; when any other clause of the try statement # is left via a break, continue or return statement. del self.requests[proto] if not blockhashes_batch: log_st.warn(&#39;empty getblockhashes result&#39;) continue if not all(isinstance(bh, bytes) for bh in blockhashes_batch): log_st.warn(&#39;got wrong data type&#39;, expected=&#39;bytes&#39;, received=type(blockhashes_batch[0])) continue break if not blockhashes_batch: log_st.warn(&#39;syncing failed with all peers&#39;, num_protos=len(protocols)) return self.exit(success=False) #在获取到的这批blockhashes中直到找到一个blockhash是自己数据库中有的，注意这里只要找到一个自己有的blockhash就可以了，而且这个blockhash不一定是自己本地chain的头区块，因为本地的头区块有可能不是在主链上的区块，上面已经提到过这点。节点总是会去同步最长的那条链，而且可能是从自己本地chain的头区块的父辈区块的某个区块开始同步，这样就提供了一定的纠错机制，让节点可以纠正到主链上去。 for blockhash in blockhashes_batch: # youngest to oldest assert utils.is_string(blockhash) if blockhash not in self.chain: blockhashes_chain.append(blockhash) else: log_st.debug(&#39;found known blockhash&#39;, blockhash=utils.encode_hex(blockhash), is_genesis=bool(blockhash == self.chain.genesis.hash)) break log_st.debug(&#39;downloaded &#39; + str(len(blockhashes_chain)) + &#39; block hashes, ending with %s&#39; % utils.encode_hex(blockhashes_chain[-1])) max_blockhashes_per_request = self.max_blockhashes_per_request #取到最长链的这批blockhash后，开始同步区块 self.fetch_blocks(blockhashes_chain) fetch blocks 向网络请求同步这批区块 def fetch_blocks(self, blockhashes_chain): # fetch blocks (no parallelism here) log_st.debug(&#39;fetching blocks&#39;, num=len(blockhashes_chain)) assert blockhashes_chain blockhashes_chain.reverse() # oldest to youngest num_blocks = len(blockhashes_chain) num_fetched = 0 while blockhashes_chain: blockhashes_batch = blockhashes_chain[:self.max_blocks_per_request] t_blocks = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #向每个节点请求 for proto in protocols: if proto.is_stopped: continue assert proto not in self.requests # request log_st.debug(&#39;requesting blocks&#39;, num=len(blockhashes_batch)) deferred = AsyncResult() self.requests[proto] = deferred #向网络请求这批hash值对应的区块 proto.send_getblocks(*blockhashes_batch) try: t_blocks = deferred.get(block=True, timeout=self.blocks_request_timeout) except gevent.Timeout: log_st.warn(&#39;getblocks timed out, trying next proto&#39;) continue finally: del self.requests[proto] if not t_blocks: log_st.warn(&#39;empty getblocks reply, trying next proto&#39;) continue elif not isinstance(t_blocks[0], TransientBlock): log_st.warn(&#39;received unexpected data&#39;, data=repr(t_blocks)) t_blocks = [] continue # we have results if not [b.header.hash for b in t_blocks] == blockhashes_batch[:len(t_blocks)]: log_st.warn(&#39;received wrong blocks, should ban peer&#39;) t_blocks = [] continue break # add received t_blocks num_fetched += len(t_blocks) log_st.debug(&#39;received blocks&#39;, num=len(t_blocks), num_fetched=num_fetched, total=num_blocks, missing=num_blocks - num_fetched) if not t_blocks: log_st.warn(&#39;failed to fetch blocks&#39;, missing=len(blockhashes_chain)) return self.exit(success=False) ts = time.time() log_st.debug(&#39;adding blocks&#39;, qsize=self.chainservice.block_queue.qsize()) for t_block in t_blocks: b = blockhashes_chain.pop(0) assert t_block.header.hash == b assert t_block.header.hash not in blockhashes_chain #将获取的block添加到队列，最后添加到本地数据库 self.chainservice.add_block(t_block, proto) # this blocks if the queue is full log_st.debug(&#39;adding blocks done&#39;, took=time.time() - ts) # done last_block = t_block assert not len(blockhashes_chain) assert last_block.header.hash == self.blockhash log_st.debug(&#39;syncing finished&#39;) # at this point blocks are not in the chain yet, but in the add_block queue if self.chain_difficulty &gt;= self.chain.head.chain_difficulty(): #广播这批区块最新的那个出去。 self.chainservice.broadcast_newblock(last_block, self.chain_difficulty, origin=proto) self.exit(success=True) 至此，on receive status 函数处理完成，已同步已连接节点的最新区块 2.transactions on_receive_transactions 节点收到transactions数据包后 矿工收到transactions数据包后，校验每笔交易的合法性，将交易打包进head candidate临时区块并广播交易 add_transaction def add_transaction(self, tx, origin=None): if self.is_syncing: #如果正在同步中的话，本地链的状态是过时的 return # we can not evaluate the tx based on outdated state log.debug(&#39;add_transaction&#39;, locked=self.add_transaction_lock.locked(), tx=tx) assert isinstance(tx, Transaction) assert origin is None or isinstance(origin, BaseProtocol) if tx.hash in self.broadcast_filter: log.debug(&#39;discarding known tx&#39;) # discard early return # validate transaction #交易合法性校验 try: #tx签名要正确；交易数nonce要与本地账户nonce一致；gas要足够；本地账户余额足够 validate_transaction(self.chain.head_candidate, tx) log.debug(&#39;valid tx, broadcasting&#39;) self.broadcast_transaction(tx, origin=origin) # asap except InvalidTransaction as e: log.debug(&#39;invalid tx&#39;, error=e) return if origin is not None: # not locally added via jsonrpc if not self.is_mining or self.is_syncing: log.debug(&#39;discarding tx&#39;, syncing=self.is_syncing, mining=self.is_mining) return self.add_transaction_lock.acquire() #向head_candidate临时区块写入交易 success = self.chain.add_transaction(tx) self.add_transaction_lock.release() if success: self._on_new_head_candidate() 3.GetBlockHashes BlockHashes 在向网络同步区块链的时候被调用fetch_hashchain中调用send_getblockhashes来发送GetBlockHashes数据包 其他节点接受到GetBlockHashes数据包后，返回BlockHashes数据包，及指定blockash开始的一批blockhash。 4.GetBlocks Blocks 在向网络同步区块链的时候被调用fetch_blocks中调用send_getblocks来发送GetBlocks数据包 其他节点接受到GetBlocks数据包后，返回Blocks数据包。 5.NewBlock 矿工挖到新块后广播该区块 节点接收到广播的新区块 def receive_newblock(self, proto, t_block, chain_difficulty): &quot;called if there&#39;s a newblock announced on the network&quot; log.debug(&#39;newblock&#39;, proto=proto, block=t_block, chain_difficulty=chain_difficulty, client=proto.peer.remote_client_version) if t_block.header.hash in self.chain: assert chain_difficulty == self.chain.get(t_block.header.hash).chain_difficulty() # memorize proto with difficulty #记住该节点区块链的总难度 self._protocols[proto] = chain_difficulty #如果该区块存在则忽略 if self.chainservice.knows_block(block_hash=t_block.header.hash): log.debug(&#39;known block&#39;) return # check pow if not t_block.header.check_pow(): log.warn(&#39;check pow failed, should ban!&#39;) return #预计的总难度 expected_difficulty = self.chain.head.chain_difficulty() + t_block.header.difficulty #总难度至少比本地链的总难度大 if chain_difficulty &gt;= self.chain.head.chain_difficulty(): # broadcast duplicates filtering is done in eth_service log.debug(&#39;sufficient difficulty, broadcasting&#39;, client=proto.peer.remote_client_version) self.chainservice.broadcast_newblock(t_block, chain_difficulty, origin=proto) else: # any criteria for which blocks/chains not to add? age = self.chain.head.number - t_block.header.number log.debug(&#39;low difficulty&#39;, client=proto.peer.remote_client_version, chain_difficulty=chain_difficulty, expected_difficulty=expected_difficulty, block_age=age) if age &gt; self.MAX_NEWBLOCK_AGE: log.debug(&#39;newblock is too old, not adding&#39;, block_age=age, max_age=self.MAX_NEWBLOCK_AGE) return # unknown and pow check and highest difficulty # check if we have parent #如果有祖先，直接添加 if self.chainservice.knows_block(block_hash=t_block.header.prevhash): log.debug(&#39;adding block&#39;) self.chainservice.add_block(t_block, proto) #没有祖先说明还差一个以上区块，向网络同步区块 else: log.debug(&#39;missing parent&#39;) if not self.synctask: self.synctask = SyncTask(self, proto, t_block.header.hash, chain_difficulty) else: log.debug(&#39;existing task, discarding&#39;) 以上是以太坊节点与节点交互的协议部分 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/06/22/e7a49b03eae48dde261a1386c013468b.html" />
+<meta property="og:url" content="https://uzzz.org/2017/06/22/e7a49b03eae48dde261a1386c013468b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-06-22T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"python ethereum 代码分析 《2》 python 版本以太坊 pyethapp 模块 本章主要介绍pyethapp 模块中的ChainService 和 PoWService 一些关键概念 totalDifficulty 总难度： total difficulty总难度是当前某条链所有区块难度的总和，total difficulty被用来指示最长的那一条链，某个节点如果想从其他节点同步数据的话，他会选择total difficulty最大的那一条链来同步数据。值得注意的是uncle block的difficulty也被计算到totalDifficulty中去，以太坊白皮书中的幽灵协议阐述了为什么这么设计 uncle block 叔叔区块：也是矿工挖出来的区块，它也是合法的，但是发现的稍晚，或者是网络传输稍慢，而没有能成为最长的链上的区块 以太坊十几秒的出块间隔，大大增加了孤块的产生，并且降低了安全性。通过鼓励引用叔块，使引用主链获得更多的安全保证(因为孤块本身也是合法的) 区块可以不引用，或者最多引用两个叔块 叔块必须是区块的前2层~前7层的祖先的直接的子块 被引用过的叔块不能重复引用 引用叔块的区块，可以获得挖矿报酬的1/32，也就是5*1/32=0.15625 Ether。最多获得2*0.15625=0.3125 Ether 参考资料http://blog.csdn.net/superswords/article/details/76445278 https://zhuanlan.zhihu.com/p/28928827 head_candidate 候选头区块: 矿工本地的候选头区块，相当于一个临时区块，head_candidate一直存在并且矿工会一直更新。矿工将交易打包进这个区块，计算出随机数后将次区块作为新区块广播出去。 contract ：合约，本身也是一个账户。每当一个交易指向一个合约账户时，该交易transaction的data属性作为该合约的输入执行该合约。 以太坊基本的一些概念：http://ethdocs.org/en/latest/contracts-and-transactions/index.html ChainService 和 PowService的关系 chain service负责区块链的同步和更新，处理连接的各个节点的eth_protocol数据包，以及交易和区块的广播； pow service是矿工挖矿的服务，计算出’幸运值’后告知chain service，chain service 将区块写入区块链并广播出去。 矿工将交易打包，更新head_candidate @property def head_candidate(self): if self._head_candidate_needs_updating: self._head_candidate_needs_updating = False # Make a copy of self.transaction_queue because # make_head_candidate modifies it. txqueue = copy.deepcopy(self.transaction_queue) #将交易打包，引用uncle区块，执行交易中的合约，更新区块状态 self._head_candidate, self._head_candidate_state = make_head_candidate( self.chain, txqueue, timestamp=int(time.time())) return self._head_candidate chain 实例的_on_new_head回调 def _on_new_head(self, block): log.debug(&#39;new head cbs&#39;, num=len(self.on_new_head_cbs)) self.transaction_queue = self.transaction_queue.diff( block.transactions) self._head_candidate_needs_updating = True #cb是pow service的回调函数mine_head_candidate，更新head_candidate并开始挖矿 for cb in self.on_new_head_cbs: cb(block) powservice的回调 def mine_head_candidate(self, _=None): #打包当前交易队里中的交易并更新head_candidate hc = self.chain.head_candidate if not self.active or self.chain.is_syncing: return elif (hc.transaction_count == 0 and not self.app.config[&#39;pow&#39;][&#39;mine_empty_blocks&#39;]): return log.debug(&#39;mining&#39;, difficulty=hc.difficulty) #开始挖矿 self.ppipe.put((&#39;mine&#39;, dict(mining_hash=hc.mining_hash, block_number=hc.number, difficulty=hc.difficulty))) 计算出幸运值后，调用chain.add_mined_block写入区块链并广播 #成功找到幸运值 def recv_found_nonce(self, bin_nonce, mixhash, mining_hash): log.info(&#39;nonce found&#39;, mining_hash=mining_hash.encode(&#39;hex&#39;)) #再次打包交易，更新head_candidate block = self.chain.head_candidate if block.mining_hash != mining_hash: log.warn(&#39;mining_hash does not match&#39;) return False block.header.mixhash = mixhash block.header.nonce = bin_nonce #添加新块并广播 if self.chain.add_mined_block(block): log.debug(&#39;mined block %d (%s) added to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return True else: log.debug(&#39;failed to add mined block %d (%s) to chain&#39; % ( block.number, encode_hex(block.hash[:8]))) return False def add_mined_block(self, block): log.debug(&#39;adding mined block&#39;, block=block) assert isinstance(block, Block) #添加新块 if self.chain.add_block(block): log.debug(&#39;added&#39;, block=block, ts=time.time()) assert block == self.chain.head self.transaction_queue = self.transaction_queue.diff(block.transactions) self._head_candidate_needs_updating = True #广播新块 self.broadcast_newblock(block, chain_difficulty=self.chain.get_score(block)) return True log.debug(&#39;failed to add&#39;, block=block, ts=time.time()) return False 在写入新块完成后，调用new_head_cb回调，再次开始挖矿 至此，整个循环的过程就是矿工不断打包交易挖矿到广播新块的过程 ChainService service start 服务启动 服务启动时将eth_protocol（以太坊协议）中command对应的回调函数添加到eth_protocol实例中 先看看eth_protocol协议 以太坊协议定义eth_protocol.py 每个peer对象都有一个eth_protocol实例。在p2p协议中，当节点收到hello数据包的时候，便初始化所有协议实例，其中包括eth_protocol peer对象receive hello 初始化eth_protocol def connect_service(self, service): assert isinstance(service, WiredService) protocol_class = service.wire_protocol assert issubclass(protocol_class, BaseProtocol) # create protcol instance which connects peer with serivce protocol = protocol_class(self, service) # register protocol assert protocol_class not in self.protocols log.debug(&#39;registering protocol&#39;, protocol=protocol.name, peer=self) self.protocols[protocol_class] = protocol self.mux.add_protocol(protocol.protocol_id) protocol.start()#调用chain_service.on_wire_protocol_start(self) chain service为该实例添加回调函数，并向对方节点发送status数据包 def on_wire_protocol_start(self, proto): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;on_wire_protocol_start&#39;, proto=proto) assert isinstance(proto, self.wire_protocol) # register callbacks proto.receive_status_callbacks.append(self.on_receive_status)#处理status数据包 proto.receive_newblockhashes_callbacks.append(self.on_newblockhashes) proto.receive_transactions_callbacks.append(self.on_receive_transactions) proto.receive_getblockheaders_callbacks.append(self.on_receive_getblockheaders) proto.receive_blockheaders_callbacks.append(self.on_receive_blockheaders) proto.receive_getblockbodies_callbacks.append(self.on_receive_getblockbodies) proto.receive_blockbodies_callbacks.append(self.on_receive_blockbodies) proto.receive_newblock_callbacks.append(self.on_receive_newblock) # send status 一旦连接就向对方发送自己的区块链状态status head = self.chain.head proto.send_status(chain_difficulty=self.chain.get_score(head), chain_head_hash=head.hash, genesis_hash=self.chain.genesis.hash) eth_protocol协议中包括 Status 与新节点建立连接后，互相发送自己的区块链状态 NewBlockHashes 向网络中广播一批新区块的hash Transactions 包含一批交易的数据包 GetBlockHashes 从指定hash开始，请求一批BlockHashes BlockHashes 返回GetBlockHashes请求 GetBlocks 从指定hash开始，请求一批Block Blocks 返回GetBlocks请求 NewBlock 矿工挖矿后广播新区块，节点接到该区块后验证后添加到本地 1.收到status： 某个已经完成握手的peer节点发送他当前的区块链网络状态ethereum state，status数据包是节点之间建立连接后收到的第一个数据包。 通过status数据包来获取网络中最新的区块并更新本地的区块链 class status(BaseProtocol.command): &quot;&quot;&quot; protocolVersion: The version of the Ethereum protocol this peer implements. 30 at present. networkID: The network version of Ethereum for this peer. 0 for the official testnet. totalDifficulty: Total Difficulty of the best chain. Integer, as found in block header. latestHash: The hash of the block with the highest validated total difficulty. GenesisHash: The hash of the Genesis block. &quot;&quot;&quot; cmd_id = 0 sent = False structure = [ (&#39;eth_version&#39;, rlp.sedes.big_endian_int), (&#39;network_id&#39;, rlp.sedes.big_endian_int), (&#39;chain_difficulty&#39;, rlp.sedes.big_endian_int),#totalDifficulty，该链的总难度 (&#39;chain_head_hash&#39;, rlp.sedes.binary),#latestHash，头区块hash (&#39;genesis_hash&#39;, rlp.sedes.binary)]#初始区块hash def create(self, proto, chain_difficulty, chain_head_hash, genesis_hash): self.sent = True network_id = proto.service.app.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id) return [proto.version, network_id, chain_difficulty, chain_head_hash, genesis_hash] receive packet收到数据包 receive status解析数据包定位到status处理函数 之前已注册回调eth_protocol实例初始化时已注册 on receive status receive status处理函数 这里注意一点，这里看的是DAO事件之前的版本，不是分叉过后的版本（还是先按正常逻辑来。。） def on_receive_status(self, proto, eth_version, network_id, chain_difficulty, chain_head_hash, genesis_hash): log.debug(&#39;----------------------------------&#39;) log.debug(&#39;status received&#39;, proto=proto, eth_version=eth_version) assert eth_version == proto.version, (eth_version, proto.version) #必须是同一个networkid if network_id != self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id): log.warn(&quot;invalid network id&quot;, remote_network_id=network_id, expected_network_id=self.config[&#39;eth&#39;].get(&#39;network_id&#39;, proto.network_id)) raise eth_protocol.ETHProtocolError(&#39;wrong network_id&#39;) # check genesis #初始区块hash必须一致 if genesis_hash != self.chain.genesis.hash: log.warn(&quot;invalid genesis hash&quot;, remote_id=proto, genesis=genesis_hash.encode(&#39;hex&#39;)) raise eth_protocol.ETHProtocolError(&#39;wrong genesis block&#39;) # request chain #调用同步器同步数据 self.synchronizer.receive_status(proto, chain_head_hash, chain_difficulty) # send transactions #获取网络中已知的但尚未被计入区块的交易transactions transactions = self.chain.get_transactions() if transactions: log.debug(&quot;sending transactions&quot;, remote_id=proto) #将这些交易告知对方 proto.send_transactions(*transactions) synchronizer同步器同步数据receive_status： def receive_status(self, proto, blockhash, chain_difficulty): &quot;called if a new peer is connected&quot; log.debug(&#39;status received&#39;, proto=proto, chain_difficulty=chain_difficulty) # memorize proto with difficulty #将改节点区块链总难度记下 self._protocols[proto] = chain_difficulty #对方头区块hash已经在本地存在，则忽略 if self.chainservice.knows_block(blockhash) or self.synctask: log.debug(&#39;existing task or known hash, discarding&#39;) return if self.force_sync: blockhash, chain_difficulty = self.force_sync log.debug(&#39;starting forced syctask&#39;, blockhash=blockhash.encode(&#39;hex&#39;)) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) #如果这条链总难度比自己的大，则认为这条链状态更新一点，并从他给出的头区块hash开始同步区块，同步的时候从已连接节点中总难度chain_difficulty最大的那个开始同步（但是这并不能保证同步的链就一定是主链，后面会分析如果同步的链不是主链的情况） elif chain_difficulty &gt; self.chain.head.chain_difficulty(): log.debug(&#39;sufficient difficulty&#39;) self.synctask = SyncTask(self, proto, blockhash, chain_difficulty) fetch_hashchain 向网络请求以指定hash作为头区块的一批区块hash def fetch_hashchain(self): log_st.debug(&#39;fetching hashchain&#39;) blockhashes_chain = [self.blockhash] # youngest to oldest # For testing purposes: skip the hash downoading stage # import ast # blockhashes_chain = ast.literal_eval(open(&#39;/home/vub/blockhashes.pyast&#39;).read())[:299000] blockhash = self.blockhash = blockhashes_chain[-1] assert blockhash not in self.chain # get block hashes until we found a known one max_blockhashes_per_request = self.initial_blockhashes_per_request while blockhash not in self.chain: # proto with highest_difficulty should be the proto we got the newblock from blockhashes_batch = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #这里的protocols是各个已连接节点peer对象的eth_protocol实例，按链总难度大小排序，难度最大在前面 for proto in protocols: log.debug(&#39;syncing with&#39;, proto=proto) if proto.is_stopped: continue # request assert proto not in self.requests deferred = AsyncResult() self.requests[proto] = deferred #从指定hash开始，请求一批BlockHashes proto.send_getblockhashes(blockhash, max_blockhashes_per_request) try: #获取到这批BlockHashes blockhashes_batch = deferred.get(block=True, timeout=self.blockhashes_request_timeout) except gevent.Timeout: log_st.warn(&#39;syncing hashchain timed out&#39;) continue finally: # is also executed &#39;on the way out&#39; when any other clause of the try statement # is left via a break, continue or return statement. del self.requests[proto] if not blockhashes_batch: log_st.warn(&#39;empty getblockhashes result&#39;) continue if not all(isinstance(bh, bytes) for bh in blockhashes_batch): log_st.warn(&#39;got wrong data type&#39;, expected=&#39;bytes&#39;, received=type(blockhashes_batch[0])) continue break if not blockhashes_batch: log_st.warn(&#39;syncing failed with all peers&#39;, num_protos=len(protocols)) return self.exit(success=False) #在获取到的这批blockhashes中直到找到一个blockhash是自己数据库中有的，注意这里只要找到一个自己有的blockhash就可以了，而且这个blockhash不一定是自己本地chain的头区块，因为本地的头区块有可能不是在主链上的区块，上面已经提到过这点。节点总是会去同步最长的那条链，而且可能是从自己本地chain的头区块的父辈区块的某个区块开始同步，这样就提供了一定的纠错机制，让节点可以纠正到主链上去。 for blockhash in blockhashes_batch: # youngest to oldest assert utils.is_string(blockhash) if blockhash not in self.chain: blockhashes_chain.append(blockhash) else: log_st.debug(&#39;found known blockhash&#39;, blockhash=utils.encode_hex(blockhash), is_genesis=bool(blockhash == self.chain.genesis.hash)) break log_st.debug(&#39;downloaded &#39; + str(len(blockhashes_chain)) + &#39; block hashes, ending with %s&#39; % utils.encode_hex(blockhashes_chain[-1])) max_blockhashes_per_request = self.max_blockhashes_per_request #取到最长链的这批blockhash后，开始同步区块 self.fetch_blocks(blockhashes_chain) fetch blocks 向网络请求同步这批区块 def fetch_blocks(self, blockhashes_chain): # fetch blocks (no parallelism here) log_st.debug(&#39;fetching blocks&#39;, num=len(blockhashes_chain)) assert blockhashes_chain blockhashes_chain.reverse() # oldest to youngest num_blocks = len(blockhashes_chain) num_fetched = 0 while blockhashes_chain: blockhashes_batch = blockhashes_chain[:self.max_blocks_per_request] t_blocks = [] # try with protos protocols = self.protocols if not protocols: log_st.warn(&#39;no protocols available&#39;) return self.exit(success=False) #向每个节点请求 for proto in protocols: if proto.is_stopped: continue assert proto not in self.requests # request log_st.debug(&#39;requesting blocks&#39;, num=len(blockhashes_batch)) deferred = AsyncResult() self.requests[proto] = deferred #向网络请求这批hash值对应的区块 proto.send_getblocks(*blockhashes_batch) try: t_blocks = deferred.get(block=True, timeout=self.blocks_request_timeout) except gevent.Timeout: log_st.warn(&#39;getblocks timed out, trying next proto&#39;) continue finally: del self.requests[proto] if not t_blocks: log_st.warn(&#39;empty getblocks reply, trying next proto&#39;) continue elif not isinstance(t_blocks[0], TransientBlock): log_st.warn(&#39;received unexpected data&#39;, data=repr(t_blocks)) t_blocks = [] continue # we have results if not [b.header.hash for b in t_blocks] == blockhashes_batch[:len(t_blocks)]: log_st.warn(&#39;received wrong blocks, should ban peer&#39;) t_blocks = [] continue break # add received t_blocks num_fetched += len(t_blocks) log_st.debug(&#39;received blocks&#39;, num=len(t_blocks), num_fetched=num_fetched, total=num_blocks, missing=num_blocks - num_fetched) if not t_blocks: log_st.warn(&#39;failed to fetch blocks&#39;, missing=len(blockhashes_chain)) return self.exit(success=False) ts = time.time() log_st.debug(&#39;adding blocks&#39;, qsize=self.chainservice.block_queue.qsize()) for t_block in t_blocks: b = blockhashes_chain.pop(0) assert t_block.header.hash == b assert t_block.header.hash not in blockhashes_chain #将获取的block添加到队列，最后添加到本地数据库 self.chainservice.add_block(t_block, proto) # this blocks if the queue is full log_st.debug(&#39;adding blocks done&#39;, took=time.time() - ts) # done last_block = t_block assert not len(blockhashes_chain) assert last_block.header.hash == self.blockhash log_st.debug(&#39;syncing finished&#39;) # at this point blocks are not in the chain yet, but in the add_block queue if self.chain_difficulty &gt;= self.chain.head.chain_difficulty(): #广播这批区块最新的那个出去。 self.chainservice.broadcast_newblock(last_block, self.chain_difficulty, origin=proto) self.exit(success=True) 至此，on receive status 函数处理完成，已同步已连接节点的最新区块 2.transactions on_receive_transactions 节点收到transactions数据包后 矿工收到transactions数据包后，校验每笔交易的合法性，将交易打包进head candidate临时区块并广播交易 add_transaction def add_transaction(self, tx, origin=None): if self.is_syncing: #如果正在同步中的话，本地链的状态是过时的 return # we can not evaluate the tx based on outdated state log.debug(&#39;add_transaction&#39;, locked=self.add_transaction_lock.locked(), tx=tx) assert isinstance(tx, Transaction) assert origin is None or isinstance(origin, BaseProtocol) if tx.hash in self.broadcast_filter: log.debug(&#39;discarding known tx&#39;) # discard early return # validate transaction #交易合法性校验 try: #tx签名要正确；交易数nonce要与本地账户nonce一致；gas要足够；本地账户余额足够 validate_transaction(self.chain.head_candidate, tx) log.debug(&#39;valid tx, broadcasting&#39;) self.broadcast_transaction(tx, origin=origin) # asap except InvalidTransaction as e: log.debug(&#39;invalid tx&#39;, error=e) return if origin is not None: # not locally added via jsonrpc if not self.is_mining or self.is_syncing: log.debug(&#39;discarding tx&#39;, syncing=self.is_syncing, mining=self.is_mining) return self.add_transaction_lock.acquire() #向head_candidate临时区块写入交易 success = self.chain.add_transaction(tx) self.add_transaction_lock.release() if success: self._on_new_head_candidate() 3.GetBlockHashes BlockHashes 在向网络同步区块链的时候被调用fetch_hashchain中调用send_getblockhashes来发送GetBlockHashes数据包 其他节点接受到GetBlockHashes数据包后，返回BlockHashes数据包，及指定blockash开始的一批blockhash。 4.GetBlocks Blocks 在向网络同步区块链的时候被调用fetch_blocks中调用send_getblocks来发送GetBlocks数据包 其他节点接受到GetBlocks数据包后，返回Blocks数据包。 5.NewBlock 矿工挖到新块后广播该区块 节点接收到广播的新区块 def receive_newblock(self, proto, t_block, chain_difficulty): &quot;called if there&#39;s a newblock announced on the network&quot; log.debug(&#39;newblock&#39;, proto=proto, block=t_block, chain_difficulty=chain_difficulty, client=proto.peer.remote_client_version) if t_block.header.hash in self.chain: assert chain_difficulty == self.chain.get(t_block.header.hash).chain_difficulty() # memorize proto with difficulty #记住该节点区块链的总难度 self._protocols[proto] = chain_difficulty #如果该区块存在则忽略 if self.chainservice.knows_block(block_hash=t_block.header.hash): log.debug(&#39;known block&#39;) return # check pow if not t_block.header.check_pow(): log.warn(&#39;check pow failed, should ban!&#39;) return #预计的总难度 expected_difficulty = self.chain.head.chain_difficulty() + t_block.header.difficulty #总难度至少比本地链的总难度大 if chain_difficulty &gt;= self.chain.head.chain_difficulty(): # broadcast duplicates filtering is done in eth_service log.debug(&#39;sufficient difficulty, broadcasting&#39;, client=proto.peer.remote_client_version) self.chainservice.broadcast_newblock(t_block, chain_difficulty, origin=proto) else: # any criteria for which blocks/chains not to add? age = self.chain.head.number - t_block.header.number log.debug(&#39;low difficulty&#39;, client=proto.peer.remote_client_version, chain_difficulty=chain_difficulty, expected_difficulty=expected_difficulty, block_age=age) if age &gt; self.MAX_NEWBLOCK_AGE: log.debug(&#39;newblock is too old, not adding&#39;, block_age=age, max_age=self.MAX_NEWBLOCK_AGE) return # unknown and pow check and highest difficulty # check if we have parent #如果有祖先，直接添加 if self.chainservice.knows_block(block_hash=t_block.header.prevhash): log.debug(&#39;adding block&#39;) self.chainservice.add_block(t_block, proto) #没有祖先说明还差一个以上区块，向网络同步区块 else: log.debug(&#39;missing parent&#39;) if not self.synctask: self.synctask = SyncTask(self, proto, t_block.header.hash, chain_difficulty) else: log.debug(&#39;existing task, discarding&#39;) 以上是以太坊节点与节点交互的协议部分 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/06/22/e7a49b03eae48dde261a1386c013468b.html","headline":"python ethereum 代码分析《2》","dateModified":"2017-06-22T00:00:00+08:00","datePublished":"2017-06-22T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/06/22/e7a49b03eae48dde261a1386c013468b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>python ethereum 代码分析《2》</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="python-ethereum-代码分析-2">python ethereum 代码分析 《2》</h1> 
+  <h2 id="python-版本以太坊">python 版本以太坊</h2> 
+  <h3 id="pyethapp-模块">pyethapp 模块</h3> 
+  <p>本章主要介绍pyethapp 模块中的ChainService 和 PoWService</p> 
+  <h3 id="一些关键概念">一些关键概念</h3> 
+  <p>totalDifficulty 总难度： <br> total difficulty总难度是当前某条链所有区块难度的总和，total difficulty被用来指示最长的那一条链，某个节点如果想从其他节点同步数据的话，他会选择total difficulty最大的那一条链来同步数据。值得注意的是uncle block的difficulty也被计算到totalDifficulty中去，<a href="http://ethfans.org/wikis/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E7%99%BD%E7%9A%AE%E4%B9%A6" rel="nofollow" target="_blank">以太坊白皮书</a>中的幽灵协议阐述了为什么这么设计</p> 
+  <p>uncle block 叔叔区块：也是矿工挖出来的区块，它也是合法的，但是发现的稍晚，或者是网络传输稍慢，而没有能成为最长的链上的区块 <br> 以太坊十几秒的出块间隔，大大增加了孤块的产生，并且降低了安全性。通过鼓励引用叔块，使引用主链获得更多的安全保证(因为孤块本身也是合法的) <br> 区块可以不引用，或者最多引用两个叔块 <br> 叔块必须是区块的前2层~前7层的祖先的直接的子块 <br> 被引用过的叔块不能重复引用 <br> 引用叔块的区块，可以获得挖矿报酬的1/32，也就是5*1/32=0.15625 Ether。最多获得2*0.15625=0.3125 Ether <br> 参考资料<a href="http://blog.csdn.net/superswords/article/details/76445278" rel="nofollow" target="_blank">http://blog.csdn.net/superswords/article/details/76445278</a> <br> <a href="https://zhuanlan.zhihu.com/p/28928827" rel="nofollow" target="_blank">https://zhuanlan.zhihu.com/p/28928827</a></p> 
+  <p>head_candidate 候选头区块: 矿工本地的候选头区块，相当于一个临时区块，head_candidate一直存在并且矿工会一直更新。矿工将交易打包进这个区块，计算出随机数后将次区块作为新区块广播出去。</p> 
+  <p>contract ：合约，本身也是一个账户。每当一个交易指向一个合约账户时，该交易transaction的data属性作为该合约的输入执行该合约。</p> 
+  <p>以太坊基本的一些概念：<a href="http://ethdocs.org/en/latest/contracts-and-transactions/index.html" rel="nofollow" target="_blank">http://ethdocs.org/en/latest/contracts-and-transactions/index.html</a></p> 
+  <h3 id="chainservice-和-powservice的关系">ChainService 和 PowService的关系</h3> 
+  <p>chain service负责区块链的同步和更新，处理连接的各个节点的eth_protocol数据包，以及交易和区块的广播； pow service是矿工挖矿的服务，计算出’幸运值’后告知chain service，chain service 将区块写入区块链并广播出去。</p> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/eth_service.py#L222" rel="nofollow" target="_blank">矿工将交易打包，更新head_candidate</a></p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-decorator">@property</span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">head_candidate</span><span class="hljs-params">(self)</span>:</span>
+        <span class="hljs-keyword">if</span> self._head_candidate_needs_updating:
+            self._head_candidate_needs_updating = <span class="hljs-keyword">False</span>
+            <span class="hljs-comment"># Make a copy of self.transaction_queue because</span>
+            <span class="hljs-comment"># make_head_candidate modifies it.</span>
+            txqueue = copy.deepcopy(self.transaction_queue)
+            <span class="hljs-comment">#将交易打包，引用uncle区块，执行交易中的合约，更新区块状态</span>
+            self._head_candidate, self._head_candidate_state = make_head_candidate(
+                self.chain, txqueue, timestamp=int(time.time()))
+        <span class="hljs-keyword">return</span> self._head_candidate</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/eth_service.py#L162" rel="nofollow" target="_blank">chain 实例的_on_new_head回调</a></p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">_on_new_head</span><span class="hljs-params">(self, block)</span>:</span>
+        log.debug(<span class="hljs-string">'new head cbs'</span>, num=len(self.on_new_head_cbs))
+        self.transaction_queue = self.transaction_queue.diff(
+            block.transactions)
+        self._head_candidate_needs_updating = <span class="hljs-keyword">True</span>
+        <span class="hljs-comment">#cb是pow service的回调函数mine_head_candidate，更新head_candidate并开始挖矿</span>
+        <span class="hljs-keyword">for</span> cb <span class="hljs-keyword">in</span> self.on_new_head_cbs:
+            cb(block)</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/pow_service.py#L125" rel="nofollow" target="_blank">powservice的回调</a></p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">mine_head_candidate</span><span class="hljs-params">(self, _=None)</span>:</span>
+        <span class="hljs-comment">#打包当前交易队里中的交易并更新head_candidate</span>
+        hc = self.chain.head_candidate
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> self.active <span class="hljs-keyword">or</span> self.chain.is_syncing:
+            <span class="hljs-keyword">return</span>
+        <span class="hljs-keyword">elif</span> (hc.transaction_count == <span class="hljs-number">0</span> <span class="hljs-keyword">and</span>
+              <span class="hljs-keyword">not</span> self.app.config[<span class="hljs-string">'pow'</span>][<span class="hljs-string">'mine_empty_blocks'</span>]):
+            <span class="hljs-keyword">return</span>
+
+        log.debug(<span class="hljs-string">'mining'</span>, difficulty=hc.difficulty)
+        <span class="hljs-comment">#开始挖矿</span>
+        self.ppipe.put((<span class="hljs-string">'mine'</span>, dict(mining_hash=hc.mining_hash,
+                                     block_number=hc.number,
+                                     difficulty=hc.difficulty)))</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/pow_service.py#L149" rel="nofollow" target="_blank">计算出幸运值后，调用chain.add_mined_block写入区块链并广播</a></p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-comment">#成功找到幸运值</span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">recv_found_nonce</span><span class="hljs-params">(self, bin_nonce, mixhash, mining_hash)</span>:</span>
+        log.info(<span class="hljs-string">'nonce found'</span>, mining_hash=mining_hash.encode(<span class="hljs-string">'hex'</span>))
+        <span class="hljs-comment">#再次打包交易，更新head_candidate</span>
+        block = self.chain.head_candidate
+        <span class="hljs-keyword">if</span> block.mining_hash != mining_hash:
+            log.warn(<span class="hljs-string">'mining_hash does not match'</span>)
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">False</span>
+        block.header.mixhash = mixhash
+        block.header.nonce = bin_nonce
+        <span class="hljs-comment">#添加新块并广播</span>
+        <span class="hljs-keyword">if</span> self.chain.add_mined_block(block):
+            log.debug(<span class="hljs-string">'mined block %d (%s) added to chain'</span> % (
+                block.number, encode_hex(block.hash[:<span class="hljs-number">8</span>])))
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">True</span>
+        <span class="hljs-keyword">else</span>:
+            log.debug(<span class="hljs-string">'failed to add mined block %d (%s) to chain'</span> % (
+                block.number, encode_hex(block.hash[:<span class="hljs-number">8</span>])))
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">False</span></code></pre> 
+  <pre class="prettyprint"><code class=" hljs oxygene">    def add_mined_block(<span class="hljs-keyword">self</span>, <span class="hljs-keyword">block</span>):
+        log.debug(<span class="hljs-string">'adding mined block'</span>, <span class="hljs-keyword">block</span>=<span class="hljs-keyword">block</span>)
+        assert isinstance(<span class="hljs-keyword">block</span>, <span class="hljs-keyword">Block</span>)
+        #添加新块
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.chain.add_block(<span class="hljs-keyword">block</span>):
+            log.debug(<span class="hljs-string">'added'</span>, <span class="hljs-keyword">block</span>=<span class="hljs-keyword">block</span>, ts=time.time())
+            assert <span class="hljs-keyword">block</span> == <span class="hljs-keyword">self</span>.chain.head
+            <span class="hljs-keyword">self</span>.transaction_queue = <span class="hljs-keyword">self</span>.transaction_queue.diff(<span class="hljs-keyword">block</span>.transactions)
+            <span class="hljs-keyword">self</span>._head_candidate_needs_updating = <span class="hljs-keyword">True</span>
+            #广播新块
+            <span class="hljs-keyword">self</span>.broadcast_newblock(<span class="hljs-keyword">block</span>, chain_difficulty=<span class="hljs-keyword">self</span>.chain.get_score(<span class="hljs-keyword">block</span>))
+            return <span class="hljs-keyword">True</span>
+        log.debug(<span class="hljs-string">'failed to add'</span>, <span class="hljs-keyword">block</span>=<span class="hljs-keyword">block</span>, ts=time.time())
+        return <span class="hljs-keyword">False</span></code></pre> 
+  <p><a href="https://github.com/ethereum/pyethereum/blob/develop/ethereum/pow/chain.py#L426" rel="nofollow" target="_blank">在写入新块完成后，调用new_head_cb回调，再次开始挖矿</a> <br> 至此，整个循环的过程就是矿工不断打包交易挖矿到广播新块的过程</p> 
+  <h3 id="chainservice">ChainService</h3> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/eth_service.py#L403" rel="nofollow" target="_blank">service start</a> 服务启动 <br> 服务启动时将eth_protocol（以太坊协议）中command对应的回调函数添加到eth_protocol实例中</p> 
+  <p>先看看<a href="https://github.com/ethereum/wiki/wiki/Ethereum-Wire-Protocol" rel="nofollow" target="_blank">eth_protocol协议</a> <br> 以太坊协议定义<a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/eth_protocol.py" rel="nofollow" target="_blank">eth_protocol.py</a></p> 
+  <p>每个peer对象都有一个eth_protocol实例。在p2p协议中，当节点收到hello数据包的时候，便初始化所有协议实例，其中包括eth_protocol <br> peer对象<a href="https://github.com/ethereum/pydevp2p/blob/develop/devp2p/peer.py#L157" rel="nofollow" target="_blank">receive hello</a> <br> 初始化eth_protocol</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">connect_service</span><span class="hljs-params">(self, service)</span>:</span>
+        <span class="hljs-keyword">assert</span> isinstance(service, WiredService)
+        protocol_class = service.wire_protocol
+        <span class="hljs-keyword">assert</span> issubclass(protocol_class, BaseProtocol)
+        <span class="hljs-comment"># create protcol instance which connects peer with serivce</span>
+        protocol = protocol_class(self, service)
+        <span class="hljs-comment"># register protocol</span>
+        <span class="hljs-keyword">assert</span> protocol_class <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.protocols
+        log.debug(<span class="hljs-string">'registering protocol'</span>, protocol=protocol.name, peer=self)
+        self.protocols[protocol_class] = protocol
+        self.mux.add_protocol(protocol.protocol_id)
+        protocol.start()<span class="hljs-comment">#调用chain_service.on_wire_protocol_start(self)</span></code></pre> 
+  <p>chain service为该实例添加回调函数，并向对方节点发送status数据包</p> 
+  <pre class="prettyprint"><code class=" hljs ruby">    <span class="hljs-function"><span class="hljs-keyword">def</span> </span>on_wire_protocol_start(<span class="hljs-keyword">self</span>, proto)<span class="hljs-symbol">:</span>
+        log.debug(<span class="hljs-string">'----------------------------------'</span>)
+        log.debug(<span class="hljs-string">'on_wire_protocol_start'</span>, proto=proto)
+        assert isinstance(proto, <span class="hljs-keyword">self</span>.wire_protocol)
+        <span class="hljs-comment"># register callbacks</span>
+        proto.receive_status_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_status)<span class="hljs-comment">#处理status数据包</span>
+        proto.receive_newblockhashes_callbacks.append(<span class="hljs-keyword">self</span>.on_newblockhashes)
+        proto.receive_transactions_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_transactions)
+        proto.receive_getblockheaders_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_getblockheaders)
+        proto.receive_blockheaders_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_blockheaders)
+        proto.receive_getblockbodies_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_getblockbodies)
+        proto.receive_blockbodies_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_blockbodies)
+        proto.receive_newblock_callbacks.append(<span class="hljs-keyword">self</span>.on_receive_newblock)
+
+        <span class="hljs-comment"># send status 一旦连接就向对方发送自己的区块链状态status</span>
+        head = <span class="hljs-keyword">self</span>.chain.head
+        proto.send_status(chain_difficulty=<span class="hljs-keyword">self</span>.chain.get_score(head), chain_head_hash=head.hash,
+                          genesis_hash=<span class="hljs-keyword">self</span>.chain.genesis.hash)</code></pre> 
+  <p>eth_protocol协议中包括 <br> Status 与新节点建立连接后，互相发送自己的区块链状态 <br> NewBlockHashes 向网络中广播一批新区块的hash <br> Transactions 包含一批交易的数据包 <br> GetBlockHashes 从指定hash开始，请求一批BlockHashes <br> BlockHashes 返回GetBlockHashes请求 <br> GetBlocks 从指定hash开始，请求一批Block <br> Blocks 返回GetBlocks请求 <br> NewBlock 矿工挖矿后广播新区块，节点接到该区块后验证后添加到本地</p> 
+  <p>1.收到status： <br> 某个已经完成握手的peer节点发送他当前的区块链网络状态ethereum state，status数据包是节点之间建立连接后收到的第一个数据包。 <br> 通过status数据包来获取网络中最新的区块并更新本地的区块链</p> 
+  <pre class="prettyprint"><code class="language-python hljs ">    <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">status</span><span class="hljs-params">(BaseProtocol.command)</span>:</span>
+
+        <span class="hljs-string">""" protocolVersion: The version of the Ethereum protocol this peer implements. 30 at present. networkID: The network version of Ethereum for this peer. 0 for the official testnet. totalDifficulty: Total Difficulty of the best chain. Integer, as found in block header. latestHash: The hash of the block with the highest validated total difficulty. GenesisHash: The hash of the Genesis block. """</span>
+        cmd_id = <span class="hljs-number">0</span>
+        sent = <span class="hljs-keyword">False</span>
+
+        structure = [
+            (<span class="hljs-string">'eth_version'</span>, rlp.sedes.big_endian_int),
+            (<span class="hljs-string">'network_id'</span>, rlp.sedes.big_endian_int),
+            (<span class="hljs-string">'chain_difficulty'</span>, rlp.sedes.big_endian_int),<span class="hljs-comment">#totalDifficulty，该链的总难度</span>
+            (<span class="hljs-string">'chain_head_hash'</span>, rlp.sedes.binary),<span class="hljs-comment">#latestHash，头区块hash</span>
+            (<span class="hljs-string">'genesis_hash'</span>, rlp.sedes.binary)]<span class="hljs-comment">#初始区块hash</span>
+
+        <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">create</span><span class="hljs-params">(self, proto, chain_difficulty, chain_head_hash, genesis_hash)</span>:</span>
+            self.sent = <span class="hljs-keyword">True</span>
+            network_id = proto.service.app.config[<span class="hljs-string">'eth'</span>].get(<span class="hljs-string">'network_id'</span>, proto.network_id)
+            <span class="hljs-keyword">return</span> [proto.version, network_id, chain_difficulty, chain_head_hash, genesis_hash]</code></pre> 
+  <p><a href="https://github.com/ethereum/pydevp2p/blob/develop/devp2p/protocol.py#L161" rel="nofollow" target="_blank">receive packet</a>收到数据包 <br> <a href="https://github.com/ethereum/pydevp2p/blob/develop/devp2p/protocol.py#L67" rel="nofollow" target="_blank">receive status</a>解析数据包定位到status处理函数 <br> <a href="https://github.com/ethereum/pyethapp/blob/develop/pyethapp/eth_service.py#L407" rel="nofollow" target="_blank">之前已注册回调</a>eth_protocol实例初始化时已注册 <br> <a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L461" rel="nofollow" target="_blank">on receive status</a> receive status处理函数</p> 
+  <p>这里注意一点，这里看的是DAO事件之前的版本，不是分叉过后的版本（还是先按正常逻辑来。。）</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">on_receive_status</span><span class="hljs-params">(self, proto, eth_version, network_id, chain_difficulty, chain_head_hash, genesis_hash)</span>:</span>
+        log.debug(<span class="hljs-string">'----------------------------------'</span>)
+        log.debug(<span class="hljs-string">'status received'</span>, proto=proto, eth_version=eth_version)
+        <span class="hljs-keyword">assert</span> eth_version == proto.version, (eth_version, proto.version)
+        <span class="hljs-comment">#必须是同一个networkid</span>
+        <span class="hljs-keyword">if</span> network_id != self.config[<span class="hljs-string">'eth'</span>].get(<span class="hljs-string">'network_id'</span>, proto.network_id):
+            log.warn(<span class="hljs-string">"invalid network id"</span>, remote_network_id=network_id,
+                     expected_network_id=self.config[<span class="hljs-string">'eth'</span>].get(<span class="hljs-string">'network_id'</span>, proto.network_id))
+            <span class="hljs-keyword">raise</span> eth_protocol.ETHProtocolError(<span class="hljs-string">'wrong network_id'</span>)
+
+        <span class="hljs-comment"># check genesis</span>
+        <span class="hljs-comment">#初始区块hash必须一致</span>
+        <span class="hljs-keyword">if</span> genesis_hash != self.chain.genesis.hash:
+            log.warn(<span class="hljs-string">"invalid genesis hash"</span>, remote_id=proto, genesis=genesis_hash.encode(<span class="hljs-string">'hex'</span>))
+            <span class="hljs-keyword">raise</span> eth_protocol.ETHProtocolError(<span class="hljs-string">'wrong genesis block'</span>)
+
+        <span class="hljs-comment"># request chain</span>
+        <span class="hljs-comment">#调用同步器同步数据</span>
+        self.synchronizer.receive_status(proto, chain_head_hash, chain_difficulty)
+
+        <span class="hljs-comment"># send transactions</span>
+        <span class="hljs-comment">#获取网络中已知的但尚未被计入区块的交易transactions</span>
+        transactions = self.chain.get_transactions()
+        <span class="hljs-keyword">if</span> transactions:
+            log.debug(<span class="hljs-string">"sending transactions"</span>, remote_id=proto)
+            <span class="hljs-comment">#将这些交易告知对方</span>
+            proto.send_transactions(*transactions)</code></pre> 
+  <p>synchronizer同步器同步数据<a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L333" rel="nofollow" target="_blank">receive_status</a>：</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">receive_status</span><span class="hljs-params">(self, proto, blockhash, chain_difficulty)</span>:</span>
+        <span class="hljs-string">"called if a new peer is connected"</span>
+        log.debug(<span class="hljs-string">'status received'</span>, proto=proto, chain_difficulty=chain_difficulty)
+
+        <span class="hljs-comment"># memorize proto with difficulty</span>
+        <span class="hljs-comment">#将改节点区块链总难度记下</span>
+        self._protocols[proto] = chain_difficulty
+
+        <span class="hljs-comment">#对方头区块hash已经在本地存在，则忽略</span>
+        <span class="hljs-keyword">if</span> self.chainservice.knows_block(blockhash) <span class="hljs-keyword">or</span> self.synctask:
+            log.debug(<span class="hljs-string">'existing task or known hash, discarding'</span>)
+            <span class="hljs-keyword">return</span>
+
+        <span class="hljs-keyword">if</span> self.force_sync:
+            blockhash, chain_difficulty = self.force_sync
+            log.debug(<span class="hljs-string">'starting forced syctask'</span>, blockhash=blockhash.encode(<span class="hljs-string">'hex'</span>))
+            self.synctask = SyncTask(self, proto, blockhash, chain_difficulty)
+
+        <span class="hljs-comment">#如果这条链总难度比自己的大，则认为这条链状态更新一点，并从他给出的头区块hash开始同步区块，同步的时候从已连接节点中总难度chain_difficulty最大的那个开始同步（但是这并不能保证同步的链就一定是主链，后面会分析如果同步的链不是主链的情况）</span>
+        <span class="hljs-keyword">elif</span> chain_difficulty &gt; self.chain.head.chain_difficulty():
+            log.debug(<span class="hljs-string">'sufficient difficulty'</span>)
+            self.synctask = SyncTask(self, proto, blockhash, chain_difficulty)</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L66" rel="nofollow" target="_blank">fetch_hashchain</a> 向网络请求以指定hash作为头区块的一批区块hash</p> 
+  <pre class="prettyprint"><code class="language-python hljs ">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">fetch_hashchain</span><span class="hljs-params">(self)</span>:</span>
+        log_st.debug(<span class="hljs-string">'fetching hashchain'</span>)
+        blockhashes_chain = [self.blockhash]  <span class="hljs-comment"># youngest to oldest</span>
+        <span class="hljs-comment"># For testing purposes: skip the hash downoading stage</span>
+        <span class="hljs-comment"># import ast</span>
+        <span class="hljs-comment"># blockhashes_chain = ast.literal_eval(open('/home/vub/blockhashes.pyast').read())[:299000]</span>
+
+        blockhash = self.blockhash = blockhashes_chain[-<span class="hljs-number">1</span>]
+        <span class="hljs-keyword">assert</span> blockhash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.chain
+
+        <span class="hljs-comment"># get block hashes until we found a known one</span>
+        max_blockhashes_per_request = self.initial_blockhashes_per_request
+        <span class="hljs-keyword">while</span> blockhash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.chain:
+            <span class="hljs-comment"># proto with highest_difficulty should be the proto we got the newblock from</span>
+            blockhashes_batch = []
+
+            <span class="hljs-comment"># try with protos</span>
+            protocols = self.protocols
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> protocols:
+                log_st.warn(<span class="hljs-string">'no protocols available'</span>)
+                <span class="hljs-keyword">return</span> self.exit(success=<span class="hljs-keyword">False</span>)
+            <span class="hljs-comment">#这里的protocols是各个已连接节点peer对象的eth_protocol实例，按链总难度大小排序，难度最大在前面</span>
+            <span class="hljs-keyword">for</span> proto <span class="hljs-keyword">in</span> protocols:
+                log.debug(<span class="hljs-string">'syncing with'</span>, proto=proto)
+                <span class="hljs-keyword">if</span> proto.is_stopped:
+                    <span class="hljs-keyword">continue</span>
+
+                <span class="hljs-comment"># request</span>
+                <span class="hljs-keyword">assert</span> proto <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.requests
+                deferred = AsyncResult()
+                self.requests[proto] = deferred
+                <span class="hljs-comment">#从指定hash开始，请求一批BlockHashes</span>
+                proto.send_getblockhashes(blockhash, max_blockhashes_per_request)
+                <span class="hljs-keyword">try</span>:
+                    <span class="hljs-comment">#获取到这批BlockHashes</span>
+                    blockhashes_batch = deferred.get(block=<span class="hljs-keyword">True</span>,
+                                                     timeout=self.blockhashes_request_timeout)
+                <span class="hljs-keyword">except</span> gevent.Timeout:
+                    log_st.warn(<span class="hljs-string">'syncing hashchain timed out'</span>)
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">finally</span>:
+                    <span class="hljs-comment"># is also executed 'on the way out' when any other clause of the try statement</span>
+                    <span class="hljs-comment"># is left via a break, continue or return statement.</span>
+                    <span class="hljs-keyword">del</span> self.requests[proto]
+
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> blockhashes_batch:
+                    log_st.warn(<span class="hljs-string">'empty getblockhashes result'</span>)
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> all(isinstance(bh, bytes) <span class="hljs-keyword">for</span> bh <span class="hljs-keyword">in</span> blockhashes_batch):
+                    log_st.warn(<span class="hljs-string">'got wrong data type'</span>, expected=<span class="hljs-string">'bytes'</span>,
+                                received=type(blockhashes_batch[<span class="hljs-number">0</span>]))
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">break</span>
+
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> blockhashes_batch:
+                log_st.warn(<span class="hljs-string">'syncing failed with all peers'</span>, num_protos=len(protocols))
+                <span class="hljs-keyword">return</span> self.exit(success=<span class="hljs-keyword">False</span>)
+
+            <span class="hljs-comment">#在获取到的这批blockhashes中直到找到一个blockhash是自己数据库中有的，注意这里只要找到一个自己有的blockhash就可以了，而且这个blockhash不一定是自己本地chain的头区块，因为本地的头区块有可能不是在主链上的区块，上面已经提到过这点。节点总是会去同步最长的那条链，而且可能是从自己本地chain的头区块的父辈区块的某个区块开始同步，这样就提供了一定的纠错机制，让节点可以纠正到主链上去。</span>
+            <span class="hljs-keyword">for</span> blockhash <span class="hljs-keyword">in</span> blockhashes_batch:  <span class="hljs-comment"># youngest to oldest</span>
+                <span class="hljs-keyword">assert</span> utils.is_string(blockhash)
+                <span class="hljs-keyword">if</span> blockhash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.chain:
+                    blockhashes_chain.append(blockhash)
+                <span class="hljs-keyword">else</span>:
+                    log_st.debug(<span class="hljs-string">'found known blockhash'</span>, blockhash=utils.encode_hex(blockhash),
+                                 is_genesis=bool(blockhash == self.chain.genesis.hash))
+                    <span class="hljs-keyword">break</span>
+            log_st.debug(<span class="hljs-string">'downloaded '</span> + str(len(blockhashes_chain)) + <span class="hljs-string">' block hashes, ending with %s'</span> % utils.encode_hex(blockhashes_chain[-<span class="hljs-number">1</span>]))
+            max_blockhashes_per_request = self.max_blockhashes_per_request
+        <span class="hljs-comment">#取到最长链的这批blockhash后，开始同步区块</span>
+        self.fetch_blocks(blockhashes_chain)
+</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L135" rel="nofollow" target="_blank">fetch blocks</a> 向网络请求同步这批区块</p> 
+  <pre class="prettyprint"><code class="language-python hljs ">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">fetch_blocks</span><span class="hljs-params">(self, blockhashes_chain)</span>:</span>
+        <span class="hljs-comment"># fetch blocks (no parallelism here)</span>
+        log_st.debug(<span class="hljs-string">'fetching blocks'</span>, num=len(blockhashes_chain))
+        <span class="hljs-keyword">assert</span> blockhashes_chain
+        blockhashes_chain.reverse()  <span class="hljs-comment"># oldest to youngest</span>
+        num_blocks = len(blockhashes_chain)
+        num_fetched = <span class="hljs-number">0</span>
+
+        <span class="hljs-keyword">while</span> blockhashes_chain:
+            blockhashes_batch = blockhashes_chain[:self.max_blocks_per_request]
+            t_blocks = []
+
+            <span class="hljs-comment"># try with protos</span>
+            protocols = self.protocols
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> protocols:
+                log_st.warn(<span class="hljs-string">'no protocols available'</span>)
+                <span class="hljs-keyword">return</span> self.exit(success=<span class="hljs-keyword">False</span>)
+            <span class="hljs-comment">#向每个节点请求</span>
+            <span class="hljs-keyword">for</span> proto <span class="hljs-keyword">in</span> protocols:
+                <span class="hljs-keyword">if</span> proto.is_stopped:
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">assert</span> proto <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> self.requests
+                <span class="hljs-comment"># request</span>
+                log_st.debug(<span class="hljs-string">'requesting blocks'</span>, num=len(blockhashes_batch))
+                deferred = AsyncResult()
+                self.requests[proto] = deferred
+                <span class="hljs-comment">#向网络请求这批hash值对应的区块</span>
+                proto.send_getblocks(*blockhashes_batch)
+                <span class="hljs-keyword">try</span>:
+                    t_blocks = deferred.get(block=<span class="hljs-keyword">True</span>, timeout=self.blocks_request_timeout)
+                <span class="hljs-keyword">except</span> gevent.Timeout:
+                    log_st.warn(<span class="hljs-string">'getblocks timed out, trying next proto'</span>)
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">finally</span>:
+                    <span class="hljs-keyword">del</span> self.requests[proto]
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> t_blocks:
+                    log_st.warn(<span class="hljs-string">'empty getblocks reply, trying next proto'</span>)
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">elif</span> <span class="hljs-keyword">not</span> isinstance(t_blocks[<span class="hljs-number">0</span>], TransientBlock):
+                    log_st.warn(<span class="hljs-string">'received unexpected data'</span>, data=repr(t_blocks))
+                    t_blocks = []
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-comment"># we have results</span>
+                <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> [b.header.hash <span class="hljs-keyword">for</span> b <span class="hljs-keyword">in</span> t_blocks] == blockhashes_batch[:len(t_blocks)]:
+                    log_st.warn(<span class="hljs-string">'received wrong blocks, should ban peer'</span>)
+                    t_blocks = []
+                    <span class="hljs-keyword">continue</span>
+                <span class="hljs-keyword">break</span>
+
+            <span class="hljs-comment"># add received t_blocks</span>
+            num_fetched += len(t_blocks)
+            log_st.debug(<span class="hljs-string">'received blocks'</span>, num=len(t_blocks), num_fetched=num_fetched,
+                         total=num_blocks, missing=num_blocks - num_fetched)
+
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> t_blocks:
+                log_st.warn(<span class="hljs-string">'failed to fetch blocks'</span>, missing=len(blockhashes_chain))
+                <span class="hljs-keyword">return</span> self.exit(success=<span class="hljs-keyword">False</span>)
+
+            ts = time.time()
+            log_st.debug(<span class="hljs-string">'adding blocks'</span>, qsize=self.chainservice.block_queue.qsize())
+            <span class="hljs-keyword">for</span> t_block <span class="hljs-keyword">in</span> t_blocks:
+                b = blockhashes_chain.pop(<span class="hljs-number">0</span>)
+                <span class="hljs-keyword">assert</span> t_block.header.hash == b
+                <span class="hljs-keyword">assert</span> t_block.header.hash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> blockhashes_chain
+                <span class="hljs-comment">#将获取的block添加到队列，最后添加到本地数据库</span>
+                self.chainservice.add_block(t_block, proto)  <span class="hljs-comment"># this blocks if the queue is full</span>
+            log_st.debug(<span class="hljs-string">'adding blocks done'</span>, took=time.time() - ts)
+
+        <span class="hljs-comment"># done</span>
+        last_block = t_block
+        <span class="hljs-keyword">assert</span> <span class="hljs-keyword">not</span> len(blockhashes_chain)
+        <span class="hljs-keyword">assert</span> last_block.header.hash == self.blockhash
+        log_st.debug(<span class="hljs-string">'syncing finished'</span>)
+        <span class="hljs-comment"># at this point blocks are not in the chain yet, but in the add_block queue</span>
+        <span class="hljs-keyword">if</span> self.chain_difficulty &gt;= self.chain.head.chain_difficulty():
+            <span class="hljs-comment">#广播这批区块最新的那个出去。</span>
+            self.chainservice.broadcast_newblock(last_block, self.chain_difficulty, origin=proto)
+
+        self.exit(success=<span class="hljs-keyword">True</span>)</code></pre> 
+  <p>至此，on receive status 函数处理完成，已同步已连接节点的最新区块</p> 
+  <p>2.transactions <br> <a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L384" rel="nofollow" target="_blank">on_receive_transactions</a> 节点收到transactions数据包后 <br> 矿工收到transactions数据包后，校验每笔交易的合法性，将交易打包进head candidate临时区块并广播交易</p> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L170" rel="nofollow" target="_blank">add_transaction</a></p> 
+  <pre class="prettyprint"><code class="language-python hljs ">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">add_transaction</span><span class="hljs-params">(self, tx, origin=None)</span>:</span>
+        <span class="hljs-keyword">if</span> self.is_syncing:
+            <span class="hljs-comment">#如果正在同步中的话，本地链的状态是过时的</span>
+            <span class="hljs-keyword">return</span>  <span class="hljs-comment"># we can not evaluate the tx based on outdated state</span>
+        log.debug(<span class="hljs-string">'add_transaction'</span>, locked=self.add_transaction_lock.locked(), tx=tx)
+        <span class="hljs-keyword">assert</span> isinstance(tx, Transaction)
+        <span class="hljs-keyword">assert</span> origin <span class="hljs-keyword">is</span> <span class="hljs-keyword">None</span> <span class="hljs-keyword">or</span> isinstance(origin, BaseProtocol)
+
+        <span class="hljs-keyword">if</span> tx.hash <span class="hljs-keyword">in</span> self.broadcast_filter:
+            log.debug(<span class="hljs-string">'discarding known tx'</span>)  <span class="hljs-comment"># discard early</span>
+            <span class="hljs-keyword">return</span>
+
+        <span class="hljs-comment"># validate transaction</span>
+        <span class="hljs-comment">#交易合法性校验</span>
+        <span class="hljs-keyword">try</span>:
+            <span class="hljs-comment">#tx签名要正确；交易数nonce要与本地账户nonce一致；gas要足够；本地账户余额足够</span>
+            validate_transaction(self.chain.head_candidate, tx)
+            log.debug(<span class="hljs-string">'valid tx, broadcasting'</span>)
+            self.broadcast_transaction(tx, origin=origin)  <span class="hljs-comment"># asap</span>
+        <span class="hljs-keyword">except</span> InvalidTransaction <span class="hljs-keyword">as</span> e:
+            log.debug(<span class="hljs-string">'invalid tx'</span>, error=e)
+            <span class="hljs-keyword">return</span>
+
+        <span class="hljs-keyword">if</span> origin <span class="hljs-keyword">is</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">None</span>:  <span class="hljs-comment"># not locally added via jsonrpc</span>
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> self.is_mining <span class="hljs-keyword">or</span> self.is_syncing:
+                log.debug(<span class="hljs-string">'discarding tx'</span>, syncing=self.is_syncing, mining=self.is_mining)
+                <span class="hljs-keyword">return</span>
+
+        self.add_transaction_lock.acquire()
+        <span class="hljs-comment">#向head_candidate临时区块写入交易</span>
+        success = self.chain.add_transaction(tx)
+        self.add_transaction_lock.release()
+        <span class="hljs-keyword">if</span> success:
+            self._on_new_head_candidate()</code></pre> 
+  <p>3.GetBlockHashes BlockHashes <br> 在向网络同步区块链的时候被调用<a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L97" rel="nofollow" target="_blank">fetch_hashchain中调用send_getblockhashes来发送GetBlockHashes数据包</a> <br> 其他节点接受到GetBlockHashes数据包后，返回BlockHashes数据包，及指定blockash开始的一批blockhash。</p> 
+  <p>4.GetBlocks Blocks <br> 在向网络同步区块链的时候被调用<a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L161" rel="nofollow" target="_blank">fetch_blocks中调用send_getblocks来发送GetBlocks数据包</a> <br> 其他节点接受到GetBlocks数据包后，返回Blocks数据包。</p> 
+  <p>5.NewBlock <br> <a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L216" rel="nofollow" target="_blank">矿工挖到新块后广播该区块</a> <br> <a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/synchronizer.py#L283" rel="nofollow" target="_blank">节点接收到广播的新区块</a></p> 
+  <pre class="prettyprint"><code class=" hljs rust">    def receive_newblock(<span class="hljs-keyword">self</span>, proto, t_block, chain_difficulty):
+        <span class="hljs-string">"called if there's a newblock announced on the network"</span>
+        <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'newblock'</span>, proto=proto, block=t_block, chain_difficulty=chain_difficulty,
+                  client=proto.peer.remote_client_version)
+
+        <span class="hljs-keyword">if</span> t_block.header.hash in <span class="hljs-keyword">self</span>.chain:
+            <span class="hljs-keyword">assert</span> chain_difficulty == <span class="hljs-keyword">self</span>.chain.get(t_block.header.hash).chain_difficulty()
+
+        # memorize proto with difficulty
+        #记住该节点区块链的总难度
+        <span class="hljs-keyword">self</span>.<span class="hljs-number">_</span>protocols[proto] = chain_difficulty
+        #如果该区块存在则忽略
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.chainservice.knows_block(block_hash=t_block.header.hash):
+            <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'known block'</span>)
+            <span class="hljs-keyword">return</span>
+
+        # <span class="hljs-keyword">check</span> pow
+        <span class="hljs-keyword">if</span> not t_block.header.check_pow():
+            <span class="hljs-keyword">log</span>.warn(<span class="hljs-string">'check pow failed, should ban!'</span>)
+            <span class="hljs-keyword">return</span>
+        #预计的总难度
+        expected_difficulty = <span class="hljs-keyword">self</span>.chain.head.chain_difficulty() + t_block.header.difficulty
+        #总难度至少比本地链的总难度大
+        <span class="hljs-keyword">if</span> chain_difficulty &gt;= <span class="hljs-keyword">self</span>.chain.head.chain_difficulty():
+            # broadcast duplicates filtering is done in eth_service
+            <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'sufficient difficulty, broadcasting'</span>,
+                      client=proto.peer.remote_client_version)
+            <span class="hljs-keyword">self</span>.chainservice.broadcast_newblock(t_block, chain_difficulty, origin=proto)
+        <span class="hljs-keyword">else</span>:
+            # any criteria <span class="hljs-keyword">for</span> which blocks/chains not to add?
+            age = <span class="hljs-keyword">self</span>.chain.head.number - t_block.header.number
+            <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'low difficulty'</span>, client=proto.peer.remote_client_version,
+                      chain_difficulty=chain_difficulty, expected_difficulty=expected_difficulty,
+                      block_age=age)
+            <span class="hljs-keyword">if</span> age &gt; <span class="hljs-keyword">self</span>.MAX_NEWBLOCK_AGE:
+                <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'newblock is too old, not adding'</span>, block_age=age,
+                          max_age=<span class="hljs-keyword">self</span>.MAX_NEWBLOCK_AGE)
+                <span class="hljs-keyword">return</span>
+
+        # unknown and pow <span class="hljs-keyword">check</span> and highest difficulty
+
+        # <span class="hljs-keyword">check</span> <span class="hljs-keyword">if</span> we have parent
+        #如果有祖先，直接添加
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.chainservice.knows_block(block_hash=t_block.header.prevhash):
+            <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'adding block'</span>)
+            <span class="hljs-keyword">self</span>.chainservice.add_block(t_block, proto)
+        #没有祖先说明还差一个以上区块，向网络同步区块
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'missing parent'</span>)
+            <span class="hljs-keyword">if</span> not <span class="hljs-keyword">self</span>.synctask:
+                <span class="hljs-keyword">self</span>.synctask = SyncTask(<span class="hljs-keyword">self</span>, proto, t_block.header.hash, chain_difficulty)
+            <span class="hljs-keyword">else</span>:
+                <span class="hljs-keyword">log</span>.debug(<span class="hljs-string">'existing task, discarding'</span>)</code></pre> 
+  <p>以上是以太坊节点与节点交互的协议部分</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/leon51639/article/details/73570753,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/leon51639/article/details/73570753,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

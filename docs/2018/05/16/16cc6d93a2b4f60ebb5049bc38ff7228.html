@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>go-ethereum发起与执行交易的流程 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="go-ethereum发起与执行交易的流程" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="在geth控制台使用如下命令来发起转账交易： personal.unlockAccount(eth.accounts[0]) eth.sendTransaction({from:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(200,&quot;ether&quot;)}) 将执行到txpool.go的validateTx()函数进行交易验证,验证项目包括交易大小、交易Gas、账户余额检查等。 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 320*1024 {//lzj change from 32 to 320 return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 然后在tx_pool.go中的promoteExecutables()函数中进行进一步检查： func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } }..... 其中重要的是pool.promoteTx(addr,hash,tx)，从这里进入promoteTx函数： func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this delete(pool.all, hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return } // Otherwise discard any previous transaction and mark this if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all[hash] == nil { pool.all[hash] = tx pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) go pool.txFeed.Send(TxPreEvent{tx}) }promoteTx函数最后用 go pool.txFeed.Send(TxPreEvent{tx}) 将交易发布发布到TxPreEvent类型的监听通道上去。接受该交易的通道定义在miner/worker.go中： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, txCh: make(chan core.TxPreEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), chainDb: eth.ChainDb(), recv: make(chan *Result, resultQueueSize), chain: eth.BlockChain(), proc: eth.BlockChain().Validator(), possibleUncles: make(map[common.Hash]*types.Block), coinbase: coinbase, agents: make(map[Agent]struct{}), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), } // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) // Subscribe events for blockchain worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) go worker.update() go worker.wait() worker.commitNewWork() return worker }接受交易的通道是worker.txCh，通过 // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) 来注册对TxPreEvent事件的监听。go-ethereum中的事件监听机制见这篇文章。txCh通道的监听执行函数在worker.go中的update（）函数： func (self *worker) update() { defer self.txSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { // A real event arrived, process interesting content select { // Handle ChainHeadEvent case &lt;-self.chainHeadCh: self.commitNewWork() // Handle ChainSideEvent case ev := &lt;-self.chainSideCh: self.uncleMu.Lock() self.possibleUncles[ev.Block.Hash()] = ev.Block self.uncleMu.Unlock() // Handle TxPreEvent case ev := &lt;-self.txCh: log.Info(&quot;worker self.txch now&quot;) // Apply transaction to the pending state if we&#39;re not mining if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() acc, _ := types.Sender(self.current.signer, ev.Tx) txs := map[common.Address]types.Transactions{acc: {ev.Tx}} txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } // System stopped case &lt;-self.txSub.Err(): return case &lt;-self.chainHeadSub.Err(): return case &lt;-self.chainSideSub.Err(): return } } } 在通过commitTransactions（）函数将交易提交给区块链执行。commitTransactions()函数中遍历每一笔交易，然后通过 commitTransaction（）函数提交并执行交易： func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) { snap := env.state.Snapshot() receipt, _, err := core.ApplyTransaction(env.config, bc, &amp;coinbase, gp, env.state, env.header, tx, &amp;env.header.GasUsed, vm.Config{}) if err != nil { log.Info(&quot;worker commitTransaction err&quot;,&quot;err&quot;,err) env.state.RevertToSnapshot(snap) return err, nil } env.txs = append(env.txs, tx) env.receipts = append(env.receipts, receipt) return nil, receipt.Logs } commitTransaction（）函数先创建区块链状态的快照，然后通过core.ApplyTransaction()函数来执行交易，如果执行出错，就又回退交易到快照状态。ApplyTransaction()的核心函数是ApplyMessage（）。基本调用流程是： state_processor.go的ApplyTransaction()--&gt;state_transition.go中的ApplyMessage(）--&gt;TransitionDb()--&gt;vm/evm.go中的Call（）函数。 阅读更多" />
+<meta property="og:description" content="在geth控制台使用如下命令来发起转账交易： personal.unlockAccount(eth.accounts[0]) eth.sendTransaction({from:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(200,&quot;ether&quot;)}) 将执行到txpool.go的validateTx()函数进行交易验证,验证项目包括交易大小、交易Gas、账户余额检查等。 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 320*1024 {//lzj change from 32 to 320 return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 然后在tx_pool.go中的promoteExecutables()函数中进行进一步检查： func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } }..... 其中重要的是pool.promoteTx(addr,hash,tx)，从这里进入promoteTx函数： func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this delete(pool.all, hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return } // Otherwise discard any previous transaction and mark this if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all[hash] == nil { pool.all[hash] = tx pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) go pool.txFeed.Send(TxPreEvent{tx}) }promoteTx函数最后用 go pool.txFeed.Send(TxPreEvent{tx}) 将交易发布发布到TxPreEvent类型的监听通道上去。接受该交易的通道定义在miner/worker.go中： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, txCh: make(chan core.TxPreEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), chainDb: eth.ChainDb(), recv: make(chan *Result, resultQueueSize), chain: eth.BlockChain(), proc: eth.BlockChain().Validator(), possibleUncles: make(map[common.Hash]*types.Block), coinbase: coinbase, agents: make(map[Agent]struct{}), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), } // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) // Subscribe events for blockchain worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) go worker.update() go worker.wait() worker.commitNewWork() return worker }接受交易的通道是worker.txCh，通过 // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) 来注册对TxPreEvent事件的监听。go-ethereum中的事件监听机制见这篇文章。txCh通道的监听执行函数在worker.go中的update（）函数： func (self *worker) update() { defer self.txSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { // A real event arrived, process interesting content select { // Handle ChainHeadEvent case &lt;-self.chainHeadCh: self.commitNewWork() // Handle ChainSideEvent case ev := &lt;-self.chainSideCh: self.uncleMu.Lock() self.possibleUncles[ev.Block.Hash()] = ev.Block self.uncleMu.Unlock() // Handle TxPreEvent case ev := &lt;-self.txCh: log.Info(&quot;worker self.txch now&quot;) // Apply transaction to the pending state if we&#39;re not mining if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() acc, _ := types.Sender(self.current.signer, ev.Tx) txs := map[common.Address]types.Transactions{acc: {ev.Tx}} txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } // System stopped case &lt;-self.txSub.Err(): return case &lt;-self.chainHeadSub.Err(): return case &lt;-self.chainSideSub.Err(): return } } } 在通过commitTransactions（）函数将交易提交给区块链执行。commitTransactions()函数中遍历每一笔交易，然后通过 commitTransaction（）函数提交并执行交易： func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) { snap := env.state.Snapshot() receipt, _, err := core.ApplyTransaction(env.config, bc, &amp;coinbase, gp, env.state, env.header, tx, &amp;env.header.GasUsed, vm.Config{}) if err != nil { log.Info(&quot;worker commitTransaction err&quot;,&quot;err&quot;,err) env.state.RevertToSnapshot(snap) return err, nil } env.txs = append(env.txs, tx) env.receipts = append(env.receipts, receipt) return nil, receipt.Logs } commitTransaction（）函数先创建区块链状态的快照，然后通过core.ApplyTransaction()函数来执行交易，如果执行出错，就又回退交易到快照状态。ApplyTransaction()的核心函数是ApplyMessage（）。基本调用流程是： state_processor.go的ApplyTransaction()--&gt;state_transition.go中的ApplyMessage(）--&gt;TransitionDb()--&gt;vm/evm.go中的Call（）函数。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/16/16cc6d93a2b4f60ebb5049bc38ff7228.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/16/16cc6d93a2b4f60ebb5049bc38ff7228.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"在geth控制台使用如下命令来发起转账交易： personal.unlockAccount(eth.accounts[0]) eth.sendTransaction({from:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(200,&quot;ether&quot;)}) 将执行到txpool.go的validateTx()函数进行交易验证,验证项目包括交易大小、交易Gas、账户余额检查等。 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 320*1024 {//lzj change from 32 to 320 return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 然后在tx_pool.go中的promoteExecutables()函数中进行进一步检查： func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } }..... 其中重要的是pool.promoteTx(addr,hash,tx)，从这里进入promoteTx函数： func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this delete(pool.all, hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return } // Otherwise discard any previous transaction and mark this if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all[hash] == nil { pool.all[hash] = tx pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) go pool.txFeed.Send(TxPreEvent{tx}) }promoteTx函数最后用 go pool.txFeed.Send(TxPreEvent{tx}) 将交易发布发布到TxPreEvent类型的监听通道上去。接受该交易的通道定义在miner/worker.go中： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { worker := &amp;worker{ config: config, engine: engine, eth: eth, mux: mux, txCh: make(chan core.TxPreEvent, txChanSize), chainHeadCh: make(chan core.ChainHeadEvent, chainHeadChanSize), chainSideCh: make(chan core.ChainSideEvent, chainSideChanSize), chainDb: eth.ChainDb(), recv: make(chan *Result, resultQueueSize), chain: eth.BlockChain(), proc: eth.BlockChain().Validator(), possibleUncles: make(map[common.Hash]*types.Block), coinbase: coinbase, agents: make(map[Agent]struct{}), unconfirmed: newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth), } // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) // Subscribe events for blockchain worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh) worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh) go worker.update() go worker.wait() worker.commitNewWork() return worker }接受交易的通道是worker.txCh，通过 // Subscribe TxPreEvent for tx pool worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh) 来注册对TxPreEvent事件的监听。go-ethereum中的事件监听机制见这篇文章。txCh通道的监听执行函数在worker.go中的update（）函数： func (self *worker) update() { defer self.txSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { // A real event arrived, process interesting content select { // Handle ChainHeadEvent case &lt;-self.chainHeadCh: self.commitNewWork() // Handle ChainSideEvent case ev := &lt;-self.chainSideCh: self.uncleMu.Lock() self.possibleUncles[ev.Block.Hash()] = ev.Block self.uncleMu.Unlock() // Handle TxPreEvent case ev := &lt;-self.txCh: log.Info(&quot;worker self.txch now&quot;) // Apply transaction to the pending state if we&#39;re not mining if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() acc, _ := types.Sender(self.current.signer, ev.Tx) txs := map[common.Address]types.Transactions{acc: {ev.Tx}} txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } // System stopped case &lt;-self.txSub.Err(): return case &lt;-self.chainHeadSub.Err(): return case &lt;-self.chainSideSub.Err(): return } } } 在通过commitTransactions（）函数将交易提交给区块链执行。commitTransactions()函数中遍历每一笔交易，然后通过 commitTransaction（）函数提交并执行交易： func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) { snap := env.state.Snapshot() receipt, _, err := core.ApplyTransaction(env.config, bc, &amp;coinbase, gp, env.state, env.header, tx, &amp;env.header.GasUsed, vm.Config{}) if err != nil { log.Info(&quot;worker commitTransaction err&quot;,&quot;err&quot;,err) env.state.RevertToSnapshot(snap) return err, nil } env.txs = append(env.txs, tx) env.receipts = append(env.receipts, receipt) return nil, receipt.Logs } commitTransaction（）函数先创建区块链状态的快照，然后通过core.ApplyTransaction()函数来执行交易，如果执行出错，就又回退交易到快照状态。ApplyTransaction()的核心函数是ApplyMessage（）。基本调用流程是： state_processor.go的ApplyTransaction()--&gt;state_transition.go中的ApplyMessage(）--&gt;TransitionDb()--&gt;vm/evm.go中的Call（）函数。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/16/16cc6d93a2b4f60ebb5049bc38ff7228.html","headline":"go-ethereum发起与执行交易的流程","dateModified":"2018-05-16T00:00:00+08:00","datePublished":"2018-05-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/16/16cc6d93a2b4f60ebb5049bc38ff7228.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>go-ethereum发起与执行交易的流程</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views">
+   在geth控制台使用如下命令来发起转账交易：
+  <pre><code class="language-html">personal.unlockAccount(eth.accounts[0])
+eth.sendTransaction({from:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(200,"ether")})</code></pre>
+  <p>将执行到txpool.go的validateTx()函数进行交易验证,验证项目包括交易大小、交易Gas、账户余额检查等。</p>
+  <pre><code class="language-html">func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
+	// Heuristic limit, reject transactions over 32KB to prevent DOS attacks
+	if tx.Size() &gt; 320*1024 {//lzj change from 32 to 320
+		return ErrOversizedData
+	}
+	// Transactions can't be negative. This may never happen using RLP decoded
+	// transactions but may occur if you create a transaction using the RPC.
+	if tx.Value().Sign() &lt; 0 {
+		return ErrNegativeValue
+	}
+	// Ensure the transaction doesn't exceed the current block limit gas.
+	if pool.currentMaxGas &lt; tx.Gas() {
+		return ErrGasLimit
+	}
+	// Make sure the transaction is signed properly
+	from, err := types.Sender(pool.signer, tx)
+	if err != nil {
+		return ErrInvalidSender
+	}
+	// Drop non-local transactions under our own minimal accepted gas price
+	local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network
+	if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 {
+		return ErrUnderpriced
+	}
+	// Ensure the transaction adheres to nonce ordering
+	if pool.currentState.GetNonce(from) &gt; tx.Nonce() {
+		return ErrNonceTooLow
+	}
+	// Transactor should have enough funds to cover the costs
+	// cost == V + GP * GL
+	if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 {
+		return ErrInsufficientFunds
+	}
+	intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead)
+	if err != nil {
+		return err
+	}
+
+	if tx.Gas() &lt; intrGas {
+		return ErrIntrinsicGas
+	}
+	return nil
+}</code></pre>
+  <p>然后在tx_pool.go中的promoteExecutables()函数中进行进一步检查：</p>
+  <pre><code class="language-html">func (pool *TxPool) promoteExecutables(accounts []common.Address) {
+	// Gather all the accounts potentially needing updates
+	if accounts == nil {
+		accounts = make([]common.Address, 0, len(pool.queue))
+		for addr := range pool.queue {
+			accounts = append(accounts, addr)
+		}
+	}
+
+	// Iterate over all accounts and promote any executable transactions
+	for _, addr := range accounts {
+		list := pool.queue[addr]
+		if list == nil {
+			continue // Just in case someone calls with a non existing account
+		}
+		// Drop all transactions that are deemed too old (low nonce)
+		for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) {
+			hash := tx.Hash()
+			log.Trace("Removed old queued transaction", "hash", hash)
+			delete(pool.all, hash)
+			pool.priced.Removed()
+		}
+		// Drop all transactions that are too costly (low balance or out of gas)
+		drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas)
+		for _, tx := range drops {
+			hash := tx.Hash()
+			log.Trace("Removed unpayable queued transaction", "hash", hash)
+			delete(pool.all, hash)
+			pool.priced.Removed()
+			queuedNofundsCounter.Inc(1)
+		}
+
+		// Gather all executable transactions and promote them
+		for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) {
+			hash := tx.Hash()
+			log.Trace("Promoting queued transaction", "hash", hash)
+			pool.promoteTx(addr, hash, tx)
+		}
+		// Drop all transactions over the allowed limit
+		if !pool.locals.contains(addr) {
+			for _, tx := range list.Cap(int(pool.config.AccountQueue)) {
+				hash := tx.Hash()
+				delete(pool.all, hash)
+				pool.priced.Removed()
+				queuedRateLimitCounter.Inc(1)
+				log.Trace("Removed cap-exceeding queued transaction", "hash", hash)
+			}
+		}.....</code></pre>
+  <p>其中重要的是pool.promoteTx(addr,hash,tx)，从这里进入promoteTx函数：</p>
+  <pre><code class="language-html">func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) {
+	// Try to insert the transaction into the pending queue
+	if pool.pending[addr] == nil {
+		pool.pending[addr] = newTxList(true)
+	}
+	list := pool.pending[addr]
+
+	inserted, old := list.Add(tx, pool.config.PriceBump)
+	if !inserted {
+		// An older transaction was better, discard this
+		delete(pool.all, hash)
+		pool.priced.Removed()
+
+		pendingDiscardCounter.Inc(1)
+		return
+	}
+	// Otherwise discard any previous transaction and mark this
+	if old != nil {
+		delete(pool.all, old.Hash())
+		pool.priced.Removed()
+
+		pendingReplaceCounter.Inc(1)
+	}
+	// Failsafe to work around direct pending inserts (tests)
+	if pool.all[hash] == nil {
+		pool.all[hash] = tx
+		pool.priced.Put(tx)
+	}
+	// Set the potentially new pending nonce and notify any subsystems of the new tx
+	pool.beats[addr] = time.Now()
+	pool.pendingState.SetNonce(addr, tx.Nonce()+1)
+
+	go pool.txFeed.Send(TxPreEvent{tx})
+}</code></pre>promoteTx函数最后用
+  <pre><code class="language-html">go pool.txFeed.Send(TxPreEvent{tx})</code></pre>
+  <p>将交易发布发布到TxPreEvent类型的监听通道上去。接受该交易的通道定义在miner/worker.go中：</p>
+  <pre><code class="language-html">func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker {
+	worker := &amp;worker{
+		config:         config,
+		engine:         engine,
+		eth:            eth,
+		mux:            mux,
+		txCh:           make(chan core.TxPreEvent, txChanSize),
+		chainHeadCh:    make(chan core.ChainHeadEvent, chainHeadChanSize),
+		chainSideCh:    make(chan core.ChainSideEvent, chainSideChanSize),
+		chainDb:        eth.ChainDb(),
+		recv:           make(chan *Result, resultQueueSize),
+		chain:          eth.BlockChain(),
+		proc:           eth.BlockChain().Validator(),
+		possibleUncles: make(map[common.Hash]*types.Block),
+		coinbase:       coinbase,
+		agents:         make(map[Agent]struct{}),
+		unconfirmed:    newUnconfirmedBlocks(eth.BlockChain(), miningLogAtDepth),
+	}
+	// Subscribe TxPreEvent for tx pool
+	worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh)
+	// Subscribe events for blockchain
+	worker.chainHeadSub = eth.BlockChain().SubscribeChainHeadEvent(worker.chainHeadCh)
+	worker.chainSideSub = eth.BlockChain().SubscribeChainSideEvent(worker.chainSideCh)
+	go worker.update()
+
+	go worker.wait()
+	worker.commitNewWork()
+
+	return worker
+}</code></pre>接受交易的通道是worker.txCh，通过
+  <pre><code class="language-html">// Subscribe TxPreEvent for tx pool
+	worker.txSub = eth.TxPool().SubscribeTxPreEvent(worker.txCh)</code></pre>
+  <p>来注册对TxPreEvent事件的监听。go-ethereum中的事件监听机制见<a href="https://www.jianshu.com/p/052be438f080" rel="nofollow">这篇文章</a>。txCh通道的监听执行函数在worker.go中的update（）函数：</p>
+  <pre><code class="language-html">func (self *worker) update() {
+	defer self.txSub.Unsubscribe()
+	defer self.chainHeadSub.Unsubscribe()
+	defer self.chainSideSub.Unsubscribe()
+
+	for {
+		// A real event arrived, process interesting content
+		select {
+		// Handle ChainHeadEvent
+		case &lt;-self.chainHeadCh:
+			self.commitNewWork()
+
+		// Handle ChainSideEvent
+		case ev := &lt;-self.chainSideCh:
+			self.uncleMu.Lock()
+			self.possibleUncles[ev.Block.Hash()] = ev.Block
+			self.uncleMu.Unlock()
+
+		// Handle TxPreEvent
+		case ev := &lt;-self.txCh:
+			log.Info("worker self.txch now")
+			// Apply transaction to the pending state if we're not mining
+			if atomic.LoadInt32(&amp;self.mining) == 0 {
+				self.currentMu.Lock()
+				acc, _ := types.Sender(self.current.signer, ev.Tx)
+				txs := map[common.Address]types.Transactions{acc: {ev.Tx}}
+				txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs)
+
+				self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase)
+				self.updateSnapshot()
+				self.currentMu.Unlock()
+			} else {
+				// If we're mining, but nothing is being processed, wake on new transactions
+				if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 {
+					self.commitNewWork()
+				}
+			}
+
+		// System stopped
+		case &lt;-self.txSub.Err():
+			return
+		case &lt;-self.chainHeadSub.Err():
+			return
+		case &lt;-self.chainSideSub.Err():
+			return
+		}
+	}
+}</code></pre>
+  <p>在通过commitTransactions（）函数将交易提交给区块链执行。commitTransactions()函数中遍历每一笔交易，然后通过</p>
+  <p>commitTransaction（）函数提交并执行交易：<br></p>
+  <pre><code class="language-html">func (env *Work) commitTransaction(tx *types.Transaction, bc *core.BlockChain, coinbase common.Address, gp *core.GasPool) (error, []*types.Log) {
+	snap := env.state.Snapshot()
+
+	receipt, _, err := core.ApplyTransaction(env.config, bc, &amp;coinbase, gp, env.state, env.header, tx, &amp;env.header.GasUsed, vm.Config{})
+	if err != nil {
+		log.Info("worker commitTransaction err","err",err)
+		env.state.RevertToSnapshot(snap)
+		return err, nil
+	}
+	env.txs = append(env.txs, tx)
+	env.receipts = append(env.receipts, receipt)
+
+	return nil, receipt.Logs
+}</code></pre>
+  <p>commitTransaction（）函数先创建区块链状态的快照，然后通过core.ApplyTransaction()函数来执行交易，如果执行出错，就又回退交易到快照状态。ApplyTransaction()的核心函数是ApplyMessage（）。基本调用流程是：</p>
+  <p>state_processor.go的ApplyTransaction()--&gt;state_transition.go中的ApplyMessage(）--&gt;TransitionDb()--&gt;vm/evm.go中的Call（）函数。<br></p>
+  <br>
+  <br>
+  <br>
+  <p></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liuzhijun301/article/details/80341104,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liuzhijun301/article/details/80341104,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

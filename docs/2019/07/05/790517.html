@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Kafka如何通过精妙的架构设计优化JVM GC问题？ | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Kafka如何通过精妙的架构设计优化JVM GC问题？" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1、Kafka的客户端缓冲机制 首先，先得给大家明确一个事情，那就是在客户端发送消息给kafka服务器的时候，一定是有一个内存缓冲机制的。 也就是说，消息会先写入一个内存缓冲中，然后直到多条消息组成了一个Batch，才会一次网络通信把Batch发送过去。 整个过程如下图所示： 2、内存缓冲造成的频繁GC问题 那么这种内存缓冲机制的本意，其实就是把多条消息组成一个Batch，一次网络请求就是一个Batch或者多个Batch。 这样每次网络请求都可以发送很多数据过去，避免了一条消息一次网络请求。从而提升了吞吐量，即单位时间内发送的数据量。 但是问题来了，大家可以思考一下，一个Batch中的数据，会取出来然后封装在底层的网络包里，通过网络发送出去到达Kafka服务器。 那么然后呢？这个Batch里的数据都发送过去了，现在Batch里的数据应该怎么处理？ 你要知道，这些Batch里的数据此时可还在客户端的JVM的内存里啊！那么此时从代码实现层面，一定会尝试避免任何变量去引用这些Batch对应的数据，然后尝试触发JVM自动回收掉这些内存垃圾。 这样不断的让JVM回收垃圾，就可以不断的清理掉已经发送成功的Batch了，然后就可以不断的腾出来新的内存空间让后面新的数据来使用。 这种想法很好，但是实际线上运行的时候一定会有问题，最大的问题，就是JVM GC问题。 大家都知道一点，JVM GC在回收内存垃圾的时候，他会有一个“Stop the World”的过程，也就是垃圾回收线程运行的时候，会导致其他工作线程短暂的停顿，这样可以便于他自己安安静静的回收内存垃圾。 这个也很容易想明白，毕竟你要是在回收内存垃圾的时候，你的工作线程还在不断的往内存里写数据，制造更多的内存垃圾，那你让人家JVM怎么回收垃圾？ 这就好比在大马路上，如果地上有很多垃圾，现在要把垃圾都扫干净，最好的办法是什么？大家都让开，把马路空出来，然后清洁工就是把垃圾清理干净。 但是如果清洁工在清扫垃圾的时候，结果一帮人在旁边不停的嗑瓜子扔瓜子壳，吃西瓜扔西瓜皮，不停的制造垃圾，你觉得清洁工内心啥感受？当然是很愤慨了，照这么搞，地上的垃圾永远的都搞不干净了！ 通过了上面的语言描述，我们再来一张图，大家看看就更加清楚了 现在JVM GC是越来越先进，从CMS垃圾回收器到G1垃圾回收器，核心的目标之一就是不断的缩减垃圾回收的时候，导致其他工作线程停顿的时间。 所以现在越是新款的垃圾回收器导致工作线程停顿的时间越短，但是再怎么短，他也还是存在啊！ 所以说，如何尽可能在自己的设计上避免JVM频繁的GC就是一个非常考验水平的事儿了。 3、Kafka设计者实现的缓冲池机制 在Kafka客户端内部，对这个问题实现了一个非常优秀的机制，就是缓冲池的机制 简单来说，就是每个Batch底层都对应一块内存空间，这个内存空间就是专门用来存放写入进去的消息的。 然后呢，当一个Batch被发送到了kafka服务器，这个Batch的数据不再需要了，就意味着这个Batch的内存空间不再使用了。 此时这个Batch底层的内存空间不要交给JVM去垃圾回收，而是把这块内存空间给放入一个缓冲池里。 这个缓冲池里放了很多块内存空间，下次如果你又有一个新的Batch了，那么不就可以直接从这个缓冲池里获取一块内存空间就ok了？ 然后如果一个Batch发送出去了之后，再把内存空间给人家还回来不就好了？以此类推，循环往复。 同样，听完了上面的文字描述，再来一张图，看完这张图相信大伙儿就明白了： 一旦使用了这个缓冲池机制之后，就不涉及到频繁的大量内存的GC问题了。 为什么呢？因为他可以上来就占用固定的内存，比如32MB。然后把32MB划分为N多个内存块，比如说一个内存块是16KB，这样的话这个缓冲池里就会有很多的内存块。 然后你需要创建一个新的Batch，就从缓冲池里取一个16KB的内存块就可以了，然后这个Batch就不断的写入消息，但是最多就是写16KB，因为Batch底层的内存块就16KB。 接着如果Batch被发送到Kafka服务器了，此时Batch底层的内存块就直接还回缓冲池就可以了。 下次别人再要构建一个Batch的时候，再次使用缓冲池里的内存块就好了。这样就可以利用有限的内存，对他不停的反复重复的利用。因为如果你的Batch使用完了以后是把内存块还回到缓冲池中去，那么就不涉及到垃圾回收了。 如果没有频繁的垃圾回收，自然就避免了频繁导致的工作线程的停顿了，JVM GC问题是不是就得到了大幅度的优化？ 没错，正是这个设计思想让Kafka客户端的性能和吞吐量都非常的高，这里蕴含了大量的优秀的机制。 那么此时有人说了，如果我现在把一个缓冲池里的内存资源都占满了，现在缓冲池里暂时没有内存块了，怎么办呢？ 很简单，阻塞你的写入操作，不让你继续写入消息了。把你给阻塞住，不停的等待，直到有内存块释放出来，然后再继续让你写入消息。 4、总结一下 这篇文章我们从Kafka内存缓冲机制的设计思路开始，一直分析到了JVM GC问题的产生原因以及恶劣的影响。 接着谈到了Kafka优秀的缓冲池机制的设计思想以及他是如何解决这个问题的，分析了很多Kafka作者在设计的时候展现出的优秀的技术设计思想和能力。 希望大家多吸取这里的精华，在以后面试或者工作的时候，可以把这些优秀的思想纳为己用" />
+<meta property="og:description" content="1、Kafka的客户端缓冲机制 首先，先得给大家明确一个事情，那就是在客户端发送消息给kafka服务器的时候，一定是有一个内存缓冲机制的。 也就是说，消息会先写入一个内存缓冲中，然后直到多条消息组成了一个Batch，才会一次网络通信把Batch发送过去。 整个过程如下图所示： 2、内存缓冲造成的频繁GC问题 那么这种内存缓冲机制的本意，其实就是把多条消息组成一个Batch，一次网络请求就是一个Batch或者多个Batch。 这样每次网络请求都可以发送很多数据过去，避免了一条消息一次网络请求。从而提升了吞吐量，即单位时间内发送的数据量。 但是问题来了，大家可以思考一下，一个Batch中的数据，会取出来然后封装在底层的网络包里，通过网络发送出去到达Kafka服务器。 那么然后呢？这个Batch里的数据都发送过去了，现在Batch里的数据应该怎么处理？ 你要知道，这些Batch里的数据此时可还在客户端的JVM的内存里啊！那么此时从代码实现层面，一定会尝试避免任何变量去引用这些Batch对应的数据，然后尝试触发JVM自动回收掉这些内存垃圾。 这样不断的让JVM回收垃圾，就可以不断的清理掉已经发送成功的Batch了，然后就可以不断的腾出来新的内存空间让后面新的数据来使用。 这种想法很好，但是实际线上运行的时候一定会有问题，最大的问题，就是JVM GC问题。 大家都知道一点，JVM GC在回收内存垃圾的时候，他会有一个“Stop the World”的过程，也就是垃圾回收线程运行的时候，会导致其他工作线程短暂的停顿，这样可以便于他自己安安静静的回收内存垃圾。 这个也很容易想明白，毕竟你要是在回收内存垃圾的时候，你的工作线程还在不断的往内存里写数据，制造更多的内存垃圾，那你让人家JVM怎么回收垃圾？ 这就好比在大马路上，如果地上有很多垃圾，现在要把垃圾都扫干净，最好的办法是什么？大家都让开，把马路空出来，然后清洁工就是把垃圾清理干净。 但是如果清洁工在清扫垃圾的时候，结果一帮人在旁边不停的嗑瓜子扔瓜子壳，吃西瓜扔西瓜皮，不停的制造垃圾，你觉得清洁工内心啥感受？当然是很愤慨了，照这么搞，地上的垃圾永远的都搞不干净了！ 通过了上面的语言描述，我们再来一张图，大家看看就更加清楚了 现在JVM GC是越来越先进，从CMS垃圾回收器到G1垃圾回收器，核心的目标之一就是不断的缩减垃圾回收的时候，导致其他工作线程停顿的时间。 所以现在越是新款的垃圾回收器导致工作线程停顿的时间越短，但是再怎么短，他也还是存在啊！ 所以说，如何尽可能在自己的设计上避免JVM频繁的GC就是一个非常考验水平的事儿了。 3、Kafka设计者实现的缓冲池机制 在Kafka客户端内部，对这个问题实现了一个非常优秀的机制，就是缓冲池的机制 简单来说，就是每个Batch底层都对应一块内存空间，这个内存空间就是专门用来存放写入进去的消息的。 然后呢，当一个Batch被发送到了kafka服务器，这个Batch的数据不再需要了，就意味着这个Batch的内存空间不再使用了。 此时这个Batch底层的内存空间不要交给JVM去垃圾回收，而是把这块内存空间给放入一个缓冲池里。 这个缓冲池里放了很多块内存空间，下次如果你又有一个新的Batch了，那么不就可以直接从这个缓冲池里获取一块内存空间就ok了？ 然后如果一个Batch发送出去了之后，再把内存空间给人家还回来不就好了？以此类推，循环往复。 同样，听完了上面的文字描述，再来一张图，看完这张图相信大伙儿就明白了： 一旦使用了这个缓冲池机制之后，就不涉及到频繁的大量内存的GC问题了。 为什么呢？因为他可以上来就占用固定的内存，比如32MB。然后把32MB划分为N多个内存块，比如说一个内存块是16KB，这样的话这个缓冲池里就会有很多的内存块。 然后你需要创建一个新的Batch，就从缓冲池里取一个16KB的内存块就可以了，然后这个Batch就不断的写入消息，但是最多就是写16KB，因为Batch底层的内存块就16KB。 接着如果Batch被发送到Kafka服务器了，此时Batch底层的内存块就直接还回缓冲池就可以了。 下次别人再要构建一个Batch的时候，再次使用缓冲池里的内存块就好了。这样就可以利用有限的内存，对他不停的反复重复的利用。因为如果你的Batch使用完了以后是把内存块还回到缓冲池中去，那么就不涉及到垃圾回收了。 如果没有频繁的垃圾回收，自然就避免了频繁导致的工作线程的停顿了，JVM GC问题是不是就得到了大幅度的优化？ 没错，正是这个设计思想让Kafka客户端的性能和吞吐量都非常的高，这里蕴含了大量的优秀的机制。 那么此时有人说了，如果我现在把一个缓冲池里的内存资源都占满了，现在缓冲池里暂时没有内存块了，怎么办呢？ 很简单，阻塞你的写入操作，不让你继续写入消息了。把你给阻塞住，不停的等待，直到有内存块释放出来，然后再继续让你写入消息。 4、总结一下 这篇文章我们从Kafka内存缓冲机制的设计思路开始，一直分析到了JVM GC问题的产生原因以及恶劣的影响。 接着谈到了Kafka优秀的缓冲池机制的设计思想以及他是如何解决这个问题的，分析了很多Kafka作者在设计的时候展现出的优秀的技术设计思想和能力。 希望大家多吸取这里的精华，在以后面试或者工作的时候，可以把这些优秀的思想纳为己用" />
+<link rel="canonical" href="https://uzzz.org/2019/07/05/790517.html" />
+<meta property="og:url" content="https://uzzz.org/2019/07/05/790517.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-07-05T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"1、Kafka的客户端缓冲机制 首先，先得给大家明确一个事情，那就是在客户端发送消息给kafka服务器的时候，一定是有一个内存缓冲机制的。 也就是说，消息会先写入一个内存缓冲中，然后直到多条消息组成了一个Batch，才会一次网络通信把Batch发送过去。 整个过程如下图所示： 2、内存缓冲造成的频繁GC问题 那么这种内存缓冲机制的本意，其实就是把多条消息组成一个Batch，一次网络请求就是一个Batch或者多个Batch。 这样每次网络请求都可以发送很多数据过去，避免了一条消息一次网络请求。从而提升了吞吐量，即单位时间内发送的数据量。 但是问题来了，大家可以思考一下，一个Batch中的数据，会取出来然后封装在底层的网络包里，通过网络发送出去到达Kafka服务器。 那么然后呢？这个Batch里的数据都发送过去了，现在Batch里的数据应该怎么处理？ 你要知道，这些Batch里的数据此时可还在客户端的JVM的内存里啊！那么此时从代码实现层面，一定会尝试避免任何变量去引用这些Batch对应的数据，然后尝试触发JVM自动回收掉这些内存垃圾。 这样不断的让JVM回收垃圾，就可以不断的清理掉已经发送成功的Batch了，然后就可以不断的腾出来新的内存空间让后面新的数据来使用。 这种想法很好，但是实际线上运行的时候一定会有问题，最大的问题，就是JVM GC问题。 大家都知道一点，JVM GC在回收内存垃圾的时候，他会有一个“Stop the World”的过程，也就是垃圾回收线程运行的时候，会导致其他工作线程短暂的停顿，这样可以便于他自己安安静静的回收内存垃圾。 这个也很容易想明白，毕竟你要是在回收内存垃圾的时候，你的工作线程还在不断的往内存里写数据，制造更多的内存垃圾，那你让人家JVM怎么回收垃圾？ 这就好比在大马路上，如果地上有很多垃圾，现在要把垃圾都扫干净，最好的办法是什么？大家都让开，把马路空出来，然后清洁工就是把垃圾清理干净。 但是如果清洁工在清扫垃圾的时候，结果一帮人在旁边不停的嗑瓜子扔瓜子壳，吃西瓜扔西瓜皮，不停的制造垃圾，你觉得清洁工内心啥感受？当然是很愤慨了，照这么搞，地上的垃圾永远的都搞不干净了！ 通过了上面的语言描述，我们再来一张图，大家看看就更加清楚了 现在JVM GC是越来越先进，从CMS垃圾回收器到G1垃圾回收器，核心的目标之一就是不断的缩减垃圾回收的时候，导致其他工作线程停顿的时间。 所以现在越是新款的垃圾回收器导致工作线程停顿的时间越短，但是再怎么短，他也还是存在啊！ 所以说，如何尽可能在自己的设计上避免JVM频繁的GC就是一个非常考验水平的事儿了。 3、Kafka设计者实现的缓冲池机制 在Kafka客户端内部，对这个问题实现了一个非常优秀的机制，就是缓冲池的机制 简单来说，就是每个Batch底层都对应一块内存空间，这个内存空间就是专门用来存放写入进去的消息的。 然后呢，当一个Batch被发送到了kafka服务器，这个Batch的数据不再需要了，就意味着这个Batch的内存空间不再使用了。 此时这个Batch底层的内存空间不要交给JVM去垃圾回收，而是把这块内存空间给放入一个缓冲池里。 这个缓冲池里放了很多块内存空间，下次如果你又有一个新的Batch了，那么不就可以直接从这个缓冲池里获取一块内存空间就ok了？ 然后如果一个Batch发送出去了之后，再把内存空间给人家还回来不就好了？以此类推，循环往复。 同样，听完了上面的文字描述，再来一张图，看完这张图相信大伙儿就明白了： 一旦使用了这个缓冲池机制之后，就不涉及到频繁的大量内存的GC问题了。 为什么呢？因为他可以上来就占用固定的内存，比如32MB。然后把32MB划分为N多个内存块，比如说一个内存块是16KB，这样的话这个缓冲池里就会有很多的内存块。 然后你需要创建一个新的Batch，就从缓冲池里取一个16KB的内存块就可以了，然后这个Batch就不断的写入消息，但是最多就是写16KB，因为Batch底层的内存块就16KB。 接着如果Batch被发送到Kafka服务器了，此时Batch底层的内存块就直接还回缓冲池就可以了。 下次别人再要构建一个Batch的时候，再次使用缓冲池里的内存块就好了。这样就可以利用有限的内存，对他不停的反复重复的利用。因为如果你的Batch使用完了以后是把内存块还回到缓冲池中去，那么就不涉及到垃圾回收了。 如果没有频繁的垃圾回收，自然就避免了频繁导致的工作线程的停顿了，JVM GC问题是不是就得到了大幅度的优化？ 没错，正是这个设计思想让Kafka客户端的性能和吞吐量都非常的高，这里蕴含了大量的优秀的机制。 那么此时有人说了，如果我现在把一个缓冲池里的内存资源都占满了，现在缓冲池里暂时没有内存块了，怎么办呢？ 很简单，阻塞你的写入操作，不让你继续写入消息了。把你给阻塞住，不停的等待，直到有内存块释放出来，然后再继续让你写入消息。 4、总结一下 这篇文章我们从Kafka内存缓冲机制的设计思路开始，一直分析到了JVM GC问题的产生原因以及恶劣的影响。 接着谈到了Kafka优秀的缓冲池机制的设计思想以及他是如何解决这个问题的，分析了很多Kafka作者在设计的时候展现出的优秀的技术设计思想和能力。 希望大家多吸取这里的精华，在以后面试或者工作的时候，可以把这些优秀的思想纳为己用","@type":"BlogPosting","url":"https://uzzz.org/2019/07/05/790517.html","headline":"Kafka如何通过精妙的架构设计优化JVM GC问题？","dateModified":"2019-07-05T00:00:00+08:00","datePublished":"2019-07-05T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/07/05/790517.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Kafka如何通过精妙的架构设计优化JVM GC问题？</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix" data-track-view="{&quot;mod&quot;:&quot;popu_307&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_43145146/article/details/94736074,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_307&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_43145146/article/details/94736074&quot;}"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-cd6c485e8b.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <p><strong>1、Kafka的客户端缓冲机制</strong><br> 首先，先得给大家明确一个事情，那就是在客户端发送消息给kafka服务器的时候，一定是有一个内存缓冲机制的。</p> 
+  <p>也就是说，消息会先写入一个内存缓冲中，然后直到多条消息组成了一个Batch，才会一次网络通信把Batch发送过去。</p> 
+  <p>整个过程如下图所示：</p> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190705150403119.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MzE0NTE0Ng==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p><strong>2、内存缓冲造成的频繁GC问题</strong><br> 那么这种内存缓冲机制的本意，其实就是把多条消息组成一个Batch，一次网络请求就是一个Batch或者多个Batch。</p> 
+  <p>这样每次网络请求都可以发送很多数据过去，避免了一条消息一次网络请求。从而提升了吞吐量，即单位时间内发送的数据量。</p> 
+  <p>但是问题来了，大家可以思考一下，一个Batch中的数据，会取出来然后封装在底层的网络包里，通过网络发送出去到达Kafka服务器。</p> 
+  <p>那么然后呢？这个Batch里的数据都发送过去了，现在Batch里的数据应该怎么处理？</p> 
+  <p>你要知道，这些Batch里的数据此时可还在客户端的JVM的内存里啊！那么此时从代码实现层面，一定会尝试避免任何变量去引用这些Batch对应的数据，然后尝试触发JVM自动回收掉这些内存垃圾。</p> 
+  <p>这样不断的让JVM回收垃圾，就可以不断的清理掉已经发送成功的Batch了，然后就可以不断的腾出来新的内存空间让后面新的数据来使用。</p> 
+  <p>这种想法很好，但是实际线上运行的时候一定会有问题，最大的问题，就是JVM GC问题。</p> 
+  <p>大家都知道一点，JVM GC在回收内存垃圾的时候，他会有一个“Stop the World”的过程，也就是垃圾回收线程运行的时候，会导致其他工作线程短暂的停顿，这样可以便于他自己安安静静的回收内存垃圾。</p> 
+  <p>这个也很容易想明白，毕竟你要是在回收内存垃圾的时候，你的工作线程还在不断的往内存里写数据，制造更多的内存垃圾，那你让人家JVM怎么回收垃圾？</p> 
+  <p>这就好比在大马路上，如果地上有很多垃圾，现在要把垃圾都扫干净，最好的办法是什么？大家都让开，把马路空出来，然后清洁工就是把垃圾清理干净。</p> 
+  <p>但是如果清洁工在清扫垃圾的时候，结果一帮人在旁边不停的嗑瓜子扔瓜子壳，吃西瓜扔西瓜皮，不停的制造垃圾，你觉得清洁工内心啥感受？当然是很愤慨了，照这么搞，地上的垃圾永远的都搞不干净了！</p> 
+  <p>通过了上面的语言描述，我们再来一张图，大家看看就更加清楚了</p> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190705150430859.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MzE0NTE0Ng==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p>现在JVM GC是越来越先进，从CMS垃圾回收器到G1垃圾回收器，核心的目标之一就是不断的缩减垃圾回收的时候，导致其他工作线程停顿的时间。</p> 
+  <p>所以现在越是新款的垃圾回收器导致工作线程停顿的时间越短，但是再怎么短，他也还是存在啊！</p> 
+  <p>所以说，如何尽可能在自己的设计上避免JVM频繁的GC就是一个非常考验水平的事儿了。</p> 
+  <p><strong>3、Kafka设计者实现的缓冲池机制</strong><br> 在Kafka客户端内部，对这个问题实现了一个非常优秀的机制，就是缓冲池的机制</p> 
+  <p>简单来说，就是每个Batch底层都对应一块内存空间，这个内存空间就是专门用来存放写入进去的消息的。</p> 
+  <p>然后呢，当一个Batch被发送到了kafka服务器，这个Batch的数据不再需要了，就意味着这个Batch的内存空间不再使用了。</p> 
+  <p>此时这个Batch底层的内存空间不要交给JVM去垃圾回收，而是把这块内存空间给放入一个缓冲池里。</p> 
+  <p>这个缓冲池里放了很多块内存空间，下次如果你又有一个新的Batch了，那么不就可以直接从这个缓冲池里获取一块内存空间就ok了？</p> 
+  <p>然后如果一个Batch发送出去了之后，再把内存空间给人家还回来不就好了？以此类推，循环往复。</p> 
+  <p>同样，听完了上面的文字描述，再来一张图，看完这张图相信大伙儿就明白了：<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190705150445869.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MzE0NTE0Ng==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p>一旦使用了这个缓冲池机制之后，就不涉及到频繁的大量内存的GC问题了。</p> 
+  <p>为什么呢？因为他可以上来就占用固定的内存，比如32MB。然后把32MB划分为N多个内存块，比如说一个内存块是16KB，这样的话这个缓冲池里就会有很多的内存块。</p> 
+  <p>然后你需要创建一个新的Batch，就从缓冲池里取一个16KB的内存块就可以了，然后这个Batch就不断的写入消息，但是最多就是写16KB，因为Batch底层的内存块就16KB。</p> 
+  <p>接着如果Batch被发送到Kafka服务器了，此时Batch底层的内存块就直接还回缓冲池就可以了。</p> 
+  <p>下次别人再要构建一个Batch的时候，再次使用缓冲池里的内存块就好了。这样就可以利用有限的内存，对他不停的反复重复的利用。因为如果你的Batch使用完了以后是把内存块还回到缓冲池中去，那么就不涉及到垃圾回收了。</p> 
+  <p>如果没有频繁的垃圾回收，自然就避免了频繁导致的工作线程的停顿了，JVM GC问题是不是就得到了大幅度的优化？</p> 
+  <p>没错，正是这个设计思想让Kafka客户端的性能和吞吐量都非常的高，这里蕴含了大量的优秀的机制。</p> 
+  <p>那么此时有人说了，如果我现在把一个缓冲池里的内存资源都占满了，现在缓冲池里暂时没有内存块了，怎么办呢？</p> 
+  <p>很简单，阻塞你的写入操作，不让你继续写入消息了。把你给阻塞住，不停的等待，直到有内存块释放出来，然后再继续让你写入消息。</p> 
+  <p><strong>4、总结一下</strong><br> 这篇文章我们从Kafka内存缓冲机制的设计思路开始，一直分析到了JVM GC问题的产生原因以及恶劣的影响。</p> 
+  <p>接着谈到了Kafka优秀的缓冲池机制的设计思想以及他是如何解决这个问题的，分析了很多Kafka作者在设计的时候展现出的优秀的技术设计思想和能力。</p> 
+  <p>希望大家多吸取这里的精华，在以后面试或者工作的时候，可以把这些优秀的思想纳为己用</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-e44c3c0e64.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊区块和交易的存储结构分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊区块和交易的存储结构分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="leveldb是一个key-value数据库，所有数据都是以键-值对的形式存储。key一般与hash相关，value一般是要存储的数据结构的RLP编码。区块存储时将区块头和区块体分开存储。 区块头的存储格式为： headerPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(header) 其中key由区块头前缀、区块号（uint64大端格式）、区块hash构成，value是区块头的RLP编码。 区块体的存储格式为： bodyPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(block body) 其中key由区块体前缀、区块号（uint64大端格式）、区块hash构成，value是区块体的RLP编码。 key中的前缀可以用来区分数据的类型，在core/database_util.go中定义了各种前缀： headerPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;h&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash -&gt; header tdSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;t&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash + tdSuffix -&gt; td numSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;n&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + numSuffix -&gt; hash blockHashPrefix&nbsp;&nbsp;&nbsp;&nbsp;= []byte(&quot;H&quot;)&nbsp;&nbsp; //blockHashPrefix + hash -&gt; num (uint64 big endian) bodyPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;b&quot;)&nbsp;&nbsp; //bodyPrefix + num (uint64 big endian) + hash -&gt; block body 其中headerPrefix定义了区块头key的前缀为h，bodyPrefix定义了区块体key的前缀为b。 下面是存储区块头的函数： // WriteHeader serializes a block header into thedatabase. funcWriteHeader(db ethdb.Database, header*types.Header) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(header) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; hash :=header.Hash().Bytes() &nbsp;&nbsp;&nbsp; num :=header.Number.Uint64() &nbsp;&nbsp;&nbsp; encNum:= encodeBlockNumber(num) &nbsp;&nbsp;&nbsp; key := append(blockHashPrefix, hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, encNum); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store hash to numbermapping into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; key = append(append(headerPrefix, encNum...), hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store header intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored header#%v [%x…]&quot;, header.Number, hash[:4]) &nbsp;&nbsp;&nbsp; returnnil } 它是先对区块头进行RLP编码，encodeBlockNumber将区块号转换成大端格式，然后组装key。这里先向数据库中存储一条&nbsp;区块hash-&gt;区块号&nbsp;的记录，最后将区块头的RLP编码写到数据库中。 下面是存储区块体的函数： // WriteBody serializes the body of a block intothe database. funcWriteBody(db ethdb.Database, hash common.Hash, number uint64, body *types.Body) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(body) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; return WriteBodyRLP(db, hash, number, data) } &nbsp; // WriteBodyRLP writes a serialized body of ablock into the database. funcWriteBodyRLP(db ethdb.Database, hash common.Hash,number uint64, rlp rlp.RawValue)error { &nbsp;&nbsp;&nbsp; key := append(append(bodyPrefix, encodeBlockNumber(number)...), hash.Bytes()...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, rlp); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store block body intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored blockbody [%x…]&quot;, hash.Bytes()[:4]) &nbsp;&nbsp;&nbsp; returnnil } WriteBody先对区块体进行RLP编码，然后调用WriteBodyRLP将区块体的RLP编码写到数据库中。WriteBodyRLP根据上面的规则组装key，然后向数据库中写入一条记录。 还有一个WriteBlock函数分别调用WriteBody和WriteHeader将区块写到数据库中。此外还有GetHeader&nbsp;GetBody&nbsp;GetBlock函数用于从数据库中读取区块。 交易存储 除了区块外，数据库中还存储了所有的交易，每条交易的存储格式如下： txHash -&gt; rlpEncode(tx) txHash + txMetaSuffix -&gt; rlpEncode(txMeta) 每条交易对应存储两条数据，一条是交易本身，一条是交易的元信息（meta）。交易以交易的hash为key、交易的RLP编码为value存储；元信息以txHash+txMetaSuffix为key、元信息的RLP编码为value存储。元信息中包含交易所在区块的区块hash、区块号、交易在区块中的索引。具体可以看WriteTransactions函数： // WriteTransactions stores the transactionsassociated with a specific block // into the given database. Beside writing thetransaction, the function also // stores a metadata entry along with thetransaction, detailing the position // of this within the blockchain. funcWriteTransactions(db ethdb.Database,block *types.Block) error { &nbsp;&nbsp;&nbsp; batch:= db.NewBatch() &nbsp; &nbsp;&nbsp;&nbsp; // Iterate over each transaction and encode it with its metadata &nbsp;&nbsp;&nbsp; for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err := rlp.EncodeToBytes(tx) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(tx.Hash().Bytes(), data); err!= nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction metadata for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;meta := struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash&nbsp; common.Hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash:&nbsp; block.Hash(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex: block.NumberU64(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64(i), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err = rlp.EncodeToBytes(meta) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(append(tx.Hash().Bytes(), txMetaSuffix...), data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; // Write the scheduled data into the database &nbsp;&nbsp;&nbsp; if err := batch.Write(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; glog.Fatalf(&quot;failed to store transactions into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; returnnil } 此外还有GetTransaction函数，根据交易hash从数据库中读取交易，它返回对应的交易、交易所在区块的区块hash、交易所在区块的区块号、交易在区块中的索引。 阅读更多" />
+<meta property="og:description" content="leveldb是一个key-value数据库，所有数据都是以键-值对的形式存储。key一般与hash相关，value一般是要存储的数据结构的RLP编码。区块存储时将区块头和区块体分开存储。 区块头的存储格式为： headerPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(header) 其中key由区块头前缀、区块号（uint64大端格式）、区块hash构成，value是区块头的RLP编码。 区块体的存储格式为： bodyPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(block body) 其中key由区块体前缀、区块号（uint64大端格式）、区块hash构成，value是区块体的RLP编码。 key中的前缀可以用来区分数据的类型，在core/database_util.go中定义了各种前缀： headerPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;h&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash -&gt; header tdSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;t&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash + tdSuffix -&gt; td numSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;n&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + numSuffix -&gt; hash blockHashPrefix&nbsp;&nbsp;&nbsp;&nbsp;= []byte(&quot;H&quot;)&nbsp;&nbsp; //blockHashPrefix + hash -&gt; num (uint64 big endian) bodyPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;b&quot;)&nbsp;&nbsp; //bodyPrefix + num (uint64 big endian) + hash -&gt; block body 其中headerPrefix定义了区块头key的前缀为h，bodyPrefix定义了区块体key的前缀为b。 下面是存储区块头的函数： // WriteHeader serializes a block header into thedatabase. funcWriteHeader(db ethdb.Database, header*types.Header) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(header) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; hash :=header.Hash().Bytes() &nbsp;&nbsp;&nbsp; num :=header.Number.Uint64() &nbsp;&nbsp;&nbsp; encNum:= encodeBlockNumber(num) &nbsp;&nbsp;&nbsp; key := append(blockHashPrefix, hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, encNum); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store hash to numbermapping into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; key = append(append(headerPrefix, encNum...), hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store header intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored header#%v [%x…]&quot;, header.Number, hash[:4]) &nbsp;&nbsp;&nbsp; returnnil } 它是先对区块头进行RLP编码，encodeBlockNumber将区块号转换成大端格式，然后组装key。这里先向数据库中存储一条&nbsp;区块hash-&gt;区块号&nbsp;的记录，最后将区块头的RLP编码写到数据库中。 下面是存储区块体的函数： // WriteBody serializes the body of a block intothe database. funcWriteBody(db ethdb.Database, hash common.Hash, number uint64, body *types.Body) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(body) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; return WriteBodyRLP(db, hash, number, data) } &nbsp; // WriteBodyRLP writes a serialized body of ablock into the database. funcWriteBodyRLP(db ethdb.Database, hash common.Hash,number uint64, rlp rlp.RawValue)error { &nbsp;&nbsp;&nbsp; key := append(append(bodyPrefix, encodeBlockNumber(number)...), hash.Bytes()...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, rlp); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store block body intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored blockbody [%x…]&quot;, hash.Bytes()[:4]) &nbsp;&nbsp;&nbsp; returnnil } WriteBody先对区块体进行RLP编码，然后调用WriteBodyRLP将区块体的RLP编码写到数据库中。WriteBodyRLP根据上面的规则组装key，然后向数据库中写入一条记录。 还有一个WriteBlock函数分别调用WriteBody和WriteHeader将区块写到数据库中。此外还有GetHeader&nbsp;GetBody&nbsp;GetBlock函数用于从数据库中读取区块。 交易存储 除了区块外，数据库中还存储了所有的交易，每条交易的存储格式如下： txHash -&gt; rlpEncode(tx) txHash + txMetaSuffix -&gt; rlpEncode(txMeta) 每条交易对应存储两条数据，一条是交易本身，一条是交易的元信息（meta）。交易以交易的hash为key、交易的RLP编码为value存储；元信息以txHash+txMetaSuffix为key、元信息的RLP编码为value存储。元信息中包含交易所在区块的区块hash、区块号、交易在区块中的索引。具体可以看WriteTransactions函数： // WriteTransactions stores the transactionsassociated with a specific block // into the given database. Beside writing thetransaction, the function also // stores a metadata entry along with thetransaction, detailing the position // of this within the blockchain. funcWriteTransactions(db ethdb.Database,block *types.Block) error { &nbsp;&nbsp;&nbsp; batch:= db.NewBatch() &nbsp; &nbsp;&nbsp;&nbsp; // Iterate over each transaction and encode it with its metadata &nbsp;&nbsp;&nbsp; for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err := rlp.EncodeToBytes(tx) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(tx.Hash().Bytes(), data); err!= nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction metadata for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;meta := struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash&nbsp; common.Hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash:&nbsp; block.Hash(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex: block.NumberU64(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64(i), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err = rlp.EncodeToBytes(meta) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(append(tx.Hash().Bytes(), txMetaSuffix...), data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; // Write the scheduled data into the database &nbsp;&nbsp;&nbsp; if err := batch.Write(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; glog.Fatalf(&quot;failed to store transactions into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; returnnil } 此外还有GetTransaction函数，根据交易hash从数据库中读取交易，它返回对应的交易、交易所在区块的区块hash、交易所在区块的区块号、交易在区块中的索引。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/07/06/bf9102450a8d9b551f6b3cb46b137fd4.html" />
+<meta property="og:url" content="https://uzzz.org/2017/07/06/bf9102450a8d9b551f6b3cb46b137fd4.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-07-06T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"leveldb是一个key-value数据库，所有数据都是以键-值对的形式存储。key一般与hash相关，value一般是要存储的数据结构的RLP编码。区块存储时将区块头和区块体分开存储。 区块头的存储格式为： headerPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(header) 其中key由区块头前缀、区块号（uint64大端格式）、区块hash构成，value是区块头的RLP编码。 区块体的存储格式为： bodyPrefix + num (uint64 big endian) + hash -&gt; rlpEncode(block body) 其中key由区块体前缀、区块号（uint64大端格式）、区块hash构成，value是区块体的RLP编码。 key中的前缀可以用来区分数据的类型，在core/database_util.go中定义了各种前缀： headerPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;h&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash -&gt; header tdSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;t&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + hash + tdSuffix -&gt; td numSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;n&quot;)&nbsp;&nbsp; //headerPrefix + num (uint64 big endian) + numSuffix -&gt; hash blockHashPrefix&nbsp;&nbsp;&nbsp;&nbsp;= []byte(&quot;H&quot;)&nbsp;&nbsp; //blockHashPrefix + hash -&gt; num (uint64 big endian) bodyPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []byte(&quot;b&quot;)&nbsp;&nbsp; //bodyPrefix + num (uint64 big endian) + hash -&gt; block body 其中headerPrefix定义了区块头key的前缀为h，bodyPrefix定义了区块体key的前缀为b。 下面是存储区块头的函数： // WriteHeader serializes a block header into thedatabase. funcWriteHeader(db ethdb.Database, header*types.Header) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(header) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; hash :=header.Hash().Bytes() &nbsp;&nbsp;&nbsp; num :=header.Number.Uint64() &nbsp;&nbsp;&nbsp; encNum:= encodeBlockNumber(num) &nbsp;&nbsp;&nbsp; key := append(blockHashPrefix, hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, encNum); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store hash to numbermapping into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; key = append(append(headerPrefix, encNum...), hash...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store header intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored header#%v [%x…]&quot;, header.Number, hash[:4]) &nbsp;&nbsp;&nbsp; returnnil } 它是先对区块头进行RLP编码，encodeBlockNumber将区块号转换成大端格式，然后组装key。这里先向数据库中存储一条&nbsp;区块hash-&gt;区块号&nbsp;的记录，最后将区块头的RLP编码写到数据库中。 下面是存储区块体的函数： // WriteBody serializes the body of a block intothe database. funcWriteBody(db ethdb.Database, hash common.Hash, number uint64, body *types.Body) error { &nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(body) &nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; return err &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; return WriteBodyRLP(db, hash, number, data) } &nbsp; // WriteBodyRLP writes a serialized body of ablock into the database. funcWriteBodyRLP(db ethdb.Database, hash common.Hash,number uint64, rlp rlp.RawValue)error { &nbsp;&nbsp;&nbsp; key := append(append(bodyPrefix, encodeBlockNumber(number)...), hash.Bytes()...) &nbsp;&nbsp;&nbsp; if err := db.Put(key, rlp); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(&quot;failed to store block body intodatabase: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(&quot;stored blockbody [%x…]&quot;, hash.Bytes()[:4]) &nbsp;&nbsp;&nbsp; returnnil } WriteBody先对区块体进行RLP编码，然后调用WriteBodyRLP将区块体的RLP编码写到数据库中。WriteBodyRLP根据上面的规则组装key，然后向数据库中写入一条记录。 还有一个WriteBlock函数分别调用WriteBody和WriteHeader将区块写到数据库中。此外还有GetHeader&nbsp;GetBody&nbsp;GetBlock函数用于从数据库中读取区块。 交易存储 除了区块外，数据库中还存储了所有的交易，每条交易的存储格式如下： txHash -&gt; rlpEncode(tx) txHash + txMetaSuffix -&gt; rlpEncode(txMeta) 每条交易对应存储两条数据，一条是交易本身，一条是交易的元信息（meta）。交易以交易的hash为key、交易的RLP编码为value存储；元信息以txHash+txMetaSuffix为key、元信息的RLP编码为value存储。元信息中包含交易所在区块的区块hash、区块号、交易在区块中的索引。具体可以看WriteTransactions函数： // WriteTransactions stores the transactionsassociated with a specific block // into the given database. Beside writing thetransaction, the function also // stores a metadata entry along with thetransaction, detailing the position // of this within the blockchain. funcWriteTransactions(db ethdb.Database,block *types.Block) error { &nbsp;&nbsp;&nbsp; batch:= db.NewBatch() &nbsp; &nbsp;&nbsp;&nbsp; // Iterate over each transaction and encode it with its metadata &nbsp;&nbsp;&nbsp; for i, tx := range block.Transactions() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err := rlp.EncodeToBytes(tx) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(tx.Hash().Bytes(), data); err!= nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; // Encode and queue up the transaction metadata for storage &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;meta := struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash&nbsp; common.Hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash:&nbsp; block.Hash(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex: block.NumberU64(), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; uint64(i), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err = rlp.EncodeToBytes(meta) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if err := batch.Put(append(tx.Hash().Bytes(), txMetaSuffix...), data); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return err &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; // Write the scheduled data into the database &nbsp;&nbsp;&nbsp; if err := batch.Write(); err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; glog.Fatalf(&quot;failed to store transactions into database: %v&quot;, err) &nbsp;&nbsp;&nbsp; } &nbsp;&nbsp;&nbsp; returnnil } 此外还有GetTransaction函数，根据交易hash从数据库中读取交易，它返回对应的交易、交易所在区块的区块hash、交易所在区块的区块号、交易在区块中的索引。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/07/06/bf9102450a8d9b551f6b3cb46b137fd4.html","headline":"以太坊区块和交易的存储结构分析","dateModified":"2017-07-06T00:00:00+08:00","datePublished":"2017-07-06T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/07/06/bf9102450a8d9b551f6b3cb46b137fd4.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊区块和交易的存储结构分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-7f5a1a725b.css"> 
+ <div class="htmledit_views"> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3F3F3F;">leveldb</span><span style="color:#3F3F3F;">是一个</span><span style="color:#3F3F3F;">key-value</span><span style="color:#3F3F3F;">数据库，所有数据都是以键</span><span style="color:#3F3F3F;">-</span><span style="color:#3F3F3F;">值对的形式存储。</span><span style="color:#3F3F3F;">key</span><span style="color:#3F3F3F;">一般与</span><span style="color:#3F3F3F;">hash</span><span style="color:#3F3F3F;">相关，</span><span style="color:#3F3F3F;">value</span><span style="color:#3F3F3F;">一般是要存储的数据结构的</span><span style="color:#3F3F3F;"><a href="https://my.oschina.net/u/2349981/blog/894117" rel="nofollow"><span style="color:rgb(63,63,63);">RLP</span><span style="color:rgb(63,63,63);">编码</span></a></span><span style="color:#3F3F3F;">。区块存储时将区块头和区块体分开存储。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><strong><span style="color:#3D464D;">区块头的存储格式为：</span></strong></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>headerPrefix + num (</span><span style="color:rgb(239,239,143);">uint64</span><span> big endian) + hash -&gt; rlpEncode(</span><span style="color:rgb(239,239,143);">header</span><span>)</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">其中</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">由区块头前缀、区块号（</span><span style="color:#3D464D;">uint64</span><span style="color:#3D464D;">大端格式）、区块</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">构成，</span><span style="color:#3D464D;">value</span><span style="color:#3D464D;">是区块头的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><strong><span style="color:#3D464D;">区块体的存储格式为：</span></strong></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>bodyPrefix + num (</span><span style="color:rgb(239,239,143);">uint64</span><span> big endian) + hash -&gt; rlpEncode(</span><span style="color:rgb(239,239,143);">block</span><span> body)</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">其中</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">由区块体前缀、区块号（</span><span style="color:#3D464D;">uint64</span><span style="color:#3D464D;">大端格式）、区块</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">构成，</span><span style="color:#3D464D;">value</span><span style="color:#3D464D;">是区块体的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">key</span><span style="color:#3D464D;">中的前缀可以用来区分数据的类型，在</span><span style="color:#3D464D;">core/database_util.go</span><span style="color:#3D464D;">中定义了各种前缀：</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>headerPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []</span><span style="color:rgb(227,206,171);">byte</span><span>(</span><span style="color:rgb(204,147,147);">"h"</span><span>)&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">//headerPrefix + num (uint64 big endian) + hash -&gt; header</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>tdSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []</span><span style="color:rgb(227,206,171);">byte</span><span>(</span><span style="color:rgb(204,147,147);">"t"</span><span>)&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">//headerPrefix + num (uint64 big endian) + hash + tdSuffix -&gt; td</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>numSuffix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []</span><span style="color:rgb(227,206,171);">byte</span><span>(</span><span style="color:rgb(204,147,147);">"n"</span><span>)&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">//headerPrefix + num (uint64 big endian) + numSuffix -&gt; hash</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>blockHashPrefix&nbsp;&nbsp;&nbsp;&nbsp;= []</span><span style="color:rgb(227,206,171);">byte</span><span>(</span><span style="color:rgb(204,147,147);">"H"</span><span>)&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">//blockHashPrefix + hash -&gt; num (uint64 big endian)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>bodyPrefix&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = []</span><span style="color:rgb(227,206,171);">byte</span><span>(</span><span style="color:rgb(204,147,147);">"b"</span><span>)&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">//bodyPrefix + num (uint64 big endian) + hash -&gt; block body</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">其中</span><span style="color:#3D464D;">headerPrefix</span><span style="color:#3D464D;">定义了区块头</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">的前缀为</span><span style="color:#3D464D;">h</span><span style="color:#3D464D;">，</span><span style="color:#3D464D;">bodyPrefix</span><span style="color:#3D464D;">定义了区块体</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">的前缀为</span><span style="color:#3D464D;">b</span><span style="color:#3D464D;">。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">下面是存储区块头的函数：</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// WriteHeader serializes a block header into thedatabase.</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(227,206,171);">func</span><span style="color:rgb(239,239,143);">WriteHeader</span><span>(db ethdb.Database, header*types.Header) </span><span style="color:rgb(239,239,143);">error</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(header)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; hash :=header.Hash().Bytes()</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; num :=header.Number.Uint64()</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; encNum:= encodeBlockNumber(num)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; key := </span><span style="color:rgb(204,147,147);">append</span><span>(blockHashPrefix, hash...)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := db.Put(key, encNum); err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(</span><span style="color:rgb(204,147,147);">"failed to store hash to numbermapping into database: %v"</span><span>, err)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; key = </span><span style="color:rgb(204,147,147);">append</span><span>(</span><span style="color:rgb(204,147,147);">append</span><span>(headerPrefix, encNum...), hash...)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := db.Put(key, data); err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(</span><span style="color:rgb(204,147,147);">"failed to store header intodatabase: %v"</span><span>, err)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(</span><span style="color:rgb(204,147,147);">"stored header#%v [%x…]"</span><span>, header.Number, hash[:</span><span style="color:rgb(140,208,211);">4</span><span>])</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span style="color:rgb(239,239,175);">nil</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>}</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">它是先对区块头进行</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码，</span><span style="color:#3D464D;">encodeBlockNumber</span><span style="color:#3D464D;">将区块号转换成大端格式，然后组装</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">。这里先向数据库中存储一条</span><span style="color:#3D464D;">&nbsp;</span><span style="color:#3D464D;">区块hash-&gt;</span>区块号<span style="color:#3D464D;">&nbsp;</span><span style="color:#3D464D;">的记录，最后将区块头的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码写到数据库中。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">下面是存储区块体的函数：</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// WriteBody serializes the body of a block intothe database.</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(227,206,171);">func</span><span style="color:rgb(239,239,143);">WriteBody</span><span>(db ethdb.Database, hash common.Hash, number </span><span style="color:rgb(227,206,171);">uint64</span><span>, body *types.Body) </span><span style="color:rgb(239,239,143);">error</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; data,err := rlp.EncodeToBytes(body)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span> WriteBodyRLP(db, hash, number, data)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>}</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// WriteBodyRLP writes a serialized body of ablock into the database.</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(227,206,171);">func</span><span style="color:rgb(239,239,143);">WriteBodyRLP</span><span>(db ethdb.Database, hash common.Hash,number </span><span style="color:rgb(227,206,171);">uint64</span><span>, rlp rlp.RawValue)</span><span style="color:rgb(239,239,143);">error</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; key := </span><span style="color:rgb(204,147,147);">append</span><span>(</span><span style="color:rgb(204,147,147);">append</span><span>(bodyPrefix, encodeBlockNumber(number)...), hash.Bytes()...)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := db.Put(key, rlp); err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;glog.Fatalf(</span><span style="color:rgb(204,147,147);">"failed to store block body intodatabase: %v"</span><span>, err)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;glog.V(logger.Debug).Infof(</span><span style="color:rgb(204,147,147);">"stored blockbody [%x…]"</span><span>, hash.Bytes()[:</span><span style="color:rgb(140,208,211);">4</span><span>])</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span style="color:rgb(239,239,175);">nil</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>}</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">WriteBody</span><span style="color:#3D464D;">先对区块体进行</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码，然后调用</span><span style="color:#3D464D;">WriteBodyRLP</span><span style="color:#3D464D;">将区块体的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码写到数据库中。</span><span style="color:#3D464D;">WriteBodyRLP</span><span style="color:#3D464D;">根据上面的规则组装</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">，然后向数据库中写入一条记录。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">还有一个</span><span style="color:#3D464D;">WriteBlock</span><span style="color:#3D464D;">函数分别调用</span><span style="color:#3D464D;">WriteBody</span><span style="color:#3D464D;">和</span><span style="color:#3D464D;">WriteHeader</span><span style="color:#3D464D;">将区块写到数据库中。此外还有</span><span style="color:#3D464D;">GetHeader</span><span style="color:#3D464D;">&nbsp;</span><span style="color:#3D464D;">GetBody</span><span style="color:#3D464D;">&nbsp;</span><span style="color:#3D464D;">GetBlock</span><span style="color:#3D464D;">函数用于从数据库中读取区块。</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;"></span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">交易存储</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">除了区块外，数据库中还存储了所有的交易，每条交易的存储格式如下：</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>txHash -&gt; rlpEncode(</span><span style="color:rgb(239,239,143);">tx</span><span>)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>txHash + txMetaSuffix -&gt; rlpEncode(</span><span style="color:rgb(239,239,143);">txMeta</span><span>)</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">每条交易对应存储两条数据，一条是交易本身，一条是交易的元信息（</span><span style="color:#3D464D;">meta</span><span style="color:#3D464D;">）。交易以交易的</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">为</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">、交易的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码为</span><span style="color:#3D464D;">value</span><span style="color:#3D464D;">存储；元信息以</span><span style="color:#3D464D;">txHash+txMetaSuffix</span><span style="color:#3D464D;">为</span><span style="color:#3D464D;">key</span><span style="color:#3D464D;">、元信息的</span><span style="color:#3D464D;">RLP</span><span style="color:#3D464D;">编码为</span><span style="color:#3D464D;">value</span><span style="color:#3D464D;">存储。元信息中包含交易所在区块的区块</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">、区块号、交易在区块中的索引。具体可以看</span><span style="color:#3D464D;">WriteTransactions</span><span style="color:#3D464D;">函数：</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// WriteTransactions stores the transactionsassociated with a specific block</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// into the given database. Beside writing thetransaction, the function also</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// stores a metadata entry along with thetransaction, detailing the position</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(127,159,127);">// of this within the blockchain.</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span style="color:rgb(227,206,171);">func</span><span style="color:rgb(239,239,143);">WriteTransactions</span><span>(db ethdb.Database,block *types.Block) </span><span style="color:rgb(239,239,143);">error</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; batch:= db.NewBatch()</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">// Iterate over each transaction and encode it with its metadata</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">for</span><span> i, tx := </span><span style="color:rgb(227,206,171);">range</span><span> block.Transactions() {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">// Encode and queue up the transaction for storage</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err := rlp.EncodeToBytes(tx)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;}</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := batch.Put(tx.Hash().Bytes(), data); err!= </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">// Encode and queue up the transaction metadata for storage</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;meta := </span><span style="color:rgb(227,206,171);">struct</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash&nbsp; common.Hash</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex </span><span style="color:rgb(227,206,171);">uint64</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">uint64</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }{</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockHash:&nbsp; block.Hash(),</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockIndex: block.NumberU64(),</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Index:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">uint64</span><span>(i),</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;data, err = rlp.EncodeToBytes(meta)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := batch.Put(</span><span style="color:rgb(204,147,147);">append</span><span>(tx.Hash().Bytes(), txMetaSuffix...), data); err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span style="color:rgb(227,206,171);">return</span><span> err</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(127,159,127);">// Write the scheduled data into the database</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">if</span><span> err := batch.Write(); err != </span><span style="color:rgb(239,239,175);">nil</span><span> {</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; glog.Fatalf(</span><span style="color:rgb(204,147,147);">"failed to store transactions into database: %v"</span><span>, err)</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; }</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>&nbsp;&nbsp;&nbsp; </span><span style="color:rgb(227,206,171);">return</span><span style="color:rgb(239,239,175);">nil</span></p> 
+  <p align="left" style="background:rgb(63,63,63);"><span>}</span></p> 
+  <p align="left" style="background:rgb(248,248,248);"><span style="color:#3D464D;">此外还有</span><span style="color:#3D464D;">GetTransaction</span><span style="color:#3D464D;">函数，根据交易</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">从数据库中读取交易，它返回对应的交易、交易所在区块的区块</span><span style="color:#3D464D;">hash</span><span style="color:#3D464D;">、交易所在区块的区块号、交易在区块中的索引。</span></p> 
+  <br> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/DDFFR/article/details/74517608,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/DDFFR/article/details/74517608,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

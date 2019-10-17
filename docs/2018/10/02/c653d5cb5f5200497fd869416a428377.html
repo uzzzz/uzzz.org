@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>eos源码赏析（二十）：EOS智能合约之push_transaction的天龙八“步” | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="eos源码赏析（二十）：EOS智能合约之push_transaction的天龙八“步”" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="很久没谈《天龙八部》了。 eosio整个系统中，transaction占据着十分重要的位置。我们在区块链上的任何有效操作，都代表着有transaction被执行了。在执行的过程中，push_transaction是不可以被忽略的。例如我们创建账户的时候，会通过push_transaction写到区块信息中，我们进行转账也会push_transaction写到区块信息中，今天我们来看看push_transaction作为区块信息写入的入口，背后做了哪些操作，交易信息是如何写入到区块中的。 本文主要包含以下内容： push_transaction的天龙八步 transaction信息写入区块的过程 1、push_transaction的天龙八步 我们平时在代码调试或者阅读的过程中，总免不了使用cleos命令行，比如我们创建账户就需要使用： cleos system newaccount eosio yourname pubkey pubkey --stake-net &quot;10.0000 EOS&quot; --stake-cpu &quot;10.0000 EOS&quot; --buy-ram-bytes 1000 那么我们在这个命令输入之后都进行了哪些操作呢？在创建新用户的过程中,我们给新用户抵押了资源,购买了内存,在cleos的main.cpp中,我们以帮助新用户购买RAM为例,可以看到该命令调用了系统合约中的buyram方法，那么我们如何来一步步找到buyram这个action执行的地方呢，我们可以分为八步来看： 1//第一步：设置cleos命令行中传入的参数 2add_standard_transaction_options(createAccount); 3//第二步：根据公钥、私钥等创建账户 4auto create = create_newaccount(creator, account_name, owner_key, active_key); 5//第三步：创建购买ram等其他操作的action，在这里我们可以看到调用了系统合约中的buyram方法 6create_action(tx_permission.empty() ? vector&lt;chain::permission_level&gt;{{creator,config::active_name}} : get_account_permissions(tx_permission), 7 config::system_account_name, N(buyram), act_payload); 8} 9//第四步：send_action 10send_actions( { create, buyram, delegate } 11//第五步：push_action 12auto result = push_actions( move(actions), extra_kcpu, compression); 13//第六步：将action写到transaction中并push_transaction 14fc::variant push_actions(std::vector&lt;chain::action&gt;&amp;&amp; actions, int32_t extra_kcpu, packed_transaction::compression_type compression = packed_transaction::none ) { 15 signed_transaction trx; 16 trx.actions = std::forward&lt;decltype(actions)&gt;(actions); 17 18 return push_transaction(trx, extra_kcpu, compression); 19} 20//第七步：通过回调，调用chain_plugin中的push_transaction 21call(push_txn_func, packed_transaction(trx, compression)); 22//第八步：chain_plugin将transaction信息异步写入到区块中 23void read_write::push_transaction(const read_write::push_transaction_params&amp; params, next_function&lt;read_write::push_transaction_results&gt; next) 24{ 25 //处理 26} 创建账户的时候是如此，其他的链上操作也基本类似，感兴趣的可以去一一查看，接下来我们要看看天龙八步中的第八步，交易信息是如何写入区块中的。 2、push_transaction背后的操作 我们通过以前的文章可以了解到，区块的生成是以producer_plugin为入口，而后在chain的controller中实际完成的，那么上面天龙八步中的第八步是如何将交易transaction信息异步发送至producer_plugin中的呢。我们在来看chain_plugin中的transaction，可以看到其中使用了incoming::methods::transaction_async异步调用的方式，一步步的走下去： 1app().get_method&lt;incoming::methods::transaction_async&gt;()(pretty_input, true, [this, next](const fc::static_variant&lt;fc::exception_ptr, transaction_trace_ptr&gt;&amp; result) 2//transaction_async的定义 3using transaction_async = method_decl&lt;chain_plugin_interface, void(const packed_transaction_ptr&amp;, bool, next_function&lt;transaction_trace_ptr&gt;), first_provider_policy&gt;; 可以看到这其实是一个插件的接口，具体可以参看method_decl，我们回头看transaction_async，通过get_method的方式将transaction信息异步发送至producer_plugin，那么get_method又是什么呢： 1 /** 2 * 获取对传入类型声明的方法的引用，第一次使用的时候将会重构这个方法，该方法也会绑定两个插件 3 */ 4 template&lt;typename MethodDecl&gt; 5 auto get_method() -&gt; std::enable_if_t&lt;is_method_decl&lt;MethodDecl&gt;::value, typename MethodDecl::method_type&amp;&gt; 6 { 7 using method_type = typename MethodDecl::method_type; 8 auto key = std::type_index(typeid(MethodDecl)); 9 auto itr = methods.find(key); 10 if(itr != methods.end()) { 11 return *method_type::get_method(itr-&gt;second); 12 } else { 13 methods.emplace(std::make_pair(key, method_type::make_unique())); 14 return *method_type::get_method(methods.at(key)); 15 } 16 } 读到这里我们大概都会猜想的到，既然是两个插件之间的通信，想必producer_plugin中也有transaction_async相关的使用，果不其然，在producer_plugin我们可以找得到transaction_async及其使用的地方： 1//接收来自chain_plugin中的transaction的句柄 2incoming::methods::transaction_async::method_type::handle _incoming_transaction_async_provider; 3//在producer_plugin插件初始化的时候就绑定了_incoming_transaction_async_provider和方法，类似于回调的方式，当有get_method执行的时候，on_incoming_transaction_async也将会执行 4 my-&gt;_incoming_transaction_async_provider = app().get_method&lt;incoming::methods::transaction_async&gt;().register_provider([this](const packed_transaction_ptr&amp; trx, bool persist_until_expired, next_function&lt;transaction_trace_ptr&gt; next) -&gt; void { 5 return my-&gt;on_incoming_transaction_async(trx, persist_until_expired, next ); 6 }); 在以前的文章中提到，节点生产区块实在start_block中执行的，我们不再赘述，下面完整的（默克尔树太长，忽略）打印其中一个区块的信息，新入门eos开发的读者朋友们也可以参考下一个区块中到底包含有哪些信息： 1{ 2 &quot;id&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 3 &quot;block_num&quot;: 58447, 4 &quot;header&quot;: { 5 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 6 &quot;producer&quot;: &quot;eosio&quot;, 7 &quot;confirmed&quot;: 0, 8 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 9 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 10 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 11 &quot;schedule_version&quot;: 0, 12 &quot;header_extensions&quot;: [], 13 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot; 14 }, 15 &quot;dpos_proposed_irreversible_blocknum&quot;: 58447, 16 &quot;dpos_irreversible_blocknum&quot;: 58446, 17 &quot;bft_irreversible_blocknum&quot;: 0, 18 &quot;pending_schedule_lib_num&quot;: 0, 19 &quot;pending_schedule_hash&quot;: &quot;828135c21a947b15cdbf4941ba09e1c9e0a80e88a157b0989e9b476b71a21c6b&quot;, 20 &quot;pending_schedule&quot;: { 21 &quot;version&quot;: 0, 22 &quot;producers&quot;: [] 23 }, 24 &quot;active_schedule&quot;: { 25 &quot;version&quot;: 0, 26 &quot;producers&quot;: [{ 27 &quot;producer_name&quot;: &quot;eosio&quot;, 28 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot; 29 }] 30 }, 31 &quot;blockroot_merkle&quot;: { //默克尔树省略 32 }, 33 &quot;producer_to_last_produced&quot;: [[&quot;eosio&quot;, 34 58447]], 35 &quot;producer_to_last_implied_irb&quot;: [[&quot;eosio&quot;, 36 58446]], 37 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot;, 38 &quot;confirm_count&quot;: [], 39 &quot;confirmations&quot;: [], 40 &quot;block&quot;: { 41 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 42 &quot;producer&quot;: &quot;eosio&quot;, 43 &quot;confirmed&quot;: 1, 44 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 45 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 46 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 47 &quot;schedule_version&quot;: 0, 48 &quot;header_extensions&quot;: [], 49 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot;, 50 &quot;transactions&quot;: [], 51 &quot;block_extensions&quot;: [] 52 }, 53 &quot;validated&quot;: false, 54 &quot;in_current_chain&quot;: true 55} 在我们的chain_plugin执行完push_transaction之后，controller.cpp中也对应着push_transaction,当没有transaction信息到来的时候，下面的内容不会执行，而当有交易信息的时候，则将会交易信息写入到pending中（注意，我这里加了部分日志打印来确认）： 1 if (!trx-&gt;implicit) { 2 transaction_receipt::status_enum s = (trx_context.delay == fc::seconds(0)) 3 ? transaction_receipt::executed 4 : transaction_receipt::delayed; 5 trace-&gt;receipt = push_receipt(trx-&gt;packed_trx, s, trx_context.billed_cpu_time_us, trace-&gt;net_usage); 6 pending-&gt;_pending_block_state-&gt;trxs.emplace_back(trx); 7 strPending = fc::json::to_string(*pending-&gt;_pending_block_state); 8 dlog(&quot;contorller push_transaction pending state step3:${state}&quot;, (&quot;state&quot;, strPending)); 9 } 在这些执行完成之后，我们可以看到pending的打印中将会多出transaction的相关信息，如下： 1&quot;transactions&quot;: [{ 2 &quot;status&quot;: &quot;executed&quot;, 3 &quot;cpu_usage_us&quot;: 953, 4 &quot;net_usage_words&quot;: 25, 5 &quot;trx&quot;: [1, 6 { 7 &quot;signatures&quot;: [&quot;SIG_K1_KVpVk3PeWTXqGmExT6Lf7TbbgmJsPXcmmF63UZrTjFxf9Q8mqnKtLrU2CcBeZH3KU6qps7g73HxPDrAsUHZcic9NUp7E6f&quot;], 8 &quot;compression&quot;: &quot;none&quot;, 9 &quot;packed_context_free_data&quot;: &quot;&quot;, 10 &quot;packed_trx&quot;: &quot;cfb49c5b4de4d5cd608f00000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea305500000819ab9cb1ca01000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000001000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000000&quot; 11 }] 本文主要结合日志打印来分析交易信息是如何通过push_action写入到区块中的，以命令行创建用户为例，拆分为八步来讨论两个插件之间的异步交互，chain_plugin中的信息是如何发送至producer_plugin中的。 如果你觉得我的文章对你有一定的帮助，请点击文章末尾的喜欢该作者。 如果你对eos开发感兴趣,欢迎关注本公众号,一起学习eos开发。 微信公众号 有任何疑问或者指教请添加本人个人微信,当然有对eos开发感兴趣或者金庸粉的也可以添加一起交流,备注eos开发或金庸。 个人微信号 阅读更多" />
+<meta property="og:description" content="很久没谈《天龙八部》了。 eosio整个系统中，transaction占据着十分重要的位置。我们在区块链上的任何有效操作，都代表着有transaction被执行了。在执行的过程中，push_transaction是不可以被忽略的。例如我们创建账户的时候，会通过push_transaction写到区块信息中，我们进行转账也会push_transaction写到区块信息中，今天我们来看看push_transaction作为区块信息写入的入口，背后做了哪些操作，交易信息是如何写入到区块中的。 本文主要包含以下内容： push_transaction的天龙八步 transaction信息写入区块的过程 1、push_transaction的天龙八步 我们平时在代码调试或者阅读的过程中，总免不了使用cleos命令行，比如我们创建账户就需要使用： cleos system newaccount eosio yourname pubkey pubkey --stake-net &quot;10.0000 EOS&quot; --stake-cpu &quot;10.0000 EOS&quot; --buy-ram-bytes 1000 那么我们在这个命令输入之后都进行了哪些操作呢？在创建新用户的过程中,我们给新用户抵押了资源,购买了内存,在cleos的main.cpp中,我们以帮助新用户购买RAM为例,可以看到该命令调用了系统合约中的buyram方法，那么我们如何来一步步找到buyram这个action执行的地方呢，我们可以分为八步来看： 1//第一步：设置cleos命令行中传入的参数 2add_standard_transaction_options(createAccount); 3//第二步：根据公钥、私钥等创建账户 4auto create = create_newaccount(creator, account_name, owner_key, active_key); 5//第三步：创建购买ram等其他操作的action，在这里我们可以看到调用了系统合约中的buyram方法 6create_action(tx_permission.empty() ? vector&lt;chain::permission_level&gt;{{creator,config::active_name}} : get_account_permissions(tx_permission), 7 config::system_account_name, N(buyram), act_payload); 8} 9//第四步：send_action 10send_actions( { create, buyram, delegate } 11//第五步：push_action 12auto result = push_actions( move(actions), extra_kcpu, compression); 13//第六步：将action写到transaction中并push_transaction 14fc::variant push_actions(std::vector&lt;chain::action&gt;&amp;&amp; actions, int32_t extra_kcpu, packed_transaction::compression_type compression = packed_transaction::none ) { 15 signed_transaction trx; 16 trx.actions = std::forward&lt;decltype(actions)&gt;(actions); 17 18 return push_transaction(trx, extra_kcpu, compression); 19} 20//第七步：通过回调，调用chain_plugin中的push_transaction 21call(push_txn_func, packed_transaction(trx, compression)); 22//第八步：chain_plugin将transaction信息异步写入到区块中 23void read_write::push_transaction(const read_write::push_transaction_params&amp; params, next_function&lt;read_write::push_transaction_results&gt; next) 24{ 25 //处理 26} 创建账户的时候是如此，其他的链上操作也基本类似，感兴趣的可以去一一查看，接下来我们要看看天龙八步中的第八步，交易信息是如何写入区块中的。 2、push_transaction背后的操作 我们通过以前的文章可以了解到，区块的生成是以producer_plugin为入口，而后在chain的controller中实际完成的，那么上面天龙八步中的第八步是如何将交易transaction信息异步发送至producer_plugin中的呢。我们在来看chain_plugin中的transaction，可以看到其中使用了incoming::methods::transaction_async异步调用的方式，一步步的走下去： 1app().get_method&lt;incoming::methods::transaction_async&gt;()(pretty_input, true, [this, next](const fc::static_variant&lt;fc::exception_ptr, transaction_trace_ptr&gt;&amp; result) 2//transaction_async的定义 3using transaction_async = method_decl&lt;chain_plugin_interface, void(const packed_transaction_ptr&amp;, bool, next_function&lt;transaction_trace_ptr&gt;), first_provider_policy&gt;; 可以看到这其实是一个插件的接口，具体可以参看method_decl，我们回头看transaction_async，通过get_method的方式将transaction信息异步发送至producer_plugin，那么get_method又是什么呢： 1 /** 2 * 获取对传入类型声明的方法的引用，第一次使用的时候将会重构这个方法，该方法也会绑定两个插件 3 */ 4 template&lt;typename MethodDecl&gt; 5 auto get_method() -&gt; std::enable_if_t&lt;is_method_decl&lt;MethodDecl&gt;::value, typename MethodDecl::method_type&amp;&gt; 6 { 7 using method_type = typename MethodDecl::method_type; 8 auto key = std::type_index(typeid(MethodDecl)); 9 auto itr = methods.find(key); 10 if(itr != methods.end()) { 11 return *method_type::get_method(itr-&gt;second); 12 } else { 13 methods.emplace(std::make_pair(key, method_type::make_unique())); 14 return *method_type::get_method(methods.at(key)); 15 } 16 } 读到这里我们大概都会猜想的到，既然是两个插件之间的通信，想必producer_plugin中也有transaction_async相关的使用，果不其然，在producer_plugin我们可以找得到transaction_async及其使用的地方： 1//接收来自chain_plugin中的transaction的句柄 2incoming::methods::transaction_async::method_type::handle _incoming_transaction_async_provider; 3//在producer_plugin插件初始化的时候就绑定了_incoming_transaction_async_provider和方法，类似于回调的方式，当有get_method执行的时候，on_incoming_transaction_async也将会执行 4 my-&gt;_incoming_transaction_async_provider = app().get_method&lt;incoming::methods::transaction_async&gt;().register_provider([this](const packed_transaction_ptr&amp; trx, bool persist_until_expired, next_function&lt;transaction_trace_ptr&gt; next) -&gt; void { 5 return my-&gt;on_incoming_transaction_async(trx, persist_until_expired, next ); 6 }); 在以前的文章中提到，节点生产区块实在start_block中执行的，我们不再赘述，下面完整的（默克尔树太长，忽略）打印其中一个区块的信息，新入门eos开发的读者朋友们也可以参考下一个区块中到底包含有哪些信息： 1{ 2 &quot;id&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 3 &quot;block_num&quot;: 58447, 4 &quot;header&quot;: { 5 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 6 &quot;producer&quot;: &quot;eosio&quot;, 7 &quot;confirmed&quot;: 0, 8 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 9 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 10 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 11 &quot;schedule_version&quot;: 0, 12 &quot;header_extensions&quot;: [], 13 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot; 14 }, 15 &quot;dpos_proposed_irreversible_blocknum&quot;: 58447, 16 &quot;dpos_irreversible_blocknum&quot;: 58446, 17 &quot;bft_irreversible_blocknum&quot;: 0, 18 &quot;pending_schedule_lib_num&quot;: 0, 19 &quot;pending_schedule_hash&quot;: &quot;828135c21a947b15cdbf4941ba09e1c9e0a80e88a157b0989e9b476b71a21c6b&quot;, 20 &quot;pending_schedule&quot;: { 21 &quot;version&quot;: 0, 22 &quot;producers&quot;: [] 23 }, 24 &quot;active_schedule&quot;: { 25 &quot;version&quot;: 0, 26 &quot;producers&quot;: [{ 27 &quot;producer_name&quot;: &quot;eosio&quot;, 28 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot; 29 }] 30 }, 31 &quot;blockroot_merkle&quot;: { //默克尔树省略 32 }, 33 &quot;producer_to_last_produced&quot;: [[&quot;eosio&quot;, 34 58447]], 35 &quot;producer_to_last_implied_irb&quot;: [[&quot;eosio&quot;, 36 58446]], 37 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot;, 38 &quot;confirm_count&quot;: [], 39 &quot;confirmations&quot;: [], 40 &quot;block&quot;: { 41 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 42 &quot;producer&quot;: &quot;eosio&quot;, 43 &quot;confirmed&quot;: 1, 44 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 45 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 46 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 47 &quot;schedule_version&quot;: 0, 48 &quot;header_extensions&quot;: [], 49 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot;, 50 &quot;transactions&quot;: [], 51 &quot;block_extensions&quot;: [] 52 }, 53 &quot;validated&quot;: false, 54 &quot;in_current_chain&quot;: true 55} 在我们的chain_plugin执行完push_transaction之后，controller.cpp中也对应着push_transaction,当没有transaction信息到来的时候，下面的内容不会执行，而当有交易信息的时候，则将会交易信息写入到pending中（注意，我这里加了部分日志打印来确认）： 1 if (!trx-&gt;implicit) { 2 transaction_receipt::status_enum s = (trx_context.delay == fc::seconds(0)) 3 ? transaction_receipt::executed 4 : transaction_receipt::delayed; 5 trace-&gt;receipt = push_receipt(trx-&gt;packed_trx, s, trx_context.billed_cpu_time_us, trace-&gt;net_usage); 6 pending-&gt;_pending_block_state-&gt;trxs.emplace_back(trx); 7 strPending = fc::json::to_string(*pending-&gt;_pending_block_state); 8 dlog(&quot;contorller push_transaction pending state step3:${state}&quot;, (&quot;state&quot;, strPending)); 9 } 在这些执行完成之后，我们可以看到pending的打印中将会多出transaction的相关信息，如下： 1&quot;transactions&quot;: [{ 2 &quot;status&quot;: &quot;executed&quot;, 3 &quot;cpu_usage_us&quot;: 953, 4 &quot;net_usage_words&quot;: 25, 5 &quot;trx&quot;: [1, 6 { 7 &quot;signatures&quot;: [&quot;SIG_K1_KVpVk3PeWTXqGmExT6Lf7TbbgmJsPXcmmF63UZrTjFxf9Q8mqnKtLrU2CcBeZH3KU6qps7g73HxPDrAsUHZcic9NUp7E6f&quot;], 8 &quot;compression&quot;: &quot;none&quot;, 9 &quot;packed_context_free_data&quot;: &quot;&quot;, 10 &quot;packed_trx&quot;: &quot;cfb49c5b4de4d5cd608f00000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea305500000819ab9cb1ca01000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000001000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000000&quot; 11 }] 本文主要结合日志打印来分析交易信息是如何通过push_action写入到区块中的，以命令行创建用户为例，拆分为八步来讨论两个插件之间的异步交互，chain_plugin中的信息是如何发送至producer_plugin中的。 如果你觉得我的文章对你有一定的帮助，请点击文章末尾的喜欢该作者。 如果你对eos开发感兴趣,欢迎关注本公众号,一起学习eos开发。 微信公众号 有任何疑问或者指教请添加本人个人微信,当然有对eos开发感兴趣或者金庸粉的也可以添加一起交流,备注eos开发或金庸。 个人微信号 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/10/02/c653d5cb5f5200497fd869416a428377.html" />
+<meta property="og:url" content="https://uzzz.org/2018/10/02/c653d5cb5f5200497fd869416a428377.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-10-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"很久没谈《天龙八部》了。 eosio整个系统中，transaction占据着十分重要的位置。我们在区块链上的任何有效操作，都代表着有transaction被执行了。在执行的过程中，push_transaction是不可以被忽略的。例如我们创建账户的时候，会通过push_transaction写到区块信息中，我们进行转账也会push_transaction写到区块信息中，今天我们来看看push_transaction作为区块信息写入的入口，背后做了哪些操作，交易信息是如何写入到区块中的。 本文主要包含以下内容： push_transaction的天龙八步 transaction信息写入区块的过程 1、push_transaction的天龙八步 我们平时在代码调试或者阅读的过程中，总免不了使用cleos命令行，比如我们创建账户就需要使用： cleos system newaccount eosio yourname pubkey pubkey --stake-net &quot;10.0000 EOS&quot; --stake-cpu &quot;10.0000 EOS&quot; --buy-ram-bytes 1000 那么我们在这个命令输入之后都进行了哪些操作呢？在创建新用户的过程中,我们给新用户抵押了资源,购买了内存,在cleos的main.cpp中,我们以帮助新用户购买RAM为例,可以看到该命令调用了系统合约中的buyram方法，那么我们如何来一步步找到buyram这个action执行的地方呢，我们可以分为八步来看： 1//第一步：设置cleos命令行中传入的参数 2add_standard_transaction_options(createAccount); 3//第二步：根据公钥、私钥等创建账户 4auto create = create_newaccount(creator, account_name, owner_key, active_key); 5//第三步：创建购买ram等其他操作的action，在这里我们可以看到调用了系统合约中的buyram方法 6create_action(tx_permission.empty() ? vector&lt;chain::permission_level&gt;{{creator,config::active_name}} : get_account_permissions(tx_permission), 7 config::system_account_name, N(buyram), act_payload); 8} 9//第四步：send_action 10send_actions( { create, buyram, delegate } 11//第五步：push_action 12auto result = push_actions( move(actions), extra_kcpu, compression); 13//第六步：将action写到transaction中并push_transaction 14fc::variant push_actions(std::vector&lt;chain::action&gt;&amp;&amp; actions, int32_t extra_kcpu, packed_transaction::compression_type compression = packed_transaction::none ) { 15 signed_transaction trx; 16 trx.actions = std::forward&lt;decltype(actions)&gt;(actions); 17 18 return push_transaction(trx, extra_kcpu, compression); 19} 20//第七步：通过回调，调用chain_plugin中的push_transaction 21call(push_txn_func, packed_transaction(trx, compression)); 22//第八步：chain_plugin将transaction信息异步写入到区块中 23void read_write::push_transaction(const read_write::push_transaction_params&amp; params, next_function&lt;read_write::push_transaction_results&gt; next) 24{ 25 //处理 26} 创建账户的时候是如此，其他的链上操作也基本类似，感兴趣的可以去一一查看，接下来我们要看看天龙八步中的第八步，交易信息是如何写入区块中的。 2、push_transaction背后的操作 我们通过以前的文章可以了解到，区块的生成是以producer_plugin为入口，而后在chain的controller中实际完成的，那么上面天龙八步中的第八步是如何将交易transaction信息异步发送至producer_plugin中的呢。我们在来看chain_plugin中的transaction，可以看到其中使用了incoming::methods::transaction_async异步调用的方式，一步步的走下去： 1app().get_method&lt;incoming::methods::transaction_async&gt;()(pretty_input, true, [this, next](const fc::static_variant&lt;fc::exception_ptr, transaction_trace_ptr&gt;&amp; result) 2//transaction_async的定义 3using transaction_async = method_decl&lt;chain_plugin_interface, void(const packed_transaction_ptr&amp;, bool, next_function&lt;transaction_trace_ptr&gt;), first_provider_policy&gt;; 可以看到这其实是一个插件的接口，具体可以参看method_decl，我们回头看transaction_async，通过get_method的方式将transaction信息异步发送至producer_plugin，那么get_method又是什么呢： 1 /** 2 * 获取对传入类型声明的方法的引用，第一次使用的时候将会重构这个方法，该方法也会绑定两个插件 3 */ 4 template&lt;typename MethodDecl&gt; 5 auto get_method() -&gt; std::enable_if_t&lt;is_method_decl&lt;MethodDecl&gt;::value, typename MethodDecl::method_type&amp;&gt; 6 { 7 using method_type = typename MethodDecl::method_type; 8 auto key = std::type_index(typeid(MethodDecl)); 9 auto itr = methods.find(key); 10 if(itr != methods.end()) { 11 return *method_type::get_method(itr-&gt;second); 12 } else { 13 methods.emplace(std::make_pair(key, method_type::make_unique())); 14 return *method_type::get_method(methods.at(key)); 15 } 16 } 读到这里我们大概都会猜想的到，既然是两个插件之间的通信，想必producer_plugin中也有transaction_async相关的使用，果不其然，在producer_plugin我们可以找得到transaction_async及其使用的地方： 1//接收来自chain_plugin中的transaction的句柄 2incoming::methods::transaction_async::method_type::handle _incoming_transaction_async_provider; 3//在producer_plugin插件初始化的时候就绑定了_incoming_transaction_async_provider和方法，类似于回调的方式，当有get_method执行的时候，on_incoming_transaction_async也将会执行 4 my-&gt;_incoming_transaction_async_provider = app().get_method&lt;incoming::methods::transaction_async&gt;().register_provider([this](const packed_transaction_ptr&amp; trx, bool persist_until_expired, next_function&lt;transaction_trace_ptr&gt; next) -&gt; void { 5 return my-&gt;on_incoming_transaction_async(trx, persist_until_expired, next ); 6 }); 在以前的文章中提到，节点生产区块实在start_block中执行的，我们不再赘述，下面完整的（默克尔树太长，忽略）打印其中一个区块的信息，新入门eos开发的读者朋友们也可以参考下一个区块中到底包含有哪些信息： 1{ 2 &quot;id&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 3 &quot;block_num&quot;: 58447, 4 &quot;header&quot;: { 5 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 6 &quot;producer&quot;: &quot;eosio&quot;, 7 &quot;confirmed&quot;: 0, 8 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 9 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 10 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 11 &quot;schedule_version&quot;: 0, 12 &quot;header_extensions&quot;: [], 13 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot; 14 }, 15 &quot;dpos_proposed_irreversible_blocknum&quot;: 58447, 16 &quot;dpos_irreversible_blocknum&quot;: 58446, 17 &quot;bft_irreversible_blocknum&quot;: 0, 18 &quot;pending_schedule_lib_num&quot;: 0, 19 &quot;pending_schedule_hash&quot;: &quot;828135c21a947b15cdbf4941ba09e1c9e0a80e88a157b0989e9b476b71a21c6b&quot;, 20 &quot;pending_schedule&quot;: { 21 &quot;version&quot;: 0, 22 &quot;producers&quot;: [] 23 }, 24 &quot;active_schedule&quot;: { 25 &quot;version&quot;: 0, 26 &quot;producers&quot;: [{ 27 &quot;producer_name&quot;: &quot;eosio&quot;, 28 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot; 29 }] 30 }, 31 &quot;blockroot_merkle&quot;: { //默克尔树省略 32 }, 33 &quot;producer_to_last_produced&quot;: [[&quot;eosio&quot;, 34 58447]], 35 &quot;producer_to_last_implied_irb&quot;: [[&quot;eosio&quot;, 36 58446]], 37 &quot;block_signing_key&quot;: &quot;EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV&quot;, 38 &quot;confirm_count&quot;: [], 39 &quot;confirmations&quot;: [], 40 &quot;block&quot;: { 41 &quot;timestamp&quot;: &quot;2018-09-15T07:28:49.500&quot;, 42 &quot;producer&quot;: &quot;eosio&quot;, 43 &quot;confirmed&quot;: 1, 44 &quot;previous&quot;: &quot;0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373&quot;, 45 &quot;transaction_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 46 &quot;action_mroot&quot;: &quot;0000000000000000000000000000000000000000000000000000000000000000&quot;, 47 &quot;schedule_version&quot;: 0, 48 &quot;header_extensions&quot;: [], 49 &quot;producer_signature&quot;: &quot;SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne&quot;, 50 &quot;transactions&quot;: [], 51 &quot;block_extensions&quot;: [] 52 }, 53 &quot;validated&quot;: false, 54 &quot;in_current_chain&quot;: true 55} 在我们的chain_plugin执行完push_transaction之后，controller.cpp中也对应着push_transaction,当没有transaction信息到来的时候，下面的内容不会执行，而当有交易信息的时候，则将会交易信息写入到pending中（注意，我这里加了部分日志打印来确认）： 1 if (!trx-&gt;implicit) { 2 transaction_receipt::status_enum s = (trx_context.delay == fc::seconds(0)) 3 ? transaction_receipt::executed 4 : transaction_receipt::delayed; 5 trace-&gt;receipt = push_receipt(trx-&gt;packed_trx, s, trx_context.billed_cpu_time_us, trace-&gt;net_usage); 6 pending-&gt;_pending_block_state-&gt;trxs.emplace_back(trx); 7 strPending = fc::json::to_string(*pending-&gt;_pending_block_state); 8 dlog(&quot;contorller push_transaction pending state step3:${state}&quot;, (&quot;state&quot;, strPending)); 9 } 在这些执行完成之后，我们可以看到pending的打印中将会多出transaction的相关信息，如下： 1&quot;transactions&quot;: [{ 2 &quot;status&quot;: &quot;executed&quot;, 3 &quot;cpu_usage_us&quot;: 953, 4 &quot;net_usage_words&quot;: 25, 5 &quot;trx&quot;: [1, 6 { 7 &quot;signatures&quot;: [&quot;SIG_K1_KVpVk3PeWTXqGmExT6Lf7TbbgmJsPXcmmF63UZrTjFxf9Q8mqnKtLrU2CcBeZH3KU6qps7g73HxPDrAsUHZcic9NUp7E6f&quot;], 8 &quot;compression&quot;: &quot;none&quot;, 9 &quot;packed_context_free_data&quot;: &quot;&quot;, 10 &quot;packed_trx&quot;: &quot;cfb49c5b4de4d5cd608f00000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea305500000819ab9cb1ca01000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000001000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000000&quot; 11 }] 本文主要结合日志打印来分析交易信息是如何通过push_action写入到区块中的，以命令行创建用户为例，拆分为八步来讨论两个插件之间的异步交互，chain_plugin中的信息是如何发送至producer_plugin中的。 如果你觉得我的文章对你有一定的帮助，请点击文章末尾的喜欢该作者。 如果你对eos开发感兴趣,欢迎关注本公众号,一起学习eos开发。 微信公众号 有任何疑问或者指教请添加本人个人微信,当然有对eos开发感兴趣或者金庸粉的也可以添加一起交流,备注eos开发或金庸。 个人微信号 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/10/02/c653d5cb5f5200497fd869416a428377.html","headline":"eos源码赏析（二十）：EOS智能合约之push_transaction的天龙八“步”","dateModified":"2018-10-02T00:00:00+08:00","datePublished":"2018-10-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/10/02/c653d5cb5f5200497fd869416a428377.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>eos源码赏析（二十）：EOS智能合约之push_transaction的天龙八“步”</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <p>很久没谈《天龙八部》了。</p> 
+  <p>eosio整个系统中，transaction占据着十分重要的位置。我们在区块链上的任何有效操作，都代表着有transaction被执行了。在执行的过程中，push_transaction是不可以被忽略的。例如我们创建账户的时候，会通过push_transaction写到区块信息中，我们进行转账也会push_transaction写到区块信息中，今天我们来看看push_transaction作为区块信息写入的入口，背后做了哪些操作，交易信息是如何写入到区块中的。</p> 
+  <p>本文主要包含以下内容：</p> 
+  <ul> 
+   <li>push_transaction的天龙八步</li> 
+   <li>transaction信息写入区块的过程</li> 
+  </ul> 
+  <p><strong>1、push_transaction的天龙八步</strong><br> 我们平时在代码调试或者阅读的过程中，总免不了使用cleos命令行，比如我们创建账户就需要使用：</p> 
+  <pre><code>cleos system newaccount eosio yourname pubkey  pubkey --stake-net "10.0000 EOS" --stake-cpu "10.0000 EOS" --buy-ram-bytes 1000
+</code></pre> 
+  <p>那么我们在这个命令输入之后都进行了哪些操作呢？在创建新用户的过程中,我们给新用户抵押了资源,购买了内存,在cleos的main.cpp中,我们以帮助新用户购买RAM为例,可以看到该命令调用了系统合约中的buyram方法，那么我们如何来一步步找到buyram这个action执行的地方呢，我们可以分为八步来看：</p> 
+  <pre><code>1//第一步：设置cleos命令行中传入的参数
+ 2add_standard_transaction_options(createAccount);
+ 3//第二步：根据公钥、私钥等创建账户
+ 4auto create = create_newaccount(creator, account_name, owner_key, active_key);
+ 5//第三步：创建购买ram等其他操作的action，在这里我们可以看到调用了系统合约中的buyram方法
+ 6create_action(tx_permission.empty() ? vector&lt;chain::permission_level&gt;{{creator,config::active_name}} : get_account_permissions(tx_permission),
+ 7                        config::system_account_name, N(buyram), act_payload);
+ 8}
+ 9//第四步：send_action
+10send_actions( { create, buyram, delegate } 
+11//第五步：push_action
+12auto result = push_actions( move(actions), extra_kcpu, compression);
+13//第六步：将action写到transaction中并push_transaction
+14fc::variant push_actions(std::vector&lt;chain::action&gt;&amp;&amp; actions, int32_t extra_kcpu, packed_transaction::compression_type compression = packed_transaction::none ) {
+15   signed_transaction trx;
+16   trx.actions = std::forward&lt;decltype(actions)&gt;(actions);
+17
+18   return push_transaction(trx, extra_kcpu, compression);
+19}
+20//第七步：通过回调，调用chain_plugin中的push_transaction
+21call(push_txn_func, packed_transaction(trx, compression));
+22//第八步：chain_plugin将transaction信息异步写入到区块中
+23void read_write::push_transaction(const read_write::push_transaction_params&amp; params, next_function&lt;read_write::push_transaction_results&gt; next) 
+24{
+25     //处理
+26}
+</code></pre> 
+  <p>创建账户的时候是如此，其他的链上操作也基本类似，感兴趣的可以去一一查看，接下来我们要看看天龙八步中的第八步，交易信息是如何写入区块中的。</p> 
+  <p><strong>2、push_transaction背后的操作</strong><br> 我们通过以前的文章可以了解到，区块的生成是以producer_plugin为入口，而后在chain的controller中实际完成的，那么上面天龙八步中的第八步是如何将交易transaction信息异步发送至producer_plugin中的呢。我们在来看chain_plugin中的transaction，可以看到其中使用了incoming::methods::transaction_async异步调用的方式，一步步的走下去：</p> 
+  <pre><code>1app().get_method&lt;incoming::methods::transaction_async&gt;()(pretty_input, true, [this, next](const fc::static_variant&lt;fc::exception_ptr, transaction_trace_ptr&gt;&amp; result) 
+2//transaction_async的定义
+3using transaction_async     = method_decl&lt;chain_plugin_interface, void(const packed_transaction_ptr&amp;, bool, next_function&lt;transaction_trace_ptr&gt;), first_provider_policy&gt;;
+</code></pre> 
+  <p>可以看到这其实是一个插件的接口，具体可以参看method_decl，我们回头看transaction_async，通过get_method的方式将transaction信息异步发送至producer_plugin，那么get_method又是什么呢：</p> 
+  <pre><code>1         /**
+ 2          * 获取对传入类型声明的方法的引用，第一次使用的时候将会重构这个方法，该方法也会绑定两个插件
+ 3          */
+ 4         template&lt;typename MethodDecl&gt;
+ 5         auto get_method() -&gt; std::enable_if_t&lt;is_method_decl&lt;MethodDecl&gt;::value, typename MethodDecl::method_type&amp;&gt;
+ 6         {
+ 7            using method_type = typename MethodDecl::method_type;
+ 8            auto key = std::type_index(typeid(MethodDecl));
+ 9            auto itr = methods.find(key);
+10            if(itr != methods.end()) {
+11               return *method_type::get_method(itr-&gt;second);
+12            } else {
+13               methods.emplace(std::make_pair(key, method_type::make_unique()));
+14               return  *method_type::get_method(methods.at(key));
+15            }
+16         }
+</code></pre> 
+  <p>读到这里我们大概都会猜想的到，既然是两个插件之间的通信，想必producer_plugin中也有transaction_async相关的使用，果不其然，在producer_plugin我们可以找得到transaction_async及其使用的地方：</p> 
+  <pre><code>1//接收来自chain_plugin中的transaction的句柄
+2incoming::methods::transaction_async::method_type::handle _incoming_transaction_async_provider;
+3//在producer_plugin插件初始化的时候就绑定了_incoming_transaction_async_provider和方法，类似于回调的方式，当有get_method执行的时候，on_incoming_transaction_async也将会执行
+4   my-&gt;_incoming_transaction_async_provider = app().get_method&lt;incoming::methods::transaction_async&gt;().register_provider([this](const packed_transaction_ptr&amp; trx, bool persist_until_expired, next_function&lt;transaction_trace_ptr&gt; next) -&gt; void {
+5      return my-&gt;on_incoming_transaction_async(trx, persist_until_expired, next );
+6   });
+</code></pre> 
+  <p>在以前的文章中提到，节点生产区块实在start_block中执行的，我们不再赘述，下面完整的（默克尔树太长，忽略）打印其中一个区块的信息，新入门eos开发的读者朋友们也可以参考下一个区块中到底包含有哪些信息：</p> 
+  <pre><code>1{
+ 2    "id": "0000000000000000000000000000000000000000000000000000000000000000",
+ 3    "block_num": 58447,
+ 4    "header": {
+ 5        "timestamp": "2018-09-15T07:28:49.500",
+ 6        "producer": "eosio",
+ 7        "confirmed": 0,
+ 8        "previous": "0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373",
+ 9        "transaction_mroot": "0000000000000000000000000000000000000000000000000000000000000000",
+10        "action_mroot": "0000000000000000000000000000000000000000000000000000000000000000",
+11        "schedule_version": 0,
+12        "header_extensions": [],
+13        "producer_signature": "SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne"
+14    },
+15    "dpos_proposed_irreversible_blocknum": 58447,
+16    "dpos_irreversible_blocknum": 58446,
+17    "bft_irreversible_blocknum": 0,
+18    "pending_schedule_lib_num": 0,
+19    "pending_schedule_hash": "828135c21a947b15cdbf4941ba09e1c9e0a80e88a157b0989e9b476b71a21c6b",
+20    "pending_schedule": {
+21        "version": 0,
+22        "producers": []
+23    },
+24    "active_schedule": {
+25        "version": 0,
+26        "producers": [{
+27            "producer_name": "eosio",
+28            "block_signing_key": "EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV"
+29        }]
+30    },
+31    "blockroot_merkle": {
+         //默克尔树省略
+32    },
+33    "producer_to_last_produced": [["eosio",
+34    58447]],
+35    "producer_to_last_implied_irb": [["eosio",
+36    58446]],
+37    "block_signing_key": "EOS6MRyAjQq8ud7hVNYcfnVPJqcVpscN5So8BhtHuGYqET5GDW5CV",
+38    "confirm_count": [],
+39    "confirmations": [],
+40    "block": {
+41        "timestamp": "2018-09-15T07:28:49.500",
+42        "producer": "eosio",
+43        "confirmed": 1,
+44        "previous": "0000e44e252e319484583568da419e4179a9d956198e933927f4b7806bb8a373",
+45        "transaction_mroot": "0000000000000000000000000000000000000000000000000000000000000000",
+46        "action_mroot": "0000000000000000000000000000000000000000000000000000000000000000",
+47        "schedule_version": 0,
+48        "header_extensions": [],
+49        "producer_signature": "SIG_K1_111111111111111111111111111111111111111111111111111111111111111116uk5ne",
+50        "transactions": [],
+51        "block_extensions": []
+52    },
+53    "validated": false,
+54    "in_current_chain": true
+55}
+</code></pre> 
+  <p>在我们的chain_plugin执行完push_transaction之后，controller.cpp中也对应着push_transaction,当没有transaction信息到来的时候，下面的内容不会执行，而当有交易信息的时候，则将会交易信息写入到pending中（注意，我这里加了部分日志打印来确认）：</p> 
+  <pre><code>1 if (!trx-&gt;implicit) {
+2               transaction_receipt::status_enum s = (trx_context.delay == fc::seconds(0))
+3                                                    ? transaction_receipt::executed
+4                                                    : transaction_receipt::delayed;
+5               trace-&gt;receipt = push_receipt(trx-&gt;packed_trx, s, trx_context.billed_cpu_time_us, trace-&gt;net_usage);
+6               pending-&gt;_pending_block_state-&gt;trxs.emplace_back(trx);
+7                strPending = fc::json::to_string(*pending-&gt;_pending_block_state);
+8                dlog("contorller push_transaction pending state step3:${state}", ("state", strPending));
+9            } 
+</code></pre> 
+  <p>在这些执行完成之后，我们可以看到pending的打印中将会多出transaction的相关信息，如下：</p> 
+  <pre><code>1"transactions": [{
+ 2           "status": "executed",
+ 3            "cpu_usage_us": 953,
+ 4            "net_usage_words": 25,
+ 5            "trx": [1,
+ 6            {
+ 7                "signatures": ["SIG_K1_KVpVk3PeWTXqGmExT6Lf7TbbgmJsPXcmmF63UZrTjFxf9Q8mqnKtLrU2CcBeZH3KU6qps7g73HxPDrAsUHZcic9NUp7E6f"],
+ 8                "compression": "none",
+ 9                "packed_context_free_data": "",
+10                "packed_trx": "cfb49c5b4de4d5cd608f00000000010000000000ea305500409e9a2264b89a010000000000ea305500000000a8ed3232660000000000ea305500000819ab9cb1ca01000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000001000000010003e2f5c375717113f8cde854b8fabf0f8db01c02b9e197e13b8cf83100728f0b390100000000"
+11            }]
+</code></pre> 
+  <p>本文主要结合日志打印来分析交易信息是如何通过push_action写入到区块中的，以命令行创建用户为例，拆分为八步来讨论两个插件之间的异步交互，chain_plugin中的信息是如何发送至producer_plugin中的。</p> 
+  <p>如果你觉得我的文章对你有一定的帮助，请点击文章末尾的喜欢该作者。</p> 
+  <p>如果你对eos开发感兴趣,欢迎关注本公众号,一起学习eos开发。</p> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180910230008245?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"><br> 微信公众号<br> 有任何疑问或者指教请添加本人个人微信,当然有对eos开发感兴趣或者金庸粉的也可以添加一起交流,备注eos开发或金庸。<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180910230017130?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3podXhpYW5nemhpZGk=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>个人微信号</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-7f770a53f2.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhuxiangzhidi/article/details/82926903,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhuxiangzhidi/article/details/82926903,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

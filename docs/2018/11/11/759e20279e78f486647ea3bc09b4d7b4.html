@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>深入区块链以太坊源码之p2p通信 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="深入区块链以太坊源码之p2p通信" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961303 一、p2p网络中分为有结构和无结构的网络 无结构化的： 这种p2p网络即最普通的，不对结构作特别设计的实现方案。 优点是结构简单易于组建，网络局部区域内个体可任意分布， 反正此时网络结构对此也没有限制；特别是在应对大量新个体加 入网络和旧个体离开网络(“churn”)时它的表现非常稳定。 缺点在于在该网络中查找数据的效率太低，因为没有预知信息， 所以往往需要将查询请求发遍整个网络(至少大多数个体)， 这会占用很大一部分网络资源，并大大拖慢网络中其他业务运行。 结构化的 这种p2p网络中的个体分布经过精心设计，主要目的是为了提高查询数据的效率， 降低查询数据带来的资源消耗。 以太坊采用了不需要结构化的结构，经过改进的非结构化(比如设计好相邻个体列表peerSet结构) 网络模型可以满足需求； 二、分布式hash表（DHT） 保存数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点得到了新加入的数据（K/V），它会先计算自己与新数据的 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么这个数据就保持在自己这里。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 获取数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点接收到查询数据的请求（key），它会先计算自己与 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么就在自己这里找有没有 key 对应的 value。 有的话就返回 value，没有的话就报错。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 三、以太坊中p2p通信的管理模块ProtocolManager /geth.go // Start creates a live P2P node and starts running it. func (n *Node) Start() error { return n.node.Start() } /* Protocol:容纳应用程序所要求的回调函数等.并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。 Node.Start()中首先会创建p2p.Server{}，此时Server中的Protocol[]还是空的； 然后将Node中载入的所有&lt;Service&gt;实现体中的Protocol都收集起来， 一并交给Server对象，作为Server.Protocols列表；然后启动Server对象， 并将Server对象作为参数去逐一启动每个&lt;Service&gt;实现体。 */ /node.go // Start create a live P2P node and starts running it. func (n *Node) Start() error { ... /* ... 初始化serverConfig */ running := &amp;p2p.Server{Config: n.serverConfig} ... // Gather the protocols and start the freshly assembled P2P server for _, service := range services { running.Protocols = append(running.Protocols, service.Protocols()...) } if err := running.Start(); err != nil { //见下面的(srv *Server)Start方法 return convertFileLockError(err) } // Start each of the services started := []reflect.Type{} for kind, service := range services { // Start the next service, stopping all previous upon failure //启动每个services通过下面的方法func (s *Ethereum) Start(srvr *p2p.Server) error { if err := service.Start(running); err != nil { for _, kind := range started { services[kind].Stop() } running.Stop() return err } ... } } // Start starts running the server. // Servers can not be re-used after stopping. func (srv *Server) Start() (err error) { srv.lock.Lock() //srv.lock为了避免多线程重复启动 defer srv.lock.Unlock() if srv.running { return errors.New(&quot;server already running&quot;) } srv.running = true srv.log = srv.Config.Logger if srv.log == nil { srv.log = log.New() } if srv.NoDial &amp;&amp; srv.ListenAddr == &quot;&quot; { srv.log.Warn(&quot;P2P server will be useless, neither dialing nor listening&quot;) } // static fields if srv.PrivateKey == nil { return fmt.Errorf(&quot;Server.PrivateKey must be set to a non-nil key&quot;) } //newTransport使用了newRLPX使用了rlpx.go中的网络协议。 if srv.newTransport == nil { srv.newTransport = newRLPX } if srv.Dialer == nil { srv.Dialer = TCPDialer{&amp;net.Dialer{Timeout: defaultDialTimeout}} } srv.quit = make(chan struct{}) srv.addpeer = make(chan *conn) srv.delpeer = make(chan peerDrop) srv.posthandshake = make(chan *conn) srv.addstatic = make(chan *enode.Node) srv.removestatic = make(chan *enode.Node) srv.addtrusted = make(chan *enode.Node) srv.removetrusted = make(chan *enode.Node) srv.peerOp = make(chan peerOpFunc) srv.peerOpDone = make(chan struct{}) //srv.setupLocalNode()这里主要执行握手 if err := srv.setupLocalNode(); err != nil { return err } if srv.ListenAddr != &quot;&quot; { //监听TCP端口--&gt;用于业务数据传输，基于RLPx协议） //在setupListening中有个go srv.listenLoop()去监听某个端口有无主动发来的IP连接 if err := srv.setupListening(); err != nil { return err } } //侦听UDP端口（用于结点发现内部会启动goroutine） if err := srv.setupDiscovery(); err != nil { return err } dynPeers := srv.maxDialedConns() dialer := newDialState(srv.localnode.ID(), srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict) srv.loopWG.Add(1) // 启动新线程发起TCP连接请求 //在run()函数中，监听srv.addpeer通道有没有信息如果有远端peer发来连接请求， //则调用Server.newPeer()生成新的peer对象，并把Server.Protocols全交给peer。 /* case c := &lt;-srv.addpeer: err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. p := newPeer(c, srv.Protocols) } */ go srv.run(dialer) return nil } // Start implements node.Service, starting all internal goroutines needed by the // Ethereum protocol implementation. func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines s.startBloomHandlers(params.BloomBitsBlocks) // Start the RPC service s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers) if s.lesServer != nil { s.lesServer.Start(srvr) } return nil } /eth/handler.go type ProtocolManager struct { networkID uint64 fastSync uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks) acceptTxs uint32 // Flag whether we&#39;re considered synchronised (enables transaction processing) txpool txPool blockchain *core.BlockChain chainconfig *params.ChainConfig maxPeers int //Downloader类型成员负责所有向相邻个体主动发起的同步流程。 downloader *downloader.Downloader //Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后做出安排 fetcher *fetcher.Fetcher //用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 peers *peerSet SubProtocols []p2p.Protocol eventMux *event.TypeMux txsCh chan core.NewTxsEvent txsSub event.Subscription minedBlockSub *event.TypeMuxSubscription //通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。 //当然在应用中，订阅也往往利用通道来实现事件通知。 // channels for fetcher, syncer, txsyncLoop newPeerCh chan *peer txsyncCh chan *txsync quitSync chan struct{} noMorePeers chan struct{} // wait group is used for graceful shutdowns during downloading // and processing wg sync.WaitGroup } Start()函数是ProtocolManager的启动函数，它会在eth.Ethereum.Start()中被主动调用。 ProtocolManager.Start()会启用4个单独线程(goroutine,协程)去分别执行4个函数， 这也标志着该以太坊个体p2p通信的全面启动。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions //广播交易的通道。 txsCh会作为txpool的TxPreEvent订阅通道。 //txpool有了这种消息会通知给这个txsCh。 广播交易的goroutine会把这个消息广播出去。 pm.txsCh = make(chan core.NewTxsEvent, txChanSize) //订阅交易信息 pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() //订阅挖矿消息。当新的Block被挖出来的时候会产生消息 // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) //挖矿广播 goroutine 当挖出来的时候需要尽快的广播到网络上面去。 go pm.minedBroadcastLoop() // start sync handlers // 同步器负责周期性地与网络同步，下载散列和块以及处理通知处理程序。 go pm.syncer() // txsyncLoop负责每个新连接的初始事务同步。 当新的peer出现时， // 转发所有当前待处理的事务。为了最小化出口带宽使用，我们一次只发送一个小包。 go pm.txsyncLoop() } //txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件， //会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 //------------------go pm.txBroadcastLoop()----------------------- func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txsCh: pm.BroadcastTxs(event.Txs) // Err() channel will be closed when unsubscribing. case &lt;-pm.txsSub.Err(): return } } } // BroadcastTxs will propagate a batch of transactions to all peers which are not known to // already have the given transaction. func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } // AsyncSendTransactions queues list of transactions propagation to a remote // peer. If the peer&#39;s broadcast queue is full, the event is silently dropped. // 同步Tx给每个相邻未知Tx的peer func (p *peer) AsyncSendTransactions(txs []*types.Transaction) { select { case p.queuedTxs &lt;- txs: for _, tx := range txs { p.knownTxs.Add(tx.Hash()) } default: p.Log().Debug(&quot;Dropping transaction propagation&quot;, &quot;count&quot;, len(txs)) } } //------------------go pm.minedBroadcastLoop()----------------------- // Mined broadcast loop //挖矿之后的广播 func (pm *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range pm.minedBlockSub.Chan() { //Data为interface{} ，使用接口断言的方法将Data转化为类型NewMinedBlockEvent if ev, ok := obj.Data.(core.NewMinedBlockEvent); ok { //BroadcastBlock的第二个参数为true时，会将整个新区块依次发给相邻区块中的一小部分； //而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 pm.BroadcastBlock(ev.Block, true) // First propagate block to peers pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } //---------------------------go pm.syncer()----------------------------- /* syncer()首先启动fetcher成员，然后进入一个无限循环， 每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。 发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时， 发起之；如果没有新peer到达，则以10s为间隔定时的发起之。 这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高， 由于Td是全链中从创世块到最新头块的Difficulty值总和， 所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步， 显然改动量是最小的，此即&quot;最优&quot;。 */ // syncer is responsible for periodically synchronising with the network, both // downloading hashes and blocks as well as handling the announcement handler. func (pm *ProtocolManager) syncer() { // Start and ensure cleanup of sync mechanisms //启动 fetcher，辅助同步区块数据 pm.fetcher.Start() defer pm.fetcher.Stop() defer pm.downloader.Terminate() // Wait for different events to fire synchronisation operations forceSync := time.NewTicker(forceSyncCycle) defer forceSync.Stop() for { select { case &lt;-pm.newPeerCh: // Make sure we have peers to select from, then sync if pm.peers.Len() &lt; minDesiredPeerCount { break } go pm.synchronise(pm.peers.BestPeer()) case &lt;-forceSync.C: // Force a sync even if not enough peers are present go pm.synchronise(pm.peers.BestPeer()) case &lt;-pm.noMorePeers: return } } } // Start boots up the announcement based synchroniser, accepting and processing // hash notifications and block fetches until termination requested. func (f *Fetcher) Start() { go f.loop() } //---------------------go.txsyncLoop()--------------------- // txsyncLoop takes care of the initial transaction sync for each new // connection. When a new peer appears, we relay all currently pending // transactions. In order to minimise egress bandwidth usage, we send // the transactions in small packs to one peer at a time. /*当从网络节点同步过来最新的交易数据后，本地也会把新同步下来的交易数据广播给网络中的其他节点。 */ func (pm *ProtocolManager) txsyncLoop() { var ( pending = make(map[enode.ID]*txsync) sending = false // whether a send is active pack = new(txsync) // the pack that is being sent done = make(chan error, 1) // result of the send ) // send starts a sending a pack of transactions from the sync. send := func(s *txsync) { // Fill pack with transactions up to the target size. size := common.StorageSize(0) pack.p = s.p pack.txs = pack.txs[:0] for i := 0; i &lt; len(s.txs) &amp;&amp; size &lt; txsyncPackSize; i++ { pack.txs = append(pack.txs, s.txs[i]) size += s.txs[i].Size() } // Remove the transactions that will be sent. s.txs = s.txs[:copy(s.txs, s.txs[len(pack.txs):])] if len(s.txs) == 0 { delete(pending, s.p.ID()) } // Send the pack in the background. s.p.Log().Trace(&quot;Sending batch of transactions&quot;, &quot;count&quot;, len(pack.txs), &quot;bytes&quot;, size) sending = true go func() { done &lt;- pack.p.SendTransactions(pack.txs) }() } // pick chooses the next pending sync. pick := func() *txsync { if len(pending) == 0 { return nil } n := rand.Intn(len(pending)) + 1 for _, s := range pending { if n--; n == 0 { return s } } return nil } for { select { case s := &lt;-pm.txsyncCh: pending[s.p.ID()] = s if !sending { send(s) } case err := &lt;-done: sending = false // Stop tracking peers that cause send failures. if err != nil { pack.p.Log().Debug(&quot;Transaction send failed&quot;, &quot;err&quot;, err) delete(pending, pack.p.ID()) } // Schedule the next send. if s := pick(); s != nil { send(s) } case &lt;-pm.quitSync: return } } } 四个管道主要的功能都是围绕广播和同步展开的 (广播区块、广播交易，同步到区块、同步到交易，再广播区块、广播交易。) /* 对于peer间通信而言，除了己方需要主动向对方peer发起通信(比如Start()中启动的四个独立流程)之外， 还需要一种由对方peer主动调用的数据传输，这种传输不仅仅是由对方peer发给己方， 更多的用法是对方peer主动调用一个函数让己方发给它们某些特定数据。这种通信方式， 在代码实现上适合用回调(callback)来实现。 ProtocolManager.handle()就是这样一个函数，它会在ProtocolManager对象创建时， 以回调函数的方式“埋入”每个p2p.Protocol对象中(实现了Protocol.Run()方法)。 之后每当有新peer要与己方建立通信时，如果对方能够支持该Protocol， 那么双方就可以顺利的建立并开始通信。以下是handle()的基本代码： */ // handle is the callback invoked to manage the life cycle of an eth peer. When // this function terminates, the peer is disconnected. func (pm *ProtocolManager) handle(p *peer) error { // Ignore maxPeers if this is a trusted peer if pm.peers.Len() &gt;= pm.maxPeers &amp;&amp; !p.Peer.Info().Network.Trusted { return p2p.DiscTooManyPeers } p.Log().Debug(&quot;Ethereum peer connected&quot;, &quot;name&quot;, p.Name()) // Execute the Ethereum handshake var ( genesis = pm.blockchain.Genesis() head = pm.blockchain.CurrentHeader() hash = head.Hash() number = head.Number.Uint64() td = pm.blockchain.GetTd(hash, number) ) //握手，与对方peer沟通己方的区块链状态 if err := p.Handshake(pm.networkID, td, hash, genesis.Hash()); err != nil { p.Log().Debug(&quot;Ethereum handshake failed&quot;, &quot;err&quot;, err) return err } //初始化一个读写通道，用以跟对方peer相互数据传输。 if rw, ok := p.rw.(*meteredMsgReadWriter); ok { rw.Init(p.version) } // Register the peer locally //注册对方peer，存入己方peer列表；只有handle()函数退出时，才会将这个peer移除出列表。 if err := pm.peers.Register(p); err != nil { p.Log().Error(&quot;Ethereum peer registration failed&quot;, &quot;err&quot;, err) return err } defer pm.removePeer(p.id) //Downloader成员注册这个新peer；Downloader会自己维护一个相邻peer列表。 // Register the peer in the downloader. If the downloader considers it banned, we disconnect if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil { return err } // Propagate existing transactions. new transactions appearing // after this will be sent via broadcasts. /* 调用syncTransactions()，用当前txpool中新累计的tx对象组装成一个txsync{}对象， 推送到内部通道txsyncCh。还记得Start()启动的四个函数么? 其中第四项txsyncLoop() 中用以等待txsync{}数据的通道txsyncCh，正是在这里被推入txsync{}的。 */ pm.syncTransactions(p) // If we&#39;re DAO hard-fork aware, validate any remote peer with regard to the hard-fork if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil { // Request the peer&#39;s DAO fork header for extra-data validation if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil { return err } // Start a timer to disconnect if the peer doesn&#39;t reply in time p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() { p.Log().Debug(&quot;Timed out DAO fork-check, dropping&quot;) pm.removePeer(p.id) }) // Make sure it&#39;s cleaned up if the peer dies off defer func() { if p.forkDrop != nil { p.forkDrop.Stop() p.forkDrop = nil } }() } //在无限循环中启动handleMsg()，当对方peer发出任何msg时， //handleMsg()可以捕捉相应类型的消息并在己方进行处理。 // main loop. handle incoming messages. for { if err := pm.handleMsg(p); err != nil { p.Log().Debug(&quot;Ethereum message handling failed&quot;, &quot;err&quot;, err) return err } } } &nbsp; 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961303 一、p2p网络中分为有结构和无结构的网络 无结构化的： 这种p2p网络即最普通的，不对结构作特别设计的实现方案。 优点是结构简单易于组建，网络局部区域内个体可任意分布， 反正此时网络结构对此也没有限制；特别是在应对大量新个体加 入网络和旧个体离开网络(“churn”)时它的表现非常稳定。 缺点在于在该网络中查找数据的效率太低，因为没有预知信息， 所以往往需要将查询请求发遍整个网络(至少大多数个体)， 这会占用很大一部分网络资源，并大大拖慢网络中其他业务运行。 结构化的 这种p2p网络中的个体分布经过精心设计，主要目的是为了提高查询数据的效率， 降低查询数据带来的资源消耗。 以太坊采用了不需要结构化的结构，经过改进的非结构化(比如设计好相邻个体列表peerSet结构) 网络模型可以满足需求； 二、分布式hash表（DHT） 保存数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点得到了新加入的数据（K/V），它会先计算自己与新数据的 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么这个数据就保持在自己这里。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 获取数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点接收到查询数据的请求（key），它会先计算自己与 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么就在自己这里找有没有 key 对应的 value。 有的话就返回 value，没有的话就报错。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 三、以太坊中p2p通信的管理模块ProtocolManager /geth.go // Start creates a live P2P node and starts running it. func (n *Node) Start() error { return n.node.Start() } /* Protocol:容纳应用程序所要求的回调函数等.并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。 Node.Start()中首先会创建p2p.Server{}，此时Server中的Protocol[]还是空的； 然后将Node中载入的所有&lt;Service&gt;实现体中的Protocol都收集起来， 一并交给Server对象，作为Server.Protocols列表；然后启动Server对象， 并将Server对象作为参数去逐一启动每个&lt;Service&gt;实现体。 */ /node.go // Start create a live P2P node and starts running it. func (n *Node) Start() error { ... /* ... 初始化serverConfig */ running := &amp;p2p.Server{Config: n.serverConfig} ... // Gather the protocols and start the freshly assembled P2P server for _, service := range services { running.Protocols = append(running.Protocols, service.Protocols()...) } if err := running.Start(); err != nil { //见下面的(srv *Server)Start方法 return convertFileLockError(err) } // Start each of the services started := []reflect.Type{} for kind, service := range services { // Start the next service, stopping all previous upon failure //启动每个services通过下面的方法func (s *Ethereum) Start(srvr *p2p.Server) error { if err := service.Start(running); err != nil { for _, kind := range started { services[kind].Stop() } running.Stop() return err } ... } } // Start starts running the server. // Servers can not be re-used after stopping. func (srv *Server) Start() (err error) { srv.lock.Lock() //srv.lock为了避免多线程重复启动 defer srv.lock.Unlock() if srv.running { return errors.New(&quot;server already running&quot;) } srv.running = true srv.log = srv.Config.Logger if srv.log == nil { srv.log = log.New() } if srv.NoDial &amp;&amp; srv.ListenAddr == &quot;&quot; { srv.log.Warn(&quot;P2P server will be useless, neither dialing nor listening&quot;) } // static fields if srv.PrivateKey == nil { return fmt.Errorf(&quot;Server.PrivateKey must be set to a non-nil key&quot;) } //newTransport使用了newRLPX使用了rlpx.go中的网络协议。 if srv.newTransport == nil { srv.newTransport = newRLPX } if srv.Dialer == nil { srv.Dialer = TCPDialer{&amp;net.Dialer{Timeout: defaultDialTimeout}} } srv.quit = make(chan struct{}) srv.addpeer = make(chan *conn) srv.delpeer = make(chan peerDrop) srv.posthandshake = make(chan *conn) srv.addstatic = make(chan *enode.Node) srv.removestatic = make(chan *enode.Node) srv.addtrusted = make(chan *enode.Node) srv.removetrusted = make(chan *enode.Node) srv.peerOp = make(chan peerOpFunc) srv.peerOpDone = make(chan struct{}) //srv.setupLocalNode()这里主要执行握手 if err := srv.setupLocalNode(); err != nil { return err } if srv.ListenAddr != &quot;&quot; { //监听TCP端口--&gt;用于业务数据传输，基于RLPx协议） //在setupListening中有个go srv.listenLoop()去监听某个端口有无主动发来的IP连接 if err := srv.setupListening(); err != nil { return err } } //侦听UDP端口（用于结点发现内部会启动goroutine） if err := srv.setupDiscovery(); err != nil { return err } dynPeers := srv.maxDialedConns() dialer := newDialState(srv.localnode.ID(), srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict) srv.loopWG.Add(1) // 启动新线程发起TCP连接请求 //在run()函数中，监听srv.addpeer通道有没有信息如果有远端peer发来连接请求， //则调用Server.newPeer()生成新的peer对象，并把Server.Protocols全交给peer。 /* case c := &lt;-srv.addpeer: err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. p := newPeer(c, srv.Protocols) } */ go srv.run(dialer) return nil } // Start implements node.Service, starting all internal goroutines needed by the // Ethereum protocol implementation. func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines s.startBloomHandlers(params.BloomBitsBlocks) // Start the RPC service s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers) if s.lesServer != nil { s.lesServer.Start(srvr) } return nil } /eth/handler.go type ProtocolManager struct { networkID uint64 fastSync uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks) acceptTxs uint32 // Flag whether we&#39;re considered synchronised (enables transaction processing) txpool txPool blockchain *core.BlockChain chainconfig *params.ChainConfig maxPeers int //Downloader类型成员负责所有向相邻个体主动发起的同步流程。 downloader *downloader.Downloader //Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后做出安排 fetcher *fetcher.Fetcher //用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 peers *peerSet SubProtocols []p2p.Protocol eventMux *event.TypeMux txsCh chan core.NewTxsEvent txsSub event.Subscription minedBlockSub *event.TypeMuxSubscription //通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。 //当然在应用中，订阅也往往利用通道来实现事件通知。 // channels for fetcher, syncer, txsyncLoop newPeerCh chan *peer txsyncCh chan *txsync quitSync chan struct{} noMorePeers chan struct{} // wait group is used for graceful shutdowns during downloading // and processing wg sync.WaitGroup } Start()函数是ProtocolManager的启动函数，它会在eth.Ethereum.Start()中被主动调用。 ProtocolManager.Start()会启用4个单独线程(goroutine,协程)去分别执行4个函数， 这也标志着该以太坊个体p2p通信的全面启动。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions //广播交易的通道。 txsCh会作为txpool的TxPreEvent订阅通道。 //txpool有了这种消息会通知给这个txsCh。 广播交易的goroutine会把这个消息广播出去。 pm.txsCh = make(chan core.NewTxsEvent, txChanSize) //订阅交易信息 pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() //订阅挖矿消息。当新的Block被挖出来的时候会产生消息 // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) //挖矿广播 goroutine 当挖出来的时候需要尽快的广播到网络上面去。 go pm.minedBroadcastLoop() // start sync handlers // 同步器负责周期性地与网络同步，下载散列和块以及处理通知处理程序。 go pm.syncer() // txsyncLoop负责每个新连接的初始事务同步。 当新的peer出现时， // 转发所有当前待处理的事务。为了最小化出口带宽使用，我们一次只发送一个小包。 go pm.txsyncLoop() } //txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件， //会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 //------------------go pm.txBroadcastLoop()----------------------- func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txsCh: pm.BroadcastTxs(event.Txs) // Err() channel will be closed when unsubscribing. case &lt;-pm.txsSub.Err(): return } } } // BroadcastTxs will propagate a batch of transactions to all peers which are not known to // already have the given transaction. func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } // AsyncSendTransactions queues list of transactions propagation to a remote // peer. If the peer&#39;s broadcast queue is full, the event is silently dropped. // 同步Tx给每个相邻未知Tx的peer func (p *peer) AsyncSendTransactions(txs []*types.Transaction) { select { case p.queuedTxs &lt;- txs: for _, tx := range txs { p.knownTxs.Add(tx.Hash()) } default: p.Log().Debug(&quot;Dropping transaction propagation&quot;, &quot;count&quot;, len(txs)) } } //------------------go pm.minedBroadcastLoop()----------------------- // Mined broadcast loop //挖矿之后的广播 func (pm *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range pm.minedBlockSub.Chan() { //Data为interface{} ，使用接口断言的方法将Data转化为类型NewMinedBlockEvent if ev, ok := obj.Data.(core.NewMinedBlockEvent); ok { //BroadcastBlock的第二个参数为true时，会将整个新区块依次发给相邻区块中的一小部分； //而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 pm.BroadcastBlock(ev.Block, true) // First propagate block to peers pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } //---------------------------go pm.syncer()----------------------------- /* syncer()首先启动fetcher成员，然后进入一个无限循环， 每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。 发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时， 发起之；如果没有新peer到达，则以10s为间隔定时的发起之。 这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高， 由于Td是全链中从创世块到最新头块的Difficulty值总和， 所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步， 显然改动量是最小的，此即&quot;最优&quot;。 */ // syncer is responsible for periodically synchronising with the network, both // downloading hashes and blocks as well as handling the announcement handler. func (pm *ProtocolManager) syncer() { // Start and ensure cleanup of sync mechanisms //启动 fetcher，辅助同步区块数据 pm.fetcher.Start() defer pm.fetcher.Stop() defer pm.downloader.Terminate() // Wait for different events to fire synchronisation operations forceSync := time.NewTicker(forceSyncCycle) defer forceSync.Stop() for { select { case &lt;-pm.newPeerCh: // Make sure we have peers to select from, then sync if pm.peers.Len() &lt; minDesiredPeerCount { break } go pm.synchronise(pm.peers.BestPeer()) case &lt;-forceSync.C: // Force a sync even if not enough peers are present go pm.synchronise(pm.peers.BestPeer()) case &lt;-pm.noMorePeers: return } } } // Start boots up the announcement based synchroniser, accepting and processing // hash notifications and block fetches until termination requested. func (f *Fetcher) Start() { go f.loop() } //---------------------go.txsyncLoop()--------------------- // txsyncLoop takes care of the initial transaction sync for each new // connection. When a new peer appears, we relay all currently pending // transactions. In order to minimise egress bandwidth usage, we send // the transactions in small packs to one peer at a time. /*当从网络节点同步过来最新的交易数据后，本地也会把新同步下来的交易数据广播给网络中的其他节点。 */ func (pm *ProtocolManager) txsyncLoop() { var ( pending = make(map[enode.ID]*txsync) sending = false // whether a send is active pack = new(txsync) // the pack that is being sent done = make(chan error, 1) // result of the send ) // send starts a sending a pack of transactions from the sync. send := func(s *txsync) { // Fill pack with transactions up to the target size. size := common.StorageSize(0) pack.p = s.p pack.txs = pack.txs[:0] for i := 0; i &lt; len(s.txs) &amp;&amp; size &lt; txsyncPackSize; i++ { pack.txs = append(pack.txs, s.txs[i]) size += s.txs[i].Size() } // Remove the transactions that will be sent. s.txs = s.txs[:copy(s.txs, s.txs[len(pack.txs):])] if len(s.txs) == 0 { delete(pending, s.p.ID()) } // Send the pack in the background. s.p.Log().Trace(&quot;Sending batch of transactions&quot;, &quot;count&quot;, len(pack.txs), &quot;bytes&quot;, size) sending = true go func() { done &lt;- pack.p.SendTransactions(pack.txs) }() } // pick chooses the next pending sync. pick := func() *txsync { if len(pending) == 0 { return nil } n := rand.Intn(len(pending)) + 1 for _, s := range pending { if n--; n == 0 { return s } } return nil } for { select { case s := &lt;-pm.txsyncCh: pending[s.p.ID()] = s if !sending { send(s) } case err := &lt;-done: sending = false // Stop tracking peers that cause send failures. if err != nil { pack.p.Log().Debug(&quot;Transaction send failed&quot;, &quot;err&quot;, err) delete(pending, pack.p.ID()) } // Schedule the next send. if s := pick(); s != nil { send(s) } case &lt;-pm.quitSync: return } } } 四个管道主要的功能都是围绕广播和同步展开的 (广播区块、广播交易，同步到区块、同步到交易，再广播区块、广播交易。) /* 对于peer间通信而言，除了己方需要主动向对方peer发起通信(比如Start()中启动的四个独立流程)之外， 还需要一种由对方peer主动调用的数据传输，这种传输不仅仅是由对方peer发给己方， 更多的用法是对方peer主动调用一个函数让己方发给它们某些特定数据。这种通信方式， 在代码实现上适合用回调(callback)来实现。 ProtocolManager.handle()就是这样一个函数，它会在ProtocolManager对象创建时， 以回调函数的方式“埋入”每个p2p.Protocol对象中(实现了Protocol.Run()方法)。 之后每当有新peer要与己方建立通信时，如果对方能够支持该Protocol， 那么双方就可以顺利的建立并开始通信。以下是handle()的基本代码： */ // handle is the callback invoked to manage the life cycle of an eth peer. When // this function terminates, the peer is disconnected. func (pm *ProtocolManager) handle(p *peer) error { // Ignore maxPeers if this is a trusted peer if pm.peers.Len() &gt;= pm.maxPeers &amp;&amp; !p.Peer.Info().Network.Trusted { return p2p.DiscTooManyPeers } p.Log().Debug(&quot;Ethereum peer connected&quot;, &quot;name&quot;, p.Name()) // Execute the Ethereum handshake var ( genesis = pm.blockchain.Genesis() head = pm.blockchain.CurrentHeader() hash = head.Hash() number = head.Number.Uint64() td = pm.blockchain.GetTd(hash, number) ) //握手，与对方peer沟通己方的区块链状态 if err := p.Handshake(pm.networkID, td, hash, genesis.Hash()); err != nil { p.Log().Debug(&quot;Ethereum handshake failed&quot;, &quot;err&quot;, err) return err } //初始化一个读写通道，用以跟对方peer相互数据传输。 if rw, ok := p.rw.(*meteredMsgReadWriter); ok { rw.Init(p.version) } // Register the peer locally //注册对方peer，存入己方peer列表；只有handle()函数退出时，才会将这个peer移除出列表。 if err := pm.peers.Register(p); err != nil { p.Log().Error(&quot;Ethereum peer registration failed&quot;, &quot;err&quot;, err) return err } defer pm.removePeer(p.id) //Downloader成员注册这个新peer；Downloader会自己维护一个相邻peer列表。 // Register the peer in the downloader. If the downloader considers it banned, we disconnect if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil { return err } // Propagate existing transactions. new transactions appearing // after this will be sent via broadcasts. /* 调用syncTransactions()，用当前txpool中新累计的tx对象组装成一个txsync{}对象， 推送到内部通道txsyncCh。还记得Start()启动的四个函数么? 其中第四项txsyncLoop() 中用以等待txsync{}数据的通道txsyncCh，正是在这里被推入txsync{}的。 */ pm.syncTransactions(p) // If we&#39;re DAO hard-fork aware, validate any remote peer with regard to the hard-fork if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil { // Request the peer&#39;s DAO fork header for extra-data validation if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil { return err } // Start a timer to disconnect if the peer doesn&#39;t reply in time p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() { p.Log().Debug(&quot;Timed out DAO fork-check, dropping&quot;) pm.removePeer(p.id) }) // Make sure it&#39;s cleaned up if the peer dies off defer func() { if p.forkDrop != nil { p.forkDrop.Stop() p.forkDrop = nil } }() } //在无限循环中启动handleMsg()，当对方peer发出任何msg时， //handleMsg()可以捕捉相应类型的消息并在己方进行处理。 // main loop. handle incoming messages. for { if err := pm.handleMsg(p); err != nil { p.Log().Debug(&quot;Ethereum message handling failed&quot;, &quot;err&quot;, err) return err } } } &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/11/11/759e20279e78f486647ea3bc09b4d7b4.html" />
+<meta property="og:url" content="https://uzzz.org/2018/11/11/759e20279e78f486647ea3bc09b4d7b4.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-11-11T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961303 一、p2p网络中分为有结构和无结构的网络 无结构化的： 这种p2p网络即最普通的，不对结构作特别设计的实现方案。 优点是结构简单易于组建，网络局部区域内个体可任意分布， 反正此时网络结构对此也没有限制；特别是在应对大量新个体加 入网络和旧个体离开网络(“churn”)时它的表现非常稳定。 缺点在于在该网络中查找数据的效率太低，因为没有预知信息， 所以往往需要将查询请求发遍整个网络(至少大多数个体)， 这会占用很大一部分网络资源，并大大拖慢网络中其他业务运行。 结构化的 这种p2p网络中的个体分布经过精心设计，主要目的是为了提高查询数据的效率， 降低查询数据带来的资源消耗。 以太坊采用了不需要结构化的结构，经过改进的非结构化(比如设计好相邻个体列表peerSet结构) 网络模型可以满足需求； 二、分布式hash表（DHT） 保存数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点得到了新加入的数据（K/V），它会先计算自己与新数据的 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么这个数据就保持在自己这里。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 获取数据 （以下只是大致原理，具体的协议实现可能会有差异） 当某个节点接收到查询数据的请求（key），它会先计算自己与 key 之间的“距离”； 然后再计算它所知道的其它节点与这个 key 的距离。 如果计算下来，自己与 key 的距离最小，那么就在自己这里找有没有 key 对应的 value。 有的话就返回 value，没有的话就报错。 否则的话，把这个数据转发给距离最小的节点。 收到数据的另一个节点，也采用上述过程进行处理（递归处理）。 三、以太坊中p2p通信的管理模块ProtocolManager /geth.go // Start creates a live P2P node and starts running it. func (n *Node) Start() error { return n.node.Start() } /* Protocol:容纳应用程序所要求的回调函数等.并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。 Node.Start()中首先会创建p2p.Server{}，此时Server中的Protocol[]还是空的； 然后将Node中载入的所有&lt;Service&gt;实现体中的Protocol都收集起来， 一并交给Server对象，作为Server.Protocols列表；然后启动Server对象， 并将Server对象作为参数去逐一启动每个&lt;Service&gt;实现体。 */ /node.go // Start create a live P2P node and starts running it. func (n *Node) Start() error { ... /* ... 初始化serverConfig */ running := &amp;p2p.Server{Config: n.serverConfig} ... // Gather the protocols and start the freshly assembled P2P server for _, service := range services { running.Protocols = append(running.Protocols, service.Protocols()...) } if err := running.Start(); err != nil { //见下面的(srv *Server)Start方法 return convertFileLockError(err) } // Start each of the services started := []reflect.Type{} for kind, service := range services { // Start the next service, stopping all previous upon failure //启动每个services通过下面的方法func (s *Ethereum) Start(srvr *p2p.Server) error { if err := service.Start(running); err != nil { for _, kind := range started { services[kind].Stop() } running.Stop() return err } ... } } // Start starts running the server. // Servers can not be re-used after stopping. func (srv *Server) Start() (err error) { srv.lock.Lock() //srv.lock为了避免多线程重复启动 defer srv.lock.Unlock() if srv.running { return errors.New(&quot;server already running&quot;) } srv.running = true srv.log = srv.Config.Logger if srv.log == nil { srv.log = log.New() } if srv.NoDial &amp;&amp; srv.ListenAddr == &quot;&quot; { srv.log.Warn(&quot;P2P server will be useless, neither dialing nor listening&quot;) } // static fields if srv.PrivateKey == nil { return fmt.Errorf(&quot;Server.PrivateKey must be set to a non-nil key&quot;) } //newTransport使用了newRLPX使用了rlpx.go中的网络协议。 if srv.newTransport == nil { srv.newTransport = newRLPX } if srv.Dialer == nil { srv.Dialer = TCPDialer{&amp;net.Dialer{Timeout: defaultDialTimeout}} } srv.quit = make(chan struct{}) srv.addpeer = make(chan *conn) srv.delpeer = make(chan peerDrop) srv.posthandshake = make(chan *conn) srv.addstatic = make(chan *enode.Node) srv.removestatic = make(chan *enode.Node) srv.addtrusted = make(chan *enode.Node) srv.removetrusted = make(chan *enode.Node) srv.peerOp = make(chan peerOpFunc) srv.peerOpDone = make(chan struct{}) //srv.setupLocalNode()这里主要执行握手 if err := srv.setupLocalNode(); err != nil { return err } if srv.ListenAddr != &quot;&quot; { //监听TCP端口--&gt;用于业务数据传输，基于RLPx协议） //在setupListening中有个go srv.listenLoop()去监听某个端口有无主动发来的IP连接 if err := srv.setupListening(); err != nil { return err } } //侦听UDP端口（用于结点发现内部会启动goroutine） if err := srv.setupDiscovery(); err != nil { return err } dynPeers := srv.maxDialedConns() dialer := newDialState(srv.localnode.ID(), srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict) srv.loopWG.Add(1) // 启动新线程发起TCP连接请求 //在run()函数中，监听srv.addpeer通道有没有信息如果有远端peer发来连接请求， //则调用Server.newPeer()生成新的peer对象，并把Server.Protocols全交给peer。 /* case c := &lt;-srv.addpeer: err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. p := newPeer(c, srv.Protocols) } */ go srv.run(dialer) return nil } // Start implements node.Service, starting all internal goroutines needed by the // Ethereum protocol implementation. func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines s.startBloomHandlers(params.BloomBitsBlocks) // Start the RPC service s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers) if s.lesServer != nil { s.lesServer.Start(srvr) } return nil } /eth/handler.go type ProtocolManager struct { networkID uint64 fastSync uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks) acceptTxs uint32 // Flag whether we&#39;re considered synchronised (enables transaction processing) txpool txPool blockchain *core.BlockChain chainconfig *params.ChainConfig maxPeers int //Downloader类型成员负责所有向相邻个体主动发起的同步流程。 downloader *downloader.Downloader //Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后做出安排 fetcher *fetcher.Fetcher //用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 peers *peerSet SubProtocols []p2p.Protocol eventMux *event.TypeMux txsCh chan core.NewTxsEvent txsSub event.Subscription minedBlockSub *event.TypeMuxSubscription //通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。 //当然在应用中，订阅也往往利用通道来实现事件通知。 // channels for fetcher, syncer, txsyncLoop newPeerCh chan *peer txsyncCh chan *txsync quitSync chan struct{} noMorePeers chan struct{} // wait group is used for graceful shutdowns during downloading // and processing wg sync.WaitGroup } Start()函数是ProtocolManager的启动函数，它会在eth.Ethereum.Start()中被主动调用。 ProtocolManager.Start()会启用4个单独线程(goroutine,协程)去分别执行4个函数， 这也标志着该以太坊个体p2p通信的全面启动。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions //广播交易的通道。 txsCh会作为txpool的TxPreEvent订阅通道。 //txpool有了这种消息会通知给这个txsCh。 广播交易的goroutine会把这个消息广播出去。 pm.txsCh = make(chan core.NewTxsEvent, txChanSize) //订阅交易信息 pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() //订阅挖矿消息。当新的Block被挖出来的时候会产生消息 // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) //挖矿广播 goroutine 当挖出来的时候需要尽快的广播到网络上面去。 go pm.minedBroadcastLoop() // start sync handlers // 同步器负责周期性地与网络同步，下载散列和块以及处理通知处理程序。 go pm.syncer() // txsyncLoop负责每个新连接的初始事务同步。 当新的peer出现时， // 转发所有当前待处理的事务。为了最小化出口带宽使用，我们一次只发送一个小包。 go pm.txsyncLoop() } //txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件， //会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 //------------------go pm.txBroadcastLoop()----------------------- func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txsCh: pm.BroadcastTxs(event.Txs) // Err() channel will be closed when unsubscribing. case &lt;-pm.txsSub.Err(): return } } } // BroadcastTxs will propagate a batch of transactions to all peers which are not known to // already have the given transaction. func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } // AsyncSendTransactions queues list of transactions propagation to a remote // peer. If the peer&#39;s broadcast queue is full, the event is silently dropped. // 同步Tx给每个相邻未知Tx的peer func (p *peer) AsyncSendTransactions(txs []*types.Transaction) { select { case p.queuedTxs &lt;- txs: for _, tx := range txs { p.knownTxs.Add(tx.Hash()) } default: p.Log().Debug(&quot;Dropping transaction propagation&quot;, &quot;count&quot;, len(txs)) } } //------------------go pm.minedBroadcastLoop()----------------------- // Mined broadcast loop //挖矿之后的广播 func (pm *ProtocolManager) minedBroadcastLoop() { // automatically stops if unsubscribe for obj := range pm.minedBlockSub.Chan() { //Data为interface{} ，使用接口断言的方法将Data转化为类型NewMinedBlockEvent if ev, ok := obj.Data.(core.NewMinedBlockEvent); ok { //BroadcastBlock的第二个参数为true时，会将整个新区块依次发给相邻区块中的一小部分； //而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 pm.BroadcastBlock(ev.Block, true) // First propagate block to peers pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest } } } //---------------------------go pm.syncer()----------------------------- /* syncer()首先启动fetcher成员，然后进入一个无限循环， 每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。 发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时， 发起之；如果没有新peer到达，则以10s为间隔定时的发起之。 这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高， 由于Td是全链中从创世块到最新头块的Difficulty值总和， 所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步， 显然改动量是最小的，此即&quot;最优&quot;。 */ // syncer is responsible for periodically synchronising with the network, both // downloading hashes and blocks as well as handling the announcement handler. func (pm *ProtocolManager) syncer() { // Start and ensure cleanup of sync mechanisms //启动 fetcher，辅助同步区块数据 pm.fetcher.Start() defer pm.fetcher.Stop() defer pm.downloader.Terminate() // Wait for different events to fire synchronisation operations forceSync := time.NewTicker(forceSyncCycle) defer forceSync.Stop() for { select { case &lt;-pm.newPeerCh: // Make sure we have peers to select from, then sync if pm.peers.Len() &lt; minDesiredPeerCount { break } go pm.synchronise(pm.peers.BestPeer()) case &lt;-forceSync.C: // Force a sync even if not enough peers are present go pm.synchronise(pm.peers.BestPeer()) case &lt;-pm.noMorePeers: return } } } // Start boots up the announcement based synchroniser, accepting and processing // hash notifications and block fetches until termination requested. func (f *Fetcher) Start() { go f.loop() } //---------------------go.txsyncLoop()--------------------- // txsyncLoop takes care of the initial transaction sync for each new // connection. When a new peer appears, we relay all currently pending // transactions. In order to minimise egress bandwidth usage, we send // the transactions in small packs to one peer at a time. /*当从网络节点同步过来最新的交易数据后，本地也会把新同步下来的交易数据广播给网络中的其他节点。 */ func (pm *ProtocolManager) txsyncLoop() { var ( pending = make(map[enode.ID]*txsync) sending = false // whether a send is active pack = new(txsync) // the pack that is being sent done = make(chan error, 1) // result of the send ) // send starts a sending a pack of transactions from the sync. send := func(s *txsync) { // Fill pack with transactions up to the target size. size := common.StorageSize(0) pack.p = s.p pack.txs = pack.txs[:0] for i := 0; i &lt; len(s.txs) &amp;&amp; size &lt; txsyncPackSize; i++ { pack.txs = append(pack.txs, s.txs[i]) size += s.txs[i].Size() } // Remove the transactions that will be sent. s.txs = s.txs[:copy(s.txs, s.txs[len(pack.txs):])] if len(s.txs) == 0 { delete(pending, s.p.ID()) } // Send the pack in the background. s.p.Log().Trace(&quot;Sending batch of transactions&quot;, &quot;count&quot;, len(pack.txs), &quot;bytes&quot;, size) sending = true go func() { done &lt;- pack.p.SendTransactions(pack.txs) }() } // pick chooses the next pending sync. pick := func() *txsync { if len(pending) == 0 { return nil } n := rand.Intn(len(pending)) + 1 for _, s := range pending { if n--; n == 0 { return s } } return nil } for { select { case s := &lt;-pm.txsyncCh: pending[s.p.ID()] = s if !sending { send(s) } case err := &lt;-done: sending = false // Stop tracking peers that cause send failures. if err != nil { pack.p.Log().Debug(&quot;Transaction send failed&quot;, &quot;err&quot;, err) delete(pending, pack.p.ID()) } // Schedule the next send. if s := pick(); s != nil { send(s) } case &lt;-pm.quitSync: return } } } 四个管道主要的功能都是围绕广播和同步展开的 (广播区块、广播交易，同步到区块、同步到交易，再广播区块、广播交易。) /* 对于peer间通信而言，除了己方需要主动向对方peer发起通信(比如Start()中启动的四个独立流程)之外， 还需要一种由对方peer主动调用的数据传输，这种传输不仅仅是由对方peer发给己方， 更多的用法是对方peer主动调用一个函数让己方发给它们某些特定数据。这种通信方式， 在代码实现上适合用回调(callback)来实现。 ProtocolManager.handle()就是这样一个函数，它会在ProtocolManager对象创建时， 以回调函数的方式“埋入”每个p2p.Protocol对象中(实现了Protocol.Run()方法)。 之后每当有新peer要与己方建立通信时，如果对方能够支持该Protocol， 那么双方就可以顺利的建立并开始通信。以下是handle()的基本代码： */ // handle is the callback invoked to manage the life cycle of an eth peer. When // this function terminates, the peer is disconnected. func (pm *ProtocolManager) handle(p *peer) error { // Ignore maxPeers if this is a trusted peer if pm.peers.Len() &gt;= pm.maxPeers &amp;&amp; !p.Peer.Info().Network.Trusted { return p2p.DiscTooManyPeers } p.Log().Debug(&quot;Ethereum peer connected&quot;, &quot;name&quot;, p.Name()) // Execute the Ethereum handshake var ( genesis = pm.blockchain.Genesis() head = pm.blockchain.CurrentHeader() hash = head.Hash() number = head.Number.Uint64() td = pm.blockchain.GetTd(hash, number) ) //握手，与对方peer沟通己方的区块链状态 if err := p.Handshake(pm.networkID, td, hash, genesis.Hash()); err != nil { p.Log().Debug(&quot;Ethereum handshake failed&quot;, &quot;err&quot;, err) return err } //初始化一个读写通道，用以跟对方peer相互数据传输。 if rw, ok := p.rw.(*meteredMsgReadWriter); ok { rw.Init(p.version) } // Register the peer locally //注册对方peer，存入己方peer列表；只有handle()函数退出时，才会将这个peer移除出列表。 if err := pm.peers.Register(p); err != nil { p.Log().Error(&quot;Ethereum peer registration failed&quot;, &quot;err&quot;, err) return err } defer pm.removePeer(p.id) //Downloader成员注册这个新peer；Downloader会自己维护一个相邻peer列表。 // Register the peer in the downloader. If the downloader considers it banned, we disconnect if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil { return err } // Propagate existing transactions. new transactions appearing // after this will be sent via broadcasts. /* 调用syncTransactions()，用当前txpool中新累计的tx对象组装成一个txsync{}对象， 推送到内部通道txsyncCh。还记得Start()启动的四个函数么? 其中第四项txsyncLoop() 中用以等待txsync{}数据的通道txsyncCh，正是在这里被推入txsync{}的。 */ pm.syncTransactions(p) // If we&#39;re DAO hard-fork aware, validate any remote peer with regard to the hard-fork if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil { // Request the peer&#39;s DAO fork header for extra-data validation if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil { return err } // Start a timer to disconnect if the peer doesn&#39;t reply in time p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() { p.Log().Debug(&quot;Timed out DAO fork-check, dropping&quot;) pm.removePeer(p.id) }) // Make sure it&#39;s cleaned up if the peer dies off defer func() { if p.forkDrop != nil { p.forkDrop.Stop() p.forkDrop = nil } }() } //在无限循环中启动handleMsg()，当对方peer发出任何msg时， //handleMsg()可以捕捉相应类型的消息并在己方进行处理。 // main loop. handle incoming messages. for { if err := pm.handleMsg(p); err != nil { p.Log().Debug(&quot;Ethereum message handling failed&quot;, &quot;err&quot;, err) return err } } } &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/11/11/759e20279e78f486647ea3bc09b4d7b4.html","headline":"深入区块链以太坊源码之p2p通信","dateModified":"2018-11-11T00:00:00+08:00","datePublished":"2018-11-11T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/11/11/759e20279e78f486647ea3bc09b4d7b4.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>深入区块链以太坊源码之p2p通信</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/Grit_ICPC/article/details/83961303 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-d7e2a68c7c.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <pre class="has">
+<code class="hljs language-Go">一、p2p网络中分为有结构和无结构的网络
+	无结构化的：
+		这种p2p网络即最普通的，不对结构作特别设计的实现方案。
+		优点是结构简单易于组建，网络局部区域内个体可任意分布，
+		反正此时网络结构对此也没有限制；特别是在应对大量新个体加
+		入网络和旧个体离开网络(“churn”)时它的表现非常稳定。
+		缺点在于在该网络中查找数据的效率太低，因为没有预知信息，
+		所以往往需要将查询请求发遍整个网络(至少大多数个体)，
+		这会占用很大一部分网络资源，并大大拖慢网络中其他业务运行。
+
+	结构化的
+		这种p2p网络中的个体分布经过精心设计，主要目的是为了提高查询数据的效率，
+		降低查询数据带来的资源消耗。
+	以太坊采用了不需要结构化的结构，经过改进的非结构化(比如设计好相邻个体列表peerSet结构)
+网络模型可以满足需求；
+
+二、分布式hash表（DHT）
+保存数据
+（以下只是大致原理，具体的协议实现可能会有差异）
+	当某个节点得到了新加入的数据（K/V），它会先计算自己与新数据的 key 之间的“距离”；
+然后再计算它所知道的其它节点与这个 key 的距离。
+如果计算下来，自己与 key 的距离最小，那么这个数据就保持在自己这里。
+否则的话，把这个数据转发给距离最小的节点。
+收到数据的另一个节点，也采用上述过程进行处理（递归处理）。
+获取数据
+（以下只是大致原理，具体的协议实现可能会有差异）
+	当某个节点接收到查询数据的请求（key），它会先计算自己与 key 之间的“距离”；
+	然后再计算它所知道的其它节点与这个 key 的距离。
+如果计算下来，自己与 key 的距离最小，那么就在自己这里找有没有 key 对应的 value。
+有的话就返回 value，没有的话就报错。
+否则的话，把这个数据转发给距离最小的节点。
+收到数据的另一个节点，也采用上述过程进行处理（递归处理）。
+
+
+
+三、以太坊中p2p通信的管理模块ProtocolManager
+
+/geth.go
+// Start creates a live P2P node and starts running it.
+func (n *Node) Start() error {
+	return n.node.Start()
+}
+
+/*
+	Protocol:容纳应用程序所要求的回调函数等.并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。
+	Node.Start()中首先会创建p2p.Server{}，此时Server中的Protocol[]还是空的；
+	然后将Node中载入的所有&lt;Service&gt;实现体中的Protocol都收集起来，
+	一并交给Server对象，作为Server.Protocols列表；然后启动Server对象，
+	并将Server对象作为参数去逐一启动每个&lt;Service&gt;实现体。
+
+*/
+/node.go
+// Start create a live P2P node and starts running it.
+func (n *Node) Start() error {
+	
+	...
+	/*
+		...
+		初始化serverConfig
+	*/
+	running := &amp;p2p.Server{Config: n.serverConfig}
+	...
+	// Gather the protocols and start the freshly assembled P2P server
+	for _, service := range services {
+		running.Protocols = append(running.Protocols, service.Protocols()...)
+	}
+	if err := running.Start(); err != nil { //见下面的(srv *Server)Start方法
+		return convertFileLockError(err)
+	}
+	// Start each of the services
+	started := []reflect.Type{}
+	for kind, service := range services {
+		// Start the next service, stopping all previous upon failure
+		//启动每个services通过下面的方法func (s *Ethereum) Start(srvr *p2p.Server) error {
+		if err := service.Start(running); err != nil {
+			for _, kind := range started {
+				services[kind].Stop()
+			}
+			running.Stop()
+
+			return err
+		}
+		...
+	}
+}
+
+
+// Start starts running the server.
+// Servers can not be re-used after stopping.
+func (srv *Server) Start() (err error) {
+	srv.lock.Lock()
+	//srv.lock为了避免多线程重复启动
+	defer srv.lock.Unlock()
+	if srv.running {
+		return errors.New("server already running")
+	}
+	srv.running = true
+	srv.log = srv.Config.Logger
+	if srv.log == nil {
+		srv.log = log.New()
+	}
+	if srv.NoDial &amp;&amp; srv.ListenAddr == "" {
+		srv.log.Warn("P2P server will be useless, neither dialing nor listening")
+	}
+
+	// static fields
+	if srv.PrivateKey == nil {
+		return fmt.Errorf("Server.PrivateKey must be set to a non-nil key")
+	}
+	//newTransport使用了newRLPX使用了rlpx.go中的网络协议。
+	if srv.newTransport == nil {
+		srv.newTransport = newRLPX
+	}
+
+	if srv.Dialer == nil {
+		srv.Dialer = TCPDialer{&amp;net.Dialer{Timeout: defaultDialTimeout}}
+	}
+	srv.quit = make(chan struct{})
+	srv.addpeer = make(chan *conn)
+	srv.delpeer = make(chan peerDrop)
+	srv.posthandshake = make(chan *conn)
+	srv.addstatic = make(chan *enode.Node)
+	srv.removestatic = make(chan *enode.Node)
+	srv.addtrusted = make(chan *enode.Node)
+	srv.removetrusted = make(chan *enode.Node)
+	srv.peerOp = make(chan peerOpFunc)
+	srv.peerOpDone = make(chan struct{})
+	//srv.setupLocalNode()这里主要执行握手
+	if err := srv.setupLocalNode(); err != nil {
+		return err
+	}
+	if srv.ListenAddr != "" {
+		//监听TCP端口--&gt;用于业务数据传输，基于RLPx协议）
+		//在setupListening中有个go srv.listenLoop()去监听某个端口有无主动发来的IP连接
+
+		if err := srv.setupListening(); err != nil {
+			return err
+		}
+	}
+	//侦听UDP端口（用于结点发现内部会启动goroutine）
+	if err := srv.setupDiscovery(); err != nil {
+		return err
+	}
+
+	dynPeers := srv.maxDialedConns()
+	dialer := newDialState(srv.localnode.ID(), srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict)
+	srv.loopWG.Add(1)
+	// 启动新线程发起TCP连接请求
+
+	//在run()函数中，监听srv.addpeer通道有没有信息如果有远端peer发来连接请求，
+	//则调用Server.newPeer()生成新的peer对象，并把Server.Protocols全交给peer。
+	/*
+	case c := &lt;-srv.addpeer:
+		err := srv.protoHandshakeChecks(peers, inboundCount, c)
+		if err == nil {
+			// The handshakes are done and it passed all checks.
+			p := newPeer(c, srv.Protocols)
+		}
+	*/
+	go srv.run(dialer)
+	return nil
+}
+
+
+// Start implements node.Service, starting all internal goroutines needed by the
+// Ethereum protocol implementation.
+func (s *Ethereum) Start(srvr *p2p.Server) error {
+	// Start the bloom bits servicing goroutines
+	s.startBloomHandlers(params.BloomBitsBlocks)
+
+	// Start the RPC service
+	s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion())
+
+	// Figure out a max peers count based on the server limits
+	maxPeers := srvr.MaxPeers
+	if s.config.LightServ &gt; 0 {
+		if s.config.LightPeers &gt;= srvr.MaxPeers {
+			return fmt.Errorf("invalid peer config: light peer count (%d) &gt;= total peer count (%d)", s.config.LightPeers, srvr.MaxPeers)
+		}
+		maxPeers -= s.config.LightPeers
+	}
+	// Start the networking layer and the light server if requested
+	s.protocolManager.Start(maxPeers)
+	if s.lesServer != nil {
+		s.lesServer.Start(srvr)
+	}
+	return nil
+}
+
+/eth/handler.go
+
+type ProtocolManager struct {
+	networkID uint64
+
+	fastSync  uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks)
+	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
+
+	txpool      txPool
+	blockchain  *core.BlockChain
+	chainconfig *params.ChainConfig
+	maxPeers    int
+
+	//Downloader类型成员负责所有向相邻个体主动发起的同步流程。
+	downloader *downloader.Downloader
+	//Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后做出安排
+	fetcher    *fetcher.Fetcher
+	//用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。
+	peers      *peerSet
+
+	SubProtocols []p2p.Protocol
+
+	eventMux      *event.TypeMux
+	txsCh         chan core.NewTxsEvent
+	txsSub        event.Subscription
+	minedBlockSub *event.TypeMuxSubscription
+
+	
+	//通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。
+	//当然在应用中，订阅也往往利用通道来实现事件通知。
+
+	// channels for fetcher, syncer, txsyncLoop
+	newPeerCh   chan *peer
+	txsyncCh    chan *txsync
+	quitSync    chan struct{}
+	noMorePeers chan struct{}
+
+	// wait group is used for graceful shutdowns during downloading
+	// and processing
+	wg sync.WaitGroup
+}
+
+	Start()函数是ProtocolManager的启动函数，它会在eth.Ethereum.Start()中被主动调用。
+ProtocolManager.Start()会启用4个单独线程(goroutine,协程)去分别执行4个函数，
+这也标志着该以太坊个体p2p通信的全面启动。
+
+
+func (pm *ProtocolManager) Start(maxPeers int) {
+	pm.maxPeers = maxPeers
+
+	// broadcast transactions
+	//广播交易的通道。 txsCh会作为txpool的TxPreEvent订阅通道。
+	//txpool有了这种消息会通知给这个txsCh。 广播交易的goroutine会把这个消息广播出去。
+	pm.txsCh = make(chan core.NewTxsEvent, txChanSize)
+	//订阅交易信息
+	pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh)
+	
+	go pm.txBroadcastLoop()
+
+	//订阅挖矿消息。当新的Block被挖出来的时候会产生消息
+	// broadcast mined blocks
+	pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{})
+	//挖矿广播 goroutine 当挖出来的时候需要尽快的广播到网络上面去。
+	go pm.minedBroadcastLoop()
+
+	// start sync handlers
+	// 同步器负责周期性地与网络同步，下载散列和块以及处理通知处理程序。
+	go pm.syncer()
+	// txsyncLoop负责每个新连接的初始事务同步。 当新的peer出现时，
+	// 转发所有当前待处理的事务。为了最小化出口带宽使用，我们一次只发送一个小包。
+	go pm.txsyncLoop()
+}
+
+//txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件，
+	//会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。
+//------------------go pm.txBroadcastLoop()-----------------------
+func (pm *ProtocolManager) txBroadcastLoop() {
+	for {
+		select {
+		case event := &lt;-pm.txsCh:
+			pm.BroadcastTxs(event.Txs)
+
+		// Err() channel will be closed when unsubscribing.
+		case &lt;-pm.txsSub.Err():
+			return
+		}
+	}
+}
+
+
+// BroadcastTxs will propagate a batch of transactions to all peers which are not known to
+// already have the given transaction.
+func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) {
+	var txset = make(map[*peer]types.Transactions)
+
+	// Broadcast transactions to a batch of peers not knowing about it
+	for _, tx := range txs {
+		peers := pm.peers.PeersWithoutTx(tx.Hash())
+		for _, peer := range peers {
+			txset[peer] = append(txset[peer], tx)
+		}
+		log.Trace("Broadcast transaction", "hash", tx.Hash(), "recipients", len(peers))
+	}
+	// FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))]
+	for peer, txs := range txset {
+		peer.AsyncSendTransactions(txs)
+	}
+}
+
+// AsyncSendTransactions queues list of transactions propagation to a remote
+// peer. If the peer's broadcast queue is full, the event is silently dropped.
+// 同步Tx给每个相邻未知Tx的peer
+func (p *peer) AsyncSendTransactions(txs []*types.Transaction) {
+	select {
+	case p.queuedTxs &lt;- txs:
+		for _, tx := range txs {
+			p.knownTxs.Add(tx.Hash())
+		}
+	default:
+		p.Log().Debug("Dropping transaction propagation", "count", len(txs))
+	}
+}
+
+//------------------go pm.minedBroadcastLoop()-----------------------
+
+// Mined broadcast loop
+//挖矿之后的广播
+func (pm *ProtocolManager) minedBroadcastLoop() {
+	// automatically stops if unsubscribe
+	for obj := range pm.minedBlockSub.Chan() {
+		//Data为interface{} ，使用接口断言的方法将Data转化为类型NewMinedBlockEvent
+		if ev, ok := obj.Data.(core.NewMinedBlockEvent); ok {
+			//BroadcastBlock的第二个参数为true时，会将整个新区块依次发给相邻区块中的一小部分；
+			//而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。
+			pm.BroadcastBlock(ev.Block, true)  // First propagate block to peers
+			pm.BroadcastBlock(ev.Block, false) // Only then announce to the rest
+		}
+	}
+}
+//---------------------------go pm.syncer()-----------------------------
+/*
+	syncer()首先启动fetcher成员，然后进入一个无限循环，
+	每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。
+	发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时，
+	发起之；如果没有新peer到达，则以10s为间隔定时的发起之。
+	这里所谓"最优"指的是peer中所维护区块链的TotalDifficulty(td)最高，
+	由于Td是全链中从创世块到最新头块的Difficulty值总和，
+	所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步，
+	显然改动量是最小的，此即"最优"。
+*/
+// syncer is responsible for periodically synchronising with the network, both
+// downloading hashes and blocks as well as handling the announcement handler.
+func (pm *ProtocolManager) syncer() {
+	// Start and ensure cleanup of sync mechanisms
+	//启动 fetcher，辅助同步区块数据
+	pm.fetcher.Start()
+	defer pm.fetcher.Stop()
+	defer pm.downloader.Terminate()
+
+	// Wait for different events to fire synchronisation operations
+	forceSync := time.NewTicker(forceSyncCycle)
+	defer forceSync.Stop()
+
+	for {
+		select {
+		case &lt;-pm.newPeerCh:
+			// Make sure we have peers to select from, then sync
+			if pm.peers.Len() &lt; minDesiredPeerCount {
+				break
+			}
+			go pm.synchronise(pm.peers.BestPeer())
+
+		case &lt;-forceSync.C:
+			// Force a sync even if not enough peers are present
+			go pm.synchronise(pm.peers.BestPeer())
+
+		case &lt;-pm.noMorePeers:
+			return
+		}
+	}
+}
+
+// Start boots up the announcement based synchroniser, accepting and processing
+// hash notifications and block fetches until termination requested.
+func (f *Fetcher) Start() {
+	go f.loop()
+}
+
+//---------------------go.txsyncLoop()---------------------
+// txsyncLoop takes care of the initial transaction sync for each new
+// connection. When a new peer appears, we relay all currently pending
+// transactions. In order to minimise egress bandwidth usage, we send
+// the transactions in small packs to one peer at a time.
+/*当从网络节点同步过来最新的交易数据后，本地也会把新同步下来的交易数据广播给网络中的其他节点。
+*/
+func (pm *ProtocolManager) txsyncLoop() {
+	var (
+		pending = make(map[enode.ID]*txsync)
+		sending = false               // whether a send is active
+		pack    = new(txsync)         // the pack that is being sent
+		done    = make(chan error, 1) // result of the send
+	)
+
+	// send starts a sending a pack of transactions from the sync.
+	send := func(s *txsync) {
+		// Fill pack with transactions up to the target size.
+		size := common.StorageSize(0)
+		pack.p = s.p
+		pack.txs = pack.txs[:0]
+		for i := 0; i &lt; len(s.txs) &amp;&amp; size &lt; txsyncPackSize; i++ {
+			pack.txs = append(pack.txs, s.txs[i])
+			size += s.txs[i].Size()
+		}
+		// Remove the transactions that will be sent.
+		s.txs = s.txs[:copy(s.txs, s.txs[len(pack.txs):])]
+		if len(s.txs) == 0 {
+			delete(pending, s.p.ID())
+		}
+		// Send the pack in the background.
+		s.p.Log().Trace("Sending batch of transactions", "count", len(pack.txs), "bytes", size)
+		sending = true
+		go func() { done &lt;- pack.p.SendTransactions(pack.txs) }()
+	}
+
+	// pick chooses the next pending sync.
+	pick := func() *txsync {
+		if len(pending) == 0 {
+			return nil
+		}
+		n := rand.Intn(len(pending)) + 1
+		for _, s := range pending {
+			if n--; n == 0 {
+				return s
+			}
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case s := &lt;-pm.txsyncCh:
+			pending[s.p.ID()] = s
+			if !sending {
+				send(s)
+			}
+		case err := &lt;-done:
+			sending = false
+			// Stop tracking peers that cause send failures.
+			if err != nil {
+				pack.p.Log().Debug("Transaction send failed", "err", err)
+				delete(pending, pack.p.ID())
+			}
+			// Schedule the next send.
+			if s := pick(); s != nil {
+				send(s)
+			}
+		case &lt;-pm.quitSync:
+			return
+		}
+	}
+}
+
+
+四个管道主要的功能都是围绕广播和同步展开的
+(广播区块、广播交易，同步到区块、同步到交易，再广播区块、广播交易。)
+
+
+
+/*
+对于peer间通信而言，除了己方需要主动向对方peer发起通信(比如Start()中启动的四个独立流程)之外，
+还需要一种由对方peer主动调用的数据传输，这种传输不仅仅是由对方peer发给己方，
+更多的用法是对方peer主动调用一个函数让己方发给它们某些特定数据。这种通信方式，
+在代码实现上适合用回调(callback)来实现。
+
+ProtocolManager.handle()就是这样一个函数，它会在ProtocolManager对象创建时，
+以回调函数的方式“埋入”每个p2p.Protocol对象中(实现了Protocol.Run()方法)。
+之后每当有新peer要与己方建立通信时，如果对方能够支持该Protocol，
+那么双方就可以顺利的建立并开始通信。以下是handle()的基本代码：
+*/
+// handle is the callback invoked to manage the life cycle of an eth peer. When
+// this function terminates, the peer is disconnected.
+func (pm *ProtocolManager) handle(p *peer) error {
+	// Ignore maxPeers if this is a trusted peer
+	if pm.peers.Len() &gt;= pm.maxPeers &amp;&amp; !p.Peer.Info().Network.Trusted {
+		return p2p.DiscTooManyPeers
+	}
+	p.Log().Debug("Ethereum peer connected", "name", p.Name())
+
+	// Execute the Ethereum handshake
+	var (
+		genesis = pm.blockchain.Genesis()
+		head    = pm.blockchain.CurrentHeader()
+		hash    = head.Hash()
+		number  = head.Number.Uint64()
+		td      = pm.blockchain.GetTd(hash, number)
+	)
+	//握手，与对方peer沟通己方的区块链状态
+	if err := p.Handshake(pm.networkID, td, hash, genesis.Hash()); err != nil {
+		p.Log().Debug("Ethereum handshake failed", "err", err)
+		return err
+	}
+	//初始化一个读写通道，用以跟对方peer相互数据传输。
+	if rw, ok := p.rw.(*meteredMsgReadWriter); ok {
+		rw.Init(p.version)
+	}
+	// Register the peer locally
+	//注册对方peer，存入己方peer列表；只有handle()函数退出时，才会将这个peer移除出列表。
+	if err := pm.peers.Register(p); err != nil {
+		p.Log().Error("Ethereum peer registration failed", "err", err)
+		return err
+	}
+	defer pm.removePeer(p.id)
+
+	//Downloader成员注册这个新peer；Downloader会自己维护一个相邻peer列表。
+	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
+	if err := pm.downloader.RegisterPeer(p.id, p.version, p); err != nil {
+		return err
+	}
+	// Propagate existing transactions. new transactions appearing
+	// after this will be sent via broadcasts.
+	/*
+	调用syncTransactions()，用当前txpool中新累计的tx对象组装成一个txsync{}对象，
+	推送到内部通道txsyncCh。还记得Start()启动的四个函数么? 其中第四项txsyncLoop()
+	中用以等待txsync{}数据的通道txsyncCh，正是在这里被推入txsync{}的。
+	*/
+	pm.syncTransactions(p)
+
+	// If we're DAO hard-fork aware, validate any remote peer with regard to the hard-fork
+	if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil {
+		// Request the peer's DAO fork header for extra-data validation
+		if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil {
+			return err
+		}
+		// Start a timer to disconnect if the peer doesn't reply in time
+		p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() {
+			p.Log().Debug("Timed out DAO fork-check, dropping")
+			pm.removePeer(p.id)
+		})
+		// Make sure it's cleaned up if the peer dies off
+		defer func() {
+			if p.forkDrop != nil {
+				p.forkDrop.Stop()
+				p.forkDrop = nil
+			}
+		}()
+	}
+		//在无限循环中启动handleMsg()，当对方peer发出任何msg时，
+		//handleMsg()可以捕捉相应类型的消息并在己方进行处理。
+	// main loop. handle incoming messages.
+	for {
+		if err := pm.handleMsg(p); err != nil {
+			p.Log().Debug("Ethereum message handling failed", "err", err)
+			return err
+		}
+	}
+}</code></pre> 
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Grit_ICPC/article/details/83961303,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/Grit_ICPC/article/details/83961303,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										if(typeof window.localStorage === "object" && typeof window.csdn.anonymousUserLimit === "object"){
+											if(!window.csdn.anonymousUserLimit.judgment()){
+												window.csdn.anonymousUserLimit.Jumplogin();
+												return false;
+											}else if(!currentUserName){
+												window.csdn.anonymousUserLimit.updata();
+											}
+										}
+										
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

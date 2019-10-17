@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Kubernetes 从懵圈到熟练：读懂此文，集群节点不下线！ | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Kubernetes 从懵圈到熟练：读懂此文，集群节点不下线！" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="排查完全陌生的问题、不熟悉的系统组件，对许多工程师来说是无与伦比的工作乐趣，当然也是一大挑战。今天，阿里巴巴售后技术专家声东跟大家分享一例 Kubernetes 集群上的问题。这个问题影响范围较广，或许某天你也会遇到。更重要的是，作者在问题排查过程中的思路和方法，也会让你有所启发。关于问题 I am Not Ready 阿里云有自己的 Kubernetes 容器集群产品。随着 Kubernetes 集群出货量剧增，线上用户零星地发现，集群会非常低概率地出现节点 NotReady 情况。据我们观察，这个问题差不多每个月，都会有一两个用户遇到。在节点 NotReady 之后，集群 Master 没有办法对这个节点做任何控制，比如下发新的 Pod，再比如抓取节点上正在运行 Pod 的实时信息。 需要知道的Kubernetes知识 这里我稍微补充一点 Kubernetes 集群的基本知识。Kubernetes 集群的“硬件基础”，是以单机形态存在的集群节点。这些节点可以是物理机，也可以是虚拟机。集群节点分为 Master 节点和 Worker 节点。Master 节点主要用来承载集群管控组件，比如调度器和控制器。而 Worker 节点主要用来跑业务。Kubelet 是跑在各个节点上的代理，它负责与管控组件沟通，并按照管控组件的指示，直接管理 Worker节点。 当集群节点进入 NotReady 状态的时候，我们需要做的第一件事情，是检查运行在节点上的 kubelet 是否正常。在这个问题出现的时候，使用 systemctl 命令查看的kubelet 状态（kubelet 是 systemd 管理的一个 daemon ）发现它是正常运行的。当我们用 journalctl 查看 kubelet 日志的时候，发现以下错误。 什么是 PLEG？ 这个报错清楚地告诉我们，容器 Runtime 是不工作的，且 PLEG 是不健康的。这里容器 Runtime 指的就是 Docker Daemon。Kubelet 通过操作 Docker Daemon 来控制容器的生命周期。而这里的 PLEG，指的是 pod lifecycle event generator。PLEG 是 kubelet 用来检查 Runtime 的健康检查机制。这件事情本来可以由 kubelet 使用 polling 的方式来做。但是 polling 有其高成本的缺陷，所以 PLEG 应用而生。PLEG 尝试以一种“中断”的形式，来实现对容器 Runtime 的健康检查，虽然实际上，它同时用了 polling 和“中断”这样折中的方案。 基本上，根据上边的报错，我们可以确认容器 Runtime 出了问题。在有问题的节点上，通过 Docker 命令尝试运行新的容器，命令会没有响应，这说明上边的报错是准确的。 Docker Stack Docker Daemon 调用栈分析 Docker 作为阿里云 Kubernetes 集群使用的容器 Runtime ，在 1.11 之后，被拆分成了多个组件以适应 OCI 标准。拆分之后，其包括 Docker Daemon，containerd，containerd-shim 以及 runC。组件 containerd 负责集群节点上容器的生命周期管理，并向上为 Docker Daemon 提供 gRPC 接口。 在这个问题中，既然 PLEG 认为容器 Runtime 出了问题，我们需要从 Docker Daemon 进程看起。我们可以使用 kill -USR1 &lt;pid&gt; 命令发送 USR1 信号给 Docker Daemon，而 Docker Daemon 收到信号之后，会把所有线程调用栈输出到 /var/run/docker 文件夹里。 Docker Daemon 进程的调用栈是比较容易分析的。稍加留意，我们会发现大多数的调用栈都长成下图中的样子。通过观察栈上每个函数的名字，以及函数所在的文件（模块）名称，我们可以了解到，这个调用栈的下半部分，是进程接到 http 请求，做请求路由的过程；而上半部分则是具体的处理函数。最终处理函数进入等待状态，等待一个 mutex 实例。 到这里，我们需要稍微看一下 ContainerInspectCurrent 这个函数的实现。从实现可以看到，这个函数的第一个参数，就是这个线程正在操作的容器名指针。使用这个指针搜索整个调用栈文件，我们会找出所有等在这个容器上的线程。同时，我们可以看到下边这个线程。 这个线程调用栈上的函数 ContainerExecStart 也是在处理相同容器。但不同的是，ContainerExecStart 并没有在等这个容器，而是已经拿到了这个容器的操作权（mutex），并把执行逻辑转向了 containerd 调用。关于这一点，我们也可以使用代码来验证。前边我提到过，containerd 通过 gRPC 向上对 Docker Daemon 提供接口。此调用栈上半部分内容，正是 Docker Daemon 在通过 gRPC 请求来呼叫 containerd。 containerd 调用栈分析 与 Docker Daemon 类似，我们可以通过 kill -SIGUSR1 &lt;pid&gt; 命令来输出containerd 的调用栈。不同的是，这次调用栈会直接输出到 messages 日志。 Containerd 作为一个 gRPC 的服务器，会在接到 Docker Daemon 的远程调用之后，新建一个线程去处理这次请求。关于 gRPC 的细节，我们这里其实不用太多关注。在这次请求的客户端调用栈上，可以看到这次调用的核心函数在 Start 一个 Process 。我们在 containerd 的调用栈里搜索 Start，Process 以及 process.go 等字段，很容易发现下边这个线程。 这个线程的核心任务，就是依靠 runC 去创建容器进程。而在容器启动之后，runC 进程会退出。所以下一步，我们自然而然会想到，runC 是不是有顺利完成自己的任务。查看进程列表，我们会发现，系统中有个别 runC 进程还在执行，这不是预期的行为。容器的启动，跟进程的启动，耗时应该是差不多数量级的，系统里有正在运行的 runC 进程，则说明 runC 不能正常启动容器。 什么是 D-Bus？ runC 请求 D-Bus 容器 Runtime 的 runC 命令，是 libcontainer 的一个简单的封装。这个工具可以用来管理单个容器，比如容器创建和容器删除。在上节的最后，我们发现 runC 不能完成创建容器的任务。我们可以把对应的进程杀掉，然后在命令行用同样的命令启动容器，同时用 strace 追踪整个过程。 分析发现，runC 停在了向带有 org.free 字段的 dbus socket 写数据的地方。那什么是 dbus 呢？在 Linux 上，dbus 是一种进程间进行消息通信的机制。 原因并不在 D-Bus 我们可以使用 busctl 命令列出系统现有的所有 bus 。如下图，在问题发生的时候，我看到问题节点 bus name 编号非常大。所以我倾向于认为，dbus 某些相关的数据结构，比如 name，耗尽了引起了这个问题。 Dbus 机制的实现，依赖于一个组件叫做 dbus daemon。如果真的是 dbus 相关数据结构耗尽，那么重启这个 daemon，应该可以解决这个问题。但不幸的是，问题并没有这么直接。重启 dbus daemon 之后，问题依然存在。 在上边 strace 追踪 runC 的截图中，runC 停在向带有 org.free 字段的 bus 写数据的地方。在 busctl 输出的 bus 列表里，显然带有这个字段的 bus，都在被 systemd使用。这时，我们用 systemctl daemon-reexec 来重启 systemd，问题消失了。所以基本上我们可以判断一个方向，问题可能跟 systemd 有关。 Systemd 是硬骨头 Systemd 是相当复杂的一个组件，尤其对没有做过相关开发工作的同学来说，比如我自己。基本上，排查 systemd 的问题，我用到了四个方法，（调试级别）日志，core dump，代码分析，以及 live debugging。其中第一个，第三个和第四个结合起来使用，让我在经过几天的鏖战之后，找到了问题的原因。但是这里我们先从“没用”的 core dump 说起。 “没用的”Core Dump 因为重启 systemd 解决了问题，而这个问题本身，是 runC 在使用 dbus 和systemd 通信的时候没有了响应，所以我们需要验证的第一件事情，就是 systemd不是有关键线程被锁住了。查看 core dump 里所有线程，只有以下一个线程，此线程并没有被锁住，它在等待 dbus 事件，以便做出响应。 零散的信息 因为无计可施，所以只能做各种测试、尝试。使用 busctl tree 命令，可以输出所有bus 上对外暴露的接口。从输出结果看来，org.freedesktop.systemd1 这个 bus 是不能响应接口查询请求的。 使用下边的命令，观察 org.freedesktop.systemd1 上接受到的所以请求，可以看到，在正常系统里，有大量 Unit 创建删除的消息，但是有问题的系统里，这个 bus 上完全没有任何消息。 gdbus monitor --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 分析问题发生前后的系统日志，runC 在重复的跑一个 libcontainer_%d_systemd_test_default.slice 测试，这个测试非常频繁，但是当问题发生的时候，这个测试就停止了。所以直觉告诉我，这个问题，可能和这个测试有很大的关系。 另外，我使用 systemd-analyze 命令，打开了 systemd 的调试级别日志，发现 systemd 有 Operation not supported 的报错。 根据以上零散的知识，可以给出一个大概的结论：org.freedesktop.systemd1 这个 bus 在经过大量 unit 创建删除之后，没有了响应。而这些频繁的 unit 创建删除测试，是 runC 某一个改动引入的。这个改动使得 UseSystemd 函数通过创建 unit 来测试 systemd 的功能。UseSystemd 在很多地方被调用，比如创建容器，或者查看容器性能等操作。 代码分析 这个问题在线上所有 Kubernetes 集群中，发生的频率大概是一个月两例。问题一直在发生，且只能在问题发生之后，通过重启 systemd 来处理，这风险极大。 我们分别给 systemd 和 runC 社区提交了 bug，但是一个很现实的问题是，他们并没有像阿里云这样的线上环境，他们重现这个问题的概率几乎是零，所以这个问题没有办法指望社区来解决。硬骨头还得我们自己啃。 在上一节最后，我们看到了，问题出现的时候，systemd 会输出一些 Operation not supported 报错。这个报错看起来和问题本身风马牛不相及，但是直觉告诉我，这，或许是离问题最近的一个地方，所以我决定，先搞清楚这个报错因何而来。 Systemd 代码量比较大，而报这个错误的地方非常多。通过大量的代码分析（这里略去一千字），我发现有几处比较可疑地方，有了这些可疑的地方，接下来需要做的事情，就是等待。在等了三周以后，终于有线上集群，再次重现了这个问题。 Live Debugging 在征求用户同意之后，下载 systemd 调试符号，挂载 gdb 到 systemd 上，在可疑的函数下断点，continue 继续执行。经过多次验证，发现 systemd 最终踩到了sd_bus_message_seal 这个函数里的 EOPNOTSUPP 报错。 这个报错背后的道理是，systemd 使用了一个变量 cookie，来追踪自己处理的 dbus message 。每次在加封一个新的 message 的时候，systemd 会先给 cookie的值加一，然后再把这个值复制给这个新的 message。 我们使用 gdb 打印出 dbus-&gt;cookie 这个值，可以很清楚看到，这个值超过了0xffffffff 。所以看起来，问题是 systemd 在加封过大量 message 之后，cookie 这个值32位溢出了，导致新的消息不能被加封，从而使得 systemd 对 runC 没有了响应。 另外，在一个正常的系统上，使用 gdb 把 bus-&gt;cookie 这个值改到接近 0xffffffff，然后观察到，问题在 cookie 溢出的时候立刻出现，则证明了我们的结论。 怎么判断集群节点 NotReady 是这个问题导致的 首先我们需要在有问题的节点上安装 gdb 和 systemd debuginfo，然后用命令 gdb /usr/lib/systemd/systemd1 把 gdb attach 到 systemd ，在函数sd_bus_send 设置断点，然后继续执行。等 systemd 踩到断点之后，用 p /x bus-&gt;cookie 查看对应的 cookie 值，如果此值超过了 0xffffffff，那么 cookie 就溢出了，则必然导致节点 NotReady 的问题。确认完之后，可以使用 quit 来 detach 调试器。 问题修复 这个问题的修复，并没有那么直截了当。原因之一，是 systemd 使用了同一个 cookie 变量，来兼容 dbus1 和 dbus2 。对于 dbus1 来说， cookie 是 32 位的，这个值在经过 systemd 三五个月频繁创建删除 unit 之后，是肯定会溢出的；而 dbus2 的 cookie 是 64 位的，可能到了时间的尽头，它也不会溢出。 另外一个原因是，我们并不能简单的让 cookie 折返，来解决溢出问题。因为这有可能导致 systemd 使用同一个 cookie 来加封不同的消息，这样的结果将是灾难性的。 最终的修复方法是，使用 32 位 cookie 来同样处理 dbus1 和 dbus2 两种情形。同时在 cookie 达到 0xfffffff 的之后，下一个 cookie 则变成 0x80000000，即用最高位来标记 cookie 已经处于溢出状态。检查到 cookie 处于这种状态时，我们需要检查是否下一个 cookie 正在被其他 message 使用，来避免 cookie 冲突。 后记 这个问题根本原因肯定在 systemd，但是 runC 的函数 UseSystemd 使用不那么美丽的方法，去测试 systemd 的功能，而这个函数在整个容器生命周期管理过程中，被频繁的调用，让这个低概率问题的发生成为了可能。systemd 的修复已经被红帽接受，预期不久的将来，我们可以通过升级 systemd，从根本上解决这个问题。 本文转载自公众号：阿里技术， 点击查看原文。 基于Kubernetes的DevOps实践培训 基于Kubernetes的DevOps实践培训将于2019年5月10日在上海开课，3天时间带你系统掌握Kubernetes，学习效果不好可以继续学习。本次培训包括：容器特性、镜像、网络；Kubernetes架构、核心组件、基本功能；Kubernetes设计理念、架构设计、基本功能、常用对象、设计原则；Kubernetes的数据库、运行时、网络、插件已经落地经验；微服务架构、组件、监控方案等，点击下方图片或者点击阅读原文了解详情。" />
+<meta property="og:description" content="排查完全陌生的问题、不熟悉的系统组件，对许多工程师来说是无与伦比的工作乐趣，当然也是一大挑战。今天，阿里巴巴售后技术专家声东跟大家分享一例 Kubernetes 集群上的问题。这个问题影响范围较广，或许某天你也会遇到。更重要的是，作者在问题排查过程中的思路和方法，也会让你有所启发。关于问题 I am Not Ready 阿里云有自己的 Kubernetes 容器集群产品。随着 Kubernetes 集群出货量剧增，线上用户零星地发现，集群会非常低概率地出现节点 NotReady 情况。据我们观察，这个问题差不多每个月，都会有一两个用户遇到。在节点 NotReady 之后，集群 Master 没有办法对这个节点做任何控制，比如下发新的 Pod，再比如抓取节点上正在运行 Pod 的实时信息。 需要知道的Kubernetes知识 这里我稍微补充一点 Kubernetes 集群的基本知识。Kubernetes 集群的“硬件基础”，是以单机形态存在的集群节点。这些节点可以是物理机，也可以是虚拟机。集群节点分为 Master 节点和 Worker 节点。Master 节点主要用来承载集群管控组件，比如调度器和控制器。而 Worker 节点主要用来跑业务。Kubelet 是跑在各个节点上的代理，它负责与管控组件沟通，并按照管控组件的指示，直接管理 Worker节点。 当集群节点进入 NotReady 状态的时候，我们需要做的第一件事情，是检查运行在节点上的 kubelet 是否正常。在这个问题出现的时候，使用 systemctl 命令查看的kubelet 状态（kubelet 是 systemd 管理的一个 daemon ）发现它是正常运行的。当我们用 journalctl 查看 kubelet 日志的时候，发现以下错误。 什么是 PLEG？ 这个报错清楚地告诉我们，容器 Runtime 是不工作的，且 PLEG 是不健康的。这里容器 Runtime 指的就是 Docker Daemon。Kubelet 通过操作 Docker Daemon 来控制容器的生命周期。而这里的 PLEG，指的是 pod lifecycle event generator。PLEG 是 kubelet 用来检查 Runtime 的健康检查机制。这件事情本来可以由 kubelet 使用 polling 的方式来做。但是 polling 有其高成本的缺陷，所以 PLEG 应用而生。PLEG 尝试以一种“中断”的形式，来实现对容器 Runtime 的健康检查，虽然实际上，它同时用了 polling 和“中断”这样折中的方案。 基本上，根据上边的报错，我们可以确认容器 Runtime 出了问题。在有问题的节点上，通过 Docker 命令尝试运行新的容器，命令会没有响应，这说明上边的报错是准确的。 Docker Stack Docker Daemon 调用栈分析 Docker 作为阿里云 Kubernetes 集群使用的容器 Runtime ，在 1.11 之后，被拆分成了多个组件以适应 OCI 标准。拆分之后，其包括 Docker Daemon，containerd，containerd-shim 以及 runC。组件 containerd 负责集群节点上容器的生命周期管理，并向上为 Docker Daemon 提供 gRPC 接口。 在这个问题中，既然 PLEG 认为容器 Runtime 出了问题，我们需要从 Docker Daemon 进程看起。我们可以使用 kill -USR1 &lt;pid&gt; 命令发送 USR1 信号给 Docker Daemon，而 Docker Daemon 收到信号之后，会把所有线程调用栈输出到 /var/run/docker 文件夹里。 Docker Daemon 进程的调用栈是比较容易分析的。稍加留意，我们会发现大多数的调用栈都长成下图中的样子。通过观察栈上每个函数的名字，以及函数所在的文件（模块）名称，我们可以了解到，这个调用栈的下半部分，是进程接到 http 请求，做请求路由的过程；而上半部分则是具体的处理函数。最终处理函数进入等待状态，等待一个 mutex 实例。 到这里，我们需要稍微看一下 ContainerInspectCurrent 这个函数的实现。从实现可以看到，这个函数的第一个参数，就是这个线程正在操作的容器名指针。使用这个指针搜索整个调用栈文件，我们会找出所有等在这个容器上的线程。同时，我们可以看到下边这个线程。 这个线程调用栈上的函数 ContainerExecStart 也是在处理相同容器。但不同的是，ContainerExecStart 并没有在等这个容器，而是已经拿到了这个容器的操作权（mutex），并把执行逻辑转向了 containerd 调用。关于这一点，我们也可以使用代码来验证。前边我提到过，containerd 通过 gRPC 向上对 Docker Daemon 提供接口。此调用栈上半部分内容，正是 Docker Daemon 在通过 gRPC 请求来呼叫 containerd。 containerd 调用栈分析 与 Docker Daemon 类似，我们可以通过 kill -SIGUSR1 &lt;pid&gt; 命令来输出containerd 的调用栈。不同的是，这次调用栈会直接输出到 messages 日志。 Containerd 作为一个 gRPC 的服务器，会在接到 Docker Daemon 的远程调用之后，新建一个线程去处理这次请求。关于 gRPC 的细节，我们这里其实不用太多关注。在这次请求的客户端调用栈上，可以看到这次调用的核心函数在 Start 一个 Process 。我们在 containerd 的调用栈里搜索 Start，Process 以及 process.go 等字段，很容易发现下边这个线程。 这个线程的核心任务，就是依靠 runC 去创建容器进程。而在容器启动之后，runC 进程会退出。所以下一步，我们自然而然会想到，runC 是不是有顺利完成自己的任务。查看进程列表，我们会发现，系统中有个别 runC 进程还在执行，这不是预期的行为。容器的启动，跟进程的启动，耗时应该是差不多数量级的，系统里有正在运行的 runC 进程，则说明 runC 不能正常启动容器。 什么是 D-Bus？ runC 请求 D-Bus 容器 Runtime 的 runC 命令，是 libcontainer 的一个简单的封装。这个工具可以用来管理单个容器，比如容器创建和容器删除。在上节的最后，我们发现 runC 不能完成创建容器的任务。我们可以把对应的进程杀掉，然后在命令行用同样的命令启动容器，同时用 strace 追踪整个过程。 分析发现，runC 停在了向带有 org.free 字段的 dbus socket 写数据的地方。那什么是 dbus 呢？在 Linux 上，dbus 是一种进程间进行消息通信的机制。 原因并不在 D-Bus 我们可以使用 busctl 命令列出系统现有的所有 bus 。如下图，在问题发生的时候，我看到问题节点 bus name 编号非常大。所以我倾向于认为，dbus 某些相关的数据结构，比如 name，耗尽了引起了这个问题。 Dbus 机制的实现，依赖于一个组件叫做 dbus daemon。如果真的是 dbus 相关数据结构耗尽，那么重启这个 daemon，应该可以解决这个问题。但不幸的是，问题并没有这么直接。重启 dbus daemon 之后，问题依然存在。 在上边 strace 追踪 runC 的截图中，runC 停在向带有 org.free 字段的 bus 写数据的地方。在 busctl 输出的 bus 列表里，显然带有这个字段的 bus，都在被 systemd使用。这时，我们用 systemctl daemon-reexec 来重启 systemd，问题消失了。所以基本上我们可以判断一个方向，问题可能跟 systemd 有关。 Systemd 是硬骨头 Systemd 是相当复杂的一个组件，尤其对没有做过相关开发工作的同学来说，比如我自己。基本上，排查 systemd 的问题，我用到了四个方法，（调试级别）日志，core dump，代码分析，以及 live debugging。其中第一个，第三个和第四个结合起来使用，让我在经过几天的鏖战之后，找到了问题的原因。但是这里我们先从“没用”的 core dump 说起。 “没用的”Core Dump 因为重启 systemd 解决了问题，而这个问题本身，是 runC 在使用 dbus 和systemd 通信的时候没有了响应，所以我们需要验证的第一件事情，就是 systemd不是有关键线程被锁住了。查看 core dump 里所有线程，只有以下一个线程，此线程并没有被锁住，它在等待 dbus 事件，以便做出响应。 零散的信息 因为无计可施，所以只能做各种测试、尝试。使用 busctl tree 命令，可以输出所有bus 上对外暴露的接口。从输出结果看来，org.freedesktop.systemd1 这个 bus 是不能响应接口查询请求的。 使用下边的命令，观察 org.freedesktop.systemd1 上接受到的所以请求，可以看到，在正常系统里，有大量 Unit 创建删除的消息，但是有问题的系统里，这个 bus 上完全没有任何消息。 gdbus monitor --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 分析问题发生前后的系统日志，runC 在重复的跑一个 libcontainer_%d_systemd_test_default.slice 测试，这个测试非常频繁，但是当问题发生的时候，这个测试就停止了。所以直觉告诉我，这个问题，可能和这个测试有很大的关系。 另外，我使用 systemd-analyze 命令，打开了 systemd 的调试级别日志，发现 systemd 有 Operation not supported 的报错。 根据以上零散的知识，可以给出一个大概的结论：org.freedesktop.systemd1 这个 bus 在经过大量 unit 创建删除之后，没有了响应。而这些频繁的 unit 创建删除测试，是 runC 某一个改动引入的。这个改动使得 UseSystemd 函数通过创建 unit 来测试 systemd 的功能。UseSystemd 在很多地方被调用，比如创建容器，或者查看容器性能等操作。 代码分析 这个问题在线上所有 Kubernetes 集群中，发生的频率大概是一个月两例。问题一直在发生，且只能在问题发生之后，通过重启 systemd 来处理，这风险极大。 我们分别给 systemd 和 runC 社区提交了 bug，但是一个很现实的问题是，他们并没有像阿里云这样的线上环境，他们重现这个问题的概率几乎是零，所以这个问题没有办法指望社区来解决。硬骨头还得我们自己啃。 在上一节最后，我们看到了，问题出现的时候，systemd 会输出一些 Operation not supported 报错。这个报错看起来和问题本身风马牛不相及，但是直觉告诉我，这，或许是离问题最近的一个地方，所以我决定，先搞清楚这个报错因何而来。 Systemd 代码量比较大，而报这个错误的地方非常多。通过大量的代码分析（这里略去一千字），我发现有几处比较可疑地方，有了这些可疑的地方，接下来需要做的事情，就是等待。在等了三周以后，终于有线上集群，再次重现了这个问题。 Live Debugging 在征求用户同意之后，下载 systemd 调试符号，挂载 gdb 到 systemd 上，在可疑的函数下断点，continue 继续执行。经过多次验证，发现 systemd 最终踩到了sd_bus_message_seal 这个函数里的 EOPNOTSUPP 报错。 这个报错背后的道理是，systemd 使用了一个变量 cookie，来追踪自己处理的 dbus message 。每次在加封一个新的 message 的时候，systemd 会先给 cookie的值加一，然后再把这个值复制给这个新的 message。 我们使用 gdb 打印出 dbus-&gt;cookie 这个值，可以很清楚看到，这个值超过了0xffffffff 。所以看起来，问题是 systemd 在加封过大量 message 之后，cookie 这个值32位溢出了，导致新的消息不能被加封，从而使得 systemd 对 runC 没有了响应。 另外，在一个正常的系统上，使用 gdb 把 bus-&gt;cookie 这个值改到接近 0xffffffff，然后观察到，问题在 cookie 溢出的时候立刻出现，则证明了我们的结论。 怎么判断集群节点 NotReady 是这个问题导致的 首先我们需要在有问题的节点上安装 gdb 和 systemd debuginfo，然后用命令 gdb /usr/lib/systemd/systemd1 把 gdb attach 到 systemd ，在函数sd_bus_send 设置断点，然后继续执行。等 systemd 踩到断点之后，用 p /x bus-&gt;cookie 查看对应的 cookie 值，如果此值超过了 0xffffffff，那么 cookie 就溢出了，则必然导致节点 NotReady 的问题。确认完之后，可以使用 quit 来 detach 调试器。 问题修复 这个问题的修复，并没有那么直截了当。原因之一，是 systemd 使用了同一个 cookie 变量，来兼容 dbus1 和 dbus2 。对于 dbus1 来说， cookie 是 32 位的，这个值在经过 systemd 三五个月频繁创建删除 unit 之后，是肯定会溢出的；而 dbus2 的 cookie 是 64 位的，可能到了时间的尽头，它也不会溢出。 另外一个原因是，我们并不能简单的让 cookie 折返，来解决溢出问题。因为这有可能导致 systemd 使用同一个 cookie 来加封不同的消息，这样的结果将是灾难性的。 最终的修复方法是，使用 32 位 cookie 来同样处理 dbus1 和 dbus2 两种情形。同时在 cookie 达到 0xfffffff 的之后，下一个 cookie 则变成 0x80000000，即用最高位来标记 cookie 已经处于溢出状态。检查到 cookie 处于这种状态时，我们需要检查是否下一个 cookie 正在被其他 message 使用，来避免 cookie 冲突。 后记 这个问题根本原因肯定在 systemd，但是 runC 的函数 UseSystemd 使用不那么美丽的方法，去测试 systemd 的功能，而这个函数在整个容器生命周期管理过程中，被频繁的调用，让这个低概率问题的发生成为了可能。systemd 的修复已经被红帽接受，预期不久的将来，我们可以通过升级 systemd，从根本上解决这个问题。 本文转载自公众号：阿里技术， 点击查看原文。 基于Kubernetes的DevOps实践培训 基于Kubernetes的DevOps实践培训将于2019年5月10日在上海开课，3天时间带你系统掌握Kubernetes，学习效果不好可以继续学习。本次培训包括：容器特性、镜像、网络；Kubernetes架构、核心组件、基本功能；Kubernetes设计理念、架构设计、基本功能、常用对象、设计原则；Kubernetes的数据库、运行时、网络、插件已经落地经验；微服务架构、组件、监控方案等，点击下方图片或者点击阅读原文了解详情。" />
+<link rel="canonical" href="https://uzzz.org/2019/04/30/781598.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/30/781598.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-30T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"排查完全陌生的问题、不熟悉的系统组件，对许多工程师来说是无与伦比的工作乐趣，当然也是一大挑战。今天，阿里巴巴售后技术专家声东跟大家分享一例 Kubernetes 集群上的问题。这个问题影响范围较广，或许某天你也会遇到。更重要的是，作者在问题排查过程中的思路和方法，也会让你有所启发。关于问题 I am Not Ready 阿里云有自己的 Kubernetes 容器集群产品。随着 Kubernetes 集群出货量剧增，线上用户零星地发现，集群会非常低概率地出现节点 NotReady 情况。据我们观察，这个问题差不多每个月，都会有一两个用户遇到。在节点 NotReady 之后，集群 Master 没有办法对这个节点做任何控制，比如下发新的 Pod，再比如抓取节点上正在运行 Pod 的实时信息。 需要知道的Kubernetes知识 这里我稍微补充一点 Kubernetes 集群的基本知识。Kubernetes 集群的“硬件基础”，是以单机形态存在的集群节点。这些节点可以是物理机，也可以是虚拟机。集群节点分为 Master 节点和 Worker 节点。Master 节点主要用来承载集群管控组件，比如调度器和控制器。而 Worker 节点主要用来跑业务。Kubelet 是跑在各个节点上的代理，它负责与管控组件沟通，并按照管控组件的指示，直接管理 Worker节点。 当集群节点进入 NotReady 状态的时候，我们需要做的第一件事情，是检查运行在节点上的 kubelet 是否正常。在这个问题出现的时候，使用 systemctl 命令查看的kubelet 状态（kubelet 是 systemd 管理的一个 daemon ）发现它是正常运行的。当我们用 journalctl 查看 kubelet 日志的时候，发现以下错误。 什么是 PLEG？ 这个报错清楚地告诉我们，容器 Runtime 是不工作的，且 PLEG 是不健康的。这里容器 Runtime 指的就是 Docker Daemon。Kubelet 通过操作 Docker Daemon 来控制容器的生命周期。而这里的 PLEG，指的是 pod lifecycle event generator。PLEG 是 kubelet 用来检查 Runtime 的健康检查机制。这件事情本来可以由 kubelet 使用 polling 的方式来做。但是 polling 有其高成本的缺陷，所以 PLEG 应用而生。PLEG 尝试以一种“中断”的形式，来实现对容器 Runtime 的健康检查，虽然实际上，它同时用了 polling 和“中断”这样折中的方案。 基本上，根据上边的报错，我们可以确认容器 Runtime 出了问题。在有问题的节点上，通过 Docker 命令尝试运行新的容器，命令会没有响应，这说明上边的报错是准确的。 Docker Stack Docker Daemon 调用栈分析 Docker 作为阿里云 Kubernetes 集群使用的容器 Runtime ，在 1.11 之后，被拆分成了多个组件以适应 OCI 标准。拆分之后，其包括 Docker Daemon，containerd，containerd-shim 以及 runC。组件 containerd 负责集群节点上容器的生命周期管理，并向上为 Docker Daemon 提供 gRPC 接口。 在这个问题中，既然 PLEG 认为容器 Runtime 出了问题，我们需要从 Docker Daemon 进程看起。我们可以使用 kill -USR1 &lt;pid&gt; 命令发送 USR1 信号给 Docker Daemon，而 Docker Daemon 收到信号之后，会把所有线程调用栈输出到 /var/run/docker 文件夹里。 Docker Daemon 进程的调用栈是比较容易分析的。稍加留意，我们会发现大多数的调用栈都长成下图中的样子。通过观察栈上每个函数的名字，以及函数所在的文件（模块）名称，我们可以了解到，这个调用栈的下半部分，是进程接到 http 请求，做请求路由的过程；而上半部分则是具体的处理函数。最终处理函数进入等待状态，等待一个 mutex 实例。 到这里，我们需要稍微看一下 ContainerInspectCurrent 这个函数的实现。从实现可以看到，这个函数的第一个参数，就是这个线程正在操作的容器名指针。使用这个指针搜索整个调用栈文件，我们会找出所有等在这个容器上的线程。同时，我们可以看到下边这个线程。 这个线程调用栈上的函数 ContainerExecStart 也是在处理相同容器。但不同的是，ContainerExecStart 并没有在等这个容器，而是已经拿到了这个容器的操作权（mutex），并把执行逻辑转向了 containerd 调用。关于这一点，我们也可以使用代码来验证。前边我提到过，containerd 通过 gRPC 向上对 Docker Daemon 提供接口。此调用栈上半部分内容，正是 Docker Daemon 在通过 gRPC 请求来呼叫 containerd。 containerd 调用栈分析 与 Docker Daemon 类似，我们可以通过 kill -SIGUSR1 &lt;pid&gt; 命令来输出containerd 的调用栈。不同的是，这次调用栈会直接输出到 messages 日志。 Containerd 作为一个 gRPC 的服务器，会在接到 Docker Daemon 的远程调用之后，新建一个线程去处理这次请求。关于 gRPC 的细节，我们这里其实不用太多关注。在这次请求的客户端调用栈上，可以看到这次调用的核心函数在 Start 一个 Process 。我们在 containerd 的调用栈里搜索 Start，Process 以及 process.go 等字段，很容易发现下边这个线程。 这个线程的核心任务，就是依靠 runC 去创建容器进程。而在容器启动之后，runC 进程会退出。所以下一步，我们自然而然会想到，runC 是不是有顺利完成自己的任务。查看进程列表，我们会发现，系统中有个别 runC 进程还在执行，这不是预期的行为。容器的启动，跟进程的启动，耗时应该是差不多数量级的，系统里有正在运行的 runC 进程，则说明 runC 不能正常启动容器。 什么是 D-Bus？ runC 请求 D-Bus 容器 Runtime 的 runC 命令，是 libcontainer 的一个简单的封装。这个工具可以用来管理单个容器，比如容器创建和容器删除。在上节的最后，我们发现 runC 不能完成创建容器的任务。我们可以把对应的进程杀掉，然后在命令行用同样的命令启动容器，同时用 strace 追踪整个过程。 分析发现，runC 停在了向带有 org.free 字段的 dbus socket 写数据的地方。那什么是 dbus 呢？在 Linux 上，dbus 是一种进程间进行消息通信的机制。 原因并不在 D-Bus 我们可以使用 busctl 命令列出系统现有的所有 bus 。如下图，在问题发生的时候，我看到问题节点 bus name 编号非常大。所以我倾向于认为，dbus 某些相关的数据结构，比如 name，耗尽了引起了这个问题。 Dbus 机制的实现，依赖于一个组件叫做 dbus daemon。如果真的是 dbus 相关数据结构耗尽，那么重启这个 daemon，应该可以解决这个问题。但不幸的是，问题并没有这么直接。重启 dbus daemon 之后，问题依然存在。 在上边 strace 追踪 runC 的截图中，runC 停在向带有 org.free 字段的 bus 写数据的地方。在 busctl 输出的 bus 列表里，显然带有这个字段的 bus，都在被 systemd使用。这时，我们用 systemctl daemon-reexec 来重启 systemd，问题消失了。所以基本上我们可以判断一个方向，问题可能跟 systemd 有关。 Systemd 是硬骨头 Systemd 是相当复杂的一个组件，尤其对没有做过相关开发工作的同学来说，比如我自己。基本上，排查 systemd 的问题，我用到了四个方法，（调试级别）日志，core dump，代码分析，以及 live debugging。其中第一个，第三个和第四个结合起来使用，让我在经过几天的鏖战之后，找到了问题的原因。但是这里我们先从“没用”的 core dump 说起。 “没用的”Core Dump 因为重启 systemd 解决了问题，而这个问题本身，是 runC 在使用 dbus 和systemd 通信的时候没有了响应，所以我们需要验证的第一件事情，就是 systemd不是有关键线程被锁住了。查看 core dump 里所有线程，只有以下一个线程，此线程并没有被锁住，它在等待 dbus 事件，以便做出响应。 零散的信息 因为无计可施，所以只能做各种测试、尝试。使用 busctl tree 命令，可以输出所有bus 上对外暴露的接口。从输出结果看来，org.freedesktop.systemd1 这个 bus 是不能响应接口查询请求的。 使用下边的命令，观察 org.freedesktop.systemd1 上接受到的所以请求，可以看到，在正常系统里，有大量 Unit 创建删除的消息，但是有问题的系统里，这个 bus 上完全没有任何消息。 gdbus monitor --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 分析问题发生前后的系统日志，runC 在重复的跑一个 libcontainer_%d_systemd_test_default.slice 测试，这个测试非常频繁，但是当问题发生的时候，这个测试就停止了。所以直觉告诉我，这个问题，可能和这个测试有很大的关系。 另外，我使用 systemd-analyze 命令，打开了 systemd 的调试级别日志，发现 systemd 有 Operation not supported 的报错。 根据以上零散的知识，可以给出一个大概的结论：org.freedesktop.systemd1 这个 bus 在经过大量 unit 创建删除之后，没有了响应。而这些频繁的 unit 创建删除测试，是 runC 某一个改动引入的。这个改动使得 UseSystemd 函数通过创建 unit 来测试 systemd 的功能。UseSystemd 在很多地方被调用，比如创建容器，或者查看容器性能等操作。 代码分析 这个问题在线上所有 Kubernetes 集群中，发生的频率大概是一个月两例。问题一直在发生，且只能在问题发生之后，通过重启 systemd 来处理，这风险极大。 我们分别给 systemd 和 runC 社区提交了 bug，但是一个很现实的问题是，他们并没有像阿里云这样的线上环境，他们重现这个问题的概率几乎是零，所以这个问题没有办法指望社区来解决。硬骨头还得我们自己啃。 在上一节最后，我们看到了，问题出现的时候，systemd 会输出一些 Operation not supported 报错。这个报错看起来和问题本身风马牛不相及，但是直觉告诉我，这，或许是离问题最近的一个地方，所以我决定，先搞清楚这个报错因何而来。 Systemd 代码量比较大，而报这个错误的地方非常多。通过大量的代码分析（这里略去一千字），我发现有几处比较可疑地方，有了这些可疑的地方，接下来需要做的事情，就是等待。在等了三周以后，终于有线上集群，再次重现了这个问题。 Live Debugging 在征求用户同意之后，下载 systemd 调试符号，挂载 gdb 到 systemd 上，在可疑的函数下断点，continue 继续执行。经过多次验证，发现 systemd 最终踩到了sd_bus_message_seal 这个函数里的 EOPNOTSUPP 报错。 这个报错背后的道理是，systemd 使用了一个变量 cookie，来追踪自己处理的 dbus message 。每次在加封一个新的 message 的时候，systemd 会先给 cookie的值加一，然后再把这个值复制给这个新的 message。 我们使用 gdb 打印出 dbus-&gt;cookie 这个值，可以很清楚看到，这个值超过了0xffffffff 。所以看起来，问题是 systemd 在加封过大量 message 之后，cookie 这个值32位溢出了，导致新的消息不能被加封，从而使得 systemd 对 runC 没有了响应。 另外，在一个正常的系统上，使用 gdb 把 bus-&gt;cookie 这个值改到接近 0xffffffff，然后观察到，问题在 cookie 溢出的时候立刻出现，则证明了我们的结论。 怎么判断集群节点 NotReady 是这个问题导致的 首先我们需要在有问题的节点上安装 gdb 和 systemd debuginfo，然后用命令 gdb /usr/lib/systemd/systemd1 把 gdb attach 到 systemd ，在函数sd_bus_send 设置断点，然后继续执行。等 systemd 踩到断点之后，用 p /x bus-&gt;cookie 查看对应的 cookie 值，如果此值超过了 0xffffffff，那么 cookie 就溢出了，则必然导致节点 NotReady 的问题。确认完之后，可以使用 quit 来 detach 调试器。 问题修复 这个问题的修复，并没有那么直截了当。原因之一，是 systemd 使用了同一个 cookie 变量，来兼容 dbus1 和 dbus2 。对于 dbus1 来说， cookie 是 32 位的，这个值在经过 systemd 三五个月频繁创建删除 unit 之后，是肯定会溢出的；而 dbus2 的 cookie 是 64 位的，可能到了时间的尽头，它也不会溢出。 另外一个原因是，我们并不能简单的让 cookie 折返，来解决溢出问题。因为这有可能导致 systemd 使用同一个 cookie 来加封不同的消息，这样的结果将是灾难性的。 最终的修复方法是，使用 32 位 cookie 来同样处理 dbus1 和 dbus2 两种情形。同时在 cookie 达到 0xfffffff 的之后，下一个 cookie 则变成 0x80000000，即用最高位来标记 cookie 已经处于溢出状态。检查到 cookie 处于这种状态时，我们需要检查是否下一个 cookie 正在被其他 message 使用，来避免 cookie 冲突。 后记 这个问题根本原因肯定在 systemd，但是 runC 的函数 UseSystemd 使用不那么美丽的方法，去测试 systemd 的功能，而这个函数在整个容器生命周期管理过程中，被频繁的调用，让这个低概率问题的发生成为了可能。systemd 的修复已经被红帽接受，预期不久的将来，我们可以通过升级 systemd，从根本上解决这个问题。 本文转载自公众号：阿里技术， 点击查看原文。 基于Kubernetes的DevOps实践培训 基于Kubernetes的DevOps实践培训将于2019年5月10日在上海开课，3天时间带你系统掌握Kubernetes，学习效果不好可以继续学习。本次培训包括：容器特性、镜像、网络；Kubernetes架构、核心组件、基本功能；Kubernetes设计理念、架构设计、基本功能、常用对象、设计原则；Kubernetes的数据库、运行时、网络、插件已经落地经验；微服务架构、组件、监控方案等，点击下方图片或者点击阅读原文了解详情。","@type":"BlogPosting","url":"https://uzzz.org/2019/04/30/781598.html","headline":"Kubernetes 从懵圈到熟练：读懂此文，集群节点不下线！","dateModified":"2019-04-30T00:00:00+08:00","datePublished":"2019-04-30T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/30/781598.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Kubernetes 从懵圈到熟练：读懂此文，集群节点不下线！</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <div class="rich_media_content" id="js_content"> 
+   <p style="text-align:center;"><img class="rich_pages" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE7DeZVSjYrtr6ldplZVyVeUbCvtLvODoicmgasssjtc2CKRo3pcsqOcg/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>排查完全陌生的问题、不熟悉的系统组件，对许多工程师来说是无与伦比的工作乐趣，当然也是一大挑战。今天，阿里巴巴售后技术专家声东跟大家分享一例 Kubernetes 集群上的问题。这个问题影响范围较广，或许某天你也会遇到。更重要的是，作者在问题排查过程中的思路和方法，也会让你有所启发。关于问题
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>
+   <strong>I am Not Ready</strong>
+   <br>阿里云有自己的 Kubernetes 容器集群产品。随着 Kubernetes 集群出货量剧增，线上用户零星地发现，集群会非常低概率地出现节点 NotReady 情况。据我们观察，这个问题差不多每个月，都会有一两个用户遇到。在节点 NotReady 之后，集群 Master 没有办法对这个节点做任何控制，比如下发新的 Pod，再比如抓取节点上正在运行 Pod 的实时信息。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEacukKtiaVGvcfC7Vy6AtuAWY48A52ic7ACn4h3gic9pk2DsmIfbm4ghHw/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>
+   <strong>需要知道的Kubernetes知识</strong>
+   <br>这里我稍微补充一点 Kubernetes 集群的基本知识。Kubernetes 集群的“硬件基础”，是以单机形态存在的集群节点。这些节点可以是物理机，也可以是虚拟机。集群节点分为 Master 节点和 Worker 节点。Master 节点主要用来承载集群管控组件，比如调度器和控制器。而 Worker 节点主要用来跑业务。Kubelet 是跑在各个节点上的代理，它负责与管控组件沟通，并按照管控组件的指示，直接管理 Worker节点。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEcYsLlcstzKLMqKP0GEveEvsicVmlgdJ04xicYt49ia4kOc8DNv92ygOBA/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>当集群节点进入 NotReady 状态的时候，我们需要做的第一件事情，是检查运行在节点上的 kubelet 是否正常。在这个问题出现的时候，使用 systemctl 命令查看的kubelet 状态（kubelet 是 systemd 管理的一个 daemon ）发现它是正常运行的。当我们用 journalctl 查看 kubelet 日志的时候，发现以下错误。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE2n3LLn9EibGMtELuCVGkmufEAyhdUPYFu84roIfENBAQXGqYj3vSGxQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>
+   <strong>什么是 PLEG？</strong>
+   <br>这个报错清楚地告诉我们，容器 Runtime 是不工作的，且 PLEG 是不健康的。这里容器 Runtime 指的就是 Docker Daemon。Kubelet 通过操作 Docker Daemon 来控制容器的生命周期。而这里的 PLEG，指的是 pod lifecycle event generator。PLEG 是 kubelet 用来检查 Runtime 的健康检查机制。这件事情本来可以由 kubelet 使用 polling 的方式来做。但是 polling 有其高成本的缺陷，所以 PLEG 应用而生。PLEG 尝试以一种“中断”的形式，来实现对容器 Runtime 的健康检查，虽然实际上，它同时用了 polling 和“中断”这样折中的方案。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/A1HKVXsfHNmibvl19PwY16192D1HJoPmEiaaXQewORN5c4cNBYCcnW6yD4Yje8KngUnlM3pibTYH0PqBmwnOS6f8Q/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <br>基本上，根据上边的报错，我们可以确认容器 Runtime 出了问题。在有问题的节点上，通过 Docker 命令尝试运行新的容器，命令会没有响应，这说明上边的报错是准确的。
+   <br>Docker Stack
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>
+   <strong>Docker Daemon 调用栈分析</strong>
+   <br>Docker 作为阿里云 Kubernetes 集群使用的容器 Runtime ，在 1.11 之后，被拆分成了多个组件以适应 OCI 标准。拆分之后，其包括 Docker Daemon，containerd，containerd-shim 以及 runC。组件 containerd 负责集群节点上容器的生命周期管理，并向上为 Docker Daemon 提供 gRPC 接口。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE8q3LMwXAmevicAgjUmA74fic3GsVXOedrKj1YVdDv7qE7hicTDX8hqTlg/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>在这个问题中，既然 PLEG 认为容器 Runtime 出了问题，我们需要从 Docker Daemon 进程看起。我们可以使用 kill -USR1 &lt;pid&gt; 命令发送 USR1 信号给 Docker Daemon，而 Docker Daemon 收到信号之后，会把所有线程调用栈输出到 /var/run/docker 文件夹里。
+   <br>Docker Daemon 进程的调用栈是比较容易分析的。稍加留意，我们会发现大多数的调用栈都长成下图中的样子。通过观察栈上每个函数的名字，以及函数所在的文件（模块）名称，我们可以了解到，这个调用栈的下半部分，是进程接到 http 请求，做请求路由的过程；而上半部分则是具体的处理函数。最终处理函数进入等待状态，等待一个 mutex 实例。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEDNm6EaATTMRicHjPtGNo57CcBjMgDGvuBSibOsps33Hp9ypMGgzRHOdQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>到这里，我们需要稍微看一下 ContainerInspectCurrent 这个函数的实现。从实现可以看到，这个函数的第一个参数，就是这个线程正在操作的容器名指针。使用这个指针搜索整个调用栈文件，我们会找出所有等在这个容器上的线程。同时，我们可以看到下边这个线程。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE3WlX7BZXBPsdlba8HcleIE8l1qibicTHwLxFibskyIsBSIO4FSk8KG7icA/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>这个线程调用栈上的函数 ContainerExecStart 也是在处理相同容器。但不同的是，ContainerExecStart 并没有在等这个容器，而是已经拿到了这个容器的操作权（mutex），并把执行逻辑转向了 containerd 调用。关于这一点，我们也可以使用代码来验证。前边我提到过，containerd 通过 gRPC 向上对 Docker Daemon 提供接口。此调用栈上半部分内容，正是 Docker Daemon 在通过 gRPC 请求来呼叫 containerd。
+   <br>
+   <strong>containerd 调用栈分析</strong>
+   <br>与 Docker Daemon 类似，我们可以通过 kill -SIGUSR1 &lt;pid&gt; 命令来输出containerd 的调用栈。不同的是，这次调用栈会直接输出到 messages 日志。
+   <br>Containerd 作为一个 gRPC 的服务器，会在接到 Docker Daemon 的远程调用之后，新建一个线程去处理这次请求。关于 gRPC 的细节，我们这里其实不用太多关注。在这次请求的客户端调用栈上，可以看到这次调用的核心函数在 Start 一个 Process 。我们在 containerd 的调用栈里搜索 Start，Process 以及 process.go 等字段，很容易发现下边这个线程。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE7MS2eeicBFFjZDRr9qcb1HDgdltMs3ZrEotbicOF5nsrYdP0viauoNGnw/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>这个线程的核心任务，就是依靠 runC 去创建容器进程。而在容器启动之后，runC 进程会退出。所以下一步，我们自然而然会想到，runC 是不是有顺利完成自己的任务。查看进程列表，我们会发现，系统中有个别 runC 进程还在执行，这不是预期的行为。容器的启动，跟进程的启动，耗时应该是差不多数量级的，系统里有正在运行的 runC 进程，则说明 runC 不能正常启动容器。
+   <br>什么是 D-Bus？
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>
+   <strong>runC 请求 D-Bus</strong>
+   <br>容器 Runtime 的 runC 命令，是 libcontainer 的一个简单的封装。这个工具可以用来管理单个容器，比如容器创建和容器删除。在上节的最后，我们发现 runC 不能完成创建容器的任务。我们可以把对应的进程杀掉，然后在命令行用同样的命令启动容器，同时用 strace 追踪整个过程。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmE5eqhLTKt5sJ2wHZcIiaFg6ABYhK6xLkDoWxDM5fPFbia4NmT9h6kkprA/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>分析发现，runC 停在了向带有 org.free 字段的 dbus socket 写数据的地方。那什么是 dbus 呢？在 Linux 上，dbus 是一种进程间进行消息通信的机制。
+   <br>
+   <strong>原因并不在 D-Bus</strong>
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEvSd5M4ATaWxNJBCoSHKbGJrG8u2PsjxUWvfYEhF0icJhRI0IWHvntWQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>我们可以使用 busctl 命令列出系统现有的所有 bus 。如下图，在问题发生的时候，我看到问题节点 bus name 编号非常大。所以我倾向于认为，dbus 某些相关的数据结构，比如 name，耗尽了引起了这个问题。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEbtGAnugKahKbb1IUC9GVz4ibzOfgWQaeNOnkuzt0cWQibqAHegOnSbuQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>Dbus 机制的实现，依赖于一个组件叫做 dbus daemon。如果真的是 dbus 相关数据结构耗尽，那么重启这个 daemon，应该可以解决这个问题。但不幸的是，问题并没有这么直接。重启 dbus daemon 之后，问题依然存在。
+   <br>在上边 strace 追踪 runC 的截图中，runC 停在向带有 org.free 字段的 bus 写数据的地方。在 busctl 输出的 bus 列表里，显然带有这个字段的 bus，都在被 systemd使用。这时，我们用 systemctl daemon-reexec 来重启 systemd，问题消失了。所以基本上我们可以判断一个方向，问题可能跟 systemd 有关。
+   <br>Systemd 是硬骨头
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>Systemd 是相当复杂的一个组件，尤其对没有做过相关开发工作的同学来说，比如我自己。基本上，排查 systemd 的问题，我用到了四个方法，（调试级别）日志，core dump，代码分析，以及 live debugging。其中第一个，第三个和第四个结合起来使用，让我在经过几天的鏖战之后，找到了问题的原因。但是这里我们先从“没用”的 core dump 说起。
+   <br>
+   <strong>“没用的”Core Dump</strong>
+   <br>因为重启 systemd 解决了问题，而这个问题本身，是 runC 在使用 dbus 和systemd 通信的时候没有了响应，所以我们需要验证的第一件事情，就是 systemd不是有关键线程被锁住了。查看 core dump 里所有线程，只有以下一个线程，此线程并没有被锁住，它在等待 dbus 事件，以便做出响应。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/A1HKVXsfHNmibvl19PwY16192D1HJoPmEiayZKl7GADjvUjiazY9DV2LBNL7CibPNsZd64L8nM1uq7TYJtn6o5ZaKA/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <br>
+   <strong>零散的信息</strong>
+   <br>因为无计可施，所以只能做各种测试、尝试。使用 busctl tree 命令，可以输出所有bus 上对外暴露的接口。从输出结果看来，org.freedesktop.systemd1 这个 bus 是不能响应接口查询请求的。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEEDLPzz7m6Lvs0SRt6zRtwrwfnsJN7RM7Q2UIdvKjU2gMJc2wo7icp2Q/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>使用下边的命令，观察 org.freedesktop.systemd1 上接受到的所以请求，可以看到，在正常系统里，有大量 Unit 创建删除的消息，但是有问题的系统里，这个 bus 上完全没有任何消息。
+   <br>
+   <pre class="prettyprint linenums prettyprinted" style="color:rgb(80,97,109);font-size:10px;line-height:12px;font-family:consolas, menlo, courier, monospace, 'Microsoft Yahei';border-width:1px;border-style:solid;border-color:rgb(226,226,226);"></pre>
+   <ol class="linenums list-paddingleft-2" style="list-style-type:none;">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;"><span style="line-height:22px;"><code style="margin-left:-20px;line-height:12px;border-width:0px;font-size:10px;font-family:inherit;"><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">gdbus monitor </span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">--</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">system </span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">--</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">dest org</span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">.</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">freedesktop</span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">.</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">systemd1 </span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">--</span><span class="kwd" style="color:rgb(149,90,231);line-height:20px;font-size:13px;">object</span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">-</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">path </span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">/</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">org</span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">/</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">freedesktop</span><span class="pun" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">/</span><span class="pln" style="color:rgb(239,236,244);line-height:20px;font-size:13px;">systemd1</span></code></span></span></p></li>
+   </ol>
+   <p><span class="js_jump_icon h5_image_link"></span></p>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEaVb2Qyv6yNhK60yKr4bz2RdvPrSXmgH2iaG7iaXkobicuLXiaLSkHibOhkQ/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>分析问题发生前后的系统日志，runC 在重复的跑一个 libcontainer_%d_systemd_test_default.slice 测试，这个测试非常频繁，但是当问题发生的时候，这个测试就停止了。所以直觉告诉我，这个问题，可能和这个测试有很大的关系。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEsWeOaNVmNq2W0nAib3HFicI5evpicdWOfic5gMDbg084tNqKrdibbiaIuicUw/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>另外，我使用 systemd-analyze 命令，打开了 systemd 的调试级别日志，发现 systemd 有 Operation not supported 的报错。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEXd6If2IZcKotCZbeReC6o8g3YvnLsLxdYhMicG9htGjy97mzLdqkXyA/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>根据以上零散的知识，可以给出一个大概的结论：org.freedesktop.systemd1 这个 bus 在经过大量 unit 创建删除之后，没有了响应。而这些频繁的 unit 创建删除测试，是 runC 某一个改动引入的。这个改动使得 UseSystemd 函数通过创建 unit 来测试 systemd 的功能。UseSystemd 在很多地方被调用，比如创建容器，或者查看容器性能等操作。
+   <br>
+   <strong>代码分析</strong>
+   <br>这个问题在线上所有 Kubernetes 集群中，发生的频率大概是一个月两例。问题一直在发生，且只能在问题发生之后，通过重启 systemd 来处理，这风险极大。
+   <br>我们分别给 systemd 和 runC 社区提交了 bug，但是一个很现实的问题是，他们并没有像阿里云这样的线上环境，他们重现这个问题的概率几乎是零，所以这个问题没有办法指望社区来解决。硬骨头还得我们自己啃。
+   <br>在上一节最后，我们看到了，问题出现的时候，systemd 会输出一些 Operation not supported 报错。这个报错看起来和问题本身风马牛不相及，但是直觉告诉我，这，或许是离问题最近的一个地方，所以我决定，先搞清楚这个报错因何而来。
+   <br>Systemd 代码量比较大，而报这个错误的地方非常多。通过大量的代码分析（这里略去一千字），我发现有几处比较可疑地方，有了这些可疑的地方，接下来需要做的事情，就是等待。在等了三周以后，终于有线上集群，再次重现了这个问题。
+   <br>
+   <strong>Live Debugging</strong>
+   <br>在征求用户同意之后，下载 systemd 调试符号，挂载 gdb 到 systemd 上，在可疑的函数下断点，continue 继续执行。经过多次验证，发现 systemd 最终踩到了sd_bus_message_seal 这个函数里的 EOPNOTSUPP 报错。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/A1HKVXsfHNmibvl19PwY16192D1HJoPmEVQbSd0jg3KZGFzZMZlKerfDtCMwoPOmCc2MXdeyWiafia4TdZ1MszKeA/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <br>这个报错背后的道理是，systemd 使用了一个变量 cookie，来追踪自己处理的 dbus message 。每次在加封一个新的 message 的时候，systemd 会先给 cookie的值加一，然后再把这个值复制给这个新的 message。
+   <br>我们使用 gdb 打印出 dbus-&gt;cookie 这个值，可以很清楚看到，这个值超过了0xffffffff 。所以看起来，问题是 systemd 在加封过大量 message 之后，cookie 这个值32位溢出了，导致新的消息不能被加封，从而使得 systemd 对 runC 没有了响应。
+   <br>
+   <p><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/A1HKVXsfHNmibvl19PwY16192D1HJoPmEcPJuz03eKKTSewM3YX6a0MPafP9fxRLFicpeGIKibkibVv2rHADbBpVNg/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <br>另外，在一个正常的系统上，使用 gdb 把 bus-&gt;cookie 这个值改到接近 0xffffffff，然后观察到，问题在 cookie 溢出的时候立刻出现，则证明了我们的结论。
+   <br>
+   <strong>怎么判断集群节点 NotReady 是这个问题导致的</strong>
+   <br>首先我们需要在有问题的节点上安装 gdb 和 systemd debuginfo，然后用命令 gdb /usr/lib/systemd/systemd1 把 gdb attach 到 systemd ，在函数sd_bus_send 设置断点，然后继续执行。等 systemd 踩到断点之后，用 p /x bus-&gt;cookie 查看对应的 cookie 值，如果此值超过了 0xffffffff，那么 cookie 就溢出了，则必然导致节点 NotReady 的问题。确认完之后，可以使用 quit 来 detach 调试器。
+   <p><span style="color:rgb(102,102,102);font-family:'Helvetica Neue', STHeiti, 'Microsoft YaHei', Helvetica, Arial, sans-serif;font-size:14px;"></span><br style="color:rgb(102,102,102);font-family:'Helvetica Neue', STHeiti, 'Microsoft YaHei', Helvetica, Arial, sans-serif;font-size:14px;"></p>问题修复
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>这个问题的修复，并没有那么直截了当。原因之一，是 systemd 使用了同一个 cookie 变量，来兼容 dbus1 和 dbus2 。对于 dbus1 来说， cookie 是 32 位的，这个值在经过 systemd 三五个月频繁创建删除 unit 之后，是肯定会溢出的；而 dbus2 的 cookie 是 64 位的，可能到了时间的尽头，它也不会溢出。
+   <br>另外一个原因是，我们并不能简单的让 cookie 折返，来解决溢出问题。因为这有可能导致 systemd 使用同一个 cookie 来加封不同的消息，这样的结果将是灾难性的。
+   <br>最终的修复方法是，使用 32 位 cookie 来同样处理 dbus1 和 dbus2 两种情形。同时在 cookie 达到 0xfffffff 的之后，下一个 cookie 则变成 0x80000000，即用最高位来标记 cookie 已经处于溢出状态。检查到 cookie 处于这种状态时，我们需要检查是否下一个 cookie 正在被其他 message 使用，来避免 cookie 冲突。
+   <p><span style="color:rgb(102,102,102);font-family:'Helvetica Neue', STHeiti, 'Microsoft YaHei', Helvetica, Arial, sans-serif;font-size:14px;"></span><br style="color:rgb(102,102,102);font-family:'Helvetica Neue', STHeiti, 'Microsoft YaHei', Helvetica, Arial, sans-serif;font-size:14px;"></p>后记
+   <p><img style="margin-left:0px;color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+   <p><br></p>这个问题根本原因肯定在 systemd，但是 runC 的函数 UseSystemd 使用不那么美丽的方法，去测试 systemd 的功能，而这个函数在整个容器生命周期管理过程中，被频繁的调用，让这个低概率问题的发生成为了可能。systemd 的修复已经被红帽接受，预期不久的将来，我们可以通过升级 systemd，从根本上解决这个问题。
+   <br>本文转载自公众号：阿里技术，
+   <a href="http://mp.weixin.qq.com/s?__biz=MzIzOTU0NTQ0MA==&amp;mid=2247490165&amp;idx=1&amp;sn=5b3ab19c7673a2c247090560215e4b72&amp;chksm=e929277ade5eae6c22a00801bd15eb39354ef87fdbfeaa5ed7f0e27cb2c4e0489a02d2597a5a&amp;scene=21#wechat_redirect" rel="nofollow">点击查看原文</a>。
+   <p><br></p>基于Kubernetes的DevOps实践培训
+   <p><img style="color:rgb(60,60,60);font-weight:bold;letter-spacing:1px;text-align:center;font-size:15px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/b2YlTLuGbKDsbJzupnILVFhPtMaRjmvPKYRqTMjibE9pnd8oiawLVrQbOHQe4wBXkBQkzpKCWPKBqWgOLgwccBug/640?" alt="640?"></p>
+   <p><br></p>
+   <span style="color:rgb(61,170,214);"><strong>基于Kubernetes的DevOps实践培训将于2019年5月10日在上海开课，3天时间带你系统掌握Kubernetes，</strong><strong>学习效果不好可以继续学习。</strong></span>本次培训包括：容器特性、镜像、网络；Kubernetes架构、核心组件、基本功能；Kubernetes设计理念、架构设计、基本功能、常用对象、设计原则；Kubernetes的数据库、运行时、网络、插件已经落地经验；微服务架构、组件、监控方案等，点击下方图片或者点击阅读原文了解详情。
+   <br>
+   <a href="https://mp.weixin.qq.com/s?__biz=MzA5OTAyNzQ2OA==&amp;mid=2649701146&amp;idx=1&amp;sn=5c58afc28e38e29bd307cf7182cd7339&amp;scene=21#wechat_redirect" rel="nofollow"><span class="js_jump_icon h5_image_link"><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/A1HKVXsfHNkhGHZO67iboyGrEjABz9Gq8hl5kBzeoiaicXwYwaKcxXmko4B1mQgrl1b2CHvRpfdc3qIfJXTomoxMA/640?wx_fmt=png" alt="640?wx_fmt=png"></span></a>
+  </div> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

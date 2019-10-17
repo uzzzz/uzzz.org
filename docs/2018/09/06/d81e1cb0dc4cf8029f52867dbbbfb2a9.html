@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>比特币-一个交易的产生（二）-提交交易 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="比特币-一个交易的产生（二）-提交交易" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/m0_37847176/article/details/82351978 /** * Call after CreateTransaction unless you want to abort */ 在创建交易后需要提交这个交易除非你想抛弃这个交易。 CommitTransaction 位于src/wallet/wallet.cpp,属于类wallet bool CWallet::CommitTransaction(CWalletTx&amp; wtxNew, CReserveKey&amp; reservekey) { { LOCK2(cs_main, cs_wallet); LogPrintf(&quot;CommitTransaction:\n%s&quot;, wtxNew.ToString()); { // This is only to keep the database open to defeat the auto-flush for the // duration of this scope. This is the only place where this optimization // maybe makes sense; please don&#39;t do it anywhere else. CWalletDB* pwalletdb = fFileBacked ? new CWalletDB(strWalletFile,&quot;r+&quot;) : NULL; // Take key pair from key pool so it won&#39;t be used again reservekey.KeepKey(); // Add tx to wallet, because if it has change it&#39;s also ours, // otherwise just for transaction history. AddToWallet(wtxNew, false, pwalletdb); // Notify that old coins are spent set&lt;CWalletTx*&gt; setCoins; BOOST_FOREACH(const CTxIn&amp; txin, wtxNew.vin) { CWalletTx &amp;coin = mapWallet[txin.prevout.hash]; coin.BindWallet(this); NotifyTransactionChanged(this, coin.GetHash(), CT_UPDATED); } if (fFileBacked) delete pwalletdb; } // Track how many getdata requests our transaction gets mapRequestCount[wtxNew.GetHash()] = 0; if (fBroadcastTransactions) { CValidationState state;//捕获交易的验证信息 // Broadcast if (!wtxNew.AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;CommitTransaction(): Transaction cannot be broadcast immediately, %s\n&quot;, state.GetRejectReason()); // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure. } else { wtxNew.RelayWalletTransaction(); } } } return true; } 步骤的注释很清晰，用过的密钥对就从密钥池中移除（主要是指用于找零的密钥对），这样保证不会重复使用，导致信息泄漏。将交易加入到钱包中，因为找零也是我们的或者用作历史记录。通知钱包中在这笔交易中花费的币。最后是广播，判断这个交易是否被加入到交易池（mempool）中。 maxTxFee是一笔交易的最大交易费，设置为0.1比特币，位于mian.h AcceptToMemoryPool bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree, CAmount nAbsurdFee, CValidationState&amp; state) { return ::AcceptToMemoryPool(mempool, state, *this, fLimitFree, NULL, false, nAbsurdFee); } 调用全局函数AcceptToMemoryPool， :::直接用在全局函数前，表示是全局函数 mempool不是CMerkleTx或其父类的成员，是一个全局对象。 //main.cpp CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE); CAmount maxTxFee = DEFAULT_TRANSACTION_MAXFEE;//0.1*coin CTxMemPool mempool(::minRelayTxFee); static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000; 设置费率最低是1000聪，这是进入内存池的最低要求，是以这个值初始化内存池。 CTxMemPool的介绍在数据结构中有写到https://blog.csdn.net/m0_37847176/article/details/81699796#ctxmempool bool AcceptToMemoryPool(CTxMemPool&amp; pool, CValidationState &amp;state, const CTransaction &amp;tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount nAbsurdFee) { std::vector&lt;uint256&gt; vHashTxToUncache; bool res = AcceptToMemoryPoolWorker(pool, state, tx, fLimitFree, pfMissingInputs, fOverrideMempoolLimit, nAbsurdFee, vHashTxToUncache); if (!res) { BOOST_FOREACH(const uint256&amp; hashTx, vHashTxToUncache) pcoinsTip-&gt;Uncache(hashTx); } return res; } AcceptToMemoryPoolWorker 这里又调用了AcceptToMemoryPoolWorker这个函数，在main.cpp中，这个函数很长，一段段来看 1)条件判断 CheckTransaction 1.交易的语法和数据结构必须正确。 2.输入与输出列表都不能为空。 3.交易的字节大小是小于MAX_BLOCK_BASE_SIZE的 /* The maximum allowed size for a block excluding witness data, in bytes (network rule) / static const unsigned int MAX_BLOCK_BASE_SIZE = 1000000;//1M大小 4.每一个输出值，以及总量，必须在规定值的范围内 (小于 2,100 万个币，大于 0)。 5.对于每一个输入，引用的输出是必须存在的，并且没有被花费。 bool AcceptToMemoryPoolWorker(CTxMemPool&amp; pool, CValidationState&amp; state, const CTransaction&amp; tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount&amp; nAbsurdFee, std::vector&lt;uint256&gt;&amp; vHashTxnToUncache) { const uint256 hash = tx.GetHash();//获取这笔交易的hash AssertLockHeld(cs_main); if (pfMissingInputs) *pfMissingInputs = false; if (!CheckTransaction(tx, state))//与上下文无关的有效性检查，如果与上下文无关则无效交易 return false; // state filled in by CheckTransaction // Coinbase is only valid in a block, not as a loose transaction if (tx.IsCoinBase())//Coinbase是特殊的交易，不是普通交易处理，不会放到池中，在块中有效 return state.DoS(100, false, REJECT_INVALID, &quot;coinbase&quot;); // Don&#39;t relay version 2 transactions until CSV is active, and we can be // sure that such transactions will be mined (unless we&#39;re on // -testnet/-regtest). /*在 const CChainParams&amp; chainparams = Params(); if (fRequireStandard &amp;&amp; tx.nVersion &gt;= 2 &amp;&amp; VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;premature-version2-tx&quot;); } // Reject transactions with witness before segregated witness activates (override with -prematurewitness) /*在隔离见证激活前拒绝使用见证的交易*/ bool witnessEnabled = IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()); if (!GetBoolArg(&quot;-prematurewitness&quot;,false) &amp;&amp; !tx.wit.IsNull() &amp;&amp; !witnessEnabled) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;no-witness-yet&quot;, true); } // Rather not work on nonstandard transactions (unless -testnet/-regtest) //不支持费标准交易，除非是测试网 string reason; if (fRequireStandard &amp;&amp; !IsStandardTx(tx, reason, witnessEnabled)) return state.DoS(0, false, REJECT_NONSTANDARD, reason); // Only accept nLockTime-using transactions that can be mined in the next // block; we don&#39;t want our mempool filled up with transactions that can&#39;t // be mined yet. /*对于使用nLockTime限定的交易只接收能进入下一个区块的交易，不希望池中充满不能被包含在下一个区块的交易*/ if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)) return state.DoS(0, false, REJECT_NONSTANDARD, &quot;non-final&quot;); // is it already in the memory pool? if (pool.exists(hash)) return state.Invalid(false, REJECT_ALREADY_KNOWN, &quot;txn-already-in-mempool&quot;); 2)条件判断 省略判断部分的代码 // Check for conflicts with in-memory transactions // do we already have it? // do all inputs exist? // are the actual inputs available? // Check for non-standard pay-to-script-hash in inputs // Check for non-standard witness in P2WSH // Keep track of transactions that spend a coinbase CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbase, nSigOpsCost, lp); // Check that the transaction doesn&#39;t have an excessive number of sigops, making it impossible to mine // Continuously rate-limit free (really, very-low-fee) transactions // A transaction that spends outputs that would be replaced by it is invalid. //Don&#39;t allow the replacement to reduce the feerate of the mempool. // Store transaction in memory pool.addUnchecked(hash, entry, setAncestors, !IsInitialBlockDownload()); 另外还有关于交易替换的逻辑代码 BOOST_FOREACH(const uint256 &amp;hashConflicting, setConflicts) { 针对有冲突的交易，用高交易费的交易替换低交易费的交易。 如果提交到内存池失败的化，提示不能马上被广播，接着调用函数RelayWalletTransaction RelayWalletTransaction 中继钱包交易，如果这个交易已经在池中或者再次提交成功的话，那么中继这个交易成功，否则失败。 bool CWalletTx::RelayWalletTransaction() { assert(pwallet-&gt;GetBroadcastTransactions()); if (!IsCoinBase() &amp;&amp; !isAbandoned() &amp;&amp; GetDepthInMainChain() == 0) { CValidationState state; /* GetDepthInMainChain already catches known conflicts. */ if (InMempool() || AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;Relaying wtx %s\n&quot;, GetHash().ToString()); RelayTransaction((CTransaction)*this); return true; } } return false; } 阅读更多 登录后自动展开" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/m0_37847176/article/details/82351978 /** * Call after CreateTransaction unless you want to abort */ 在创建交易后需要提交这个交易除非你想抛弃这个交易。 CommitTransaction 位于src/wallet/wallet.cpp,属于类wallet bool CWallet::CommitTransaction(CWalletTx&amp; wtxNew, CReserveKey&amp; reservekey) { { LOCK2(cs_main, cs_wallet); LogPrintf(&quot;CommitTransaction:\n%s&quot;, wtxNew.ToString()); { // This is only to keep the database open to defeat the auto-flush for the // duration of this scope. This is the only place where this optimization // maybe makes sense; please don&#39;t do it anywhere else. CWalletDB* pwalletdb = fFileBacked ? new CWalletDB(strWalletFile,&quot;r+&quot;) : NULL; // Take key pair from key pool so it won&#39;t be used again reservekey.KeepKey(); // Add tx to wallet, because if it has change it&#39;s also ours, // otherwise just for transaction history. AddToWallet(wtxNew, false, pwalletdb); // Notify that old coins are spent set&lt;CWalletTx*&gt; setCoins; BOOST_FOREACH(const CTxIn&amp; txin, wtxNew.vin) { CWalletTx &amp;coin = mapWallet[txin.prevout.hash]; coin.BindWallet(this); NotifyTransactionChanged(this, coin.GetHash(), CT_UPDATED); } if (fFileBacked) delete pwalletdb; } // Track how many getdata requests our transaction gets mapRequestCount[wtxNew.GetHash()] = 0; if (fBroadcastTransactions) { CValidationState state;//捕获交易的验证信息 // Broadcast if (!wtxNew.AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;CommitTransaction(): Transaction cannot be broadcast immediately, %s\n&quot;, state.GetRejectReason()); // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure. } else { wtxNew.RelayWalletTransaction(); } } } return true; } 步骤的注释很清晰，用过的密钥对就从密钥池中移除（主要是指用于找零的密钥对），这样保证不会重复使用，导致信息泄漏。将交易加入到钱包中，因为找零也是我们的或者用作历史记录。通知钱包中在这笔交易中花费的币。最后是广播，判断这个交易是否被加入到交易池（mempool）中。 maxTxFee是一笔交易的最大交易费，设置为0.1比特币，位于mian.h AcceptToMemoryPool bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree, CAmount nAbsurdFee, CValidationState&amp; state) { return ::AcceptToMemoryPool(mempool, state, *this, fLimitFree, NULL, false, nAbsurdFee); } 调用全局函数AcceptToMemoryPool， :::直接用在全局函数前，表示是全局函数 mempool不是CMerkleTx或其父类的成员，是一个全局对象。 //main.cpp CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE); CAmount maxTxFee = DEFAULT_TRANSACTION_MAXFEE;//0.1*coin CTxMemPool mempool(::minRelayTxFee); static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000; 设置费率最低是1000聪，这是进入内存池的最低要求，是以这个值初始化内存池。 CTxMemPool的介绍在数据结构中有写到https://blog.csdn.net/m0_37847176/article/details/81699796#ctxmempool bool AcceptToMemoryPool(CTxMemPool&amp; pool, CValidationState &amp;state, const CTransaction &amp;tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount nAbsurdFee) { std::vector&lt;uint256&gt; vHashTxToUncache; bool res = AcceptToMemoryPoolWorker(pool, state, tx, fLimitFree, pfMissingInputs, fOverrideMempoolLimit, nAbsurdFee, vHashTxToUncache); if (!res) { BOOST_FOREACH(const uint256&amp; hashTx, vHashTxToUncache) pcoinsTip-&gt;Uncache(hashTx); } return res; } AcceptToMemoryPoolWorker 这里又调用了AcceptToMemoryPoolWorker这个函数，在main.cpp中，这个函数很长，一段段来看 1)条件判断 CheckTransaction 1.交易的语法和数据结构必须正确。 2.输入与输出列表都不能为空。 3.交易的字节大小是小于MAX_BLOCK_BASE_SIZE的 /* The maximum allowed size for a block excluding witness data, in bytes (network rule) / static const unsigned int MAX_BLOCK_BASE_SIZE = 1000000;//1M大小 4.每一个输出值，以及总量，必须在规定值的范围内 (小于 2,100 万个币，大于 0)。 5.对于每一个输入，引用的输出是必须存在的，并且没有被花费。 bool AcceptToMemoryPoolWorker(CTxMemPool&amp; pool, CValidationState&amp; state, const CTransaction&amp; tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount&amp; nAbsurdFee, std::vector&lt;uint256&gt;&amp; vHashTxnToUncache) { const uint256 hash = tx.GetHash();//获取这笔交易的hash AssertLockHeld(cs_main); if (pfMissingInputs) *pfMissingInputs = false; if (!CheckTransaction(tx, state))//与上下文无关的有效性检查，如果与上下文无关则无效交易 return false; // state filled in by CheckTransaction // Coinbase is only valid in a block, not as a loose transaction if (tx.IsCoinBase())//Coinbase是特殊的交易，不是普通交易处理，不会放到池中，在块中有效 return state.DoS(100, false, REJECT_INVALID, &quot;coinbase&quot;); // Don&#39;t relay version 2 transactions until CSV is active, and we can be // sure that such transactions will be mined (unless we&#39;re on // -testnet/-regtest). /*在 const CChainParams&amp; chainparams = Params(); if (fRequireStandard &amp;&amp; tx.nVersion &gt;= 2 &amp;&amp; VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;premature-version2-tx&quot;); } // Reject transactions with witness before segregated witness activates (override with -prematurewitness) /*在隔离见证激活前拒绝使用见证的交易*/ bool witnessEnabled = IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()); if (!GetBoolArg(&quot;-prematurewitness&quot;,false) &amp;&amp; !tx.wit.IsNull() &amp;&amp; !witnessEnabled) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;no-witness-yet&quot;, true); } // Rather not work on nonstandard transactions (unless -testnet/-regtest) //不支持费标准交易，除非是测试网 string reason; if (fRequireStandard &amp;&amp; !IsStandardTx(tx, reason, witnessEnabled)) return state.DoS(0, false, REJECT_NONSTANDARD, reason); // Only accept nLockTime-using transactions that can be mined in the next // block; we don&#39;t want our mempool filled up with transactions that can&#39;t // be mined yet. /*对于使用nLockTime限定的交易只接收能进入下一个区块的交易，不希望池中充满不能被包含在下一个区块的交易*/ if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)) return state.DoS(0, false, REJECT_NONSTANDARD, &quot;non-final&quot;); // is it already in the memory pool? if (pool.exists(hash)) return state.Invalid(false, REJECT_ALREADY_KNOWN, &quot;txn-already-in-mempool&quot;); 2)条件判断 省略判断部分的代码 // Check for conflicts with in-memory transactions // do we already have it? // do all inputs exist? // are the actual inputs available? // Check for non-standard pay-to-script-hash in inputs // Check for non-standard witness in P2WSH // Keep track of transactions that spend a coinbase CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbase, nSigOpsCost, lp); // Check that the transaction doesn&#39;t have an excessive number of sigops, making it impossible to mine // Continuously rate-limit free (really, very-low-fee) transactions // A transaction that spends outputs that would be replaced by it is invalid. //Don&#39;t allow the replacement to reduce the feerate of the mempool. // Store transaction in memory pool.addUnchecked(hash, entry, setAncestors, !IsInitialBlockDownload()); 另外还有关于交易替换的逻辑代码 BOOST_FOREACH(const uint256 &amp;hashConflicting, setConflicts) { 针对有冲突的交易，用高交易费的交易替换低交易费的交易。 如果提交到内存池失败的化，提示不能马上被广播，接着调用函数RelayWalletTransaction RelayWalletTransaction 中继钱包交易，如果这个交易已经在池中或者再次提交成功的话，那么中继这个交易成功，否则失败。 bool CWalletTx::RelayWalletTransaction() { assert(pwallet-&gt;GetBroadcastTransactions()); if (!IsCoinBase() &amp;&amp; !isAbandoned() &amp;&amp; GetDepthInMainChain() == 0) { CValidationState state; /* GetDepthInMainChain already catches known conflicts. */ if (InMempool() || AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;Relaying wtx %s\n&quot;, GetHash().ToString()); RelayTransaction((CTransaction)*this); return true; } } return false; } 阅读更多 登录后自动展开" />
+<link rel="canonical" href="https://uzzz.org/2018/09/06/d81e1cb0dc4cf8029f52867dbbbfb2a9.html" />
+<meta property="og:url" content="https://uzzz.org/2018/09/06/d81e1cb0dc4cf8029f52867dbbbfb2a9.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-09-06T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/m0_37847176/article/details/82351978 /** * Call after CreateTransaction unless you want to abort */ 在创建交易后需要提交这个交易除非你想抛弃这个交易。 CommitTransaction 位于src/wallet/wallet.cpp,属于类wallet bool CWallet::CommitTransaction(CWalletTx&amp; wtxNew, CReserveKey&amp; reservekey) { { LOCK2(cs_main, cs_wallet); LogPrintf(&quot;CommitTransaction:\\n%s&quot;, wtxNew.ToString()); { // This is only to keep the database open to defeat the auto-flush for the // duration of this scope. This is the only place where this optimization // maybe makes sense; please don&#39;t do it anywhere else. CWalletDB* pwalletdb = fFileBacked ? new CWalletDB(strWalletFile,&quot;r+&quot;) : NULL; // Take key pair from key pool so it won&#39;t be used again reservekey.KeepKey(); // Add tx to wallet, because if it has change it&#39;s also ours, // otherwise just for transaction history. AddToWallet(wtxNew, false, pwalletdb); // Notify that old coins are spent set&lt;CWalletTx*&gt; setCoins; BOOST_FOREACH(const CTxIn&amp; txin, wtxNew.vin) { CWalletTx &amp;coin = mapWallet[txin.prevout.hash]; coin.BindWallet(this); NotifyTransactionChanged(this, coin.GetHash(), CT_UPDATED); } if (fFileBacked) delete pwalletdb; } // Track how many getdata requests our transaction gets mapRequestCount[wtxNew.GetHash()] = 0; if (fBroadcastTransactions) { CValidationState state;//捕获交易的验证信息 // Broadcast if (!wtxNew.AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;CommitTransaction(): Transaction cannot be broadcast immediately, %s\\n&quot;, state.GetRejectReason()); // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure. } else { wtxNew.RelayWalletTransaction(); } } } return true; } 步骤的注释很清晰，用过的密钥对就从密钥池中移除（主要是指用于找零的密钥对），这样保证不会重复使用，导致信息泄漏。将交易加入到钱包中，因为找零也是我们的或者用作历史记录。通知钱包中在这笔交易中花费的币。最后是广播，判断这个交易是否被加入到交易池（mempool）中。 maxTxFee是一笔交易的最大交易费，设置为0.1比特币，位于mian.h AcceptToMemoryPool bool CMerkleTx::AcceptToMemoryPool(bool fLimitFree, CAmount nAbsurdFee, CValidationState&amp; state) { return ::AcceptToMemoryPool(mempool, state, *this, fLimitFree, NULL, false, nAbsurdFee); } 调用全局函数AcceptToMemoryPool， :::直接用在全局函数前，表示是全局函数 mempool不是CMerkleTx或其父类的成员，是一个全局对象。 //main.cpp CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE); CAmount maxTxFee = DEFAULT_TRANSACTION_MAXFEE;//0.1*coin CTxMemPool mempool(::minRelayTxFee); static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000; 设置费率最低是1000聪，这是进入内存池的最低要求，是以这个值初始化内存池。 CTxMemPool的介绍在数据结构中有写到https://blog.csdn.net/m0_37847176/article/details/81699796#ctxmempool bool AcceptToMemoryPool(CTxMemPool&amp; pool, CValidationState &amp;state, const CTransaction &amp;tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount nAbsurdFee) { std::vector&lt;uint256&gt; vHashTxToUncache; bool res = AcceptToMemoryPoolWorker(pool, state, tx, fLimitFree, pfMissingInputs, fOverrideMempoolLimit, nAbsurdFee, vHashTxToUncache); if (!res) { BOOST_FOREACH(const uint256&amp; hashTx, vHashTxToUncache) pcoinsTip-&gt;Uncache(hashTx); } return res; } AcceptToMemoryPoolWorker 这里又调用了AcceptToMemoryPoolWorker这个函数，在main.cpp中，这个函数很长，一段段来看 1)条件判断 CheckTransaction 1.交易的语法和数据结构必须正确。 2.输入与输出列表都不能为空。 3.交易的字节大小是小于MAX_BLOCK_BASE_SIZE的 /* The maximum allowed size for a block excluding witness data, in bytes (network rule) / static const unsigned int MAX_BLOCK_BASE_SIZE = 1000000;//1M大小 4.每一个输出值，以及总量，必须在规定值的范围内 (小于 2,100 万个币，大于 0)。 5.对于每一个输入，引用的输出是必须存在的，并且没有被花费。 bool AcceptToMemoryPoolWorker(CTxMemPool&amp; pool, CValidationState&amp; state, const CTransaction&amp; tx, bool fLimitFree, bool* pfMissingInputs, bool fOverrideMempoolLimit, const CAmount&amp; nAbsurdFee, std::vector&lt;uint256&gt;&amp; vHashTxnToUncache) { const uint256 hash = tx.GetHash();//获取这笔交易的hash AssertLockHeld(cs_main); if (pfMissingInputs) *pfMissingInputs = false; if (!CheckTransaction(tx, state))//与上下文无关的有效性检查，如果与上下文无关则无效交易 return false; // state filled in by CheckTransaction // Coinbase is only valid in a block, not as a loose transaction if (tx.IsCoinBase())//Coinbase是特殊的交易，不是普通交易处理，不会放到池中，在块中有效 return state.DoS(100, false, REJECT_INVALID, &quot;coinbase&quot;); // Don&#39;t relay version 2 transactions until CSV is active, and we can be // sure that such transactions will be mined (unless we&#39;re on // -testnet/-regtest). /*在 const CChainParams&amp; chainparams = Params(); if (fRequireStandard &amp;&amp; tx.nVersion &gt;= 2 &amp;&amp; VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;premature-version2-tx&quot;); } // Reject transactions with witness before segregated witness activates (override with -prematurewitness) /*在隔离见证激活前拒绝使用见证的交易*/ bool witnessEnabled = IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus()); if (!GetBoolArg(&quot;-prematurewitness&quot;,false) &amp;&amp; !tx.wit.IsNull() &amp;&amp; !witnessEnabled) { return state.DoS(0, false, REJECT_NONSTANDARD, &quot;no-witness-yet&quot;, true); } // Rather not work on nonstandard transactions (unless -testnet/-regtest) //不支持费标准交易，除非是测试网 string reason; if (fRequireStandard &amp;&amp; !IsStandardTx(tx, reason, witnessEnabled)) return state.DoS(0, false, REJECT_NONSTANDARD, reason); // Only accept nLockTime-using transactions that can be mined in the next // block; we don&#39;t want our mempool filled up with transactions that can&#39;t // be mined yet. /*对于使用nLockTime限定的交易只接收能进入下一个区块的交易，不希望池中充满不能被包含在下一个区块的交易*/ if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)) return state.DoS(0, false, REJECT_NONSTANDARD, &quot;non-final&quot;); // is it already in the memory pool? if (pool.exists(hash)) return state.Invalid(false, REJECT_ALREADY_KNOWN, &quot;txn-already-in-mempool&quot;); 2)条件判断 省略判断部分的代码 // Check for conflicts with in-memory transactions // do we already have it? // do all inputs exist? // are the actual inputs available? // Check for non-standard pay-to-script-hash in inputs // Check for non-standard witness in P2WSH // Keep track of transactions that spend a coinbase CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbase, nSigOpsCost, lp); // Check that the transaction doesn&#39;t have an excessive number of sigops, making it impossible to mine // Continuously rate-limit free (really, very-low-fee) transactions // A transaction that spends outputs that would be replaced by it is invalid. //Don&#39;t allow the replacement to reduce the feerate of the mempool. // Store transaction in memory pool.addUnchecked(hash, entry, setAncestors, !IsInitialBlockDownload()); 另外还有关于交易替换的逻辑代码 BOOST_FOREACH(const uint256 &amp;hashConflicting, setConflicts) { 针对有冲突的交易，用高交易费的交易替换低交易费的交易。 如果提交到内存池失败的化，提示不能马上被广播，接着调用函数RelayWalletTransaction RelayWalletTransaction 中继钱包交易，如果这个交易已经在池中或者再次提交成功的话，那么中继这个交易成功，否则失败。 bool CWalletTx::RelayWalletTransaction() { assert(pwallet-&gt;GetBroadcastTransactions()); if (!IsCoinBase() &amp;&amp; !isAbandoned() &amp;&amp; GetDepthInMainChain() == 0) { CValidationState state; /* GetDepthInMainChain already catches known conflicts. */ if (InMempool() || AcceptToMemoryPool(false, maxTxFee, state)) { LogPrintf(&quot;Relaying wtx %s\\n&quot;, GetHash().ToString()); RelayTransaction((CTransaction)*this); return true; } } return false; } 阅读更多 登录后自动展开","@type":"BlogPosting","url":"https://uzzz.org/2018/09/06/d81e1cb0dc4cf8029f52867dbbbfb2a9.html","headline":"比特币-一个交易的产生（二）-提交交易","dateModified":"2018-09-06T00:00:00+08:00","datePublished":"2018-09-06T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/09/06/d81e1cb0dc4cf8029f52867dbbbfb2a9.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>比特币-一个交易的产生（二）-提交交易</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/m0_37847176/article/details/82351978 
+ </div> 
+ <div class="markdown_views"> 
+  <blockquote> 
+   <p>/** <br> * Call after CreateTransaction unless you want to abort <br> */ <br> 在创建交易后需要提交这个交易除非你想抛弃这个交易。</p> 
+  </blockquote> 
+  <h1 id="committransaction">CommitTransaction</h1> 
+  <p>位于src/wallet/wallet.cpp,属于类wallet</p> 
+  <pre class="prettyprint"><code class=" hljs cpp"><span class="hljs-keyword">bool</span> CWallet::CommitTransaction(CWalletTx&amp; wtxNew, CReserveKey&amp; reservekey)
+{
+    {
+        LOCK2(cs_main, cs_wallet);
+        LogPrintf(<span class="hljs-string">"CommitTransaction:\n%s"</span>, wtxNew.ToString());
+        {
+            <span class="hljs-comment">// This is only to keep the database open to defeat the auto-flush for the</span>
+            <span class="hljs-comment">// duration of this scope. This is the only place where this optimization</span>
+            <span class="hljs-comment">// maybe makes sense; please don't do it anywhere else.</span>
+            CWalletDB* pwalletdb = fFileBacked ? <span class="hljs-keyword">new</span> CWalletDB(strWalletFile,<span class="hljs-string">"r+"</span>) : NULL;
+
+            <span class="hljs-comment">// Take key pair from key pool so it won't be used again</span>
+            reservekey.KeepKey();
+
+            <span class="hljs-comment">// Add tx to wallet, because if it has change it's also ours,</span>
+            <span class="hljs-comment">// otherwise just for transaction history.</span>
+            AddToWallet(wtxNew, <span class="hljs-keyword">false</span>, pwalletdb);
+
+            <span class="hljs-comment">// Notify that old coins are spent</span>
+            <span class="hljs-stl_container"><span class="hljs-built_in">set</span>&lt;CWalletTx*&gt;</span> setCoins;
+            BOOST_FOREACH(<span class="hljs-keyword">const</span> CTxIn&amp; txin, wtxNew.vin)
+            {
+                CWalletTx &amp;coin = mapWallet[txin.prevout.hash];
+                coin.BindWallet(<span class="hljs-keyword">this</span>);
+                NotifyTransactionChanged(<span class="hljs-keyword">this</span>, coin.GetHash(), CT_UPDATED);
+            }
+
+            <span class="hljs-keyword">if</span> (fFileBacked)
+                <span class="hljs-keyword">delete</span> pwalletdb;
+        }
+
+        <span class="hljs-comment">// Track how many getdata requests our transaction gets</span>
+        mapRequestCount[wtxNew.GetHash()] = <span class="hljs-number">0</span>;
+
+        <span class="hljs-keyword">if</span> (fBroadcastTransactions)
+        {
+            CValidationState state;<span class="hljs-comment">//捕获交易的验证信息</span>
+            <span class="hljs-comment">// Broadcast</span>
+            <span class="hljs-keyword">if</span> (!wtxNew.AcceptToMemoryPool(<span class="hljs-keyword">false</span>, maxTxFee, state)) {
+                LogPrintf(<span class="hljs-string">"CommitTransaction(): Transaction cannot be broadcast immediately, %s\n"</span>, state.GetRejectReason());
+                <span class="hljs-comment">// TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure.</span>
+            } <span class="hljs-keyword">else</span> {
+                wtxNew.RelayWalletTransaction();
+            }
+        }
+    }
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <p>步骤的注释很清晰，用过的密钥对就从密钥池中移除（主要是指用于找零的密钥对），这样保证不会重复使用，导致信息泄漏。将交易加入到钱包中，因为找零也是我们的或者用作历史记录。通知钱包中在这笔交易中花费的币。最后是广播，判断这个交易是否被加入到交易池（mempool）中。 <br> <code>maxTxFee</code>是一笔交易的最大交易费，设置为0.1比特币，位于mian.h</p> 
+  <h2 id="accepttomemorypool">AcceptToMemoryPool</h2> 
+  <pre class="prettyprint"><code class=" hljs css"><span class="hljs-tag">bool</span> <span class="hljs-tag">CMerkleTx</span><span class="hljs-pseudo">::AcceptToMemoryPool(bool</span> <span class="hljs-tag">fLimitFree</span>, <span class="hljs-tag">CAmount</span> <span class="hljs-tag">nAbsurdFee</span>, <span class="hljs-tag">CValidationState</span>&amp; <span class="hljs-tag">state</span>)
+<span class="hljs-rules">{ <span class="hljs-rule"><span class="hljs-attribute">return </span>:<span class="hljs-value">:<span class="hljs-function">AcceptToMemoryPool(mempool, state, *this, fLimitFree, NULL, false, nAbsurdFee)</span></span></span>; <span class="hljs-rule">}</span></span></code></pre> 
+  <p>调用全局函数AcceptToMemoryPool，</p> 
+  <blockquote> 
+   <p><code>::</code>:直接用在全局函数前，表示是全局函数 </p> 
+  </blockquote> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180904105559129?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L20wXzM3ODQ3MTc2/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述" title=""></p> 
+  <p>mempool不是CMerkleTx或其父类的成员，是一个全局对象。</p> 
+  <pre class="prettyprint"><code class=" hljs lasso"><span class="hljs-comment">//main.cpp</span>
+CFeeRate minRelayTxFee <span class="hljs-subst">=</span> CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
+CAmount maxTxFee <span class="hljs-subst">=</span> DEFAULT_TRANSACTION_MAXFEE;<span class="hljs-comment">//0.1*coin</span>
+CTxMemPool mempool(<span class="hljs-tag">::minRelayTxFee</span>);</code></pre> 
+  <blockquote> 
+   <p>static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000;</p> 
+  </blockquote> 
+  <p>设置费率最低是1000聪，这是进入内存池的最低要求，是以这个值初始化内存池。 <br> <code>CTxMemPool</code>的介绍在数据结构中有写到<a href="https://blog.csdn.net/m0_37847176/article/details/81699796#ctxmempool" rel="nofollow">https://blog.csdn.net/m0_37847176/article/details/81699796#ctxmempool</a></p> 
+  <pre class="prettyprint"><code class=" hljs cpp"><span class="hljs-keyword">bool</span> AcceptToMemoryPool(CTxMemPool&amp; pool, CValidationState &amp;state, <span class="hljs-keyword">const</span> CTransaction &amp;tx, <span class="hljs-keyword">bool</span> fLimitFree,
+                        <span class="hljs-keyword">bool</span>* pfMissingInputs, <span class="hljs-keyword">bool</span> fOverrideMempoolLimit, <span class="hljs-keyword">const</span> CAmount nAbsurdFee)
+{
+    <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;uint256&gt;</span> vHashTxToUncache;
+    <span class="hljs-keyword">bool</span> res = AcceptToMemoryPoolWorker(pool, state, tx, fLimitFree, pfMissingInputs, fOverrideMempoolLimit, nAbsurdFee, vHashTxToUncache);
+    <span class="hljs-keyword">if</span> (!res) {
+        BOOST_FOREACH(<span class="hljs-keyword">const</span> uint256&amp; hashTx, vHashTxToUncache)
+            pcoinsTip-&gt;Uncache(hashTx);
+    }
+    <span class="hljs-keyword">return</span> res;
+}</code></pre> 
+  <h2 id="accepttomemorypoolworker">AcceptToMemoryPoolWorker</h2> 
+  <p>这里又调用了<code>AcceptToMemoryPoolWorker</code>这个函数，在main.cpp中，这个函数很长，一段段来看</p> 
+  <h3 id="1条件判断">1)条件判断</h3> 
+  <p>CheckTransaction <br> 1.交易的语法和数据结构必须正确。 <br> 2.输入与输出列表都不能为空。 <br> 3.交易的字节大小是小于MAX_BLOCK_BASE_SIZE的</p> 
+  <blockquote> 
+   <p>/<em>* The maximum allowed size for a block excluding witness data, in bytes (network rule) </em>/ <br> static const unsigned int MAX_BLOCK_BASE_SIZE = 1000000;//1M大小</p> 
+  </blockquote> 
+  <p>4.每一个输出值，以及总量，必须在规定值的范围内 (小于 2,100 万个币，大于 <br> 0)。 <br> 5.对于每一个输入，引用的输出是必须存在的，并且没有被花费。</p> 
+  <pre class="prettyprint"><code class=" hljs cpp"><span class="hljs-keyword">bool</span> AcceptToMemoryPoolWorker(CTxMemPool&amp; pool, CValidationState&amp; state, <span class="hljs-keyword">const</span> CTransaction&amp; tx, <span class="hljs-keyword">bool</span> fLimitFree,
+                              <span class="hljs-keyword">bool</span>* pfMissingInputs, <span class="hljs-keyword">bool</span> fOverrideMempoolLimit, <span class="hljs-keyword">const</span> CAmount&amp; nAbsurdFee,
+                              <span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;uint256&gt;</span>&amp; vHashTxnToUncache)
+{
+    <span class="hljs-keyword">const</span> uint256 hash = tx.GetHash();<span class="hljs-comment">//获取这笔交易的hash</span>
+    AssertLockHeld(cs_main);
+    <span class="hljs-keyword">if</span> (pfMissingInputs)
+        *pfMissingInputs = <span class="hljs-keyword">false</span>;
+
+    <span class="hljs-keyword">if</span> (!CheckTransaction(tx, state))<span class="hljs-comment">//与上下文无关的有效性检查，如果与上下文无关则无效交易</span>
+        <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>; <span class="hljs-comment">// state filled in by CheckTransaction</span>
+
+    <span class="hljs-comment">// Coinbase is only valid in a block, not as a loose transaction</span>
+    <span class="hljs-keyword">if</span> (tx.IsCoinBase())<span class="hljs-comment">//Coinbase是特殊的交易，不是普通交易处理，不会放到池中，在块中有效</span>
+        <span class="hljs-keyword">return</span> state.DoS(<span class="hljs-number">100</span>, <span class="hljs-keyword">false</span>, REJECT_INVALID, <span class="hljs-string">"coinbase"</span>);
+
+    <span class="hljs-comment">// Don't relay version 2 transactions until CSV is active, and we can be</span>
+    <span class="hljs-comment">// sure that such transactions will be mined (unless we're on</span>
+    <span class="hljs-comment">// -testnet/-regtest).</span>
+    <span class="hljs-comment">/*在 const CChainParams&amp; chainparams = Params(); if (fRequireStandard &amp;&amp; tx.nVersion &gt;= 2 &amp;&amp; VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE) { return state.DoS(0, false, REJECT_NONSTANDARD, "premature-version2-tx"); } // Reject transactions with witness before segregated witness activates (override with -prematurewitness) /*在隔离见证激活前拒绝使用见证的交易*/</span>
+    <span class="hljs-keyword">bool</span> witnessEnabled = IsWitnessEnabled(chainActive.Tip(), Params().GetConsensus());
+    <span class="hljs-keyword">if</span> (!GetBoolArg(<span class="hljs-string">"-prematurewitness"</span>,<span class="hljs-keyword">false</span>) &amp;&amp; !tx.wit.IsNull() &amp;&amp; !witnessEnabled) {
+        <span class="hljs-keyword">return</span> state.DoS(<span class="hljs-number">0</span>, <span class="hljs-keyword">false</span>, REJECT_NONSTANDARD, <span class="hljs-string">"no-witness-yet"</span>, <span class="hljs-keyword">true</span>);
+    }
+     <span class="hljs-comment">// Rather not work on nonstandard transactions (unless -testnet/-regtest)</span>
+     <span class="hljs-comment">//不支持费标准交易，除非是测试网</span>
+    <span class="hljs-built_in">string</span> reason;
+    <span class="hljs-keyword">if</span> (fRequireStandard &amp;&amp; !IsStandardTx(tx, reason, witnessEnabled))
+        <span class="hljs-keyword">return</span> state.DoS(<span class="hljs-number">0</span>, <span class="hljs-keyword">false</span>, REJECT_NONSTANDARD, reason);
+ <span class="hljs-comment">// Only accept nLockTime-using transactions that can be mined in the next</span>
+    <span class="hljs-comment">// block; we don't want our mempool filled up with transactions that can't</span>
+    <span class="hljs-comment">// be mined yet.</span>
+    <span class="hljs-comment">/*对于使用nLockTime限定的交易只接收能进入下一个区块的交易，不希望池中充满不能被包含在下一个区块的交易*/</span>
+    <span class="hljs-keyword">if</span> (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS))
+        <span class="hljs-keyword">return</span> state.DoS(<span class="hljs-number">0</span>, <span class="hljs-keyword">false</span>, REJECT_NONSTANDARD, <span class="hljs-string">"non-final"</span>);
+
+    <span class="hljs-comment">// is it already in the memory pool?</span>
+    <span class="hljs-keyword">if</span> (pool.exists(hash))
+        <span class="hljs-keyword">return</span> state.Invalid(<span class="hljs-keyword">false</span>, REJECT_ALREADY_KNOWN, <span class="hljs-string">"txn-already-in-mempool"</span>);
+</code></pre> 
+  <h3 id="2条件判断">2)条件判断</h3> 
+  <p>省略判断部分的代码</p> 
+  <pre class="prettyprint"><code class="language-c hljs "> <span class="hljs-comment">// Check for conflicts with in-memory transactions</span>
+ <span class="hljs-comment">// do we already have it?</span>
+ <span class="hljs-comment">// do all inputs exist?</span>
+ <span class="hljs-comment">// are the actual inputs available?</span>
+ <span class="hljs-comment">// Check for non-standard pay-to-script-hash in inputs </span>
+ <span class="hljs-comment">// Check for non-standard witness in P2WSH</span>
+ <span class="hljs-comment">// Keep track of transactions that spend a coinbase</span>
+
+  CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbase, nSigOpsCost, lp);
+
+ <span class="hljs-comment">// Check that the transaction doesn't have an excessive number of sigops, making it impossible to mine</span>
+ <span class="hljs-comment">// Continuously rate-limit free (really, very-low-fee) transactions</span>
+ <span class="hljs-comment">// A transaction that spends outputs that would be replaced by it is invalid.</span>
+ <span class="hljs-comment">//Don't allow the replacement to reduce the feerate of the mempool.</span>
+
+<span class="hljs-comment">// Store transaction in memory</span>
+ pool.addUnchecked(hash, entry, setAncestors, !IsInitialBlockDownload());</code></pre> 
+  <p>另外还有关于交易替换的逻辑代码</p> 
+  <pre class="prettyprint"><code class=" hljs bash">BOOST_FOREACH(const uint256 &amp;<span class="hljs-built_in">hash</span>Conflicting, <span class="hljs-keyword">set</span>Conflicts)
+            {</code></pre> 
+  <p>针对有冲突的交易，用高交易费的交易替换低交易费的交易。</p> 
+  <hr> 
+  <p>如果提交到内存池失败的化，提示不能马上被广播，接着调用函数RelayWalletTransaction</p> 
+  <h2 id="relaywallettransaction">RelayWalletTransaction</h2> 
+  <p>中继钱包交易，如果这个交易已经在池中或者再次提交成功的话，那么中继这个交易成功，否则失败。</p> 
+  <pre class="prettyprint"><code class=" hljs d"><span class="hljs-built_in">bool</span> CWalletTx::RelayWalletTransaction()
+{
+    <span class="hljs-keyword">assert</span>(pwallet-&gt;GetBroadcastTransactions());
+    <span class="hljs-keyword">if</span> (!IsCoinBase() &amp;&amp; !isAbandoned() &amp;&amp; GetDepthInMainChain() == <span class="hljs-number">0</span>)
+    {
+        CValidationState state;
+        <span class="hljs-comment">/* GetDepthInMainChain already catches known conflicts. */</span>
+        <span class="hljs-keyword">if</span> (InMempool() || AcceptToMemoryPool(<span class="hljs-literal">false</span>, maxTxFee, state)) {
+            LogPrintf(<span class="hljs-string">"Relaying wtx %s\n"</span>, GetHash().ToString());
+            RelayTransaction((CTransaction)*<span class="hljs-keyword">this</span>);
+            <span class="hljs-keyword">return</span> <span class="hljs-literal">true</span>;
+        }
+    }
+    <span class="hljs-keyword">return</span> <span class="hljs-literal">false</span>;
+}</code></pre> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/m0_37847176/article/details/82351978,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/m0_37847176/article/details/82351978,&quot;}">阅读更多</a> 
+ <a class="btn" href="https://passport.csdn.net/account/login?utm_source=csdn_blog_pc_more_login" target="_self" id="btn-lobinreadmore" data-track-view="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/m0_37847176/article/details/82351978,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/m0_37847176/article/details/82351978,&quot;}">登录后自动展开</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

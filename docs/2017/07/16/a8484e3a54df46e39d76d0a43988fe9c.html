@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>bigchaindb源码分析（四）——创建创世区块 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="bigchaindb源码分析（四）——创建创世区块" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="根据bigchaindb源码分析（三）所述，在初始化后端存储后，命令bigchaindb start所触发执行的_run_init函数将创建创世区块 # commands/bigchaindb.py def _run_init(): # Try to access the keypair, throws an exception if it does not exist b = bigchaindb.Bigchain() schema.init_database(connection=b.connection) b.create_genesis_block() logger.info(&#39;Genesis block created.&#39;) 创建创世区块的具体实现在core.py，其首先查找目前后端存储中已有的区块数目，如果存在区块，则说明创世区块已经创建好，抛出异常返回，否则则新建创世区块，并写入后端存储中 # core.py def create_genesis_block(self): blocks_count = backend.query.count_blocks(self.connection) if blocks_count: raise exceptions.GenesisBlockAlreadyExistsError(&#39;Cannot create the Genesis block&#39;) block = self.prepare_genesis_block() self.write_block(block) return block 查询已有区块数目 查询已有区块数目代码如下。调用的count_blocks的原型在backend/query.py。该函数有装饰器singledispatch，在源码分析（三）中，我们对该装饰器进行了详细的分析，其作用在于实现根据参数列表的不同类型来调用该函数原型，相当于实现函数多态。 # core.py blocks_count = backend.query.count_blocks(self.connection) # backend/query.py @singledispatch def count_blocks(connection): raise NotImplementedError 由于形参self.connection实际上为位于bigchaindb.backend.mongodb.connection模块中的MongoDBConnection类，根据源码分析（三），我们可以分析得到真正执行的函数为bigchaindb.backend.mongodb.query中的count_blocks函数，并且实参为MongoDBConnection类的实例 @register_query(MongoDBConnection) def count_blocks(conn): return conn.run( conn.collection(&#39;bigchain&#39;) .count()) conn.collection(&#39;bigchain&#39;).count()故将调用MongoDBConnection.collection，conn.run将调用MongoDBConnection.run # bigchaindb.backend.mongodb.connection.MongoDBConnection def query(self): return Lazy() def collection(self, name): return self.query()[self.dbname][name] def run(self, query): try: try: return query.run(self.conn) except ... except ... 将这些函数组合起来，count_blocks相当于调用了Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn)。其中self.dbname按照我们的配置文件，值为bigchain，而self.conn是一个已经通过了验证的pymongo.MongoClient实例（源码分析（三）中有说明） 这里涉及到了Lazy类，我们就先来看这个类吧 Lazy类位于bigchaindb/utils.py，其代码如下。Lazy类维护了名为stack的list，挡在触发__getattr__、__call__、__getitem__时，会将参数等加入到这个list中，从而形成了一条记录链。而run函数则是对于输入的实参instance，依次执行这个记录链。估计是因为可以暂缓执行记录链（直到调用run），所以才取名为Lazy吧。。 class Lazy: def __init__(self): &quot;&quot;&quot;Instantiate a new Lazy object.&quot;&quot;&quot; self.stack = [] def __getattr__(self, name): self.stack.append(name) return self def __call__(self, *args, **kwargs): self.stack.append((args, kwargs)) return self def __getitem__(self, key): self.stack.append(&#39;__getitem__&#39;) self.stack.append(([key], {})) return self def run(self, instance): &quot;&quot;&quot;Run the recorded chain of methods on `instance`. Args: instance: an object. &quot;&quot;&quot; last = instance for item in self.stack: if isinstance(item, str): last = getattr(last, item) else: last = last(*item[0], **item[1]) self.stack = [] return last 现在再来仔细分析count_blocks所执行的代码，即Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn) 首先，每一次[]运算符会调用__getitem__，因此，Lazy()[self.dbname][&#39;bigchain&#39;]执行完成后，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {})] 之后再调用count函数，此时将首先调用__getattr__来查找名为name的函数，然后调用__call__来调用name函数，因此，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {}), &#39;count&#39;, ((), {})] 最后再来调用run函数，run函数已经被定义了，因此不会再调用__getattr__或者__call__，而是直接执行run函数。run函数首先执行两次__getitem__，然后再执行一次count，故而实际上是把stack中记录的操作重新记录一遍，因此执行的也就为 # ::代表对某个对象进行操作 pymongo.MongoClient::[self.dbname][&#39;bigchain&#39;].count() 所以获取区块的数目其实就是查看表bigchain中的记录数目。。那么，为什么要使用Lazy类呢？估计是为了防止在连续调用时数据可能会发生变化而导致某些问题？并不清楚。。以后再来思考这个问题 创建创世区块 若未查找到已有区块，则说明应当要创建创世区块，对应的最外层代码为 # core.py create_genesis_block block = self.prepare_genesis_block() self.write_block(block) prepare_genesis_block首先创建一个Transaction类，并指定签名者为本节点（self.me为本节点的公钥），接受者也为本节点，云数据为{&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;}，之后将该事务的operation设置为GENESIS，代表创世区块。bigchaindb中的事务有三类，其中create表示新建资产，transfer表示转移资源，而genesis则特指创世区块。接着再利用sign函数来对事务进行签名 def prepare_genesis_block(self): &quot;&quot;&quot;Prepare a genesis block.&quot;&quot;&quot; metadata = {&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;} transaction = Transaction.create([self.me], [([self.me], 1)], metadata=metadata) transaction.operation = &#39;GENESIS&#39; transaction = transaction.sign([self.me_private]) # create the block return self.create_block([transaction]) 在创建事务完成后，再使用Block类来根据事务创建区块，创建时指明了生成区块的节点（self.me）、时间戳以及投票者。投票者为配置文件中keyring所指定的节点（self.nodes_except_me）以及本节点。区块创建成功后，再使用本节点的私钥进行签名 federation = property(lambda self: set(self.nodes_except_me + [self.me])) def create_block(self, validated_transactions): # Prevent the creation of empty blocks if not validated_transactions: raise exceptions.OperationError(&#39;Empty block creation is not &#39; &#39;allowed&#39;) voters = list(self.federation) block = Block(validated_transactions, self.me, gen_timestamp(), voters) block = block.sign(self.me_private) return block 在区块成功创建并被签名后，bigchaindb首先调用decouple_assets将区块里的事务中的资产asset去重，并设置资产的id为创建该资产的事务的id，之后调用后端存储的write_assets与write_block方法来将资产与事务写入到后端存储中 def write_block(self, block): # Decouple assets from block assets, block_dict = block.decouple_assets() # write the assets if assets: self.write_assets(assets) # write the block return backend.query.write_block(self.connection, block_dict) def write_assets(self, assets): return backend.query.write_assets(self.connection, assets) 写资产与写区块的实现代码均位于backend/mongodb/query.py中。根据之前对Lazy类的分析，这两个函数实际上就是分别将资产插入到assets表中、将区块写入到bigchain表中 @register_query(MongoDBConnection) def write_assets(conn, assets): try: return conn.run( conn.collection(&#39;assets&#39;) .insert_many(assets, ordered=False)) except OperationError: return @register_query(MongoDBConnection) def write_block(conn, block_dict): return conn.run( conn.collection(&#39;bigchain&#39;) .insert_one(block_dict)) 至此，创建创世区块步骤完成，基本流程也就为：创建事务-&gt;对事务签名-&gt;根据事务创建区块-&gt;对区块进行签名-&gt;获取区块里的资产，设置资产的id为事务id-&gt;写资产-&gt;写事务。关于事务、区块、资产还有目前没有提到的投票的细节，我们之后在调用API写bigchaindb时再来分析 阅读更多" />
+<meta property="og:description" content="根据bigchaindb源码分析（三）所述，在初始化后端存储后，命令bigchaindb start所触发执行的_run_init函数将创建创世区块 # commands/bigchaindb.py def _run_init(): # Try to access the keypair, throws an exception if it does not exist b = bigchaindb.Bigchain() schema.init_database(connection=b.connection) b.create_genesis_block() logger.info(&#39;Genesis block created.&#39;) 创建创世区块的具体实现在core.py，其首先查找目前后端存储中已有的区块数目，如果存在区块，则说明创世区块已经创建好，抛出异常返回，否则则新建创世区块，并写入后端存储中 # core.py def create_genesis_block(self): blocks_count = backend.query.count_blocks(self.connection) if blocks_count: raise exceptions.GenesisBlockAlreadyExistsError(&#39;Cannot create the Genesis block&#39;) block = self.prepare_genesis_block() self.write_block(block) return block 查询已有区块数目 查询已有区块数目代码如下。调用的count_blocks的原型在backend/query.py。该函数有装饰器singledispatch，在源码分析（三）中，我们对该装饰器进行了详细的分析，其作用在于实现根据参数列表的不同类型来调用该函数原型，相当于实现函数多态。 # core.py blocks_count = backend.query.count_blocks(self.connection) # backend/query.py @singledispatch def count_blocks(connection): raise NotImplementedError 由于形参self.connection实际上为位于bigchaindb.backend.mongodb.connection模块中的MongoDBConnection类，根据源码分析（三），我们可以分析得到真正执行的函数为bigchaindb.backend.mongodb.query中的count_blocks函数，并且实参为MongoDBConnection类的实例 @register_query(MongoDBConnection) def count_blocks(conn): return conn.run( conn.collection(&#39;bigchain&#39;) .count()) conn.collection(&#39;bigchain&#39;).count()故将调用MongoDBConnection.collection，conn.run将调用MongoDBConnection.run # bigchaindb.backend.mongodb.connection.MongoDBConnection def query(self): return Lazy() def collection(self, name): return self.query()[self.dbname][name] def run(self, query): try: try: return query.run(self.conn) except ... except ... 将这些函数组合起来，count_blocks相当于调用了Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn)。其中self.dbname按照我们的配置文件，值为bigchain，而self.conn是一个已经通过了验证的pymongo.MongoClient实例（源码分析（三）中有说明） 这里涉及到了Lazy类，我们就先来看这个类吧 Lazy类位于bigchaindb/utils.py，其代码如下。Lazy类维护了名为stack的list，挡在触发__getattr__、__call__、__getitem__时，会将参数等加入到这个list中，从而形成了一条记录链。而run函数则是对于输入的实参instance，依次执行这个记录链。估计是因为可以暂缓执行记录链（直到调用run），所以才取名为Lazy吧。。 class Lazy: def __init__(self): &quot;&quot;&quot;Instantiate a new Lazy object.&quot;&quot;&quot; self.stack = [] def __getattr__(self, name): self.stack.append(name) return self def __call__(self, *args, **kwargs): self.stack.append((args, kwargs)) return self def __getitem__(self, key): self.stack.append(&#39;__getitem__&#39;) self.stack.append(([key], {})) return self def run(self, instance): &quot;&quot;&quot;Run the recorded chain of methods on `instance`. Args: instance: an object. &quot;&quot;&quot; last = instance for item in self.stack: if isinstance(item, str): last = getattr(last, item) else: last = last(*item[0], **item[1]) self.stack = [] return last 现在再来仔细分析count_blocks所执行的代码，即Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn) 首先，每一次[]运算符会调用__getitem__，因此，Lazy()[self.dbname][&#39;bigchain&#39;]执行完成后，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {})] 之后再调用count函数，此时将首先调用__getattr__来查找名为name的函数，然后调用__call__来调用name函数，因此，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {}), &#39;count&#39;, ((), {})] 最后再来调用run函数，run函数已经被定义了，因此不会再调用__getattr__或者__call__，而是直接执行run函数。run函数首先执行两次__getitem__，然后再执行一次count，故而实际上是把stack中记录的操作重新记录一遍，因此执行的也就为 # ::代表对某个对象进行操作 pymongo.MongoClient::[self.dbname][&#39;bigchain&#39;].count() 所以获取区块的数目其实就是查看表bigchain中的记录数目。。那么，为什么要使用Lazy类呢？估计是为了防止在连续调用时数据可能会发生变化而导致某些问题？并不清楚。。以后再来思考这个问题 创建创世区块 若未查找到已有区块，则说明应当要创建创世区块，对应的最外层代码为 # core.py create_genesis_block block = self.prepare_genesis_block() self.write_block(block) prepare_genesis_block首先创建一个Transaction类，并指定签名者为本节点（self.me为本节点的公钥），接受者也为本节点，云数据为{&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;}，之后将该事务的operation设置为GENESIS，代表创世区块。bigchaindb中的事务有三类，其中create表示新建资产，transfer表示转移资源，而genesis则特指创世区块。接着再利用sign函数来对事务进行签名 def prepare_genesis_block(self): &quot;&quot;&quot;Prepare a genesis block.&quot;&quot;&quot; metadata = {&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;} transaction = Transaction.create([self.me], [([self.me], 1)], metadata=metadata) transaction.operation = &#39;GENESIS&#39; transaction = transaction.sign([self.me_private]) # create the block return self.create_block([transaction]) 在创建事务完成后，再使用Block类来根据事务创建区块，创建时指明了生成区块的节点（self.me）、时间戳以及投票者。投票者为配置文件中keyring所指定的节点（self.nodes_except_me）以及本节点。区块创建成功后，再使用本节点的私钥进行签名 federation = property(lambda self: set(self.nodes_except_me + [self.me])) def create_block(self, validated_transactions): # Prevent the creation of empty blocks if not validated_transactions: raise exceptions.OperationError(&#39;Empty block creation is not &#39; &#39;allowed&#39;) voters = list(self.federation) block = Block(validated_transactions, self.me, gen_timestamp(), voters) block = block.sign(self.me_private) return block 在区块成功创建并被签名后，bigchaindb首先调用decouple_assets将区块里的事务中的资产asset去重，并设置资产的id为创建该资产的事务的id，之后调用后端存储的write_assets与write_block方法来将资产与事务写入到后端存储中 def write_block(self, block): # Decouple assets from block assets, block_dict = block.decouple_assets() # write the assets if assets: self.write_assets(assets) # write the block return backend.query.write_block(self.connection, block_dict) def write_assets(self, assets): return backend.query.write_assets(self.connection, assets) 写资产与写区块的实现代码均位于backend/mongodb/query.py中。根据之前对Lazy类的分析，这两个函数实际上就是分别将资产插入到assets表中、将区块写入到bigchain表中 @register_query(MongoDBConnection) def write_assets(conn, assets): try: return conn.run( conn.collection(&#39;assets&#39;) .insert_many(assets, ordered=False)) except OperationError: return @register_query(MongoDBConnection) def write_block(conn, block_dict): return conn.run( conn.collection(&#39;bigchain&#39;) .insert_one(block_dict)) 至此，创建创世区块步骤完成，基本流程也就为：创建事务-&gt;对事务签名-&gt;根据事务创建区块-&gt;对区块进行签名-&gt;获取区块里的资产，设置资产的id为事务id-&gt;写资产-&gt;写事务。关于事务、区块、资产还有目前没有提到的投票的细节，我们之后在调用API写bigchaindb时再来分析 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/07/16/a8484e3a54df46e39d76d0a43988fe9c.html" />
+<meta property="og:url" content="https://uzzz.org/2017/07/16/a8484e3a54df46e39d76d0a43988fe9c.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-07-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"根据bigchaindb源码分析（三）所述，在初始化后端存储后，命令bigchaindb start所触发执行的_run_init函数将创建创世区块 # commands/bigchaindb.py def _run_init(): # Try to access the keypair, throws an exception if it does not exist b = bigchaindb.Bigchain() schema.init_database(connection=b.connection) b.create_genesis_block() logger.info(&#39;Genesis block created.&#39;) 创建创世区块的具体实现在core.py，其首先查找目前后端存储中已有的区块数目，如果存在区块，则说明创世区块已经创建好，抛出异常返回，否则则新建创世区块，并写入后端存储中 # core.py def create_genesis_block(self): blocks_count = backend.query.count_blocks(self.connection) if blocks_count: raise exceptions.GenesisBlockAlreadyExistsError(&#39;Cannot create the Genesis block&#39;) block = self.prepare_genesis_block() self.write_block(block) return block 查询已有区块数目 查询已有区块数目代码如下。调用的count_blocks的原型在backend/query.py。该函数有装饰器singledispatch，在源码分析（三）中，我们对该装饰器进行了详细的分析，其作用在于实现根据参数列表的不同类型来调用该函数原型，相当于实现函数多态。 # core.py blocks_count = backend.query.count_blocks(self.connection) # backend/query.py @singledispatch def count_blocks(connection): raise NotImplementedError 由于形参self.connection实际上为位于bigchaindb.backend.mongodb.connection模块中的MongoDBConnection类，根据源码分析（三），我们可以分析得到真正执行的函数为bigchaindb.backend.mongodb.query中的count_blocks函数，并且实参为MongoDBConnection类的实例 @register_query(MongoDBConnection) def count_blocks(conn): return conn.run( conn.collection(&#39;bigchain&#39;) .count()) conn.collection(&#39;bigchain&#39;).count()故将调用MongoDBConnection.collection，conn.run将调用MongoDBConnection.run # bigchaindb.backend.mongodb.connection.MongoDBConnection def query(self): return Lazy() def collection(self, name): return self.query()[self.dbname][name] def run(self, query): try: try: return query.run(self.conn) except ... except ... 将这些函数组合起来，count_blocks相当于调用了Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn)。其中self.dbname按照我们的配置文件，值为bigchain，而self.conn是一个已经通过了验证的pymongo.MongoClient实例（源码分析（三）中有说明） 这里涉及到了Lazy类，我们就先来看这个类吧 Lazy类位于bigchaindb/utils.py，其代码如下。Lazy类维护了名为stack的list，挡在触发__getattr__、__call__、__getitem__时，会将参数等加入到这个list中，从而形成了一条记录链。而run函数则是对于输入的实参instance，依次执行这个记录链。估计是因为可以暂缓执行记录链（直到调用run），所以才取名为Lazy吧。。 class Lazy: def __init__(self): &quot;&quot;&quot;Instantiate a new Lazy object.&quot;&quot;&quot; self.stack = [] def __getattr__(self, name): self.stack.append(name) return self def __call__(self, *args, **kwargs): self.stack.append((args, kwargs)) return self def __getitem__(self, key): self.stack.append(&#39;__getitem__&#39;) self.stack.append(([key], {})) return self def run(self, instance): &quot;&quot;&quot;Run the recorded chain of methods on `instance`. Args: instance: an object. &quot;&quot;&quot; last = instance for item in self.stack: if isinstance(item, str): last = getattr(last, item) else: last = last(*item[0], **item[1]) self.stack = [] return last 现在再来仔细分析count_blocks所执行的代码，即Lazy()[self.dbname][&#39;bigchain&#39;].count().run(self.conn) 首先，每一次[]运算符会调用__getitem__，因此，Lazy()[self.dbname][&#39;bigchain&#39;]执行完成后，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {})] 之后再调用count函数，此时将首先调用__getattr__来查找名为name的函数，然后调用__call__来调用name函数，因此，Lazy实例中的stack应该为 [&#39;__getitem__&#39;, ([self.dbname], {}), &#39;__getitem__&#39;, ([&#39;bigchain&#39;], {}), &#39;count&#39;, ((), {})] 最后再来调用run函数，run函数已经被定义了，因此不会再调用__getattr__或者__call__，而是直接执行run函数。run函数首先执行两次__getitem__，然后再执行一次count，故而实际上是把stack中记录的操作重新记录一遍，因此执行的也就为 # ::代表对某个对象进行操作 pymongo.MongoClient::[self.dbname][&#39;bigchain&#39;].count() 所以获取区块的数目其实就是查看表bigchain中的记录数目。。那么，为什么要使用Lazy类呢？估计是为了防止在连续调用时数据可能会发生变化而导致某些问题？并不清楚。。以后再来思考这个问题 创建创世区块 若未查找到已有区块，则说明应当要创建创世区块，对应的最外层代码为 # core.py create_genesis_block block = self.prepare_genesis_block() self.write_block(block) prepare_genesis_block首先创建一个Transaction类，并指定签名者为本节点（self.me为本节点的公钥），接受者也为本节点，云数据为{&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;}，之后将该事务的operation设置为GENESIS，代表创世区块。bigchaindb中的事务有三类，其中create表示新建资产，transfer表示转移资源，而genesis则特指创世区块。接着再利用sign函数来对事务进行签名 def prepare_genesis_block(self): &quot;&quot;&quot;Prepare a genesis block.&quot;&quot;&quot; metadata = {&#39;message&#39;: &#39;Hello World from the BigchainDB&#39;} transaction = Transaction.create([self.me], [([self.me], 1)], metadata=metadata) transaction.operation = &#39;GENESIS&#39; transaction = transaction.sign([self.me_private]) # create the block return self.create_block([transaction]) 在创建事务完成后，再使用Block类来根据事务创建区块，创建时指明了生成区块的节点（self.me）、时间戳以及投票者。投票者为配置文件中keyring所指定的节点（self.nodes_except_me）以及本节点。区块创建成功后，再使用本节点的私钥进行签名 federation = property(lambda self: set(self.nodes_except_me + [self.me])) def create_block(self, validated_transactions): # Prevent the creation of empty blocks if not validated_transactions: raise exceptions.OperationError(&#39;Empty block creation is not &#39; &#39;allowed&#39;) voters = list(self.federation) block = Block(validated_transactions, self.me, gen_timestamp(), voters) block = block.sign(self.me_private) return block 在区块成功创建并被签名后，bigchaindb首先调用decouple_assets将区块里的事务中的资产asset去重，并设置资产的id为创建该资产的事务的id，之后调用后端存储的write_assets与write_block方法来将资产与事务写入到后端存储中 def write_block(self, block): # Decouple assets from block assets, block_dict = block.decouple_assets() # write the assets if assets: self.write_assets(assets) # write the block return backend.query.write_block(self.connection, block_dict) def write_assets(self, assets): return backend.query.write_assets(self.connection, assets) 写资产与写区块的实现代码均位于backend/mongodb/query.py中。根据之前对Lazy类的分析，这两个函数实际上就是分别将资产插入到assets表中、将区块写入到bigchain表中 @register_query(MongoDBConnection) def write_assets(conn, assets): try: return conn.run( conn.collection(&#39;assets&#39;) .insert_many(assets, ordered=False)) except OperationError: return @register_query(MongoDBConnection) def write_block(conn, block_dict): return conn.run( conn.collection(&#39;bigchain&#39;) .insert_one(block_dict)) 至此，创建创世区块步骤完成，基本流程也就为：创建事务-&gt;对事务签名-&gt;根据事务创建区块-&gt;对区块进行签名-&gt;获取区块里的资产，设置资产的id为事务id-&gt;写资产-&gt;写事务。关于事务、区块、资产还有目前没有提到的投票的细节，我们之后在调用API写bigchaindb时再来分析 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/07/16/a8484e3a54df46e39d76d0a43988fe9c.html","headline":"bigchaindb源码分析（四）——创建创世区块","dateModified":"2017-07-16T00:00:00+08:00","datePublished":"2017-07-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/07/16/a8484e3a54df46e39d76d0a43988fe9c.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>bigchaindb源码分析（四）——创建创世区块</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>根据bigchaindb源码分析（三）所述，在初始化后端存储后，命令<code>bigchaindb start</code>所触发执行的<code>_run_init</code>函数将创建创世区块</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># commands/bigchaindb.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">_run_init</span><span class="hljs-params">()</span>:</span>
+    <span class="hljs-comment"># Try to access the keypair, throws an exception if it does not exist</span>
+    b = bigchaindb.Bigchain()
+
+    schema.init_database(connection=b.connection)
+
+    b.create_genesis_block()
+    logger.info(<span class="hljs-string">'Genesis block created.'</span>)</code></pre> 
+  <p>创建创世区块的具体实现在<code>core.py</code>，其首先查找目前后端存储中已有的区块数目，如果存在区块，则说明创世区块已经创建好，抛出异常返回，否则则新建创世区块，并写入后端存储中</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># core.py</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">create_genesis_block</span><span class="hljs-params">(self)</span>:</span>
+    blocks_count = backend.query.count_blocks(self.connection)
+
+    <span class="hljs-keyword">if</span> blocks_count:
+        <span class="hljs-keyword">raise</span> exceptions.GenesisBlockAlreadyExistsError(<span class="hljs-string">'Cannot create the Genesis block'</span>)
+
+    block = self.prepare_genesis_block()
+    self.write_block(block)
+
+    <span class="hljs-keyword">return</span> block</code></pre> 
+  <h2 id="查询已有区块数目">查询已有区块数目</h2> 
+  <p>查询已有区块数目代码如下。调用的<code>count_blocks</code>的原型在<code>backend/query.py</code>。该函数有装饰器singledispatch，在源码分析（三）中，我们对该装饰器进行了详细的分析，其作用在于实现根据参数列表的不同类型来调用该函数原型，相当于实现函数多态。</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># core.py</span>
+blocks_count = backend.query.count_blocks(self.connection)
+
+<span class="hljs-comment"># backend/query.py</span>
+<span class="hljs-decorator">@singledispatch</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">count_blocks</span><span class="hljs-params">(connection)</span>:</span>
+    <span class="hljs-keyword">raise</span> NotImplementedError</code></pre> 
+  <p>由于形参<code>self.connection</code>实际上为位于<code>bigchaindb.backend.mongodb.connection</code>模块中的<code>MongoDBConnection</code>类，根据源码分析（三），我们可以分析得到真正执行的函数为<code>bigchaindb.backend.mongodb.query</code>中的<code>count_blocks</code>函数，并且实参为<code>MongoDBConnection</code>类的实例</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">count_blocks</span><span class="hljs-params">(conn)</span>:</span>
+    <span class="hljs-keyword">return</span> conn.run(
+        conn.collection(<span class="hljs-string">'bigchain'</span>)
+        .count())</code></pre> 
+  <p><code>conn.collection('bigchain').count()</code>故将调用<code>MongoDBConnection.collection</code>，<code>conn.run</code>将调用<code>MongoDBConnection.run</code></p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-comment"># bigchaindb.backend.mongodb.connection.MongoDBConnection</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">query</span><span class="hljs-params">(self)</span>:</span>
+    <span class="hljs-keyword">return</span> Lazy()
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">collection</span><span class="hljs-params">(self, name)</span>:</span>
+    <span class="hljs-keyword">return</span> self.query()[self.dbname][name]
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">run</span><span class="hljs-params">(self, query)</span>:</span>
+    <span class="hljs-keyword">try</span>:
+        <span class="hljs-keyword">try</span>:
+            <span class="hljs-keyword">return</span> query.run(self.conn)
+        <span class="hljs-keyword">except</span> ...
+    <span class="hljs-keyword">except</span> ...</code></pre> 
+  <p>将这些函数组合起来，<code>count_blocks</code>相当于调用了<code>Lazy()[self.dbname]['bigchain'].count().run(self.conn)</code>。其中<code>self.dbname</code>按照我们的配置文件，值为<code>bigchain</code>，而<code>self.conn</code>是一个已经通过了验证的<code>pymongo.MongoClient</code>实例（源码分析（三）中有说明）</p> 
+  <p>这里涉及到了<code>Lazy</code>类，我们就先来看这个类吧</p> 
+  <p>Lazy类位于<code>bigchaindb/utils.py</code>，其代码如下。Lazy类维护了名为stack的list，挡在触发<code>__getattr__</code>、<code>__call__</code>、<code>__getitem__</code>时，会将参数等加入到这个list中，从而形成了一条记录链。而run函数则是对于输入的实参instance，依次执行这个记录链。估计是因为可以暂缓执行记录链（直到调用<code>run</code>），所以才取名为Lazy吧。。</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Lazy</span>:</span>
+
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">__init__</span><span class="hljs-params">(self)</span>:</span>
+        <span class="hljs-string">"""Instantiate a new Lazy object."""</span>
+        self.stack = []
+
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">__getattr__</span><span class="hljs-params">(self, name)</span>:</span>
+        self.stack.append(name)
+        <span class="hljs-keyword">return</span> self
+
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">__call__</span><span class="hljs-params">(self, *args, **kwargs)</span>:</span>
+        self.stack.append((args, kwargs))
+        <span class="hljs-keyword">return</span> self
+
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">__getitem__</span><span class="hljs-params">(self, key)</span>:</span>
+        self.stack.append(<span class="hljs-string">'__getitem__'</span>)
+        self.stack.append(([key], {}))
+        <span class="hljs-keyword">return</span> self
+
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">run</span><span class="hljs-params">(self, instance)</span>:</span>
+        <span class="hljs-string">"""Run the recorded chain of methods on `instance`. Args: instance: an object. """</span>
+
+        last = instance
+
+        <span class="hljs-keyword">for</span> item <span class="hljs-keyword">in</span> self.stack:
+            <span class="hljs-keyword">if</span> isinstance(item, str):
+                last = getattr(last, item)
+            <span class="hljs-keyword">else</span>:
+                last = last(*item[<span class="hljs-number">0</span>], **item[<span class="hljs-number">1</span>])
+
+        self.stack = []
+        <span class="hljs-keyword">return</span> last</code></pre> 
+  <p>现在再来仔细分析<code>count_blocks</code>所执行的代码，即<code>Lazy()[self.dbname]['bigchain'].count().run(self.conn)</code></p> 
+  <ul> 
+   <li>首先，每一次<code>[]</code>运算符会调用<code>__getitem__</code>，因此，<code>Lazy()[self.dbname]['bigchain']</code>执行完成后，Lazy实例中的stack应该为</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs json">['__getitem__', ([self.dbname], {}), '__getitem__', (['bigchain'], {})]</code></pre> 
+  <ul> 
+   <li>之后再调用count函数，此时将首先调用<code>__getattr__</code>来查找名为name的函数，然后调用<code>__call__</code>来调用name函数，因此，Lazy实例中的stack应该为</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs json">['__getitem__', ([self.dbname], {}), '__getitem__', (['bigchain'], {}), 'count', ((), {})]</code></pre> 
+  <ul> 
+   <li>最后再来调用run函数，run函数已经被定义了，因此不会再调用<code>__getattr__</code>或者<code>__call__</code>，而是直接执行run函数。run函数首先执行两次<code>__getitem__</code>，然后再执行一次count，故而实际上是把stack中记录的操作重新记录一遍，因此执行的也就为</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs markdown"><span class="hljs-header"># ::代表对某个对象进行操作</span>
+pymongo.MongoClient::[<span class="hljs-link_label">self.dbname</span>][<span class="hljs-link_reference">'bigchain'</span>].count()</code></pre> 
+  <p>所以获取区块的数目其实就是查看表bigchain中的记录数目。。那么，为什么要使用Lazy类呢？估计是为了防止在连续调用时数据可能会发生变化而导致某些问题？并不清楚。。以后再来思考这个问题</p> 
+  <h2 id="创建创世区块">创建创世区块</h2> 
+  <p>若未查找到已有区块，则说明应当要创建创世区块，对应的最外层代码为</p> 
+  <pre class="prettyprint"><code class=" hljs oxygene"># core.py create_genesis_block
+<span class="hljs-keyword">block</span> = <span class="hljs-keyword">self</span>.prepare_genesis_block()
+<span class="hljs-keyword">self</span>.write_block(<span class="hljs-keyword">block</span>)</code></pre> 
+  <p><code>prepare_genesis_block</code>首先创建一个Transaction类，并指定签名者为本节点（<code>self.me</code>为本节点的公钥），接受者也为本节点，云数据为<code>{'message': 'Hello World from the BigchainDB'}</code>，之后将该事务的operation设置为<code>GENESIS</code>，代表创世区块。bigchaindb中的事务有三类，其中<code>create</code>表示新建资产，<code>transfer</code>表示转移资源，而<code>genesis</code>则特指创世区块。接着再利用sign函数来对事务进行签名</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">prepare_genesis_block</span><span class="hljs-params">(self)</span>:</span>
+    <span class="hljs-string">"""Prepare a genesis block."""</span>
+
+    metadata = {<span class="hljs-string">'message'</span>: <span class="hljs-string">'Hello World from the BigchainDB'</span>}
+    transaction = Transaction.create([self.me], [([self.me], <span class="hljs-number">1</span>)],
+                                     metadata=metadata)
+
+    transaction.operation = <span class="hljs-string">'GENESIS'</span>
+    transaction = transaction.sign([self.me_private])
+
+    <span class="hljs-comment"># create the block</span>
+    <span class="hljs-keyword">return</span> self.create_block([transaction])</code></pre> 
+  <p>在创建事务完成后，再使用Block类来根据事务创建区块，创建时指明了生成区块的节点（<code>self.me</code>）、时间戳以及投票者。投票者为配置文件中keyring所指定的节点（<code>self.nodes_except_me</code>）以及本节点。区块创建成功后，再使用本节点的私钥进行签名</p> 
+  <pre class="prettyprint"><code class=" hljs oxygene">federation = <span class="hljs-keyword">property</span>(lambda <span class="hljs-keyword">self</span>: <span class="hljs-keyword">set</span>(<span class="hljs-keyword">self</span>.nodes_except_me + [<span class="hljs-keyword">self</span>.me]))
+
+def create_block(<span class="hljs-keyword">self</span>, validated_transactions):
+    # Prevent the creation <span class="hljs-keyword">of</span> <span class="hljs-keyword">empty</span> blocks
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> validated_transactions:
+        <span class="hljs-keyword">raise</span> exceptions.OperationError(<span class="hljs-string">'Empty block creation is not '</span>
+                                        <span class="hljs-string">'allowed'</span>)
+
+    voters = list(<span class="hljs-keyword">self</span>.federation)
+    <span class="hljs-keyword">block</span> = <span class="hljs-keyword">Block</span>(validated_transactions, <span class="hljs-keyword">self</span>.me, gen_timestamp(), voters)
+    <span class="hljs-keyword">block</span> = <span class="hljs-keyword">block</span>.sign(<span class="hljs-keyword">self</span>.me_private)
+
+    return <span class="hljs-keyword">block</span></code></pre> 
+  <p>在区块成功创建并被签名后，bigchaindb首先调用<code>decouple_assets</code>将区块里的事务中的资产asset去重，并设置资产的id为创建该资产的事务的id，之后调用后端存储的<code>write_assets</code>与<code>write_block</code>方法来将资产与事务写入到后端存储中</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">write_block</span><span class="hljs-params">(self, block)</span>:</span>
+    <span class="hljs-comment"># Decouple assets from block</span>
+    assets, block_dict = block.decouple_assets()
+    <span class="hljs-comment"># write the assets</span>
+    <span class="hljs-keyword">if</span> assets:
+        self.write_assets(assets)
+
+    <span class="hljs-comment"># write the block</span>
+    <span class="hljs-keyword">return</span> backend.query.write_block(self.connection, block_dict)
+
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">write_assets</span><span class="hljs-params">(self, assets)</span>:</span>
+    <span class="hljs-keyword">return</span> backend.query.write_assets(self.connection, assets)</code></pre> 
+  <p>写资产与写区块的实现代码均位于<code>backend/mongodb/query.py</code>中。根据之前对Lazy类的分析，这两个函数实际上就是分别将资产插入到assets表中、将区块写入到<code>bigchain</code>表中</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">write_assets</span><span class="hljs-params">(conn, assets)</span>:</span>
+    <span class="hljs-keyword">try</span>:
+        <span class="hljs-keyword">return</span> conn.run(
+            conn.collection(<span class="hljs-string">'assets'</span>)
+            .insert_many(assets, ordered=<span class="hljs-keyword">False</span>))
+    <span class="hljs-keyword">except</span> OperationError:
+        <span class="hljs-keyword">return</span>
+
+<span class="hljs-decorator">@register_query(MongoDBConnection)</span>
+<span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">write_block</span><span class="hljs-params">(conn, block_dict)</span>:</span>
+    <span class="hljs-keyword">return</span> conn.run(
+        conn.collection(<span class="hljs-string">'bigchain'</span>)
+        .insert_one(block_dict))</code></pre> 
+  <p>至此，创建创世区块步骤完成，基本流程也就为：创建事务-&gt;对事务签名-&gt;根据事务创建区块-&gt;对区块进行签名-&gt;获取区块里的资产，设置资产的id为事务id-&gt;写资产-&gt;写事务。关于事务、区块、资产还有目前没有提到的投票的细节，我们之后在调用API写bigchaindb时再来分析</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/lwyeluo/article/details/75208150,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/lwyeluo/article/details/75208150,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

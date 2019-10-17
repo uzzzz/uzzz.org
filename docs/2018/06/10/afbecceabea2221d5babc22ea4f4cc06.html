@@ -1,0 +1,1091 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析之三网络分析之二网络的数据交互 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析之三网络分析之二网络的数据交互" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊源码分析之三网络分析之二网络的数据交互 一、 网络的数据交互准备&nbsp; 在前面提到过启动节点时会启动P2P网络的监听（包括UDP和TCP）， 首先看创建一个Service，在前文的makeFullNode 函数时，使用了RegisterEthService这个函数，在这个函数里： func RegisterEthService(stack *node.Node, cfg *eth.Config) { var err error if cfg.SyncMode == downloader.LightSync { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个轻量级的服务，SPV等 return les.New(ctx, cfg) }) } else { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个全节点并在配置情况下添加轻量级服务，也就是全节点既支持全同//步也支持轻同步，默认为FastSync，但新的以太坊中明确定义FastSync和//LightSync两种同步方式在参数设置中废弃 fullNode, err := eth.New(ctx, cfg) if fullNode != nil &amp;&amp; cfg.LightServ &gt; 0 { ls, _ := les.NewLesServer(fullNode, cfg) fullNode.AddLesServer(ls) } return fullNode, err }) } if err != nil { Fatalf(&quot;Failed to register the Ethereum service: %v&quot;, err) } } 有必要说明一下这个定义： const ( &nbsp; &nbsp; FullSync &nbsp;SyncMode = iota // 同步完整的区块信息 &nbsp; &nbsp; FastSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;// 快速同步header，然后再由header同步全部内容 &nbsp; &nbsp; LightSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; // 类似比特币，只下载header并在之后终止 ) 在flag.go中，默认定义： defaultSyncMode = eth.DefaultConfig.SyncMode SyncModeFlag &nbsp; &nbsp;= TextMarshalerFlag{ Name: &nbsp;&quot;syncmode&quot;, Usage: `Blockchain sync mode (&quot;fast&quot;, &quot;full&quot;, or &quot;light&quot;)`, Value: &amp;defaultSyncMode, } 而在eth/config.go中可以看到： var DefaultConfig = Config{ SyncMode: downloader.FastSync, //默认是快速的 ……. } 那么服务的同步方式到底怎么设置呢？在 eth/handler(注意，les/handler.go其它两个服务都有类似情况)： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Figure out whether to allow fast sync or not if mode == downloader.FastSync &amp;&amp; blockchain.CurrentBlock().NumberU64() &gt; 0 { log.Warn(&quot;Blockchain not empty, fast sync disabled&quot;) mode = downloader.FullSync } if mode == downloader.FastSync { manager.fastSync = uint32(1) } …… } 这说明了什么？说明以太坊启动时的同步模式使用的是快速的，当header的编号为0时，继续使用fastSync,当其不为0时，自动转成fullSync。 这里需要注意的是，这是指在不传递启动参数时，但刚刚也说过了，传递的参数只能是fullSync一种,另外的两种fastSync和LigthSync已经废弃。 说了一些相对的题外话，再扯回来接着看服务。 func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) { if config.SyncMode == downloader.LightSync { &nbsp; &nbsp; &nbsp; &nbsp; //这里就是上文提到的les模式(les/backend.go)，在当前这种情况下的错误警告 return nil, errors.New(&quot;can&#39;t run eth.Ethereum in light sync mode, use les.LightEthereum&quot;) } if !config.SyncMode.IsValid() { return nil, fmt.Errorf(&quot;invalid sync mode %d&quot;, config.SyncMode) } &nbsp; &nbsp; //打存储数据库，用的是leveldb。 chainDb, err := CreateDB(ctx, config, &quot;chaindata&quot;) if err != nil { return nil, err } &nbsp; &nbsp; //如果需要，启动后台进程升级数据库 stopDbUpgrade := upgradeDeduplicateData(chainDb) &nbsp; &nbsp; //创世区块的设置,根据条件判断从配置文件或者数据库加载 chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis) if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil &amp;&amp; !ok { return nil, genesisErr } log.Info(&quot;Initialised chain configuration&quot;, &quot;config&quot;, chainConfig) &nbsp; &nbsp; //eth变量声明 eth := &amp;Ethereum{ config: &nbsp; &nbsp; &nbsp; &nbsp; config, chainDb: &nbsp; &nbsp; &nbsp; &nbsp;chainDb, chainConfig: &nbsp; &nbsp;chainConfig, eventMux: &nbsp; &nbsp; &nbsp; ctx.EventMux, accountManager: ctx.AccountManager, engine: &nbsp; &nbsp; &nbsp; &nbsp; CreateConsensusEngine(ctx, &amp;config.Ethash, chainConfig, chainDb), shutdownChan: &nbsp; make(chan bool), stopDbUpgrade: &nbsp;stopDbUpgrade, networkId: &nbsp; &nbsp; &nbsp;config.NetworkId, gasPrice: &nbsp; &nbsp; &nbsp; config.GasPrice, etherbase: &nbsp; &nbsp; &nbsp;config.Etherbase, bloomRequests: &nbsp;make(chan chan *bloombits.Retrieval), bloomIndexer: &nbsp; NewBloomIndexer(chainDb, params.BloomBitsBlocks), } &nbsp; &nbsp; //版本比较 log.Info(&quot;Initialising Ethereum protocol&quot;, &quot;versions&quot;, ProtocolVersions, &quot;network&quot;, config.NetworkId) if !config.SkipBcVersionCheck { bcVersion := core.GetBlockChainVersion(chainDb) if bcVersion != core.BlockChainVersion &amp;&amp; bcVersion != 0 { return nil, fmt.Errorf(&quot;Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\n&quot;, bcVersion, core.BlockChainVersion) } core.WriteBlockChainVersion(chainDb, core.BlockChainVersion) } var ( vmConfig &nbsp; &nbsp;= vm.Config{EnablePreimageRecording: config.EnablePreimageRecording} cacheConfig = &amp;core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout} ) &nbsp; &nbsp; //eth内部变量的初始化：1、初始化区块链 eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, eth.chainConfig, eth.engine, vmConfig) if err != nil { return nil, err } // Rewind the chain in case of an incompatible config upgrade. if compat, ok := genesisErr.(*params.ConfigCompatError); ok { log.Warn(&quot;Rewinding chain to upgrade configuration&quot;, &quot;err&quot;, compat) eth.blockchain.SetHead(compat.RewindTo) core.WriteChainConfig(chainDb, genesisHash, chainConfig) } &nbsp; //2、bloom启动 eth.bloomIndexer.Start(eth.blockchain) if config.TxPool.Journal != &quot;&quot; { config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal) } &nbsp; &nbsp; //3、交易池初始化，和比特币类似，可以存储本地和网络传送的交易 eth.txPool = core.NewTxPool(config.TxPool, eth.chainConfig, eth.blockchain) &nbsp; &nbsp; //4、P2P协议管理初始化 if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb); err != nil { return nil, err } &nbsp; &nbsp; //5、挖矿初始化 eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine) eth.miner.SetExtra(makeExtraData(config.ExtraData)) eth.ApiBackend = &amp;EthApiBackend{eth, nil} gpoParams := config.GPO if gpoParams.Default == nil { gpoParams.Default = config.GasPrice } &nbsp; &nbsp; 6、gas预言机初始化 eth.ApiBackend.gpo = gasprice.NewOracle(eth.ApiBackend, gpoParams) return eth, nil } 在前面的StartNode中会调用： …… for kind, service := range services { // Start the next service, stopping all previous upon failure if err := service.Start(running); err != nil { &nbsp; &nbsp; &nbsp; …… } …… } 好，看一下它： func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines &nbsp; &nbsp; //启动布隆过滤器 s.startBloomHandlers() // Start the RPC service &nbsp; &nbsp; //启动RPC服务 s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits &nbsp; &nbsp; //配置最大启动节点 maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers)//启动最大节点同步数 if s.lesServer != nil { s.lesServer.Start(srvr)//如果包含轻量级服务也启动之 } return nil } 都写到注释里了，没啥太需要关心注意的。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 服务的启动主要是交易池事件的定阅，启动广播和挖矿的事件订阅。最后启动同步循环。 二、 网络数据通信 在以太坊的网络通信中，是通过Peer来发送和接收数据的，他通过handle来处理回调： 在Server.go中： func (srv *Server) listenLoop() { …… fd, err = srv.listener.Accept() &nbsp;//fd的类型是net.Conn …… } 而它又被： // SetupConn runs the handshakes and attempts to add the connection // as a peer. It returns when the connection has been added as a peer // or the handshakes have failed. func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Node) error { …… &nbsp; &nbsp; //注意此处的srv.newTransport(fd) c := &amp;conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)} err := srv.setupConn(c, flags, dialDest) &nbsp;如果正常添加新peer …… return err } 上面的注意中在: func (srv *Server) Start() (err error) { if srv.newTransport == nil { srv.newTransport = newRLPX &nbsp; //重定义成了rlpx进行加密 } } func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error { …… c.caps, c.name = phs.Caps, phs.Name err = srv.checkpoint(c, srv.addpeer) &nbsp;//这里看下面一个函数run if err != nil { clog.Trace(&quot;Rejected peer&quot;, &quot;err&quot;, err) return err } // If the checks completed successfully, runPeer has now been // launched by run. …… return nil } func (srv *Server) run(dialstate dialer) { …… case c := &lt;-srv.addpeer: // At this point the connection is past the protocol handshake. // Its capabilities are known and the remote identity is verified. err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. //这里接着上面的通道接收新的conn，并依此创建peer p := newPeer(c, srv.Protocols) // If message events are enabled, pass the peerFeed // to the peer if srv.EnableMsgEvents { p.events = &amp;srv.peerFeed } name := truncateName(c.name) srv.log.Debug(&quot;Adding p2p peer&quot;, &quot;name&quot;, name, &quot;addr&quot;, c.fd.RemoteAddr(), &quot;peers&quot;, len(peers)+1) go srv.runPeer(p) &nbsp;//运行 peers[c.id] = p &nbsp; &nbsp;//添加到Set中 if p.Inbound() { inboundCount++ } } // The dialer logic relies on the assumption that // dial tasks complete after the peer has been added or // discarded. Unblock the task last. select { case c.cont &lt;- err: case &lt;-srv.quit: break running } …… } 看runPeer(server.go)： func (srv *Server) runPeer(p *Peer) { if srv.newPeerHook != nil { srv.newPeerHook(p) } // broadcast peer add srv.peerFeed.Send(&amp;PeerEvent{ Type: PeerEventTypeAdd, Peer: p.ID(), }) // run the protocol 运行自己的创建的协议 remoteRequested, err := p.run() // broadcast peer drop srv.peerFeed.Send(&amp;PeerEvent{ Type: &nbsp;PeerEventTypeDrop, Peer: &nbsp;p.ID(), Error: err.Error(), }) // Note: run waits for existing peers to be sent on srv.delpeer // before returning, so this send should not select on srv.quit. srv.delpeer &lt;- peerDrop{p, err, remoteRequested} } 看peer.go中的run: func (p *Peer) run() (remoteRequested bool, err error) { var ( writeStart = make(chan struct{}, 1) writeErr &nbsp; = make(chan error, 1) readErr &nbsp; &nbsp;= make(chan error, 1) reason &nbsp; &nbsp; DiscReason // sent to the peer ) p.wg.Add(2) &nbsp; &nbsp; //读和ping go p.readLoop(readErr) go p.pingLoop() // Start all protocol handlers. writeStart &lt;- struct{}{} &nbsp; &nbsp; //这里启动相应的协议 p.startProtocols(writeStart, writeErr) // Wait for an error or disconnect. loop: for { select { case err = &lt;-writeErr: // A write finished. Allow the next write to start if // there was no error. if err != nil { reason = DiscNetworkError break loop } writeStart &lt;- struct{}{} case err = &lt;-readErr: if r, ok := err.(DiscReason); ok { remoteRequested = true reason = r } else { reason = DiscNetworkError } break loop case err = &lt;-p.protoErr: reason = discReasonForError(err) break loop case err = &lt;-p.disc: break loop } } close(p.closed) p.rw.close(reason) p.wg.Wait() return remoteRequested, err } 继续看readloop: func (p *Peer) readLoop(errc chan&lt;- error) { defer p.wg.Done() for { msg, err := p.rw.ReadMsg() if err != nil { errc &lt;- err return } msg.ReceivedAt = time.Now() &nbsp; &nbsp; &nbsp; &nbsp; //这就是前面提到的handle的回调 if err = p.handle(msg); err != nil { errc &lt;- err return } } } 看一下handle: func (p *Peer) handle(msg Msg) error { switch { case msg.Code == pingMsg: msg.Discard() go SendItems(p.rw, pongMsg) case msg.Code == discMsg: var reason [1]DiscReason // This is the last message. We don&#39;t need to discard or // check errors because, the connection will be closed after it. rlp.Decode(msg.Payload, &amp;reason) return reason[0] case msg.Code &lt; baseProtocolLength: // ignore other base protocol messages return msg.Discard() default: // it&#39;s a subprotocol message这里处理子协议，在这里 proto, err := p.getProto(msg.Code) if err != nil { return fmt.Errorf(&quot;msg code out of range: %v&quot;, msg.Code) } select { case proto.in &lt;- msg: return nil case &lt;-p.closed: return io.EOF } } return nil } 看那个子协议处理： // getProto finds the protocol responsible for handling // the given message code. func (p *Peer) getProto(code uint64) (*protoRW, error) { for _, proto := range p.running { if code &gt;= proto.offset &amp;&amp; code &lt; proto.offset+proto.Length { return proto, nil } } return nil, newPeerError(errInvalidMsgCode, &quot;%d&quot;, code) } 看看p.running是个什么东东，在前面创建peer时，用了： func newPeer(conn *conn, protocols []Protocol) *Peer { protomap := matchProtocols(protocols, conn.caps, conn) p := &amp;Peer{ rw: &nbsp; &nbsp; &nbsp; conn, running: &nbsp;protomap, &nbsp;//在这里，是它，它从函数第一行创建来的 created: &nbsp;mclock.Now(), disc: &nbsp; &nbsp; make(chan DiscReason), protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop closed: &nbsp; make(chan struct{}), log: &nbsp; &nbsp; &nbsp;log.New(&quot;id&quot;, conn.id, &quot;conn&quot;, conn.flags), } return p } 回到Peer的Run函数，看启动协议的函数： func (p *Peer) startProtocols(writeStart &lt;-chan struct{}, writeErr chan&lt;- error) { p.wg.Add(len(p.running)) for _, proto := range p.running { proto := proto proto.closed = p.closed proto.wstart = writeStart proto.werr = writeErr var rw MsgReadWriter = proto if p.events != nil { rw = newMsgEventer(rw, p.events, p.ID(), proto.Name) } p.log.Trace(fmt.Sprintf(&quot;Starting protocol %s/%d&quot;, proto.Name, proto.Version)) go func() { err := proto.Run(p, rw) &nbsp;//这里非常重要 if err == nil { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d returned&quot;, proto.Name, proto.Version)) err = errProtocolReturned } else if err != io.EOF { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d failed&quot;, proto.Name, proto.Version), &quot;err&quot;, err) } p.protoErr &lt;- err p.wg.Done() }() } } 上面的proto.Run(p, rw)的Run哪来的，看一下最初初始化PM时的代码（handle.go）： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Initiate a sub-protocol for every implemented version we can handle manager.SubProtocols = make([]p2p.Protocol, 0, len(ProtocolVersions)) for i, version := range ProtocolVersions { // Skip protocol version if incompatible with the mode of operation if mode == downloader.FastSync &amp;&amp; version &lt; eth63 { continue } // Compatible; initialise the sub-protocol version := version // Closure for the run manager.SubProtocols = append(manager.SubProtocols, p2p.Protocol{ Name: &nbsp; &nbsp;ProtocolName, Version: version, Length: &nbsp;ProtocolLengths[i], &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //在这里Run Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error { peer := manager.newPeer(int(version), p, rw) select { case manager.newPeerCh &lt;- peer: manager.wg.Add(1) defer manager.wg.Done() return manager.handle(peer) case &lt;-manager.quitSync: return p2p.DiscQuitting } }, NodeInfo: func() interface{} { return manager.NodeInfo() }, PeerInfo: func(id discover.NodeID) interface{} { if p := manager.peers.Peer(fmt.Sprintf(&quot;%x&quot;, id[:8])); p != nil { return p.Info() } return nil }, }) } …… return manager, nil } 这样就把相关的Peer创建好了。这里需要注意的是newPeer是eth/peer.go，要和p2p/peer.go区别开来。 创建好后，就相当于在Socket编程中创建了一个链接，就可以直接接收数据了，比如在rlpx.go中： func (rw *rlpxFrameRW) WriteMsg(msg Msg) error { …… // write frame MAC. egress MAC hash is up to date because // frame content was written to it as well. fmacseed := rw.egressMAC.Sum(nil) mac := updateMAC(rw.egressMAC, rw.macCipher, fmacseed) _, err := rw.conn.Write(mac) return err } func (rw *rlpxFrameRW) ReadMsg() (msg Msg, err error) { // read the header headbuf := make([]byte, 32) if _, err := io.ReadFull(rw.conn, headbuf); err != nil { return msg, err } …… return msg, nil } 读写操作直接落到了IO上。下一次说一下整个的消息流通过程，做为对这一篇的一个补充。 阅读更多" />
+<meta property="og:description" content="以太坊源码分析之三网络分析之二网络的数据交互 一、 网络的数据交互准备&nbsp; 在前面提到过启动节点时会启动P2P网络的监听（包括UDP和TCP）， 首先看创建一个Service，在前文的makeFullNode 函数时，使用了RegisterEthService这个函数，在这个函数里： func RegisterEthService(stack *node.Node, cfg *eth.Config) { var err error if cfg.SyncMode == downloader.LightSync { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个轻量级的服务，SPV等 return les.New(ctx, cfg) }) } else { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个全节点并在配置情况下添加轻量级服务，也就是全节点既支持全同//步也支持轻同步，默认为FastSync，但新的以太坊中明确定义FastSync和//LightSync两种同步方式在参数设置中废弃 fullNode, err := eth.New(ctx, cfg) if fullNode != nil &amp;&amp; cfg.LightServ &gt; 0 { ls, _ := les.NewLesServer(fullNode, cfg) fullNode.AddLesServer(ls) } return fullNode, err }) } if err != nil { Fatalf(&quot;Failed to register the Ethereum service: %v&quot;, err) } } 有必要说明一下这个定义： const ( &nbsp; &nbsp; FullSync &nbsp;SyncMode = iota // 同步完整的区块信息 &nbsp; &nbsp; FastSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;// 快速同步header，然后再由header同步全部内容 &nbsp; &nbsp; LightSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; // 类似比特币，只下载header并在之后终止 ) 在flag.go中，默认定义： defaultSyncMode = eth.DefaultConfig.SyncMode SyncModeFlag &nbsp; &nbsp;= TextMarshalerFlag{ Name: &nbsp;&quot;syncmode&quot;, Usage: `Blockchain sync mode (&quot;fast&quot;, &quot;full&quot;, or &quot;light&quot;)`, Value: &amp;defaultSyncMode, } 而在eth/config.go中可以看到： var DefaultConfig = Config{ SyncMode: downloader.FastSync, //默认是快速的 ……. } 那么服务的同步方式到底怎么设置呢？在 eth/handler(注意，les/handler.go其它两个服务都有类似情况)： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Figure out whether to allow fast sync or not if mode == downloader.FastSync &amp;&amp; blockchain.CurrentBlock().NumberU64() &gt; 0 { log.Warn(&quot;Blockchain not empty, fast sync disabled&quot;) mode = downloader.FullSync } if mode == downloader.FastSync { manager.fastSync = uint32(1) } …… } 这说明了什么？说明以太坊启动时的同步模式使用的是快速的，当header的编号为0时，继续使用fastSync,当其不为0时，自动转成fullSync。 这里需要注意的是，这是指在不传递启动参数时，但刚刚也说过了，传递的参数只能是fullSync一种,另外的两种fastSync和LigthSync已经废弃。 说了一些相对的题外话，再扯回来接着看服务。 func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) { if config.SyncMode == downloader.LightSync { &nbsp; &nbsp; &nbsp; &nbsp; //这里就是上文提到的les模式(les/backend.go)，在当前这种情况下的错误警告 return nil, errors.New(&quot;can&#39;t run eth.Ethereum in light sync mode, use les.LightEthereum&quot;) } if !config.SyncMode.IsValid() { return nil, fmt.Errorf(&quot;invalid sync mode %d&quot;, config.SyncMode) } &nbsp; &nbsp; //打存储数据库，用的是leveldb。 chainDb, err := CreateDB(ctx, config, &quot;chaindata&quot;) if err != nil { return nil, err } &nbsp; &nbsp; //如果需要，启动后台进程升级数据库 stopDbUpgrade := upgradeDeduplicateData(chainDb) &nbsp; &nbsp; //创世区块的设置,根据条件判断从配置文件或者数据库加载 chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis) if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil &amp;&amp; !ok { return nil, genesisErr } log.Info(&quot;Initialised chain configuration&quot;, &quot;config&quot;, chainConfig) &nbsp; &nbsp; //eth变量声明 eth := &amp;Ethereum{ config: &nbsp; &nbsp; &nbsp; &nbsp; config, chainDb: &nbsp; &nbsp; &nbsp; &nbsp;chainDb, chainConfig: &nbsp; &nbsp;chainConfig, eventMux: &nbsp; &nbsp; &nbsp; ctx.EventMux, accountManager: ctx.AccountManager, engine: &nbsp; &nbsp; &nbsp; &nbsp; CreateConsensusEngine(ctx, &amp;config.Ethash, chainConfig, chainDb), shutdownChan: &nbsp; make(chan bool), stopDbUpgrade: &nbsp;stopDbUpgrade, networkId: &nbsp; &nbsp; &nbsp;config.NetworkId, gasPrice: &nbsp; &nbsp; &nbsp; config.GasPrice, etherbase: &nbsp; &nbsp; &nbsp;config.Etherbase, bloomRequests: &nbsp;make(chan chan *bloombits.Retrieval), bloomIndexer: &nbsp; NewBloomIndexer(chainDb, params.BloomBitsBlocks), } &nbsp; &nbsp; //版本比较 log.Info(&quot;Initialising Ethereum protocol&quot;, &quot;versions&quot;, ProtocolVersions, &quot;network&quot;, config.NetworkId) if !config.SkipBcVersionCheck { bcVersion := core.GetBlockChainVersion(chainDb) if bcVersion != core.BlockChainVersion &amp;&amp; bcVersion != 0 { return nil, fmt.Errorf(&quot;Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\n&quot;, bcVersion, core.BlockChainVersion) } core.WriteBlockChainVersion(chainDb, core.BlockChainVersion) } var ( vmConfig &nbsp; &nbsp;= vm.Config{EnablePreimageRecording: config.EnablePreimageRecording} cacheConfig = &amp;core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout} ) &nbsp; &nbsp; //eth内部变量的初始化：1、初始化区块链 eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, eth.chainConfig, eth.engine, vmConfig) if err != nil { return nil, err } // Rewind the chain in case of an incompatible config upgrade. if compat, ok := genesisErr.(*params.ConfigCompatError); ok { log.Warn(&quot;Rewinding chain to upgrade configuration&quot;, &quot;err&quot;, compat) eth.blockchain.SetHead(compat.RewindTo) core.WriteChainConfig(chainDb, genesisHash, chainConfig) } &nbsp; //2、bloom启动 eth.bloomIndexer.Start(eth.blockchain) if config.TxPool.Journal != &quot;&quot; { config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal) } &nbsp; &nbsp; //3、交易池初始化，和比特币类似，可以存储本地和网络传送的交易 eth.txPool = core.NewTxPool(config.TxPool, eth.chainConfig, eth.blockchain) &nbsp; &nbsp; //4、P2P协议管理初始化 if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb); err != nil { return nil, err } &nbsp; &nbsp; //5、挖矿初始化 eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine) eth.miner.SetExtra(makeExtraData(config.ExtraData)) eth.ApiBackend = &amp;EthApiBackend{eth, nil} gpoParams := config.GPO if gpoParams.Default == nil { gpoParams.Default = config.GasPrice } &nbsp; &nbsp; 6、gas预言机初始化 eth.ApiBackend.gpo = gasprice.NewOracle(eth.ApiBackend, gpoParams) return eth, nil } 在前面的StartNode中会调用： …… for kind, service := range services { // Start the next service, stopping all previous upon failure if err := service.Start(running); err != nil { &nbsp; &nbsp; &nbsp; …… } …… } 好，看一下它： func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines &nbsp; &nbsp; //启动布隆过滤器 s.startBloomHandlers() // Start the RPC service &nbsp; &nbsp; //启动RPC服务 s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits &nbsp; &nbsp; //配置最大启动节点 maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers)//启动最大节点同步数 if s.lesServer != nil { s.lesServer.Start(srvr)//如果包含轻量级服务也启动之 } return nil } 都写到注释里了，没啥太需要关心注意的。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 服务的启动主要是交易池事件的定阅，启动广播和挖矿的事件订阅。最后启动同步循环。 二、 网络数据通信 在以太坊的网络通信中，是通过Peer来发送和接收数据的，他通过handle来处理回调： 在Server.go中： func (srv *Server) listenLoop() { …… fd, err = srv.listener.Accept() &nbsp;//fd的类型是net.Conn …… } 而它又被： // SetupConn runs the handshakes and attempts to add the connection // as a peer. It returns when the connection has been added as a peer // or the handshakes have failed. func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Node) error { …… &nbsp; &nbsp; //注意此处的srv.newTransport(fd) c := &amp;conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)} err := srv.setupConn(c, flags, dialDest) &nbsp;如果正常添加新peer …… return err } 上面的注意中在: func (srv *Server) Start() (err error) { if srv.newTransport == nil { srv.newTransport = newRLPX &nbsp; //重定义成了rlpx进行加密 } } func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error { …… c.caps, c.name = phs.Caps, phs.Name err = srv.checkpoint(c, srv.addpeer) &nbsp;//这里看下面一个函数run if err != nil { clog.Trace(&quot;Rejected peer&quot;, &quot;err&quot;, err) return err } // If the checks completed successfully, runPeer has now been // launched by run. …… return nil } func (srv *Server) run(dialstate dialer) { …… case c := &lt;-srv.addpeer: // At this point the connection is past the protocol handshake. // Its capabilities are known and the remote identity is verified. err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. //这里接着上面的通道接收新的conn，并依此创建peer p := newPeer(c, srv.Protocols) // If message events are enabled, pass the peerFeed // to the peer if srv.EnableMsgEvents { p.events = &amp;srv.peerFeed } name := truncateName(c.name) srv.log.Debug(&quot;Adding p2p peer&quot;, &quot;name&quot;, name, &quot;addr&quot;, c.fd.RemoteAddr(), &quot;peers&quot;, len(peers)+1) go srv.runPeer(p) &nbsp;//运行 peers[c.id] = p &nbsp; &nbsp;//添加到Set中 if p.Inbound() { inboundCount++ } } // The dialer logic relies on the assumption that // dial tasks complete after the peer has been added or // discarded. Unblock the task last. select { case c.cont &lt;- err: case &lt;-srv.quit: break running } …… } 看runPeer(server.go)： func (srv *Server) runPeer(p *Peer) { if srv.newPeerHook != nil { srv.newPeerHook(p) } // broadcast peer add srv.peerFeed.Send(&amp;PeerEvent{ Type: PeerEventTypeAdd, Peer: p.ID(), }) // run the protocol 运行自己的创建的协议 remoteRequested, err := p.run() // broadcast peer drop srv.peerFeed.Send(&amp;PeerEvent{ Type: &nbsp;PeerEventTypeDrop, Peer: &nbsp;p.ID(), Error: err.Error(), }) // Note: run waits for existing peers to be sent on srv.delpeer // before returning, so this send should not select on srv.quit. srv.delpeer &lt;- peerDrop{p, err, remoteRequested} } 看peer.go中的run: func (p *Peer) run() (remoteRequested bool, err error) { var ( writeStart = make(chan struct{}, 1) writeErr &nbsp; = make(chan error, 1) readErr &nbsp; &nbsp;= make(chan error, 1) reason &nbsp; &nbsp; DiscReason // sent to the peer ) p.wg.Add(2) &nbsp; &nbsp; //读和ping go p.readLoop(readErr) go p.pingLoop() // Start all protocol handlers. writeStart &lt;- struct{}{} &nbsp; &nbsp; //这里启动相应的协议 p.startProtocols(writeStart, writeErr) // Wait for an error or disconnect. loop: for { select { case err = &lt;-writeErr: // A write finished. Allow the next write to start if // there was no error. if err != nil { reason = DiscNetworkError break loop } writeStart &lt;- struct{}{} case err = &lt;-readErr: if r, ok := err.(DiscReason); ok { remoteRequested = true reason = r } else { reason = DiscNetworkError } break loop case err = &lt;-p.protoErr: reason = discReasonForError(err) break loop case err = &lt;-p.disc: break loop } } close(p.closed) p.rw.close(reason) p.wg.Wait() return remoteRequested, err } 继续看readloop: func (p *Peer) readLoop(errc chan&lt;- error) { defer p.wg.Done() for { msg, err := p.rw.ReadMsg() if err != nil { errc &lt;- err return } msg.ReceivedAt = time.Now() &nbsp; &nbsp; &nbsp; &nbsp; //这就是前面提到的handle的回调 if err = p.handle(msg); err != nil { errc &lt;- err return } } } 看一下handle: func (p *Peer) handle(msg Msg) error { switch { case msg.Code == pingMsg: msg.Discard() go SendItems(p.rw, pongMsg) case msg.Code == discMsg: var reason [1]DiscReason // This is the last message. We don&#39;t need to discard or // check errors because, the connection will be closed after it. rlp.Decode(msg.Payload, &amp;reason) return reason[0] case msg.Code &lt; baseProtocolLength: // ignore other base protocol messages return msg.Discard() default: // it&#39;s a subprotocol message这里处理子协议，在这里 proto, err := p.getProto(msg.Code) if err != nil { return fmt.Errorf(&quot;msg code out of range: %v&quot;, msg.Code) } select { case proto.in &lt;- msg: return nil case &lt;-p.closed: return io.EOF } } return nil } 看那个子协议处理： // getProto finds the protocol responsible for handling // the given message code. func (p *Peer) getProto(code uint64) (*protoRW, error) { for _, proto := range p.running { if code &gt;= proto.offset &amp;&amp; code &lt; proto.offset+proto.Length { return proto, nil } } return nil, newPeerError(errInvalidMsgCode, &quot;%d&quot;, code) } 看看p.running是个什么东东，在前面创建peer时，用了： func newPeer(conn *conn, protocols []Protocol) *Peer { protomap := matchProtocols(protocols, conn.caps, conn) p := &amp;Peer{ rw: &nbsp; &nbsp; &nbsp; conn, running: &nbsp;protomap, &nbsp;//在这里，是它，它从函数第一行创建来的 created: &nbsp;mclock.Now(), disc: &nbsp; &nbsp; make(chan DiscReason), protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop closed: &nbsp; make(chan struct{}), log: &nbsp; &nbsp; &nbsp;log.New(&quot;id&quot;, conn.id, &quot;conn&quot;, conn.flags), } return p } 回到Peer的Run函数，看启动协议的函数： func (p *Peer) startProtocols(writeStart &lt;-chan struct{}, writeErr chan&lt;- error) { p.wg.Add(len(p.running)) for _, proto := range p.running { proto := proto proto.closed = p.closed proto.wstart = writeStart proto.werr = writeErr var rw MsgReadWriter = proto if p.events != nil { rw = newMsgEventer(rw, p.events, p.ID(), proto.Name) } p.log.Trace(fmt.Sprintf(&quot;Starting protocol %s/%d&quot;, proto.Name, proto.Version)) go func() { err := proto.Run(p, rw) &nbsp;//这里非常重要 if err == nil { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d returned&quot;, proto.Name, proto.Version)) err = errProtocolReturned } else if err != io.EOF { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d failed&quot;, proto.Name, proto.Version), &quot;err&quot;, err) } p.protoErr &lt;- err p.wg.Done() }() } } 上面的proto.Run(p, rw)的Run哪来的，看一下最初初始化PM时的代码（handle.go）： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Initiate a sub-protocol for every implemented version we can handle manager.SubProtocols = make([]p2p.Protocol, 0, len(ProtocolVersions)) for i, version := range ProtocolVersions { // Skip protocol version if incompatible with the mode of operation if mode == downloader.FastSync &amp;&amp; version &lt; eth63 { continue } // Compatible; initialise the sub-protocol version := version // Closure for the run manager.SubProtocols = append(manager.SubProtocols, p2p.Protocol{ Name: &nbsp; &nbsp;ProtocolName, Version: version, Length: &nbsp;ProtocolLengths[i], &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //在这里Run Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error { peer := manager.newPeer(int(version), p, rw) select { case manager.newPeerCh &lt;- peer: manager.wg.Add(1) defer manager.wg.Done() return manager.handle(peer) case &lt;-manager.quitSync: return p2p.DiscQuitting } }, NodeInfo: func() interface{} { return manager.NodeInfo() }, PeerInfo: func(id discover.NodeID) interface{} { if p := manager.peers.Peer(fmt.Sprintf(&quot;%x&quot;, id[:8])); p != nil { return p.Info() } return nil }, }) } …… return manager, nil } 这样就把相关的Peer创建好了。这里需要注意的是newPeer是eth/peer.go，要和p2p/peer.go区别开来。 创建好后，就相当于在Socket编程中创建了一个链接，就可以直接接收数据了，比如在rlpx.go中： func (rw *rlpxFrameRW) WriteMsg(msg Msg) error { …… // write frame MAC. egress MAC hash is up to date because // frame content was written to it as well. fmacseed := rw.egressMAC.Sum(nil) mac := updateMAC(rw.egressMAC, rw.macCipher, fmacseed) _, err := rw.conn.Write(mac) return err } func (rw *rlpxFrameRW) ReadMsg() (msg Msg, err error) { // read the header headbuf := make([]byte, 32) if _, err := io.ReadFull(rw.conn, headbuf); err != nil { return msg, err } …… return msg, nil } 读写操作直接落到了IO上。下一次说一下整个的消息流通过程，做为对这一篇的一个补充。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/10/afbecceabea2221d5babc22ea4f4cc06.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/10/afbecceabea2221d5babc22ea4f4cc06.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-10T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊源码分析之三网络分析之二网络的数据交互 一、 网络的数据交互准备&nbsp; 在前面提到过启动节点时会启动P2P网络的监听（包括UDP和TCP）， 首先看创建一个Service，在前文的makeFullNode 函数时，使用了RegisterEthService这个函数，在这个函数里： func RegisterEthService(stack *node.Node, cfg *eth.Config) { var err error if cfg.SyncMode == downloader.LightSync { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个轻量级的服务，SPV等 return les.New(ctx, cfg) }) } else { err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个全节点并在配置情况下添加轻量级服务，也就是全节点既支持全同//步也支持轻同步，默认为FastSync，但新的以太坊中明确定义FastSync和//LightSync两种同步方式在参数设置中废弃 fullNode, err := eth.New(ctx, cfg) if fullNode != nil &amp;&amp; cfg.LightServ &gt; 0 { ls, _ := les.NewLesServer(fullNode, cfg) fullNode.AddLesServer(ls) } return fullNode, err }) } if err != nil { Fatalf(&quot;Failed to register the Ethereum service: %v&quot;, err) } } 有必要说明一下这个定义： const ( &nbsp; &nbsp; FullSync &nbsp;SyncMode = iota // 同步完整的区块信息 &nbsp; &nbsp; FastSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;// 快速同步header，然后再由header同步全部内容 &nbsp; &nbsp; LightSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; // 类似比特币，只下载header并在之后终止 ) 在flag.go中，默认定义： defaultSyncMode = eth.DefaultConfig.SyncMode SyncModeFlag &nbsp; &nbsp;= TextMarshalerFlag{ Name: &nbsp;&quot;syncmode&quot;, Usage: `Blockchain sync mode (&quot;fast&quot;, &quot;full&quot;, or &quot;light&quot;)`, Value: &amp;defaultSyncMode, } 而在eth/config.go中可以看到： var DefaultConfig = Config{ SyncMode: downloader.FastSync, //默认是快速的 ……. } 那么服务的同步方式到底怎么设置呢？在 eth/handler(注意，les/handler.go其它两个服务都有类似情况)： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Figure out whether to allow fast sync or not if mode == downloader.FastSync &amp;&amp; blockchain.CurrentBlock().NumberU64() &gt; 0 { log.Warn(&quot;Blockchain not empty, fast sync disabled&quot;) mode = downloader.FullSync } if mode == downloader.FastSync { manager.fastSync = uint32(1) } …… } 这说明了什么？说明以太坊启动时的同步模式使用的是快速的，当header的编号为0时，继续使用fastSync,当其不为0时，自动转成fullSync。 这里需要注意的是，这是指在不传递启动参数时，但刚刚也说过了，传递的参数只能是fullSync一种,另外的两种fastSync和LigthSync已经废弃。 说了一些相对的题外话，再扯回来接着看服务。 func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) { if config.SyncMode == downloader.LightSync { &nbsp; &nbsp; &nbsp; &nbsp; //这里就是上文提到的les模式(les/backend.go)，在当前这种情况下的错误警告 return nil, errors.New(&quot;can&#39;t run eth.Ethereum in light sync mode, use les.LightEthereum&quot;) } if !config.SyncMode.IsValid() { return nil, fmt.Errorf(&quot;invalid sync mode %d&quot;, config.SyncMode) } &nbsp; &nbsp; //打存储数据库，用的是leveldb。 chainDb, err := CreateDB(ctx, config, &quot;chaindata&quot;) if err != nil { return nil, err } &nbsp; &nbsp; //如果需要，启动后台进程升级数据库 stopDbUpgrade := upgradeDeduplicateData(chainDb) &nbsp; &nbsp; //创世区块的设置,根据条件判断从配置文件或者数据库加载 chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis) if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil &amp;&amp; !ok { return nil, genesisErr } log.Info(&quot;Initialised chain configuration&quot;, &quot;config&quot;, chainConfig) &nbsp; &nbsp; //eth变量声明 eth := &amp;Ethereum{ config: &nbsp; &nbsp; &nbsp; &nbsp; config, chainDb: &nbsp; &nbsp; &nbsp; &nbsp;chainDb, chainConfig: &nbsp; &nbsp;chainConfig, eventMux: &nbsp; &nbsp; &nbsp; ctx.EventMux, accountManager: ctx.AccountManager, engine: &nbsp; &nbsp; &nbsp; &nbsp; CreateConsensusEngine(ctx, &amp;config.Ethash, chainConfig, chainDb), shutdownChan: &nbsp; make(chan bool), stopDbUpgrade: &nbsp;stopDbUpgrade, networkId: &nbsp; &nbsp; &nbsp;config.NetworkId, gasPrice: &nbsp; &nbsp; &nbsp; config.GasPrice, etherbase: &nbsp; &nbsp; &nbsp;config.Etherbase, bloomRequests: &nbsp;make(chan chan *bloombits.Retrieval), bloomIndexer: &nbsp; NewBloomIndexer(chainDb, params.BloomBitsBlocks), } &nbsp; &nbsp; //版本比较 log.Info(&quot;Initialising Ethereum protocol&quot;, &quot;versions&quot;, ProtocolVersions, &quot;network&quot;, config.NetworkId) if !config.SkipBcVersionCheck { bcVersion := core.GetBlockChainVersion(chainDb) if bcVersion != core.BlockChainVersion &amp;&amp; bcVersion != 0 { return nil, fmt.Errorf(&quot;Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\\n&quot;, bcVersion, core.BlockChainVersion) } core.WriteBlockChainVersion(chainDb, core.BlockChainVersion) } var ( vmConfig &nbsp; &nbsp;= vm.Config{EnablePreimageRecording: config.EnablePreimageRecording} cacheConfig = &amp;core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout} ) &nbsp; &nbsp; //eth内部变量的初始化：1、初始化区块链 eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, eth.chainConfig, eth.engine, vmConfig) if err != nil { return nil, err } // Rewind the chain in case of an incompatible config upgrade. if compat, ok := genesisErr.(*params.ConfigCompatError); ok { log.Warn(&quot;Rewinding chain to upgrade configuration&quot;, &quot;err&quot;, compat) eth.blockchain.SetHead(compat.RewindTo) core.WriteChainConfig(chainDb, genesisHash, chainConfig) } &nbsp; //2、bloom启动 eth.bloomIndexer.Start(eth.blockchain) if config.TxPool.Journal != &quot;&quot; { config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal) } &nbsp; &nbsp; //3、交易池初始化，和比特币类似，可以存储本地和网络传送的交易 eth.txPool = core.NewTxPool(config.TxPool, eth.chainConfig, eth.blockchain) &nbsp; &nbsp; //4、P2P协议管理初始化 if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb); err != nil { return nil, err } &nbsp; &nbsp; //5、挖矿初始化 eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine) eth.miner.SetExtra(makeExtraData(config.ExtraData)) eth.ApiBackend = &amp;EthApiBackend{eth, nil} gpoParams := config.GPO if gpoParams.Default == nil { gpoParams.Default = config.GasPrice } &nbsp; &nbsp; 6、gas预言机初始化 eth.ApiBackend.gpo = gasprice.NewOracle(eth.ApiBackend, gpoParams) return eth, nil } 在前面的StartNode中会调用： …… for kind, service := range services { // Start the next service, stopping all previous upon failure if err := service.Start(running); err != nil { &nbsp; &nbsp; &nbsp; …… } …… } 好，看一下它： func (s *Ethereum) Start(srvr *p2p.Server) error { // Start the bloom bits servicing goroutines &nbsp; &nbsp; //启动布隆过滤器 s.startBloomHandlers() // Start the RPC service &nbsp; &nbsp; //启动RPC服务 s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion()) // Figure out a max peers count based on the server limits &nbsp; &nbsp; //配置最大启动节点 maxPeers := srvr.MaxPeers if s.config.LightServ &gt; 0 { if s.config.LightPeers &gt;= srvr.MaxPeers { return fmt.Errorf(&quot;invalid peer config: light peer count (%d) &gt;= total peer count (%d)&quot;, s.config.LightPeers, srvr.MaxPeers) } maxPeers -= s.config.LightPeers } // Start the networking layer and the light server if requested s.protocolManager.Start(maxPeers)//启动最大节点同步数 if s.lesServer != nil { s.lesServer.Start(srvr)//如果包含轻量级服务也启动之 } return nil } 都写到注释里了，没啥太需要关心注意的。 func (pm *ProtocolManager) Start(maxPeers int) { pm.maxPeers = maxPeers // broadcast transactions pm.txCh = make(chan core.TxPreEvent, txChanSize) pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh) go pm.txBroadcastLoop() // broadcast mined blocks pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{}) go pm.minedBroadcastLoop() // start sync handlers go pm.syncer() go pm.txsyncLoop() } 服务的启动主要是交易池事件的定阅，启动广播和挖矿的事件订阅。最后启动同步循环。 二、 网络数据通信 在以太坊的网络通信中，是通过Peer来发送和接收数据的，他通过handle来处理回调： 在Server.go中： func (srv *Server) listenLoop() { …… fd, err = srv.listener.Accept() &nbsp;//fd的类型是net.Conn …… } 而它又被： // SetupConn runs the handshakes and attempts to add the connection // as a peer. It returns when the connection has been added as a peer // or the handshakes have failed. func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Node) error { …… &nbsp; &nbsp; //注意此处的srv.newTransport(fd) c := &amp;conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)} err := srv.setupConn(c, flags, dialDest) &nbsp;如果正常添加新peer …… return err } 上面的注意中在: func (srv *Server) Start() (err error) { if srv.newTransport == nil { srv.newTransport = newRLPX &nbsp; //重定义成了rlpx进行加密 } } func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error { …… c.caps, c.name = phs.Caps, phs.Name err = srv.checkpoint(c, srv.addpeer) &nbsp;//这里看下面一个函数run if err != nil { clog.Trace(&quot;Rejected peer&quot;, &quot;err&quot;, err) return err } // If the checks completed successfully, runPeer has now been // launched by run. …… return nil } func (srv *Server) run(dialstate dialer) { …… case c := &lt;-srv.addpeer: // At this point the connection is past the protocol handshake. // Its capabilities are known and the remote identity is verified. err := srv.protoHandshakeChecks(peers, inboundCount, c) if err == nil { // The handshakes are done and it passed all checks. //这里接着上面的通道接收新的conn，并依此创建peer p := newPeer(c, srv.Protocols) // If message events are enabled, pass the peerFeed // to the peer if srv.EnableMsgEvents { p.events = &amp;srv.peerFeed } name := truncateName(c.name) srv.log.Debug(&quot;Adding p2p peer&quot;, &quot;name&quot;, name, &quot;addr&quot;, c.fd.RemoteAddr(), &quot;peers&quot;, len(peers)+1) go srv.runPeer(p) &nbsp;//运行 peers[c.id] = p &nbsp; &nbsp;//添加到Set中 if p.Inbound() { inboundCount++ } } // The dialer logic relies on the assumption that // dial tasks complete after the peer has been added or // discarded. Unblock the task last. select { case c.cont &lt;- err: case &lt;-srv.quit: break running } …… } 看runPeer(server.go)： func (srv *Server) runPeer(p *Peer) { if srv.newPeerHook != nil { srv.newPeerHook(p) } // broadcast peer add srv.peerFeed.Send(&amp;PeerEvent{ Type: PeerEventTypeAdd, Peer: p.ID(), }) // run the protocol 运行自己的创建的协议 remoteRequested, err := p.run() // broadcast peer drop srv.peerFeed.Send(&amp;PeerEvent{ Type: &nbsp;PeerEventTypeDrop, Peer: &nbsp;p.ID(), Error: err.Error(), }) // Note: run waits for existing peers to be sent on srv.delpeer // before returning, so this send should not select on srv.quit. srv.delpeer &lt;- peerDrop{p, err, remoteRequested} } 看peer.go中的run: func (p *Peer) run() (remoteRequested bool, err error) { var ( writeStart = make(chan struct{}, 1) writeErr &nbsp; = make(chan error, 1) readErr &nbsp; &nbsp;= make(chan error, 1) reason &nbsp; &nbsp; DiscReason // sent to the peer ) p.wg.Add(2) &nbsp; &nbsp; //读和ping go p.readLoop(readErr) go p.pingLoop() // Start all protocol handlers. writeStart &lt;- struct{}{} &nbsp; &nbsp; //这里启动相应的协议 p.startProtocols(writeStart, writeErr) // Wait for an error or disconnect. loop: for { select { case err = &lt;-writeErr: // A write finished. Allow the next write to start if // there was no error. if err != nil { reason = DiscNetworkError break loop } writeStart &lt;- struct{}{} case err = &lt;-readErr: if r, ok := err.(DiscReason); ok { remoteRequested = true reason = r } else { reason = DiscNetworkError } break loop case err = &lt;-p.protoErr: reason = discReasonForError(err) break loop case err = &lt;-p.disc: break loop } } close(p.closed) p.rw.close(reason) p.wg.Wait() return remoteRequested, err } 继续看readloop: func (p *Peer) readLoop(errc chan&lt;- error) { defer p.wg.Done() for { msg, err := p.rw.ReadMsg() if err != nil { errc &lt;- err return } msg.ReceivedAt = time.Now() &nbsp; &nbsp; &nbsp; &nbsp; //这就是前面提到的handle的回调 if err = p.handle(msg); err != nil { errc &lt;- err return } } } 看一下handle: func (p *Peer) handle(msg Msg) error { switch { case msg.Code == pingMsg: msg.Discard() go SendItems(p.rw, pongMsg) case msg.Code == discMsg: var reason [1]DiscReason // This is the last message. We don&#39;t need to discard or // check errors because, the connection will be closed after it. rlp.Decode(msg.Payload, &amp;reason) return reason[0] case msg.Code &lt; baseProtocolLength: // ignore other base protocol messages return msg.Discard() default: // it&#39;s a subprotocol message这里处理子协议，在这里 proto, err := p.getProto(msg.Code) if err != nil { return fmt.Errorf(&quot;msg code out of range: %v&quot;, msg.Code) } select { case proto.in &lt;- msg: return nil case &lt;-p.closed: return io.EOF } } return nil } 看那个子协议处理： // getProto finds the protocol responsible for handling // the given message code. func (p *Peer) getProto(code uint64) (*protoRW, error) { for _, proto := range p.running { if code &gt;= proto.offset &amp;&amp; code &lt; proto.offset+proto.Length { return proto, nil } } return nil, newPeerError(errInvalidMsgCode, &quot;%d&quot;, code) } 看看p.running是个什么东东，在前面创建peer时，用了： func newPeer(conn *conn, protocols []Protocol) *Peer { protomap := matchProtocols(protocols, conn.caps, conn) p := &amp;Peer{ rw: &nbsp; &nbsp; &nbsp; conn, running: &nbsp;protomap, &nbsp;//在这里，是它，它从函数第一行创建来的 created: &nbsp;mclock.Now(), disc: &nbsp; &nbsp; make(chan DiscReason), protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop closed: &nbsp; make(chan struct{}), log: &nbsp; &nbsp; &nbsp;log.New(&quot;id&quot;, conn.id, &quot;conn&quot;, conn.flags), } return p } 回到Peer的Run函数，看启动协议的函数： func (p *Peer) startProtocols(writeStart &lt;-chan struct{}, writeErr chan&lt;- error) { p.wg.Add(len(p.running)) for _, proto := range p.running { proto := proto proto.closed = p.closed proto.wstart = writeStart proto.werr = writeErr var rw MsgReadWriter = proto if p.events != nil { rw = newMsgEventer(rw, p.events, p.ID(), proto.Name) } p.log.Trace(fmt.Sprintf(&quot;Starting protocol %s/%d&quot;, proto.Name, proto.Version)) go func() { err := proto.Run(p, rw) &nbsp;//这里非常重要 if err == nil { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d returned&quot;, proto.Name, proto.Version)) err = errProtocolReturned } else if err != io.EOF { p.log.Trace(fmt.Sprintf(&quot;Protocol %s/%d failed&quot;, proto.Name, proto.Version), &quot;err&quot;, err) } p.protoErr &lt;- err p.wg.Done() }() } } 上面的proto.Run(p, rw)的Run哪来的，看一下最初初始化PM时的代码（handle.go）： func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) { …… // Initiate a sub-protocol for every implemented version we can handle manager.SubProtocols = make([]p2p.Protocol, 0, len(ProtocolVersions)) for i, version := range ProtocolVersions { // Skip protocol version if incompatible with the mode of operation if mode == downloader.FastSync &amp;&amp; version &lt; eth63 { continue } // Compatible; initialise the sub-protocol version := version // Closure for the run manager.SubProtocols = append(manager.SubProtocols, p2p.Protocol{ Name: &nbsp; &nbsp;ProtocolName, Version: version, Length: &nbsp;ProtocolLengths[i], &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //在这里Run Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error { peer := manager.newPeer(int(version), p, rw) select { case manager.newPeerCh &lt;- peer: manager.wg.Add(1) defer manager.wg.Done() return manager.handle(peer) case &lt;-manager.quitSync: return p2p.DiscQuitting } }, NodeInfo: func() interface{} { return manager.NodeInfo() }, PeerInfo: func(id discover.NodeID) interface{} { if p := manager.peers.Peer(fmt.Sprintf(&quot;%x&quot;, id[:8])); p != nil { return p.Info() } return nil }, }) } …… return manager, nil } 这样就把相关的Peer创建好了。这里需要注意的是newPeer是eth/peer.go，要和p2p/peer.go区别开来。 创建好后，就相当于在Socket编程中创建了一个链接，就可以直接接收数据了，比如在rlpx.go中： func (rw *rlpxFrameRW) WriteMsg(msg Msg) error { …… // write frame MAC. egress MAC hash is up to date because // frame content was written to it as well. fmacseed := rw.egressMAC.Sum(nil) mac := updateMAC(rw.egressMAC, rw.macCipher, fmacseed) _, err := rw.conn.Write(mac) return err } func (rw *rlpxFrameRW) ReadMsg() (msg Msg, err error) { // read the header headbuf := make([]byte, 32) if _, err := io.ReadFull(rw.conn, headbuf); err != nil { return msg, err } …… return msg, nil } 读写操作直接落到了IO上。下一次说一下整个的消息流通过程，做为对这一篇的一个补充。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/10/afbecceabea2221d5babc22ea4f4cc06.html","headline":"以太坊源码分析之三网络分析之二网络的数据交互","dateModified":"2018-06-10T00:00:00+08:00","datePublished":"2018-06-10T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/10/afbecceabea2221d5babc22ea4f4cc06.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析之三网络分析之二网络的数据交互</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views">
+   以太坊源码分析之三网络分析之二网络的数据交互
+  <br>一、
+  <span> </span>网络的数据交互准备&nbsp;
+  <br>在前面提到过启动节点时会启动P2P网络的监听（包括UDP和TCP），
+  <br>首先看创建一个Service，在前文的makeFullNode 函数时，使用了RegisterEthService这个函数，在这个函数里：
+  <br>func RegisterEthService(stack *node.Node, cfg *eth.Config) {
+  <br>
+  <span> </span>var err error
+  <br>
+  <span> </span>if cfg.SyncMode == downloader.LightSync {
+  <br>
+  <span> </span>err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) {
+  <br>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个轻量级的服务，SPV等
+  <br>
+  <span> </span>return les.New(ctx, cfg)
+  <br>
+  <span> </span>})
+  <br>
+  <span> </span>} else {
+  <br>
+  <span> </span>err = stack.Register(func(ctx *node.ServiceContext) (node.Service, error) {
+  <br>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //注册一个全节点并在配置情况下添加轻量级服务，也就是全节点既支持全同//步也支持轻同步，默认为FastSync，但新的以太坊中明确定义FastSync和//LightSync两种同步方式在参数设置中废弃
+  <br>
+  <span> </span>fullNode, err := eth.New(ctx, cfg)
+  <br>
+  <span> </span>if fullNode != nil &amp;&amp; cfg.LightServ &gt; 0 {
+  <br>
+  <span> </span>ls, _ := les.NewLesServer(fullNode, cfg)
+  <br>
+  <span> </span>fullNode.AddLesServer(ls)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return fullNode, err
+  <br>
+  <span> </span>})
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>Fatalf("Failed to register the Ethereum service: %v", err)
+  <br>
+  <span> </span>}
+  <br>}
+  <br>有必要说明一下这个定义：
+  <br>const (
+  <br>&nbsp; &nbsp; FullSync &nbsp;SyncMode = iota // 同步完整的区块信息
+  <br>&nbsp; &nbsp; FastSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;// 快速同步header，然后再由header同步全部内容
+  <br>&nbsp; &nbsp; LightSync &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; // 类似比特币，只下载header并在之后终止
+  <br>)
+  <br>在flag.go中，默认定义：
+  <br>
+  <span> </span>defaultSyncMode = eth.DefaultConfig.SyncMode
+  <br>
+  <span> </span>SyncModeFlag &nbsp; &nbsp;= TextMarshalerFlag{
+  <br>
+  <span> </span>Name: &nbsp;"syncmode",
+  <br>
+  <span> </span>Usage: `Blockchain sync mode ("fast", "full", or "light")`,
+  <br>
+  <span> </span>Value: &amp;defaultSyncMode,
+  <br>
+  <span> </span>}
+  <br>而在eth/config.go中可以看到：
+  <br>var DefaultConfig = Config{
+  <br>
+  <span> </span>SyncMode: downloader.FastSync, //默认是快速的
+  <br>…….
+  <br>}
+  <br>那么服务的同步方式到底怎么设置呢？在 eth/handler(注意，les/handler.go其它两个服务都有类似情况)：
+  <br>func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) {
+  <br>……
+  <br>
+  <span> </span>// Figure out whether to allow fast sync or not
+  <br>
+  <span> </span>if mode == downloader.FastSync &amp;&amp; blockchain.CurrentBlock().NumberU64() &gt; 0 {
+  <br>
+  <span> </span>log.Warn("Blockchain not empty, fast sync disabled")
+  <br>
+  <span> </span>mode = downloader.FullSync
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>if mode == downloader.FastSync {
+  <br>
+  <span> </span>manager.fastSync = uint32(1)
+  <br>
+  <span> </span>}
+  <br>……
+  <br>}
+  <br>这说明了什么？说明以太坊启动时的同步模式使用的是快速的，当header的编号为0时，继续使用fastSync,当其不为0时，自动转成fullSync。
+  <br>这里需要注意的是，这是指在不传递启动参数时，但刚刚也说过了，传递的参数只能是fullSync一种,另外的两种fastSync和LigthSync已经废弃。
+  <br>说了一些相对的题外话，再扯回来接着看服务。
+  <br>func New(ctx *node.ServiceContext, config *Config) (*Ethereum, error) {
+  <br>
+  <span> </span>if config.SyncMode == downloader.LightSync {
+  <br>&nbsp; &nbsp; &nbsp; &nbsp; //这里就是上文提到的les模式(les/backend.go)，在当前这种情况下的错误警告
+  <br>
+  <span> </span>return nil, errors.New("can't run eth.Ethereum in light sync mode, use les.LightEthereum")
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>if !config.SyncMode.IsValid() {
+  <br>
+  <span> </span>return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
+  <br>
+  <span> </span>}
+  <br>&nbsp; &nbsp; //打存储数据库，用的是leveldb。
+  <br>
+  <span> </span>chainDb, err := CreateDB(ctx, config, "chaindata")
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>return nil, err
+  <br>
+  <span> </span>}
+  <br>
+  <br>
+  <br>&nbsp; &nbsp; //如果需要，启动后台进程升级数据库
+  <br>
+  <span> </span>stopDbUpgrade := upgradeDeduplicateData(chainDb)
+  <br>&nbsp; &nbsp; //创世区块的设置,根据条件判断从配置文件或者数据库加载
+  <br>
+  <span> </span>chainConfig, genesisHash, genesisErr := core.SetupGenesisBlock(chainDb, config.Genesis)
+  <br>
+  <span> </span>if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil &amp;&amp; !ok {
+  <br>
+  <span> </span>return nil, genesisErr
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>log.Info("Initialised chain configuration", "config", chainConfig)
+  <br>
+  <br>
+  <br>&nbsp; &nbsp; //eth变量声明
+  <br>
+  <span> </span>eth := &amp;Ethereum{
+  <br>
+  <span> </span>config: &nbsp; &nbsp; &nbsp; &nbsp; config,
+  <br>
+  <span> </span>chainDb: &nbsp; &nbsp; &nbsp; &nbsp;chainDb,
+  <br>
+  <span> </span>chainConfig: &nbsp; &nbsp;chainConfig,
+  <br>
+  <span> </span>eventMux: &nbsp; &nbsp; &nbsp; ctx.EventMux,
+  <br>
+  <span> </span>accountManager: ctx.AccountManager,
+  <br>
+  <span> </span>engine: &nbsp; &nbsp; &nbsp; &nbsp; CreateConsensusEngine(ctx, &amp;config.Ethash, chainConfig, chainDb),
+  <br>
+  <span> </span>shutdownChan: &nbsp; make(chan bool),
+  <br>
+  <span> </span>stopDbUpgrade: &nbsp;stopDbUpgrade,
+  <br>
+  <span> </span>networkId: &nbsp; &nbsp; &nbsp;config.NetworkId,
+  <br>
+  <span> </span>gasPrice: &nbsp; &nbsp; &nbsp; config.GasPrice,
+  <br>
+  <span> </span>etherbase: &nbsp; &nbsp; &nbsp;config.Etherbase,
+  <br>
+  <span> </span>bloomRequests: &nbsp;make(chan chan *bloombits.Retrieval),
+  <br>
+  <span> </span>bloomIndexer: &nbsp; NewBloomIndexer(chainDb, params.BloomBitsBlocks),
+  <br>
+  <span> </span>}
+  <br>
+  <br>
+  <br>&nbsp; &nbsp; //版本比较
+  <br>
+  <span> </span>log.Info("Initialising Ethereum protocol", "versions", ProtocolVersions, "network", config.NetworkId)
+  <br>
+  <br>
+  <br>
+  <span> </span>if !config.SkipBcVersionCheck {
+  <br>
+  <span> </span>bcVersion := core.GetBlockChainVersion(chainDb)
+  <br>
+  <span> </span>if bcVersion != core.BlockChainVersion &amp;&amp; bcVersion != 0 {
+  <br>
+  <span> </span>return nil, fmt.Errorf("Blockchain DB version mismatch (%d / %d). Run geth upgradedb.\n", bcVersion, core.BlockChainVersion)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>core.WriteBlockChainVersion(chainDb, core.BlockChainVersion)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>var (
+  <br>
+  <span> </span>vmConfig &nbsp; &nbsp;= vm.Config{EnablePreimageRecording: config.EnablePreimageRecording}
+  <br>
+  <span> </span>cacheConfig = &amp;core.CacheConfig{Disabled: config.NoPruning, TrieNodeLimit: config.TrieCache, TrieTimeLimit: config.TrieTimeout}
+  <br>
+  <span> </span>)
+  <br>
+  <br>
+  <br>&nbsp; &nbsp; //eth内部变量的初始化：1、初始化区块链
+  <br>
+  <span> </span>eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, eth.chainConfig, eth.engine, vmConfig)
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>return nil, err
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>// Rewind the chain in case of an incompatible config upgrade.
+  <br>
+  <span> </span>if compat, ok := genesisErr.(*params.ConfigCompatError); ok {
+  <br>
+  <span> </span>log.Warn("Rewinding chain to upgrade configuration", "err", compat)
+  <br>
+  <span> </span>eth.blockchain.SetHead(compat.RewindTo)
+  <br>
+  <span> </span>core.WriteChainConfig(chainDb, genesisHash, chainConfig)
+  <br>
+  <span> </span>}
+  <br>&nbsp; //2、bloom启动
+  <br>
+  <span> </span>eth.bloomIndexer.Start(eth.blockchain)
+  <br>
+  <br>
+  <br>
+  <span> </span>if config.TxPool.Journal != "" {
+  <br>
+  <span> </span>config.TxPool.Journal = ctx.ResolvePath(config.TxPool.Journal)
+  <br>
+  <span> </span>}
+  <br>&nbsp; &nbsp; //3、交易池初始化，和比特币类似，可以存储本地和网络传送的交易
+  <br>
+  <span> </span>eth.txPool = core.NewTxPool(config.TxPool, eth.chainConfig, eth.blockchain)
+  <br>&nbsp; &nbsp; //4、P2P协议管理初始化
+  <br>
+  <span> </span>if eth.protocolManager, err = NewProtocolManager(eth.chainConfig, config.SyncMode, config.NetworkId, eth.eventMux, eth.txPool, eth.engine, eth.blockchain, chainDb); err != nil {
+  <br>
+  <span> </span>return nil, err
+  <br>
+  <span> </span>}
+  <br>&nbsp; &nbsp; //5、挖矿初始化
+  <br>
+  <span> </span>eth.miner = miner.New(eth, eth.chainConfig, eth.EventMux(), eth.engine)
+  <br>
+  <span> </span>eth.miner.SetExtra(makeExtraData(config.ExtraData))
+  <br>
+  <br>
+  <br>
+  <span> </span>eth.ApiBackend = &amp;EthApiBackend{eth, nil}
+  <br>
+  <span> </span>gpoParams := config.GPO
+  <br>
+  <span> </span>if gpoParams.Default == nil {
+  <br>
+  <span> </span>gpoParams.Default = config.GasPrice
+  <br>
+  <span> </span>}
+  <br>&nbsp; &nbsp; 6、gas预言机初始化
+  <br>
+  <span> </span>eth.ApiBackend.gpo = gasprice.NewOracle(eth.ApiBackend, gpoParams)
+  <br>
+  <br>
+  <br>
+  <span> </span>return eth, nil
+  <br>}
+  <br>在前面的StartNode中会调用：
+  <br>……
+  <span> </span>
+  <br>for kind, service := range services {
+  <br>
+  <span> </span>// Start the next service, stopping all previous upon failure
+  <br>
+  <span> </span>if err := service.Start(running); err != nil {
+  <br>&nbsp; &nbsp; &nbsp; ……
+  <br>}
+  <br>……
+  <br>
+  <span> </span>}
+  <br>好，看一下它：
+  <br>func (s *Ethereum) Start(srvr *p2p.Server) error {
+  <br>
+  <span> </span>// Start the bloom bits servicing goroutines
+  <br>&nbsp; &nbsp; //启动布隆过滤器
+  <br>
+  <span> </span>s.startBloomHandlers()
+  <br>
+  <br>
+  <br>
+  <span> </span>// Start the RPC service
+  <br>&nbsp; &nbsp; //启动RPC服务
+  <br>
+  <span> </span>s.netRPCService = ethapi.NewPublicNetAPI(srvr, s.NetVersion())
+  <br>
+  <br>
+  <br>
+  <span> </span>// Figure out a max peers count based on the server limits
+  <br>&nbsp; &nbsp; //配置最大启动节点
+  <br>
+  <span> </span>maxPeers := srvr.MaxPeers
+  <br>
+  <span> </span>if s.config.LightServ &gt; 0 {
+  <br>
+  <span> </span>if s.config.LightPeers &gt;= srvr.MaxPeers {
+  <br>
+  <span> </span>return fmt.Errorf("invalid peer config: light peer count (%d) &gt;= total peer count (%d)", s.config.LightPeers, srvr.MaxPeers)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>maxPeers -= s.config.LightPeers
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>// Start the networking layer and the light server if requested
+  <br>
+  <span> </span>s.protocolManager.Start(maxPeers)//启动最大节点同步数
+  <br>
+  <span> </span>if s.lesServer != nil {
+  <br>
+  <span> </span>s.lesServer.Start(srvr)//如果包含轻量级服务也启动之
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return nil
+  <br>}
+  <br>都写到注释里了，没啥太需要关心注意的。
+  <br>func (pm *ProtocolManager) Start(maxPeers int) {
+  <br>
+  <span> </span>pm.maxPeers = maxPeers
+  <br>
+  <br>
+  <br>
+  <span> </span>// broadcast transactions
+  <br>
+  <span> </span>pm.txCh = make(chan core.TxPreEvent, txChanSize)
+  <br>
+  <span> </span>pm.txSub = pm.txpool.SubscribeTxPreEvent(pm.txCh)
+  <br>
+  <span> </span>go pm.txBroadcastLoop()
+  <br>
+  <br>
+  <br>
+  <span> </span>// broadcast mined blocks
+  <br>
+  <span> </span>pm.minedBlockSub = pm.eventMux.Subscribe(core.NewMinedBlockEvent{})
+  <br>
+  <span> </span>go pm.minedBroadcastLoop()
+  <br>
+  <br>
+  <br>
+  <span> </span>// start sync handlers
+  <br>
+  <span> </span>go pm.syncer()
+  <br>
+  <span> </span>go pm.txsyncLoop()
+  <br>}
+  <br>服务的启动主要是交易池事件的定阅，启动广播和挖矿的事件订阅。最后启动同步循环。
+  <br>
+  <br>
+  <br>二、
+  <span> </span>网络数据通信
+  <br>
+  <br>
+  <br>在以太坊的网络通信中，是通过Peer来发送和接收数据的，他通过handle来处理回调：
+  <br>在Server.go中：
+  <br>
+  <br>
+  <br>func (srv *Server) listenLoop() {
+  <br>……
+  <br>fd, err = srv.listener.Accept() &nbsp;//fd的类型是net.Conn
+  <br>……
+  <br>}
+  <br>而它又被：
+  <br>// SetupConn runs the handshakes and attempts to add the connection
+  <br>// as a peer. It returns when the connection has been added as a peer
+  <br>// or the handshakes have failed.
+  <br>func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Node) error {
+  <br>……
+  <br>&nbsp; &nbsp; //注意此处的srv.newTransport(fd)
+  <br>
+  <span> </span>c := &amp;conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)}
+  <br>
+  <span> </span>err := srv.setupConn(c, flags, dialDest) &nbsp;如果正常添加新peer
+  <br>……
+  <br>
+  <span> </span>return err
+  <br>}
+  <br>上面的注意中在:
+  <br>func (srv *Server) Start() (err error) {
+  <br>
+  <span> </span>if srv.newTransport == nil {
+  <br>
+  <span> </span>srv.newTransport = newRLPX &nbsp; //重定义成了rlpx进行加密
+  <br>
+  <span> </span>}
+  <br>}
+  <br>
+  <br>
+  <br>func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error {
+  <br>……
+  <br>
+  <span> </span>c.caps, c.name = phs.Caps, phs.Name
+  <br>
+  <span> </span>err = srv.checkpoint(c, srv.addpeer) &nbsp;//这里看下面一个函数run
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>clog.Trace("Rejected peer", "err", err)
+  <br>
+  <span> </span>return err
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>// If the checks completed successfully, runPeer has now been
+  <br>
+  <span> </span>// launched by run.
+  <br>……
+  <br>
+  <span> </span>return nil
+  <br>}
+  <br>
+  <br>
+  <br>func (srv *Server) run(dialstate dialer) {
+  <br>……
+  <br>
+  <span> </span>case c := &lt;-srv.addpeer:
+  <br>
+  <span> </span>// At this point the connection is past the protocol handshake.
+  <br>
+  <span> </span>// Its capabilities are known and the remote identity is verified.
+  <br>
+  <span> </span>err := srv.protoHandshakeChecks(peers, inboundCount, c)
+  <br>
+  <span> </span>if err == nil {
+  <br>
+  <span> </span>// The handshakes are done and it passed all checks.
+  <br>//这里接着上面的通道接收新的conn，并依此创建peer
+  <br>
+  <span> </span>p := newPeer(c, srv.Protocols)
+  <br>
+  <span> </span>// If message events are enabled, pass the peerFeed
+  <br>
+  <span> </span>// to the peer
+  <br>
+  <span> </span>if srv.EnableMsgEvents {
+  <br>
+  <span> </span>p.events = &amp;srv.peerFeed
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>name := truncateName(c.name)
+  <br>
+  <span> </span>srv.log.Debug("Adding p2p peer", "name", name, "addr", c.fd.RemoteAddr(), "peers", len(peers)+1)
+  <br>
+  <span> </span>go srv.runPeer(p) &nbsp;//运行
+  <br>
+  <span> </span>peers[c.id] = p &nbsp; &nbsp;//添加到Set中
+  <br>
+  <span> </span>if p.Inbound() {
+  <br>
+  <span> </span>inboundCount++
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>// The dialer logic relies on the assumption that
+  <br>
+  <span> </span>// dial tasks complete after the peer has been added or
+  <br>
+  <span> </span>// discarded. Unblock the task last.
+  <br>
+  <span> </span>select {
+  <br>
+  <span> </span>case c.cont &lt;- err:
+  <br>
+  <span> </span>case &lt;-srv.quit:
+  <br>
+  <span> </span>break running
+  <br>
+  <span> </span>}
+  <br>……
+  <br>}
+  <br>看runPeer(server.go)：
+  <br>func (srv *Server) runPeer(p *Peer) {
+  <br>
+  <span> </span>if srv.newPeerHook != nil {
+  <br>
+  <span> </span>srv.newPeerHook(p)
+  <br>
+  <span> </span>}
+  <br>
+  <br>
+  <br>
+  <span> </span>// broadcast peer add
+  <br>
+  <span> </span>srv.peerFeed.Send(&amp;PeerEvent{
+  <br>
+  <span> </span>Type: PeerEventTypeAdd,
+  <br>
+  <span> </span>Peer: p.ID(),
+  <br>
+  <span> </span>})
+  <br>
+  <br>
+  <br>
+  <span> </span>// run the protocol 运行自己的创建的协议
+  <br>
+  <span> </span>remoteRequested, err := p.run()
+  <br>
+  <br>
+  <br>
+  <span> </span>// broadcast peer drop
+  <br>
+  <span> </span>srv.peerFeed.Send(&amp;PeerEvent{
+  <br>
+  <span> </span>Type: &nbsp;PeerEventTypeDrop,
+  <br>
+  <span> </span>Peer: &nbsp;p.ID(),
+  <br>
+  <span> </span>Error: err.Error(),
+  <br>
+  <span> </span>})
+  <br>
+  <br>
+  <br>
+  <span> </span>// Note: run waits for existing peers to be sent on srv.delpeer
+  <br>
+  <span> </span>// before returning, so this send should not select on srv.quit.
+  <br>
+  <span> </span>srv.delpeer &lt;- peerDrop{p, err, remoteRequested}
+  <br>}
+  <br>看peer.go中的run:
+  <br>func (p *Peer) run() (remoteRequested bool, err error) {
+  <br>
+  <span> </span>var (
+  <br>
+  <span> </span>writeStart = make(chan struct{}, 1)
+  <br>
+  <span> </span>writeErr &nbsp; = make(chan error, 1)
+  <br>
+  <span> </span>readErr &nbsp; &nbsp;= make(chan error, 1)
+  <br>
+  <span> </span>reason &nbsp; &nbsp; DiscReason // sent to the peer
+  <br>
+  <span> </span>)
+  <br>
+  <span> </span>p.wg.Add(2)
+  <br>&nbsp; &nbsp; //读和ping
+  <br>
+  <span> </span>go p.readLoop(readErr)
+  <br>
+  <span> </span>go p.pingLoop()
+  <br>
+  <br>
+  <br>
+  <span> </span>// Start all protocol handlers.
+  <br>
+  <span> </span>writeStart &lt;- struct{}{}
+  <br>&nbsp; &nbsp; //这里启动相应的协议
+  <br>
+  <span> </span>p.startProtocols(writeStart, writeErr)
+  <br>
+  <br>
+  <br>
+  <span> </span>// Wait for an error or disconnect.
+  <br>loop:
+  <br>
+  <span> </span>for {
+  <br>
+  <span> </span>select {
+  <br>
+  <span> </span>case err = &lt;-writeErr:
+  <br>
+  <span> </span>// A write finished. Allow the next write to start if
+  <br>
+  <span> </span>// there was no error.
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>reason = DiscNetworkError
+  <br>
+  <span> </span>break loop
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>writeStart &lt;- struct{}{}
+  <br>
+  <span> </span>case err = &lt;-readErr:
+  <br>
+  <span> </span>if r, ok := err.(DiscReason); ok {
+  <br>
+  <span> </span>remoteRequested = true
+  <br>
+  <span> </span>reason = r
+  <br>
+  <span> </span>} else {
+  <br>
+  <span> </span>reason = DiscNetworkError
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>break loop
+  <br>
+  <span> </span>case err = &lt;-p.protoErr:
+  <br>
+  <span> </span>reason = discReasonForError(err)
+  <br>
+  <span> </span>break loop
+  <br>
+  <span> </span>case err = &lt;-p.disc:
+  <br>
+  <span> </span>break loop
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>}
+  <br>
+  <br>
+  <br>
+  <span> </span>close(p.closed)
+  <br>
+  <span> </span>p.rw.close(reason)
+  <br>
+  <span> </span>p.wg.Wait()
+  <br>
+  <span> </span>return remoteRequested, err
+  <br>}
+  <br>继续看readloop:
+  <br>
+  <br>
+  <br>func (p *Peer) readLoop(errc chan&lt;- error) {
+  <br>
+  <span> </span>defer p.wg.Done()
+  <br>
+  <span> </span>for {
+  <br>
+  <span> </span>msg, err := p.rw.ReadMsg()
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>errc &lt;- err
+  <br>
+  <span> </span>return
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>msg.ReceivedAt = time.Now()
+  <br>&nbsp; &nbsp; &nbsp; &nbsp; //这就是前面提到的handle的回调
+  <br>
+  <span> </span>if err = p.handle(msg); err != nil {
+  <br>
+  <span> </span>errc &lt;- err
+  <br>
+  <span> </span>return
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>}
+  <br>}
+  <br>看一下handle:
+  <br>func (p *Peer) handle(msg Msg) error {
+  <br>
+  <span> </span>switch {
+  <br>
+  <span> </span>case msg.Code == pingMsg:
+  <br>
+  <span> </span>msg.Discard()
+  <br>
+  <span> </span>go SendItems(p.rw, pongMsg)
+  <br>
+  <span> </span>case msg.Code == discMsg:
+  <br>
+  <span> </span>var reason [1]DiscReason
+  <br>
+  <span> </span>// This is the last message. We don't need to discard or
+  <br>
+  <span> </span>// check errors because, the connection will be closed after it.
+  <br>
+  <span> </span>rlp.Decode(msg.Payload, &amp;reason)
+  <br>
+  <span> </span>return reason[0]
+  <br>
+  <span> </span>case msg.Code &lt; baseProtocolLength:
+  <br>
+  <span> </span>// ignore other base protocol messages
+  <br>
+  <span> </span>return msg.Discard()
+  <br>
+  <span> </span>default:
+  <br>
+  <span> </span>// it's a subprotocol message这里处理子协议，在这里
+  <br>
+  <span> </span>proto, err := p.getProto(msg.Code)
+  <br>
+  <span> </span>if err != nil {
+  <br>
+  <span> </span>return fmt.Errorf("msg code out of range: %v", msg.Code)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>select {
+  <br>
+  <span> </span>case proto.in &lt;- msg:
+  <br>
+  <span> </span>return nil
+  <br>
+  <span> </span>case &lt;-p.closed:
+  <br>
+  <span> </span>return io.EOF
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return nil
+  <br>}
+  <br>看那个子协议处理：
+  <br>// getProto finds the protocol responsible for handling
+  <br>// the given message code.
+  <br>func (p *Peer) getProto(code uint64) (*protoRW, error) {
+  <br>
+  <span> </span>for _, proto := range p.running {
+  <br>
+  <span> </span>if code &gt;= proto.offset &amp;&amp; code &lt; proto.offset+proto.Length {
+  <br>
+  <span> </span>return proto, nil
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return nil, newPeerError(errInvalidMsgCode, "%d", code)
+  <br>}
+  <br>看看p.running是个什么东东，在前面创建peer时，用了：
+  <br>func newPeer(conn *conn, protocols []Protocol) *Peer {
+  <br>
+  <span> </span>protomap := matchProtocols(protocols, conn.caps, conn)
+  <br>
+  <span> </span>p := &amp;Peer{
+  <br>
+  <span> </span>rw: &nbsp; &nbsp; &nbsp; conn,
+  <br>
+  <span> </span>running: &nbsp;protomap, &nbsp;//在这里，是它，它从函数第一行创建来的
+  <br>
+  <span> </span>created: &nbsp;mclock.Now(),
+  <br>
+  <span> </span>disc: &nbsp; &nbsp; make(chan DiscReason),
+  <br>
+  <span> </span>protoErr: make(chan error, len(protomap)+1), // protocols + pingLoop
+  <br>
+  <span> </span>closed: &nbsp; make(chan struct{}),
+  <br>
+  <span> </span>log: &nbsp; &nbsp; &nbsp;log.New("id", conn.id, "conn", conn.flags),
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return p
+  <br>}
+  <br>回到Peer的Run函数，看启动协议的函数：
+  <br>func (p *Peer) startProtocols(writeStart &lt;-chan struct{}, writeErr chan&lt;- error) {
+  <br>
+  <span> </span>p.wg.Add(len(p.running))
+  <br>
+  <span> </span>for _, proto := range p.running {
+  <br>
+  <span> </span>proto := proto
+  <br>
+  <span> </span>proto.closed = p.closed
+  <br>
+  <span> </span>proto.wstart = writeStart
+  <br>
+  <span> </span>proto.werr = writeErr
+  <br>
+  <span> </span>var rw MsgReadWriter = proto
+  <br>
+  <span> </span>if p.events != nil {
+  <br>
+  <span> </span>rw = newMsgEventer(rw, p.events, p.ID(), proto.Name)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>p.log.Trace(fmt.Sprintf("Starting protocol %s/%d", proto.Name, proto.Version))
+  <br>
+  <span> </span>go func() {
+  <br>
+  <span> </span>err := proto.Run(p, rw) &nbsp;//这里非常重要
+  <br>
+  <span> </span>if err == nil {
+  <br>
+  <span> </span>p.log.Trace(fmt.Sprintf("Protocol %s/%d returned", proto.Name, proto.Version))
+  <br>
+  <span> </span>err = errProtocolReturned
+  <br>
+  <span> </span>} else if err != io.EOF {
+  <br>
+  <span> </span>p.log.Trace(fmt.Sprintf("Protocol %s/%d failed", proto.Name, proto.Version), "err", err)
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>p.protoErr &lt;- err
+  <br>
+  <span> </span>p.wg.Done()
+  <br>
+  <span> </span>}()
+  <br>
+  <span> </span>}
+  <br>}
+  <br>上面的proto.Run(p, rw)的Run哪来的，看一下最初初始化PM时的代码（handle.go）：
+  <br>func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkId uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) {
+  <br>……
+  <br>
+  <span> </span>// Initiate a sub-protocol for every implemented version we can handle
+  <br>
+  <span> </span>manager.SubProtocols = make([]p2p.Protocol, 0, len(ProtocolVersions))
+  <br>
+  <span> </span>for i, version := range ProtocolVersions {
+  <br>
+  <span> </span>// Skip protocol version if incompatible with the mode of operation
+  <br>
+  <span> </span>if mode == downloader.FastSync &amp;&amp; version &lt; eth63 {
+  <br>
+  <span> </span>continue
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>// Compatible; initialise the sub-protocol
+  <br>
+  <span> </span>version := version // Closure for the run
+  <br>
+  <span> </span>manager.SubProtocols = append(manager.SubProtocols, p2p.Protocol{
+  <br>
+  <span> </span>Name: &nbsp; &nbsp;ProtocolName,
+  <br>
+  <span> </span>Version: version,
+  <br>
+  <span> </span>Length: &nbsp;ProtocolLengths[i],
+  <br>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; //在这里Run
+  <br>
+  <span> </span>Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
+  <br>
+  <span> </span>peer := manager.newPeer(int(version), p, rw)
+  <br>
+  <span> </span>select {
+  <br>
+  <span> </span>case manager.newPeerCh &lt;- peer:
+  <br>
+  <span> </span>manager.wg.Add(1)
+  <br>
+  <span> </span>defer manager.wg.Done()
+  <br>
+  <span> </span>return manager.handle(peer)
+  <br>
+  <span> </span>case &lt;-manager.quitSync:
+  <br>
+  <span> </span>return p2p.DiscQuitting
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>},
+  <br>
+  <span> </span>NodeInfo: func() interface{} {
+  <br>
+  <span> </span>return manager.NodeInfo()
+  <br>
+  <span> </span>},
+  <br>
+  <span> </span>PeerInfo: func(id discover.NodeID) interface{} {
+  <br>
+  <span> </span>if p := manager.peers.Peer(fmt.Sprintf("%x", id[:8])); p != nil {
+  <br>
+  <span> </span>return p.Info()
+  <br>
+  <span> </span>}
+  <br>
+  <span> </span>return nil
+  <br>
+  <span> </span>},
+  <br>
+  <span> </span>})
+  <br>
+  <span> </span>}
+  <br>……
+  <br>
+  <br>
+  <br>
+  <span> </span>return manager, nil
+  <br>}
+  <br>这样就把相关的Peer创建好了。这里需要注意的是newPeer是eth/peer.go，要和p2p/peer.go区别开来。
+  <br>创建好后，就相当于在Socket编程中创建了一个链接，就可以直接接收数据了，比如在rlpx.go中：
+  <br>func (rw *rlpxFrameRW) WriteMsg(msg Msg) error {
+  <br>……
+  <br>
+  <span> </span>// write frame MAC. egress MAC hash is up to date because
+  <br>
+  <span> </span>// frame content was written to it as well.
+  <br>
+  <span> </span>fmacseed := rw.egressMAC.Sum(nil)
+  <br>
+  <span> </span>mac := updateMAC(rw.egressMAC, rw.macCipher, fmacseed)
+  <br>
+  <span> </span>_, err := rw.conn.Write(mac)
+  <br>
+  <span> </span>return err
+  <br>}
+  <br>func (rw *rlpxFrameRW) ReadMsg() (msg Msg, err error) {
+  <br>
+  <span> </span>// read the header
+  <br>
+  <span> </span>headbuf := make([]byte, 32)
+  <br>
+  <span> </span>if _, err := io.ReadFull(rw.conn, headbuf); err != nil {
+  <br>
+  <span> </span>return msg, err
+  <br>
+  <span> </span>}
+  <br>……
+  <br>
+  <span> </span>return msg, nil
+  <br>}
+  <br>读写操作直接落到了IO上。下一次说一下整个的消息流通过程，做为对这一篇的一个补充。 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/fpcc/article/details/80643147,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/fpcc/article/details/80643147,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

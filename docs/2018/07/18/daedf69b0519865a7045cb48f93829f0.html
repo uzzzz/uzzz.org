@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>SmartBillions智能合约漏洞分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="SmartBillions智能合约漏洞分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81102641 看随机数生成器时偶然看到这个漏洞，虽然已经是大半年前的事情了，但是网上的解释跟合约代码对不上，就抽了点时间研究了一下。 首先介绍一下这个SmartBillions项目，是一个在线博彩游戏，官网地址：https://smartbillions.com/ 玩法很简单： 选择投注金额，范围是0.001～1 ETH 选择6个幸运数字，每个数字的范围是0～15 点击Play按钮完成投注 开奖号码是当前区块之后的第3个区块的哈希值的末6位 如果有2个或以上的数字对上就中奖了，6个数字都对上的赔率是1:7000000！（顺序也必须一致） 点击领奖按钮，如果中奖则会把奖金打入你的账户 项目方非常自信，因此在去年10月份举办了一次Hackathon，往里面存了1500个ETH，邀请所有人来测试他们的合约。结果就悲剧了，有两个兄弟不知是不是踩了狗屎运，投注了“000001”这个号码，并且过了256个区块之后才去领奖，每人赢走了200个ETH。第2位兄弟似乎发现了这个漏洞，于是紧接着又发起了一笔投注，还是投“000001”这个号码。不幸的是，由于油费不足这笔交易失败了，同时项目方也发现了这个漏洞，随即通过一个后门函数取回了剩余的1100个ETH。。。 所有的交易记录都可以在下面这个链接中查到（铁证如山:-)）： https://etherscan.io/address/0x5ace17f87c7391e5792a7683069a8025b83bbd85#internaltx 于是网上的人都开始分析这个漏洞，大部分人的说法都是：合约中通过blockhash()获取区块哈希时返回了0值，从而导致投注号码“000001”命中了其中5个数字，获得了20000倍的奖金。 这事儿首先要从Solidity的限制说起： Note: The block hashes are not available for all blocks for scalability reasons. You can only access the hashes of the most recent 256 blocks, all other values will be zero. 也就是说，我们最多只能获取之前256个区块的哈希值，超过256个区块都会返回0。 然而，事情真的如大部分人说的那么简单吗？从合约代码看，写代码的人显然是知道这个限制并且增加了对应的处理逻辑。玩家首先会调用playSystem()函数完成投注，然后调用won()函数领奖。我们来看下面这段代码： function won() public { ... ... uint prize = 0; uint32 hash = 0; if(block.number&lt;player.blockNum+256){ hash = uint24(block.blockhash(player.blockNum)); prize = betPrize(player,uint24(hash)); } else { if(hashFirst&gt;0){ // lottery is open even before swap space (hashes) is ready, but player must collect results within 256 blocks after run hash = getHash(player.blockNum); if(hash == 0x1000000) { // load hash failed :-(, return funds prize = uint(player.value); } else{ prize = betPrize(player,uint24(hash)); } } else{ LogLate(msg.sender,player.blockNum,block.number); bets[msg.sender] = Bet({value: 0, betHash: 0, blockNum: 1}); return(); } } ... ... } 可以看到，如果在256个区块之内领奖，会直接通过blockhash()获取区块哈希值，否则会通过一个getHash()函数从数据库中获取历史区块的哈希值。那么这个“数据库”是怎么组织的呢？参见下图： 由于开奖号码只是区块哈希的末6位（24bit），为了充分利用存储空间，每个uint都可以存储10个开奖号码。 另外，项目方规定必须在投注1个月之内领奖，过期作废。因此利用头部的16位存储一个delta值，用来标识属于第几个月。以太坊每个月的出块数量大约是163840个，因此用区块号除以163840就可以算出delta的值。一共只存储16384个值，超过这个数量则会覆盖以前的值。 这个机制看起来似乎没什么问题，问题出在数据库的更新方式上。合约期望通过2种方式来更新数据库，一种是由游戏玩家触发putHash()： function playSystem(uint _hash, address _partner) payable public returns (uint) { ... ... putHash(); // players help collecing data return(hashNext); } 但是如果某个玩家投注后，过了很久都没有其他人投注怎么办？于是项目方雇了一个admin，每个小时调用一次putHashes(25)。这个putHashes()方法就是循环调用putHash()函数： function putHashes(uint _num) external { uint n=0; for(;n&lt;_num;n++){ if(!putHash()){ return; } } } 但是嘞，在举办Hackathon的时候，这个admin开了个小差，忘记调用这个函数了。。。也就是说，数据库里有一些哈希值没有被更新，还是默认值。那么默认值是多少呢？看下面的数据库初始化代码： function addHashes(uint _sadd) public returns (uint) { ... ... for(;n&lt;hashes.length;n++){ // make sure to burn gas hashes[n] = 1; } ... ... } 屋漏偏逢连夜，默认值是1，所以头部的delta的值是0。也就是说，如果你在第一个月内玩这个游戏，投注“000000”或者“000001”，并且超过256个区块后再领奖，你就可以获得二等奖甚至头奖！ 如果在第二个月玩的话就没这么好运气了，你当前区块的delta会变成1，匹配不上，因此无法领奖。 结论：这个漏洞是由于“admin失职 + 不正确的默认初始值”导致的。 修复： 开掉那个admin。。。（官方真是这么说的） 把默认初始值从1改成FFFFFFFFFFFFFFFFFFFFFFFFFF 把playSystem()中的putHash()换成putHashes(25)，也就是让玩家代替admin干活。这么做的代价一方面是玩家消耗的gas可能会增加，另外如果你超过256个区块再领奖，并且在这期间没有其他人投注的话，就没有办法领奖了（最新的合约里甚至不会退还投注金）。 新合约代码地址：https://etherscan.io/address/0x6F6DEb5db0C4994A8283A01D6CFeEB27Fc3bBe9C#code 综上，区块链世界是一个去中心化的世界，设置admin这样的中心化角色本身就是不合理的，事实也证明是相当的不靠谱。我们需要的是透明的规则和忠实运行的代码，在区块链上开发dapp时需要把这一点牢记于心。 参考： https://medium.com/@SmartBillions/smartbillions-hackathon-smart-contract-hacked-with-120-000-b62a66b34268 https://www.reddit.com/r/ethereum/comments/74d3dc/smartbillions_lottery_contract_just_got_hacked/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81102641 看随机数生成器时偶然看到这个漏洞，虽然已经是大半年前的事情了，但是网上的解释跟合约代码对不上，就抽了点时间研究了一下。 首先介绍一下这个SmartBillions项目，是一个在线博彩游戏，官网地址：https://smartbillions.com/ 玩法很简单： 选择投注金额，范围是0.001～1 ETH 选择6个幸运数字，每个数字的范围是0～15 点击Play按钮完成投注 开奖号码是当前区块之后的第3个区块的哈希值的末6位 如果有2个或以上的数字对上就中奖了，6个数字都对上的赔率是1:7000000！（顺序也必须一致） 点击领奖按钮，如果中奖则会把奖金打入你的账户 项目方非常自信，因此在去年10月份举办了一次Hackathon，往里面存了1500个ETH，邀请所有人来测试他们的合约。结果就悲剧了，有两个兄弟不知是不是踩了狗屎运，投注了“000001”这个号码，并且过了256个区块之后才去领奖，每人赢走了200个ETH。第2位兄弟似乎发现了这个漏洞，于是紧接着又发起了一笔投注，还是投“000001”这个号码。不幸的是，由于油费不足这笔交易失败了，同时项目方也发现了这个漏洞，随即通过一个后门函数取回了剩余的1100个ETH。。。 所有的交易记录都可以在下面这个链接中查到（铁证如山:-)）： https://etherscan.io/address/0x5ace17f87c7391e5792a7683069a8025b83bbd85#internaltx 于是网上的人都开始分析这个漏洞，大部分人的说法都是：合约中通过blockhash()获取区块哈希时返回了0值，从而导致投注号码“000001”命中了其中5个数字，获得了20000倍的奖金。 这事儿首先要从Solidity的限制说起： Note: The block hashes are not available for all blocks for scalability reasons. You can only access the hashes of the most recent 256 blocks, all other values will be zero. 也就是说，我们最多只能获取之前256个区块的哈希值，超过256个区块都会返回0。 然而，事情真的如大部分人说的那么简单吗？从合约代码看，写代码的人显然是知道这个限制并且增加了对应的处理逻辑。玩家首先会调用playSystem()函数完成投注，然后调用won()函数领奖。我们来看下面这段代码： function won() public { ... ... uint prize = 0; uint32 hash = 0; if(block.number&lt;player.blockNum+256){ hash = uint24(block.blockhash(player.blockNum)); prize = betPrize(player,uint24(hash)); } else { if(hashFirst&gt;0){ // lottery is open even before swap space (hashes) is ready, but player must collect results within 256 blocks after run hash = getHash(player.blockNum); if(hash == 0x1000000) { // load hash failed :-(, return funds prize = uint(player.value); } else{ prize = betPrize(player,uint24(hash)); } } else{ LogLate(msg.sender,player.blockNum,block.number); bets[msg.sender] = Bet({value: 0, betHash: 0, blockNum: 1}); return(); } } ... ... } 可以看到，如果在256个区块之内领奖，会直接通过blockhash()获取区块哈希值，否则会通过一个getHash()函数从数据库中获取历史区块的哈希值。那么这个“数据库”是怎么组织的呢？参见下图： 由于开奖号码只是区块哈希的末6位（24bit），为了充分利用存储空间，每个uint都可以存储10个开奖号码。 另外，项目方规定必须在投注1个月之内领奖，过期作废。因此利用头部的16位存储一个delta值，用来标识属于第几个月。以太坊每个月的出块数量大约是163840个，因此用区块号除以163840就可以算出delta的值。一共只存储16384个值，超过这个数量则会覆盖以前的值。 这个机制看起来似乎没什么问题，问题出在数据库的更新方式上。合约期望通过2种方式来更新数据库，一种是由游戏玩家触发putHash()： function playSystem(uint _hash, address _partner) payable public returns (uint) { ... ... putHash(); // players help collecing data return(hashNext); } 但是如果某个玩家投注后，过了很久都没有其他人投注怎么办？于是项目方雇了一个admin，每个小时调用一次putHashes(25)。这个putHashes()方法就是循环调用putHash()函数： function putHashes(uint _num) external { uint n=0; for(;n&lt;_num;n++){ if(!putHash()){ return; } } } 但是嘞，在举办Hackathon的时候，这个admin开了个小差，忘记调用这个函数了。。。也就是说，数据库里有一些哈希值没有被更新，还是默认值。那么默认值是多少呢？看下面的数据库初始化代码： function addHashes(uint _sadd) public returns (uint) { ... ... for(;n&lt;hashes.length;n++){ // make sure to burn gas hashes[n] = 1; } ... ... } 屋漏偏逢连夜，默认值是1，所以头部的delta的值是0。也就是说，如果你在第一个月内玩这个游戏，投注“000000”或者“000001”，并且超过256个区块后再领奖，你就可以获得二等奖甚至头奖！ 如果在第二个月玩的话就没这么好运气了，你当前区块的delta会变成1，匹配不上，因此无法领奖。 结论：这个漏洞是由于“admin失职 + 不正确的默认初始值”导致的。 修复： 开掉那个admin。。。（官方真是这么说的） 把默认初始值从1改成FFFFFFFFFFFFFFFFFFFFFFFFFF 把playSystem()中的putHash()换成putHashes(25)，也就是让玩家代替admin干活。这么做的代价一方面是玩家消耗的gas可能会增加，另外如果你超过256个区块再领奖，并且在这期间没有其他人投注的话，就没有办法领奖了（最新的合约里甚至不会退还投注金）。 新合约代码地址：https://etherscan.io/address/0x6F6DEb5db0C4994A8283A01D6CFeEB27Fc3bBe9C#code 综上，区块链世界是一个去中心化的世界，设置admin这样的中心化角色本身就是不合理的，事实也证明是相当的不靠谱。我们需要的是透明的规则和忠实运行的代码，在区块链上开发dapp时需要把这一点牢记于心。 参考： https://medium.com/@SmartBillions/smartbillions-hackathon-smart-contract-hacked-with-120-000-b62a66b34268 https://www.reddit.com/r/ethereum/comments/74d3dc/smartbillions_lottery_contract_just_got_hacked/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/07/18/daedf69b0519865a7045cb48f93829f0.html" />
+<meta property="og:url" content="https://uzzz.org/2018/07/18/daedf69b0519865a7045cb48f93829f0.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-07-18T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81102641 看随机数生成器时偶然看到这个漏洞，虽然已经是大半年前的事情了，但是网上的解释跟合约代码对不上，就抽了点时间研究了一下。 首先介绍一下这个SmartBillions项目，是一个在线博彩游戏，官网地址：https://smartbillions.com/ 玩法很简单： 选择投注金额，范围是0.001～1 ETH 选择6个幸运数字，每个数字的范围是0～15 点击Play按钮完成投注 开奖号码是当前区块之后的第3个区块的哈希值的末6位 如果有2个或以上的数字对上就中奖了，6个数字都对上的赔率是1:7000000！（顺序也必须一致） 点击领奖按钮，如果中奖则会把奖金打入你的账户 项目方非常自信，因此在去年10月份举办了一次Hackathon，往里面存了1500个ETH，邀请所有人来测试他们的合约。结果就悲剧了，有两个兄弟不知是不是踩了狗屎运，投注了“000001”这个号码，并且过了256个区块之后才去领奖，每人赢走了200个ETH。第2位兄弟似乎发现了这个漏洞，于是紧接着又发起了一笔投注，还是投“000001”这个号码。不幸的是，由于油费不足这笔交易失败了，同时项目方也发现了这个漏洞，随即通过一个后门函数取回了剩余的1100个ETH。。。 所有的交易记录都可以在下面这个链接中查到（铁证如山:-)）： https://etherscan.io/address/0x5ace17f87c7391e5792a7683069a8025b83bbd85#internaltx 于是网上的人都开始分析这个漏洞，大部分人的说法都是：合约中通过blockhash()获取区块哈希时返回了0值，从而导致投注号码“000001”命中了其中5个数字，获得了20000倍的奖金。 这事儿首先要从Solidity的限制说起： Note: The block hashes are not available for all blocks for scalability reasons. You can only access the hashes of the most recent 256 blocks, all other values will be zero. 也就是说，我们最多只能获取之前256个区块的哈希值，超过256个区块都会返回0。 然而，事情真的如大部分人说的那么简单吗？从合约代码看，写代码的人显然是知道这个限制并且增加了对应的处理逻辑。玩家首先会调用playSystem()函数完成投注，然后调用won()函数领奖。我们来看下面这段代码： function won() public { ... ... uint prize = 0; uint32 hash = 0; if(block.number&lt;player.blockNum+256){ hash = uint24(block.blockhash(player.blockNum)); prize = betPrize(player,uint24(hash)); } else { if(hashFirst&gt;0){ // lottery is open even before swap space (hashes) is ready, but player must collect results within 256 blocks after run hash = getHash(player.blockNum); if(hash == 0x1000000) { // load hash failed :-(, return funds prize = uint(player.value); } else{ prize = betPrize(player,uint24(hash)); } } else{ LogLate(msg.sender,player.blockNum,block.number); bets[msg.sender] = Bet({value: 0, betHash: 0, blockNum: 1}); return(); } } ... ... } 可以看到，如果在256个区块之内领奖，会直接通过blockhash()获取区块哈希值，否则会通过一个getHash()函数从数据库中获取历史区块的哈希值。那么这个“数据库”是怎么组织的呢？参见下图： 由于开奖号码只是区块哈希的末6位（24bit），为了充分利用存储空间，每个uint都可以存储10个开奖号码。 另外，项目方规定必须在投注1个月之内领奖，过期作废。因此利用头部的16位存储一个delta值，用来标识属于第几个月。以太坊每个月的出块数量大约是163840个，因此用区块号除以163840就可以算出delta的值。一共只存储16384个值，超过这个数量则会覆盖以前的值。 这个机制看起来似乎没什么问题，问题出在数据库的更新方式上。合约期望通过2种方式来更新数据库，一种是由游戏玩家触发putHash()： function playSystem(uint _hash, address _partner) payable public returns (uint) { ... ... putHash(); // players help collecing data return(hashNext); } 但是如果某个玩家投注后，过了很久都没有其他人投注怎么办？于是项目方雇了一个admin，每个小时调用一次putHashes(25)。这个putHashes()方法就是循环调用putHash()函数： function putHashes(uint _num) external { uint n=0; for(;n&lt;_num;n++){ if(!putHash()){ return; } } } 但是嘞，在举办Hackathon的时候，这个admin开了个小差，忘记调用这个函数了。。。也就是说，数据库里有一些哈希值没有被更新，还是默认值。那么默认值是多少呢？看下面的数据库初始化代码： function addHashes(uint _sadd) public returns (uint) { ... ... for(;n&lt;hashes.length;n++){ // make sure to burn gas hashes[n] = 1; } ... ... } 屋漏偏逢连夜，默认值是1，所以头部的delta的值是0。也就是说，如果你在第一个月内玩这个游戏，投注“000000”或者“000001”，并且超过256个区块后再领奖，你就可以获得二等奖甚至头奖！ 如果在第二个月玩的话就没这么好运气了，你当前区块的delta会变成1，匹配不上，因此无法领奖。 结论：这个漏洞是由于“admin失职 + 不正确的默认初始值”导致的。 修复： 开掉那个admin。。。（官方真是这么说的） 把默认初始值从1改成FFFFFFFFFFFFFFFFFFFFFFFFFF 把playSystem()中的putHash()换成putHashes(25)，也就是让玩家代替admin干活。这么做的代价一方面是玩家消耗的gas可能会增加，另外如果你超过256个区块再领奖，并且在这期间没有其他人投注的话，就没有办法领奖了（最新的合约里甚至不会退还投注金）。 新合约代码地址：https://etherscan.io/address/0x6F6DEb5db0C4994A8283A01D6CFeEB27Fc3bBe9C#code 综上，区块链世界是一个去中心化的世界，设置admin这样的中心化角色本身就是不合理的，事实也证明是相当的不靠谱。我们需要的是透明的规则和忠实运行的代码，在区块链上开发dapp时需要把这一点牢记于心。 参考： https://medium.com/@SmartBillions/smartbillions-hackathon-smart-contract-hacked-with-120-000-b62a66b34268 https://www.reddit.com/r/ethereum/comments/74d3dc/smartbillions_lottery_contract_just_got_hacked/ 更多文章欢迎关注“鑫鑫点灯”专栏：https://blog.csdn.net/turkeycock 或关注飞久微信公众号： 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/07/18/daedf69b0519865a7045cb48f93829f0.html","headline":"SmartBillions智能合约漏洞分析","dateModified":"2018-07-18T00:00:00+08:00","datePublished":"2018-07-18T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/07/18/daedf69b0519865a7045cb48f93829f0.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>SmartBillions智能合约漏洞分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/TurkeyCock/article/details/81102641 
+ </div> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <p>看随机数生成器时偶然看到这个漏洞，虽然已经是大半年前的事情了，但是网上的解释跟合约代码对不上，就抽了点时间研究了一下。</p> 
+  <p>首先介绍一下这个SmartBillions项目，是一个在线博彩游戏，官网地址：<a href="https://smartbillions.com/" rel="nofollow">https://smartbillions.com/</a><br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180718175248787?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>玩法很简单：</p> 
+  <h3><a id="_6"></a></h3> 
+  <ul> 
+   <li>选择投注金额，范围是0.001～1 ETH</li> 
+   <li>选择6个幸运数字，每个数字的范围是0～15</li> 
+   <li>点击Play按钮完成投注</li> 
+   <li>开奖号码是当前区块之后的第3个区块的哈希值的末6位</li> 
+   <li>如果有2个或以上的数字对上就中奖了，6个数字都对上的赔率是1:7000000！（顺序也必须一致）</li> 
+   <li>点击领奖按钮，如果中奖则会把奖金打入你的账户</li> 
+  </ul> 
+  <p>项目方非常自信，因此在去年10月份举办了一次Hackathon，往里面存了1500个ETH，邀请所有人来测试他们的合约。结果就悲剧了，有两个兄弟不知是不是踩了狗屎运，投注了“000001”这个号码，并且过了256个区块之后才去领奖，每人赢走了200个ETH。第2位兄弟似乎发现了这个漏洞，于是紧接着又发起了一笔投注，还是投“000001”这个号码。不幸的是，由于油费不足这笔交易失败了，同时项目方也发现了这个漏洞，随即通过一个后门函数取回了剩余的1100个ETH。。。</p> 
+  <p>所有的交易记录都可以在下面这个链接中查到（铁证如山:-)）：</p> 
+  <p><a href="https://etherscan.io/address/0x5ace17f87c7391e5792a7683069a8025b83bbd85#internaltx" rel="nofollow">https://etherscan.io/address/0x5ace17f87c7391e5792a7683069a8025b83bbd85#internaltx</a></p> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180718175334769?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>于是网上的人都开始分析这个漏洞，大部分人的说法都是：合约中通过blockhash()获取区块哈希时返回了0值，从而导致投注号码“000001”命中了其中5个数字，获得了20000倍的奖金。</p> 
+  <p>这事儿首先要从Solidity的限制说起：</p> 
+  <pre><code>Note:
+The block hashes are not available for all blocks for scalability reasons.
+You can only access the hashes of the most recent 256 blocks, all other values will be zero.
+</code></pre> 
+  <p>也就是说，我们最多只能获取之前256个区块的哈希值，超过256个区块都会返回0。<br> 然而，事情真的如大部分人说的那么简单吗？从合约代码看，写代码的人显然是知道这个限制并且增加了对应的处理逻辑。玩家首先会调用playSystem()函数完成投注，然后调用won()函数领奖。我们来看下面这段代码：</p> 
+  <pre><code>    function won() public {
+        ... ...
+
+        uint prize = 0;
+        uint32 hash = 0;
+        if(block.number&lt;player.blockNum+256){
+            hash = uint24(block.blockhash(player.blockNum));
+            prize = betPrize(player,uint24(hash));
+        }
+        else {
+            if(hashFirst&gt;0){ // lottery is open even before swap space (hashes) is ready, but player must collect results within 256 blocks after run
+                hash = getHash(player.blockNum);
+                if(hash == 0x1000000) { // load hash failed :-(, return funds
+                    prize = uint(player.value);
+                }
+                else{
+                    prize = betPrize(player,uint24(hash));
+                }
+              }
+            else{
+                LogLate(msg.sender,player.blockNum,block.number);
+                bets[msg.sender] = Bet({value: 0, betHash: 0, blockNum: 1});
+                return();
+            }
+        }
+        ... ...
+    }
+</code></pre> 
+  <p>可以看到，如果在256个区块之内领奖，会直接通过blockhash()获取区块哈希值，否则会通过一个getHash()函数从数据库中获取历史区块的哈希值。那么这个“数据库”是怎么组织的呢？参见下图：</p> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180718175348163?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述"></p> 
+  <p>由于开奖号码只是区块哈希的末6位（24bit），为了充分利用存储空间，每个uint都可以存储10个开奖号码。<br> 另外，项目方规定必须在投注1个月之内领奖，过期作废。因此利用头部的16位存储一个delta值，用来标识属于第几个月。以太坊每个月的出块数量大约是163840个，因此用区块号除以163840就可以算出delta的值。一共只存储16384个值，超过这个数量则会覆盖以前的值。</p> 
+  <p>这个机制看起来似乎没什么问题，问题出在数据库的更新方式上。合约期望通过2种方式来更新数据库，一种是由游戏玩家触发putHash()：</p> 
+  <pre><code>    function playSystem(uint _hash, address _partner) payable public returns (uint) {
+        ... ...
+        putHash(); // players help collecing data
+        return(hashNext);
+    }
+</code></pre> 
+  <p>但是如果某个玩家投注后，过了很久都没有其他人投注怎么办？于是项目方雇了一个admin，每个小时调用一次putHashes(25)。这个putHashes()方法就是循环调用putHash()函数：</p> 
+  <pre><code>    function putHashes(uint _num) external {
+        uint n=0;
+        for(;n&lt;_num;n++){
+            if(!putHash()){
+                return;
+            }
+        }
+    }
+</code></pre> 
+  <p>但是嘞，在举办Hackathon的时候，这个admin开了个小差，忘记调用这个函数了。。。也就是说，数据库里有一些哈希值没有被更新，还是默认值。那么默认值是多少呢？看下面的数据库初始化代码：</p> 
+  <pre><code>    function addHashes(uint _sadd) public returns (uint) {
+        ... ...
+        for(;n&lt;hashes.length;n++){ // make sure to burn gas
+            hashes[n] = 1;
+        }
+        ... ...
+    }
+</code></pre> 
+  <p>屋漏偏逢连夜，默认值是1，所以头部的delta的值是0。也就是说，如果你在第一个月内玩这个游戏，投注“000000”或者“000001”，并且超过256个区块后再领奖，你就可以获得二等奖甚至头奖！<br> 如果在第二个月玩的话就没这么好运气了，你当前区块的delta会变成1，匹配不上，因此无法领奖。</p> 
+  <p>结论：这个漏洞是由于“admin失职 + 不正确的默认初始值”导致的。</p> 
+  <p>修复：</p> 
+  <h3><a id="_109"></a></h3> 
+  <ul> 
+   <li>开掉那个admin。。。（官方真是这么说的）</li> 
+   <li>把默认初始值从1改成FFFFFFFFFFFFFFFFFFFFFFFFFF</li> 
+   <li>把playSystem()中的putHash()换成putHashes(25)，也就是让玩家代替admin干活。这么做的代价一方面是玩家消耗的gas可能会增加，另外如果你超过256个区块再领奖，并且在这期间没有其他人投注的话，就没有办法领奖了（最新的合约里甚至不会退还投注金）。</li> 
+  </ul> 
+  <p>新合约代码地址：<a href="https://etherscan.io/address/0x6F6DEb5db0C4994A8283A01D6CFeEB27Fc3bBe9C#code" rel="nofollow">https://etherscan.io/address/0x6F6DEb5db0C4994A8283A01D6CFeEB27Fc3bBe9C#code</a></p> 
+  <p>综上，区块链世界是一个去中心化的世界，设置admin这样的中心化角色本身就是不合理的，事实也证明是相当的不靠谱。我们需要的是透明的规则和忠实运行的代码，在区块链上开发dapp时需要把这一点牢记于心。</p> 
+  <blockquote> 
+   <p>参考：<br> <a href="https://medium.com/@SmartBillions/smartbillions-hackathon-smart-contract-hacked-with-120-000-b62a66b34268" rel="nofollow">https://medium.com/@SmartBillions/smartbillions-hackathon-smart-contract-hacked-with-120-000-b62a66b34268</a><br> <a href="https://www.reddit.com/r/ethereum/comments/74d3dc/smartbillions_lottery_contract_just_got_hacked/" rel="nofollow">https://www.reddit.com/r/ethereum/comments/74d3dc/smartbillions_lottery_contract_just_got_hacked/</a></p> 
+  </blockquote> 
+  <p><font color="red">更多文章欢迎关注“鑫鑫点灯”专栏：</font><a href="https://blog.csdn.net/turkeycock" rel="nofollow">https://blog.csdn.net/turkeycock</a><br> <font color="green">或关注飞久微信公众号：</font><br> <img src="https://img-blog.csdnimg.cn/20181030102331553.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L1R1cmtleUNvY2s=,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-7f770a53f2.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/TurkeyCock/article/details/81102641,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/TurkeyCock/article/details/81102641,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊智能合约call注入攻击 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊智能合约call注入攻击" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="TL;DR 这是我在先知安全大会上分享议题中的一部分内容。主要介绍了利用对call调用处理不当，配合一定的应用场景的一种攻击手段。 0x00 基础知识 以太坊中跨合约调用是指的合约调用另外一个合约方法的方式。为了好理解整个调用的过程，我们可以简单将调用发起方合约当做传统web世界的浏览器，被调用的合约看作webserver，而调用的msg则是http数据，EVM底层通过ABI规范来解码参数，获取方法选择器，然后执行对应的合约代码。 当然，实际上智能合约的执行一般在打包交易或者验证交易的时候发生，上面的比喻只是方便理解。 在solidity语言中，我们可以通过call方法来实现对某个合约或者本地合约的某个方法进行调用。 调用的方式大致如下： &nbsp;&lt;address&gt;.call(方法选择器, arg1, arg2, …) &lt;address&gt;.call(bytes) 如上所述，可以通过传递参数的方式，将方法选择器、参数进行传递，也可以直接传入一个字节数组，当然要自己去构造msg.data的结构。 Solidity编程中，一般跨合约调用执行方都会使用msg.sender全局变量来获取调用方的以太坊地址，从而进行一些逻辑判断等。 比如在ERC20标准中的transfer方法的实现中，就是使用msg.sender来作为扣款方： function transfer(address _to, uint256 _value) returns (bool success) { …. balances[msg.sender] -= _value; balances[_to] += _value; …. } 0x01 攻击模型 Call方法注入漏洞，顾名思义就是外界可以直接控制合约中的call方法调用的参数，按照注入位置可以分为以下三个场景： •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;参数列表可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4 selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;方法选择器可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bytes可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(bytesdata) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(msg.data) 简单举个例子，比如存在一个合约B，代码如下： contract B{ function info(bytes data){ this.call(data) ; } function secret() public{ require(this == msg.sender); // secret operations } } 其中有info和secret方法，secret方法中判断必须是合约自身调用才能执行。然而这里的info方法中有个call的调用，并且外界可以直接控制call调用的字节数组，因此如果外界精心构造一个data，这个data的方法选择器指定为secret方法，那么外部用户就可以以合约身份调用到这个secret方法，这样就会造成一定的风险。 &nbsp; 0x02 具体场景 这里举两种实际的攻击场景： （1）&nbsp;&nbsp;&nbsp; bytes注入 在合约代码中，有个approveAndCallcode方法，这个方法中允许调用_spender合约的某些方法或者传递一些数据，通过引入了_spender.call来完成这个功能。 如果外界调用中指定_spender为合约自身的地址，就可以以合约的身份去调用合约中的某些方法。比如如果我们使用合约的身份去调用transfer方法： 只需要自己去构造bytes即可，比如把transfer的_to参数指定为我们自己的账户地址。这样其实就可以直接把合约账户中的代币全部转到自己的账户中，因为通过call注入，在transfer方法看来，msg.sender其实就是合约自己的地址。 （2）&nbsp;&nbsp;&nbsp; 方法选择器注入 比如这里有个logAndCall方法。 function logAndCall(address _to, uint _value, bytes data, string _fallback){ ….. assert(_to.call(bytes4(keccak256(_fallback)), msg.sender, _value, _data)) ; …… } 这里我们对_fallback参数可控，也就是说我们可以指定调用_to地址的任何方法，但是后面跟了三个参数，分别是msg.sender,_value, _data，类型分别为address，uint256以及bytes。那么我们是不是只能调用参数类型必须为这三个的方法呢？ 当然不是。这里涉及到EVM在处理calldata的一个特性。 比如Sample1合约中有个test方法，这个方法中有三个参数，都是uint256类型的。而Sample2通过call调用了Sample1的test方法，这里传入了5个参数，同样是可以调用成功的。这是因为EVM在获取参数的时候没有参数个数校验的过程，因此取到前三个参数1,2,3之后，就把4,5给截断掉了，在编译和运行阶段都不会报错。 利用这个特性，我们其实有很多攻击面，比如我们可以通过logAndCall中的call注入来调用approve方法： 这里的approve方法有两个参数，而且类型为address和uint256，所以我们是可以调用成功的。这样就可以将合约账户中的代币授权给我们自己的账户了。 &nbsp; 0x03 深远的问题 ERC223标准是为了解决ERC20中对智能合约账户进行转币场景缺失的问题，可以看作是ERC20标准的升级版。但是在很多ERC223标准的实现代码中就带入了call注入的问题： 此外，很多合约在判断权限的时候会将合约自身的地址也纳入到白名单中： 如果这个合约中出现了call注入的问题，就可以绕过这种方式的权限判断，对合约造成一定的风险。 &nbsp; 0x04 防护手段 针对本文提到的这个风险，作为开发者来说，需要对ERC223的实现进行排查，不要引入call注入问题，如果非要执行回调，则可以指定方法选择器字符串，避免使用直接注入bytes的形式来进行call调用。 对于一些敏感操作或者权限判断函数，则不要轻易将合约自身的账户地址作为可信的地址。 阅读更多" />
+<meta property="og:description" content="TL;DR 这是我在先知安全大会上分享议题中的一部分内容。主要介绍了利用对call调用处理不当，配合一定的应用场景的一种攻击手段。 0x00 基础知识 以太坊中跨合约调用是指的合约调用另外一个合约方法的方式。为了好理解整个调用的过程，我们可以简单将调用发起方合约当做传统web世界的浏览器，被调用的合约看作webserver，而调用的msg则是http数据，EVM底层通过ABI规范来解码参数，获取方法选择器，然后执行对应的合约代码。 当然，实际上智能合约的执行一般在打包交易或者验证交易的时候发生，上面的比喻只是方便理解。 在solidity语言中，我们可以通过call方法来实现对某个合约或者本地合约的某个方法进行调用。 调用的方式大致如下： &nbsp;&lt;address&gt;.call(方法选择器, arg1, arg2, …) &lt;address&gt;.call(bytes) 如上所述，可以通过传递参数的方式，将方法选择器、参数进行传递，也可以直接传入一个字节数组，当然要自己去构造msg.data的结构。 Solidity编程中，一般跨合约调用执行方都会使用msg.sender全局变量来获取调用方的以太坊地址，从而进行一些逻辑判断等。 比如在ERC20标准中的transfer方法的实现中，就是使用msg.sender来作为扣款方： function transfer(address _to, uint256 _value) returns (bool success) { …. balances[msg.sender] -= _value; balances[_to] += _value; …. } 0x01 攻击模型 Call方法注入漏洞，顾名思义就是外界可以直接控制合约中的call方法调用的参数，按照注入位置可以分为以下三个场景： •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;参数列表可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4 selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;方法选择器可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bytes可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(bytesdata) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(msg.data) 简单举个例子，比如存在一个合约B，代码如下： contract B{ function info(bytes data){ this.call(data) ; } function secret() public{ require(this == msg.sender); // secret operations } } 其中有info和secret方法，secret方法中判断必须是合约自身调用才能执行。然而这里的info方法中有个call的调用，并且外界可以直接控制call调用的字节数组，因此如果外界精心构造一个data，这个data的方法选择器指定为secret方法，那么外部用户就可以以合约身份调用到这个secret方法，这样就会造成一定的风险。 &nbsp; 0x02 具体场景 这里举两种实际的攻击场景： （1）&nbsp;&nbsp;&nbsp; bytes注入 在合约代码中，有个approveAndCallcode方法，这个方法中允许调用_spender合约的某些方法或者传递一些数据，通过引入了_spender.call来完成这个功能。 如果外界调用中指定_spender为合约自身的地址，就可以以合约的身份去调用合约中的某些方法。比如如果我们使用合约的身份去调用transfer方法： 只需要自己去构造bytes即可，比如把transfer的_to参数指定为我们自己的账户地址。这样其实就可以直接把合约账户中的代币全部转到自己的账户中，因为通过call注入，在transfer方法看来，msg.sender其实就是合约自己的地址。 （2）&nbsp;&nbsp;&nbsp; 方法选择器注入 比如这里有个logAndCall方法。 function logAndCall(address _to, uint _value, bytes data, string _fallback){ ….. assert(_to.call(bytes4(keccak256(_fallback)), msg.sender, _value, _data)) ; …… } 这里我们对_fallback参数可控，也就是说我们可以指定调用_to地址的任何方法，但是后面跟了三个参数，分别是msg.sender,_value, _data，类型分别为address，uint256以及bytes。那么我们是不是只能调用参数类型必须为这三个的方法呢？ 当然不是。这里涉及到EVM在处理calldata的一个特性。 比如Sample1合约中有个test方法，这个方法中有三个参数，都是uint256类型的。而Sample2通过call调用了Sample1的test方法，这里传入了5个参数，同样是可以调用成功的。这是因为EVM在获取参数的时候没有参数个数校验的过程，因此取到前三个参数1,2,3之后，就把4,5给截断掉了，在编译和运行阶段都不会报错。 利用这个特性，我们其实有很多攻击面，比如我们可以通过logAndCall中的call注入来调用approve方法： 这里的approve方法有两个参数，而且类型为address和uint256，所以我们是可以调用成功的。这样就可以将合约账户中的代币授权给我们自己的账户了。 &nbsp; 0x03 深远的问题 ERC223标准是为了解决ERC20中对智能合约账户进行转币场景缺失的问题，可以看作是ERC20标准的升级版。但是在很多ERC223标准的实现代码中就带入了call注入的问题： 此外，很多合约在判断权限的时候会将合约自身的地址也纳入到白名单中： 如果这个合约中出现了call注入的问题，就可以绕过这种方式的权限判断，对合约造成一定的风险。 &nbsp; 0x04 防护手段 针对本文提到的这个风险，作为开发者来说，需要对ERC223的实现进行排查，不要引入call注入问题，如果非要执行回调，则可以指定方法选择器字符串，避免使用直接注入bytes的形式来进行call调用。 对于一些敏感操作或者权限判断函数，则不要轻易将合约自身的账户地址作为可信的地址。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/21/5cd7a3dbabae6458f83a51e3c844ba5b.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/21/5cd7a3dbabae6458f83a51e3c844ba5b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"TL;DR 这是我在先知安全大会上分享议题中的一部分内容。主要介绍了利用对call调用处理不当，配合一定的应用场景的一种攻击手段。 0x00 基础知识 以太坊中跨合约调用是指的合约调用另外一个合约方法的方式。为了好理解整个调用的过程，我们可以简单将调用发起方合约当做传统web世界的浏览器，被调用的合约看作webserver，而调用的msg则是http数据，EVM底层通过ABI规范来解码参数，获取方法选择器，然后执行对应的合约代码。 当然，实际上智能合约的执行一般在打包交易或者验证交易的时候发生，上面的比喻只是方便理解。 在solidity语言中，我们可以通过call方法来实现对某个合约或者本地合约的某个方法进行调用。 调用的方式大致如下： &nbsp;&lt;address&gt;.call(方法选择器, arg1, arg2, …) &lt;address&gt;.call(bytes) 如上所述，可以通过传递参数的方式，将方法选择器、参数进行传递，也可以直接传入一个字节数组，当然要自己去构造msg.data的结构。 Solidity编程中，一般跨合约调用执行方都会使用msg.sender全局变量来获取调用方的以太坊地址，从而进行一些逻辑判断等。 比如在ERC20标准中的transfer方法的实现中，就是使用msg.sender来作为扣款方： function transfer(address _to, uint256 _value) returns (bool success) { …. balances[msg.sender] -= _value; balances[_to] += _value; …. } 0x01 攻击模型 Call方法注入漏洞，顾名思义就是外界可以直接控制合约中的call方法调用的参数，按照注入位置可以分为以下三个场景： •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;参数列表可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4 selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;方法选择器可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4selection, arg1, arg2, ...) •&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bytes可控 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(bytesdata) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(msg.data) 简单举个例子，比如存在一个合约B，代码如下： contract B{ function info(bytes data){ this.call(data) ; } function secret() public{ require(this == msg.sender); // secret operations } } 其中有info和secret方法，secret方法中判断必须是合约自身调用才能执行。然而这里的info方法中有个call的调用，并且外界可以直接控制call调用的字节数组，因此如果外界精心构造一个data，这个data的方法选择器指定为secret方法，那么外部用户就可以以合约身份调用到这个secret方法，这样就会造成一定的风险。 &nbsp; 0x02 具体场景 这里举两种实际的攻击场景： （1）&nbsp;&nbsp;&nbsp; bytes注入 在合约代码中，有个approveAndCallcode方法，这个方法中允许调用_spender合约的某些方法或者传递一些数据，通过引入了_spender.call来完成这个功能。 如果外界调用中指定_spender为合约自身的地址，就可以以合约的身份去调用合约中的某些方法。比如如果我们使用合约的身份去调用transfer方法： 只需要自己去构造bytes即可，比如把transfer的_to参数指定为我们自己的账户地址。这样其实就可以直接把合约账户中的代币全部转到自己的账户中，因为通过call注入，在transfer方法看来，msg.sender其实就是合约自己的地址。 （2）&nbsp;&nbsp;&nbsp; 方法选择器注入 比如这里有个logAndCall方法。 function logAndCall(address _to, uint _value, bytes data, string _fallback){ ….. assert(_to.call(bytes4(keccak256(_fallback)), msg.sender, _value, _data)) ; …… } 这里我们对_fallback参数可控，也就是说我们可以指定调用_to地址的任何方法，但是后面跟了三个参数，分别是msg.sender,_value, _data，类型分别为address，uint256以及bytes。那么我们是不是只能调用参数类型必须为这三个的方法呢？ 当然不是。这里涉及到EVM在处理calldata的一个特性。 比如Sample1合约中有个test方法，这个方法中有三个参数，都是uint256类型的。而Sample2通过call调用了Sample1的test方法，这里传入了5个参数，同样是可以调用成功的。这是因为EVM在获取参数的时候没有参数个数校验的过程，因此取到前三个参数1,2,3之后，就把4,5给截断掉了，在编译和运行阶段都不会报错。 利用这个特性，我们其实有很多攻击面，比如我们可以通过logAndCall中的call注入来调用approve方法： 这里的approve方法有两个参数，而且类型为address和uint256，所以我们是可以调用成功的。这样就可以将合约账户中的代币授权给我们自己的账户了。 &nbsp; 0x03 深远的问题 ERC223标准是为了解决ERC20中对智能合约账户进行转币场景缺失的问题，可以看作是ERC20标准的升级版。但是在很多ERC223标准的实现代码中就带入了call注入的问题： 此外，很多合约在判断权限的时候会将合约自身的地址也纳入到白名单中： 如果这个合约中出现了call注入的问题，就可以绕过这种方式的权限判断，对合约造成一定的风险。 &nbsp; 0x04 防护手段 针对本文提到的这个风险，作为开发者来说，需要对ERC223的实现进行排查，不要引入call注入问题，如果非要执行回调，则可以指定方法选择器字符串，避免使用直接注入bytes的形式来进行call调用。 对于一些敏感操作或者权限判断函数，则不要轻易将合约自身的账户地址作为可信的地址。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/21/5cd7a3dbabae6458f83a51e3c844ba5b.html","headline":"以太坊智能合约call注入攻击","dateModified":"2018-06-21T00:00:00+08:00","datePublished":"2018-06-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/21/5cd7a3dbabae6458f83a51e3c844ba5b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊智能合约call注入攻击</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h2>TL;DR</h2>
+  <p>这是我在先知安全大会上分享议题中的一部分内容。主要介绍了利用对call调用处理不当，配合一定的应用场景的一种攻击手段。</p>
+  <h2>0x00 基础知识</h2>
+  <p>以太坊中跨合约调用是指的合约调用另外一个合约方法的方式。为了好理解整个调用的过程，我们可以简单将调用发起方合约当做传统web世界的浏览器，被调用的合约看作webserver，而调用的msg则是http数据，EVM底层通过ABI规范来解码参数，获取方法选择器，然后执行对应的合约代码。</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112016118?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>当然，实际上智能合约的执行一般在打包交易或者验证交易的时候发生，上面的比喻只是方便理解。</p>
+  <p>在solidity语言中，我们可以通过call方法来实现对某个合约或者本地合约的某个方法进行调用。</p>
+  <p>调用的方式大致如下：</p>
+  <p></p>
+  <ul>
+   <li>&nbsp;&lt;address&gt;.call(方法选择器, arg1, arg2, …)</li>
+   <li>&lt;address&gt;.call(bytes)</li>
+  </ul>
+  <p>如上所述，可以通过传递参数的方式，将方法选择器、参数进行传递，也可以直接传入一个字节数组，当然要自己去构造msg.data的结构。</p>
+  <p>Solidity编程中，一般跨合约调用执行方都会使用msg.sender全局变量来获取调用方的以太坊地址，从而进行一些逻辑判断等。</p>
+  <p>比如在ERC20标准中的transfer方法的实现中，就是使用msg.sender来作为扣款方：</p>
+  <pre><code class="language-html">function transfer(address _to, uint256 _value) returns (bool success) {
+    ….
+    balances[msg.sender] -= _value;
+balances[_to] += _value;
+….
+}
+</code></pre>
+  <h2>0x01 攻击模型</h2>
+  <p>Call方法注入漏洞，顾名思义就是外界可以直接控制合约中的call方法调用的参数，按照注入位置可以分为以下三个场景：</p>
+  <p>•&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;参数列表可控</p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(bytes4 selection, <span style="color:#FF0000;">arg1, arg2, ...</span>)</p>
+  <p>•&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;方法选择器可控</p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&nbsp;&lt;address&gt;.call(<span style="color:#FF0000;">bytes4selection</span>, arg1, arg2, ...)</p>
+  <p>•&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bytes可控</p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(<span style="color:#FF0000;">bytesdata</span>)</p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;•&lt;address&gt;.call(<span style="color:#FF0000;">msg.data</span>)</p>
+  <p>简单举个例子，比如存在一个合约B，代码如下：</p>
+  <pre><code class="language-html">contract B{
+    function info(bytes data){
+          this.call(data) ;
+    }
+    function secret() public{
+        require(this == msg.sender);
+        // secret operations
+    }
+}
+</code></pre>
+  <p>其中有info和secret方法，secret方法中判断必须是合约自身调用才能执行。然而这里的info方法中有个call的调用，并且外界可以直接控制call调用的字节数组，因此如果外界精心构造一个data，这个data的方法选择器指定为secret方法，那么外部用户就可以以合约身份调用到这个secret方法，这样就会造成一定的风险。</p>
+  <p>&nbsp;</p>
+  <h2>0x02 具体场景</h2>
+  <p>这里举两种实际的攻击场景：</p>
+  <p>（1）&nbsp;&nbsp;&nbsp; bytes注入</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018062111220461?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>在合约代码中，有个approveAndCallcode方法，这个方法中允许调用_spender合约的某些方法或者传递一些数据，通过引入了_spender.call来完成这个功能。</p>
+  <p>如果外界调用中指定_spender为合约自身的地址，就可以以合约的身份去调用合约中的某些方法。比如如果我们使用合约的身份去调用transfer方法：</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112215583?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>只需要自己去构造bytes即可，比如把transfer的_to参数指定为我们自己的账户地址。这样其实就可以直接把合约账户中的代币全部转到自己的账户中，因为通过call注入，在transfer方法看来，msg.sender其实就是合约自己的地址。</p>
+  <p>（2）&nbsp;&nbsp;&nbsp; 方法选择器注入</p>
+  <p>比如这里有个logAndCall方法。</p>
+  <pre><code class="language-html">function logAndCall(address _to, uint _value, bytes data, string _fallback){
+	…..
+	assert(_to.call(bytes4(keccak256(_fallback)), msg.sender, _value, _data)) ;
+	……
+} 
+</code></pre>
+  <p>这里我们对_fallback参数可控，也就是说我们可以指定调用_to地址的任何方法，但是后面跟了三个参数，分别是msg.sender,_value, _data，类型分别为address，uint256以及bytes。那么我们是不是只能调用参数类型必须为这三个的方法呢？</p>
+  <p>当然不是。这里涉及到EVM在处理calldata的一个特性。</p>
+  <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112253243?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="">
+  <br>
+  <p>比如Sample1合约中有个test方法，这个方法中有三个参数，都是uint256类型的。而Sample2通过call调用了Sample1的test方法，这里传入了5个参数，同样是可以调用成功的。这是因为EVM在获取参数的时候没有参数个数校验的过程，因此取到前三个参数1,2,3之后，就把4,5给截断掉了，在编译和运行阶段都不会报错。</p>
+  <p>利用这个特性，我们其实有很多攻击面，比如我们可以通过logAndCall中的call注入来调用approve方法：</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112306591?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>这里的approve方法有两个参数，而且类型为address和uint256，所以我们是可以调用成功的。这样就可以将合约账户中的代币授权给我们自己的账户了。</p>
+  <p>&nbsp;</p>
+  <h2>0x03 深远的问题</h2>
+  <p>ERC223标准是为了解决ERC20中对智能合约账户进行转币场景缺失的问题，可以看作是ERC20标准的升级版。但是在很多ERC223标准的实现代码中就带入了call注入的问题：</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112318299?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>此外，很多合约在判断权限的时候会将合约自身的地址也纳入到白名单中：</p>
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180621112329233?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3UwMTE3MjE1MDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+  <p></p>
+  <p>如果这个合约中出现了call注入的问题，就可以绕过这种方式的权限判断，对合约造成一定的风险。</p>
+  <p>&nbsp;</p>
+  <h2>0x04 防护手段</h2>
+  <p>针对本文提到的这个风险，作为开发者来说，需要对ERC223的实现进行排查，不要引入call注入问题，如果非要执行回调，则可以指定方法选择器字符串，避免使用直接注入bytes的形式来进行call调用。</p>
+  <p>对于一些敏感操作或者权限判断函数，则不要轻易将合约自身的账户地址作为可信的地址。</p>
+  <br> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011721501/article/details/80757811,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/u011721501/article/details/80757811,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

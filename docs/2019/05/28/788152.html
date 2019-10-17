@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>深入理解 HBase Compaction 机制 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="深入理解 HBase Compaction 机制" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="HBase有很多话题可以聊，包括读写路径上涉及到的一些数据结构，性能优化以及优化读写做的一些设计等。今天要探讨的Compaction机制就是HBase架构上做的一个重要优化，其实关于HBase的架构设计、Flush&amp;Compaction等文章已经多不胜数了，本文也是主要参考HBase官网、社区的一些文章总结，从各个关键点进行总结，旨在为了帮助我们更加牢固的掌握Compaction机制。 为什么要执行 Compaction 熟悉HBase的同学应该知道，HBase是基于一种LSM-Tree（Log-Structured Merge Tree）存储模型设计的，写入路径上是先写入WAL（Write-Ahead-Log）即预写日志，再写入memstore缓存，满足一定条件后执行flush操作将缓存数据刷写到磁盘，生成一个HFile数据文件。随着数据不断写入，磁盘HFile文件就会越来越多，文件太多会影响HBase查询性能，主要体现在查询数据的io次数增加。为了优化查询性能，HBase会合并小的HFile以减少文件数量，这种合并HFile的操作称为Compaction，这也是为什么要进行Compaction的原因。 Compaction 作用 其实Compaction操作属于资源密集型操作特别是IO密集型，这点后面也会提及到，Compaction本质上其实就是牺牲了部分IO，以换取相对稳定的读取性能。 Compaction 分类 HBase Compaction分为两种：Minor Compaction 与 Major Compaction，通常我们简称为小合并、大合并。下面是一个简单示意图 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2q9R9a7SLbxnvKOmjMdOiazq7DmjwSyyNKEMVV31Hv9eZhlTChPfjA3Nw/640 这里有个习惯是在讲述Compaction操作时我们有时以StoreFile来表述HFile，StoreFile底层就是HFile，可以理解为是HFile的一种轻量级封装。 Minor Compaction：指选取一些小的、相邻的StoreFile将他们合并成一个更大的StoreFile，在这个过程中不会处理已经Deleted或Expired的Cell。一次 Minor Compaction 的结果是更少并且更大的StoreFile。 Major Compaction：指将所有的StoreFile合并成一个StoreFile，这个过程会清理三类没有意义的数据：被删除的数据、TTL过期数据、版本号超过设定版本号的数据。另外，一般情况下，major compaction时间会持续比较长，整个过程会消耗大量系统资源，对上层业务有比较大的影响。因此线上业务都会将关闭自动触发major compaction功能，改为手动在业务低峰期触发。 这里值得关注的一点是只有在触发执行major compaction后才会真正删除数据，包含写入的Delete数据、设置TTL的列族中已经过期的数据以及版本号过大的数据。 Compaction 触发条件 HBase触发Compaction的条件有三种：memstore Flush、后台线程周期性检查、手动触发。 memstore flush：可以说compaction的根源就在于flush，memstore 达到一定阈值或其他条件时就会触发flush刷写到磁盘生成HFile文件，正是因为HFile文件越来越多才需要compact。HBase每次flush之后，都会判断是否要进行compaction，一旦满足minor compaction或major compaction的条件便会触发执行。 后台线程周期性检查： 后台线程 CompactionChecker 会定期检查是否需要执行compaction，检查周期为hbase.server.thread.wakefrequency * hbase.server.compactchecker.interval.multiplier，这里主要考虑的是一段时间内没有写入请求仍然需要做compact检查。其中参数 hbase.server.thread.wakefrequency 默认值 10000 即 10s，是HBase服务端线程唤醒时间间隔，用于log roller、memstore flusher等操作周期性检查；参数 hbase.server.compactchecker.interval.multiplier 默认值1000，是compaction操作周期性检查乘数因子。10 * 1000 s 时间上约等于2hrs, 46mins, 40sec。 手动触发：是指通过HBase Shell、Master UI界面或者HBase API等任一种方式 执行 compact、major_compact等命令。 Compaction 参数解析 Major Compaction 参数 Major Compaction涉及的参数比较少，主要有大合并时间间隔与一个抖动参数因子，如下： 1.hbase.hregion.majorcompaction Major compaction周期性时间间隔，默认值604800000，单位ms。表示major compaction默认7天调度一次，HBase 0.96.x及之前默认为1天调度一次。设置为 0 时表示禁用自动触发major compaction。需要强调的是一般major compaction持续时间较长、系统资源消耗较大，对上层业务也有比较大的影响，一般生产环境下为了避免影响读写请求，会禁用自动触发major compaction。 2.hbase.hregion.majorcompaction.jitter Major compaction抖动参数，默认值0.5。这个参数是为了避免major compaction同时在各个regionserver上同时发生，避免此操作给集群带来很大压力。 这样节点major compaction就会在 + 或 - 两者乘积的时间范围内随机发生。 Minor Compaction 参数 Minor compaction涉及的参数比major compaction要多，各个参数的目标是为了选择合适的StoreFile，具体参数如下： 1.hbase.hstore.compaction.min 一次minor compaction最少合并的StoreFile数量，默认值 3。表示至少有3个符合条件的StoreFile,minor compaction才会启动。一般情况下不建议调整该参数。 如果要调整，不建议调小该参数，这样会带来更频繁的压缩，调大该参数的同时其他相关参数也应该做调整。早期参数名称为 hbase.hstore.compactionthreshold。 2.hbase.hstore.compaction.max 一次minor compaction最多合并的StoreFile数量，默认值 10。这个参数也是控制着一次压缩的时间。一般情况下不建议调整该参数。调大该值意味着一次compaction将会合并更多的StoreFile，压缩时间将会延长。 3.hbase.hstore.compaction.min.size 文件大小 &lt; 该参数值的StoreFile一定是适合进行minor compaction文件，默认值 128M（memstore flush size）。意味着小于该大小的StoreFile将会自动加入（automatic include）压缩队列。一般情况下不建议调整该参数。 但是，在write-heavy就是写压力非常大的场景，可能需要微调该参数、减小参数值，假如每次memstore大小达到1~2M时就会flush生成StoreFile，此时生成的每个StoreFile都会加入压缩队列，而且压缩生成的StoreFile仍然可能小于该配置值会再次加入压缩队列，这样将会导致压缩队列持续很长。 4.hbase.hstore.compaction.max.size 文件大小 &gt; 该参数值的StoreFile将会被排除，不会加入minor compaction，默认值Long.MAX_VALUE，表示没有什么限制。一般情况下也不建议调整该参数。 5.hbase.hstore.compaction.ratio 这个ratio参数的作用是判断文件大小 &gt; hbase.hstore.compaction.min.size的StoreFile是否也是适合进行minor compaction的，默认值1.2。更大的值将压缩产生更大的StoreFile，建议取值范围在1.0~1.4之间。大多数场景下也不建议调整该参数。 6.hbase.hstore.compaction.ratio.offpeak 此参数与compaction ratio参数含义相同，是在原有文件选择策略基础上增加了一个非高峰期的ratio控制，默认值5.0。这个参数受另外两个参数 hbase.offpeak.start.hour 与 hbase.offpeak.end.hour 控制，这两个参数值为[0, 23]的整数，用于定义非高峰期时间段，默认值均为-1表示禁用非高峰期ratio设置。 Compaction 线程池选择 HBase RegionServer内部专门有一个 CompactSplitThead 用于维护执行minor compaction、major compaction、split、merge操作的线程池。其中与compaction操作有关的线程池称为 largeCompactions（又称longCompactions） 与 smallCompactions（又称shortCompactions），前者用来处理大规模compaction，后者处理小规模compaction，线程池大小都默认为 1 即只分别提供了一个线程用于相应的compaction。 这里并不是major compaction就一定会交给largeCompactions线程池处理。关于HBase compaction分配给largeCompactions还是smallCompactions线程池受参数hbase.regionserver.thread.compaction.throttle控制，该参数默认值为2 * hbase.hstore.compaction.max * hbase.hregion.memstore.flush.size，如果flush size 大小是128M，该参数默认值就是2684354560 即2.5G。一次compaction的文件总大小如果超过该配置，就会分配给largeCompactions处理，否则分配给smallCompactions处理。 largeCompactions与smallCompactions的线程池大小可通过参数 hbase.regionserver.thread.compaction.large、hbase.regionserver.thread.compaction.small进行配置。对于compaction压力比较大的场景，如果要调大两种线程池的大小，建议调整范围在2~5之间，不建议设置过大否则可能会消费过多的服务端资源造成不良影响。 Compaction 策略介绍 HBase的compaction policy准确的说有4种，分别是RatioBasedCompactionPolicy、ExploringCompactionPolicy、FIFOCompactionPolicy 以及 StripeCompactionPolicy。其中，HBase使用的压缩策略主要就是前两种，HBase 0.96.x版本之前，默认的压缩策略是RatioBasedCompactionPolicy，HBase 0.96.x以及更新版本中，默认为ExploringCompactionPolicy。ExploringCompactionPoliy要比旧版本中的RatioBasedCompactionPolicy 性能更高，因此一般情况下也不建议改变默认配置。各种压缩策略之间更详细的区别不再介绍。 如果在HBase 0.96.x之后仍想配置RatioBasedCompactionPolicy策略，可以通过修改hbase-site.xml添加hbase.hstore.defaultengine.compactionpolicy.class配置项，配置值为RatioBasedCompactionPolicy，恢复默认配置只需移除该配置项即可。 Compaction 对读写请求的影响 存储上的写入放大 HBase Compaction会带来写入放大，特别是在写多读少的场景下，写入放大就会比较明显，下图简单示意了写入放大的效果。 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2qfx417fJ8QHmfn82uBhSS1fC4mDqSB67JHzGs6kyqHiccrQEu2ryPKJA/640 随着minor compaction以及major Compaction的发生，可以看到，这条数据被反复读取/写入了多次，这是导致写放大的一个关键原因，这里的写放大，涉及到网络IO与磁盘IO，因为数据在HDFS中默认有三个副本。 读路径上的延时毛刺 HBase执行compaction操作结果会使文件数基本稳定，进而IO Seek次数相对稳定，延迟就会稳定在一定范围。然而，compaction操作会带来很大的带宽压力以及短时间IO压力。因此compaction就是使用短时间的IO消耗以及带宽消耗换取后续查询的低延迟。这种短时间的压力就会造成读请求在延时上会有比较大的毛刺。下图是一张示意图，可见读请求延时有很大毛刺，但是总体趋势基本稳定。 图片来源：http://img0.tuicool.com/3m2aIjv.png 写请求上的短暂阻塞 Compaction对写请求也会有比较大的影响。主要体现在HFile比较多的场景下，HBase会限制写请求的速度。如果底层HFile数量超过hbase.hstore.blockingStoreFiles 配置值，默认10，flush操作将会受到阻塞，阻塞时间为hbase.hstore.blockingWaitTime，默认90000，即1.5分钟，在这段时间内，如果compaction操作使得HFile下降到blockingStoreFiles配置值，则停止阻塞。另外阻塞超过时间后，也会恢复执行flush操作。这样做可以有效地控制大量写请求的速度，但同时这也是影响写请求速度的主要原因之一。 Compaction 总结 HBase Compaction操作是为了数据读取做的优化，总的来说是以牺牲磁盘io来换取读性能的基本稳定。Compaction操作分为minor compaction与major compaction，其中major compaction消耗资源较大、对读写请求有一定影响，因此一般是禁用自动周期性执行而选择业务低峰期时手动执行。另外本文也重点介绍了操作相关的各个参数，帮助加强对Compaction的理解以及便于后续调参参考。 参考 http://hbase.apache.org/book.html#compaction https://mp.weixin.qq.com/s/ctnCm3uLCotgRpozbXmVMg https://blog.csdn.net/cangencong/article/details/72763265 https://blog.csdn.net/shenshouniu/article/details/83902291 欢迎关注微信公众号： 大数据手稿笔记，一起死磕大数据！" />
+<meta property="og:description" content="HBase有很多话题可以聊，包括读写路径上涉及到的一些数据结构，性能优化以及优化读写做的一些设计等。今天要探讨的Compaction机制就是HBase架构上做的一个重要优化，其实关于HBase的架构设计、Flush&amp;Compaction等文章已经多不胜数了，本文也是主要参考HBase官网、社区的一些文章总结，从各个关键点进行总结，旨在为了帮助我们更加牢固的掌握Compaction机制。 为什么要执行 Compaction 熟悉HBase的同学应该知道，HBase是基于一种LSM-Tree（Log-Structured Merge Tree）存储模型设计的，写入路径上是先写入WAL（Write-Ahead-Log）即预写日志，再写入memstore缓存，满足一定条件后执行flush操作将缓存数据刷写到磁盘，生成一个HFile数据文件。随着数据不断写入，磁盘HFile文件就会越来越多，文件太多会影响HBase查询性能，主要体现在查询数据的io次数增加。为了优化查询性能，HBase会合并小的HFile以减少文件数量，这种合并HFile的操作称为Compaction，这也是为什么要进行Compaction的原因。 Compaction 作用 其实Compaction操作属于资源密集型操作特别是IO密集型，这点后面也会提及到，Compaction本质上其实就是牺牲了部分IO，以换取相对稳定的读取性能。 Compaction 分类 HBase Compaction分为两种：Minor Compaction 与 Major Compaction，通常我们简称为小合并、大合并。下面是一个简单示意图 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2q9R9a7SLbxnvKOmjMdOiazq7DmjwSyyNKEMVV31Hv9eZhlTChPfjA3Nw/640 这里有个习惯是在讲述Compaction操作时我们有时以StoreFile来表述HFile，StoreFile底层就是HFile，可以理解为是HFile的一种轻量级封装。 Minor Compaction：指选取一些小的、相邻的StoreFile将他们合并成一个更大的StoreFile，在这个过程中不会处理已经Deleted或Expired的Cell。一次 Minor Compaction 的结果是更少并且更大的StoreFile。 Major Compaction：指将所有的StoreFile合并成一个StoreFile，这个过程会清理三类没有意义的数据：被删除的数据、TTL过期数据、版本号超过设定版本号的数据。另外，一般情况下，major compaction时间会持续比较长，整个过程会消耗大量系统资源，对上层业务有比较大的影响。因此线上业务都会将关闭自动触发major compaction功能，改为手动在业务低峰期触发。 这里值得关注的一点是只有在触发执行major compaction后才会真正删除数据，包含写入的Delete数据、设置TTL的列族中已经过期的数据以及版本号过大的数据。 Compaction 触发条件 HBase触发Compaction的条件有三种：memstore Flush、后台线程周期性检查、手动触发。 memstore flush：可以说compaction的根源就在于flush，memstore 达到一定阈值或其他条件时就会触发flush刷写到磁盘生成HFile文件，正是因为HFile文件越来越多才需要compact。HBase每次flush之后，都会判断是否要进行compaction，一旦满足minor compaction或major compaction的条件便会触发执行。 后台线程周期性检查： 后台线程 CompactionChecker 会定期检查是否需要执行compaction，检查周期为hbase.server.thread.wakefrequency * hbase.server.compactchecker.interval.multiplier，这里主要考虑的是一段时间内没有写入请求仍然需要做compact检查。其中参数 hbase.server.thread.wakefrequency 默认值 10000 即 10s，是HBase服务端线程唤醒时间间隔，用于log roller、memstore flusher等操作周期性检查；参数 hbase.server.compactchecker.interval.multiplier 默认值1000，是compaction操作周期性检查乘数因子。10 * 1000 s 时间上约等于2hrs, 46mins, 40sec。 手动触发：是指通过HBase Shell、Master UI界面或者HBase API等任一种方式 执行 compact、major_compact等命令。 Compaction 参数解析 Major Compaction 参数 Major Compaction涉及的参数比较少，主要有大合并时间间隔与一个抖动参数因子，如下： 1.hbase.hregion.majorcompaction Major compaction周期性时间间隔，默认值604800000，单位ms。表示major compaction默认7天调度一次，HBase 0.96.x及之前默认为1天调度一次。设置为 0 时表示禁用自动触发major compaction。需要强调的是一般major compaction持续时间较长、系统资源消耗较大，对上层业务也有比较大的影响，一般生产环境下为了避免影响读写请求，会禁用自动触发major compaction。 2.hbase.hregion.majorcompaction.jitter Major compaction抖动参数，默认值0.5。这个参数是为了避免major compaction同时在各个regionserver上同时发生，避免此操作给集群带来很大压力。 这样节点major compaction就会在 + 或 - 两者乘积的时间范围内随机发生。 Minor Compaction 参数 Minor compaction涉及的参数比major compaction要多，各个参数的目标是为了选择合适的StoreFile，具体参数如下： 1.hbase.hstore.compaction.min 一次minor compaction最少合并的StoreFile数量，默认值 3。表示至少有3个符合条件的StoreFile,minor compaction才会启动。一般情况下不建议调整该参数。 如果要调整，不建议调小该参数，这样会带来更频繁的压缩，调大该参数的同时其他相关参数也应该做调整。早期参数名称为 hbase.hstore.compactionthreshold。 2.hbase.hstore.compaction.max 一次minor compaction最多合并的StoreFile数量，默认值 10。这个参数也是控制着一次压缩的时间。一般情况下不建议调整该参数。调大该值意味着一次compaction将会合并更多的StoreFile，压缩时间将会延长。 3.hbase.hstore.compaction.min.size 文件大小 &lt; 该参数值的StoreFile一定是适合进行minor compaction文件，默认值 128M（memstore flush size）。意味着小于该大小的StoreFile将会自动加入（automatic include）压缩队列。一般情况下不建议调整该参数。 但是，在write-heavy就是写压力非常大的场景，可能需要微调该参数、减小参数值，假如每次memstore大小达到1~2M时就会flush生成StoreFile，此时生成的每个StoreFile都会加入压缩队列，而且压缩生成的StoreFile仍然可能小于该配置值会再次加入压缩队列，这样将会导致压缩队列持续很长。 4.hbase.hstore.compaction.max.size 文件大小 &gt; 该参数值的StoreFile将会被排除，不会加入minor compaction，默认值Long.MAX_VALUE，表示没有什么限制。一般情况下也不建议调整该参数。 5.hbase.hstore.compaction.ratio 这个ratio参数的作用是判断文件大小 &gt; hbase.hstore.compaction.min.size的StoreFile是否也是适合进行minor compaction的，默认值1.2。更大的值将压缩产生更大的StoreFile，建议取值范围在1.0~1.4之间。大多数场景下也不建议调整该参数。 6.hbase.hstore.compaction.ratio.offpeak 此参数与compaction ratio参数含义相同，是在原有文件选择策略基础上增加了一个非高峰期的ratio控制，默认值5.0。这个参数受另外两个参数 hbase.offpeak.start.hour 与 hbase.offpeak.end.hour 控制，这两个参数值为[0, 23]的整数，用于定义非高峰期时间段，默认值均为-1表示禁用非高峰期ratio设置。 Compaction 线程池选择 HBase RegionServer内部专门有一个 CompactSplitThead 用于维护执行minor compaction、major compaction、split、merge操作的线程池。其中与compaction操作有关的线程池称为 largeCompactions（又称longCompactions） 与 smallCompactions（又称shortCompactions），前者用来处理大规模compaction，后者处理小规模compaction，线程池大小都默认为 1 即只分别提供了一个线程用于相应的compaction。 这里并不是major compaction就一定会交给largeCompactions线程池处理。关于HBase compaction分配给largeCompactions还是smallCompactions线程池受参数hbase.regionserver.thread.compaction.throttle控制，该参数默认值为2 * hbase.hstore.compaction.max * hbase.hregion.memstore.flush.size，如果flush size 大小是128M，该参数默认值就是2684354560 即2.5G。一次compaction的文件总大小如果超过该配置，就会分配给largeCompactions处理，否则分配给smallCompactions处理。 largeCompactions与smallCompactions的线程池大小可通过参数 hbase.regionserver.thread.compaction.large、hbase.regionserver.thread.compaction.small进行配置。对于compaction压力比较大的场景，如果要调大两种线程池的大小，建议调整范围在2~5之间，不建议设置过大否则可能会消费过多的服务端资源造成不良影响。 Compaction 策略介绍 HBase的compaction policy准确的说有4种，分别是RatioBasedCompactionPolicy、ExploringCompactionPolicy、FIFOCompactionPolicy 以及 StripeCompactionPolicy。其中，HBase使用的压缩策略主要就是前两种，HBase 0.96.x版本之前，默认的压缩策略是RatioBasedCompactionPolicy，HBase 0.96.x以及更新版本中，默认为ExploringCompactionPolicy。ExploringCompactionPoliy要比旧版本中的RatioBasedCompactionPolicy 性能更高，因此一般情况下也不建议改变默认配置。各种压缩策略之间更详细的区别不再介绍。 如果在HBase 0.96.x之后仍想配置RatioBasedCompactionPolicy策略，可以通过修改hbase-site.xml添加hbase.hstore.defaultengine.compactionpolicy.class配置项，配置值为RatioBasedCompactionPolicy，恢复默认配置只需移除该配置项即可。 Compaction 对读写请求的影响 存储上的写入放大 HBase Compaction会带来写入放大，特别是在写多读少的场景下，写入放大就会比较明显，下图简单示意了写入放大的效果。 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2qfx417fJ8QHmfn82uBhSS1fC4mDqSB67JHzGs6kyqHiccrQEu2ryPKJA/640 随着minor compaction以及major Compaction的发生，可以看到，这条数据被反复读取/写入了多次，这是导致写放大的一个关键原因，这里的写放大，涉及到网络IO与磁盘IO，因为数据在HDFS中默认有三个副本。 读路径上的延时毛刺 HBase执行compaction操作结果会使文件数基本稳定，进而IO Seek次数相对稳定，延迟就会稳定在一定范围。然而，compaction操作会带来很大的带宽压力以及短时间IO压力。因此compaction就是使用短时间的IO消耗以及带宽消耗换取后续查询的低延迟。这种短时间的压力就会造成读请求在延时上会有比较大的毛刺。下图是一张示意图，可见读请求延时有很大毛刺，但是总体趋势基本稳定。 图片来源：http://img0.tuicool.com/3m2aIjv.png 写请求上的短暂阻塞 Compaction对写请求也会有比较大的影响。主要体现在HFile比较多的场景下，HBase会限制写请求的速度。如果底层HFile数量超过hbase.hstore.blockingStoreFiles 配置值，默认10，flush操作将会受到阻塞，阻塞时间为hbase.hstore.blockingWaitTime，默认90000，即1.5分钟，在这段时间内，如果compaction操作使得HFile下降到blockingStoreFiles配置值，则停止阻塞。另外阻塞超过时间后，也会恢复执行flush操作。这样做可以有效地控制大量写请求的速度，但同时这也是影响写请求速度的主要原因之一。 Compaction 总结 HBase Compaction操作是为了数据读取做的优化，总的来说是以牺牲磁盘io来换取读性能的基本稳定。Compaction操作分为minor compaction与major compaction，其中major compaction消耗资源较大、对读写请求有一定影响，因此一般是禁用自动周期性执行而选择业务低峰期时手动执行。另外本文也重点介绍了操作相关的各个参数，帮助加强对Compaction的理解以及便于后续调参参考。 参考 http://hbase.apache.org/book.html#compaction https://mp.weixin.qq.com/s/ctnCm3uLCotgRpozbXmVMg https://blog.csdn.net/cangencong/article/details/72763265 https://blog.csdn.net/shenshouniu/article/details/83902291 欢迎关注微信公众号： 大数据手稿笔记，一起死磕大数据！" />
+<link rel="canonical" href="https://uzzz.org/2019/05/28/788152.html" />
+<meta property="og:url" content="https://uzzz.org/2019/05/28/788152.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-05-28T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"HBase有很多话题可以聊，包括读写路径上涉及到的一些数据结构，性能优化以及优化读写做的一些设计等。今天要探讨的Compaction机制就是HBase架构上做的一个重要优化，其实关于HBase的架构设计、Flush&amp;Compaction等文章已经多不胜数了，本文也是主要参考HBase官网、社区的一些文章总结，从各个关键点进行总结，旨在为了帮助我们更加牢固的掌握Compaction机制。 为什么要执行 Compaction 熟悉HBase的同学应该知道，HBase是基于一种LSM-Tree（Log-Structured Merge Tree）存储模型设计的，写入路径上是先写入WAL（Write-Ahead-Log）即预写日志，再写入memstore缓存，满足一定条件后执行flush操作将缓存数据刷写到磁盘，生成一个HFile数据文件。随着数据不断写入，磁盘HFile文件就会越来越多，文件太多会影响HBase查询性能，主要体现在查询数据的io次数增加。为了优化查询性能，HBase会合并小的HFile以减少文件数量，这种合并HFile的操作称为Compaction，这也是为什么要进行Compaction的原因。 Compaction 作用 其实Compaction操作属于资源密集型操作特别是IO密集型，这点后面也会提及到，Compaction本质上其实就是牺牲了部分IO，以换取相对稳定的读取性能。 Compaction 分类 HBase Compaction分为两种：Minor Compaction 与 Major Compaction，通常我们简称为小合并、大合并。下面是一个简单示意图 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2q9R9a7SLbxnvKOmjMdOiazq7DmjwSyyNKEMVV31Hv9eZhlTChPfjA3Nw/640 这里有个习惯是在讲述Compaction操作时我们有时以StoreFile来表述HFile，StoreFile底层就是HFile，可以理解为是HFile的一种轻量级封装。 Minor Compaction：指选取一些小的、相邻的StoreFile将他们合并成一个更大的StoreFile，在这个过程中不会处理已经Deleted或Expired的Cell。一次 Minor Compaction 的结果是更少并且更大的StoreFile。 Major Compaction：指将所有的StoreFile合并成一个StoreFile，这个过程会清理三类没有意义的数据：被删除的数据、TTL过期数据、版本号超过设定版本号的数据。另外，一般情况下，major compaction时间会持续比较长，整个过程会消耗大量系统资源，对上层业务有比较大的影响。因此线上业务都会将关闭自动触发major compaction功能，改为手动在业务低峰期触发。 这里值得关注的一点是只有在触发执行major compaction后才会真正删除数据，包含写入的Delete数据、设置TTL的列族中已经过期的数据以及版本号过大的数据。 Compaction 触发条件 HBase触发Compaction的条件有三种：memstore Flush、后台线程周期性检查、手动触发。 memstore flush：可以说compaction的根源就在于flush，memstore 达到一定阈值或其他条件时就会触发flush刷写到磁盘生成HFile文件，正是因为HFile文件越来越多才需要compact。HBase每次flush之后，都会判断是否要进行compaction，一旦满足minor compaction或major compaction的条件便会触发执行。 后台线程周期性检查： 后台线程 CompactionChecker 会定期检查是否需要执行compaction，检查周期为hbase.server.thread.wakefrequency * hbase.server.compactchecker.interval.multiplier，这里主要考虑的是一段时间内没有写入请求仍然需要做compact检查。其中参数 hbase.server.thread.wakefrequency 默认值 10000 即 10s，是HBase服务端线程唤醒时间间隔，用于log roller、memstore flusher等操作周期性检查；参数 hbase.server.compactchecker.interval.multiplier 默认值1000，是compaction操作周期性检查乘数因子。10 * 1000 s 时间上约等于2hrs, 46mins, 40sec。 手动触发：是指通过HBase Shell、Master UI界面或者HBase API等任一种方式 执行 compact、major_compact等命令。 Compaction 参数解析 Major Compaction 参数 Major Compaction涉及的参数比较少，主要有大合并时间间隔与一个抖动参数因子，如下： 1.hbase.hregion.majorcompaction Major compaction周期性时间间隔，默认值604800000，单位ms。表示major compaction默认7天调度一次，HBase 0.96.x及之前默认为1天调度一次。设置为 0 时表示禁用自动触发major compaction。需要强调的是一般major compaction持续时间较长、系统资源消耗较大，对上层业务也有比较大的影响，一般生产环境下为了避免影响读写请求，会禁用自动触发major compaction。 2.hbase.hregion.majorcompaction.jitter Major compaction抖动参数，默认值0.5。这个参数是为了避免major compaction同时在各个regionserver上同时发生，避免此操作给集群带来很大压力。 这样节点major compaction就会在 + 或 - 两者乘积的时间范围内随机发生。 Minor Compaction 参数 Minor compaction涉及的参数比major compaction要多，各个参数的目标是为了选择合适的StoreFile，具体参数如下： 1.hbase.hstore.compaction.min 一次minor compaction最少合并的StoreFile数量，默认值 3。表示至少有3个符合条件的StoreFile,minor compaction才会启动。一般情况下不建议调整该参数。 如果要调整，不建议调小该参数，这样会带来更频繁的压缩，调大该参数的同时其他相关参数也应该做调整。早期参数名称为 hbase.hstore.compactionthreshold。 2.hbase.hstore.compaction.max 一次minor compaction最多合并的StoreFile数量，默认值 10。这个参数也是控制着一次压缩的时间。一般情况下不建议调整该参数。调大该值意味着一次compaction将会合并更多的StoreFile，压缩时间将会延长。 3.hbase.hstore.compaction.min.size 文件大小 &lt; 该参数值的StoreFile一定是适合进行minor compaction文件，默认值 128M（memstore flush size）。意味着小于该大小的StoreFile将会自动加入（automatic include）压缩队列。一般情况下不建议调整该参数。 但是，在write-heavy就是写压力非常大的场景，可能需要微调该参数、减小参数值，假如每次memstore大小达到1~2M时就会flush生成StoreFile，此时生成的每个StoreFile都会加入压缩队列，而且压缩生成的StoreFile仍然可能小于该配置值会再次加入压缩队列，这样将会导致压缩队列持续很长。 4.hbase.hstore.compaction.max.size 文件大小 &gt; 该参数值的StoreFile将会被排除，不会加入minor compaction，默认值Long.MAX_VALUE，表示没有什么限制。一般情况下也不建议调整该参数。 5.hbase.hstore.compaction.ratio 这个ratio参数的作用是判断文件大小 &gt; hbase.hstore.compaction.min.size的StoreFile是否也是适合进行minor compaction的，默认值1.2。更大的值将压缩产生更大的StoreFile，建议取值范围在1.0~1.4之间。大多数场景下也不建议调整该参数。 6.hbase.hstore.compaction.ratio.offpeak 此参数与compaction ratio参数含义相同，是在原有文件选择策略基础上增加了一个非高峰期的ratio控制，默认值5.0。这个参数受另外两个参数 hbase.offpeak.start.hour 与 hbase.offpeak.end.hour 控制，这两个参数值为[0, 23]的整数，用于定义非高峰期时间段，默认值均为-1表示禁用非高峰期ratio设置。 Compaction 线程池选择 HBase RegionServer内部专门有一个 CompactSplitThead 用于维护执行minor compaction、major compaction、split、merge操作的线程池。其中与compaction操作有关的线程池称为 largeCompactions（又称longCompactions） 与 smallCompactions（又称shortCompactions），前者用来处理大规模compaction，后者处理小规模compaction，线程池大小都默认为 1 即只分别提供了一个线程用于相应的compaction。 这里并不是major compaction就一定会交给largeCompactions线程池处理。关于HBase compaction分配给largeCompactions还是smallCompactions线程池受参数hbase.regionserver.thread.compaction.throttle控制，该参数默认值为2 * hbase.hstore.compaction.max * hbase.hregion.memstore.flush.size，如果flush size 大小是128M，该参数默认值就是2684354560 即2.5G。一次compaction的文件总大小如果超过该配置，就会分配给largeCompactions处理，否则分配给smallCompactions处理。 largeCompactions与smallCompactions的线程池大小可通过参数 hbase.regionserver.thread.compaction.large、hbase.regionserver.thread.compaction.small进行配置。对于compaction压力比较大的场景，如果要调大两种线程池的大小，建议调整范围在2~5之间，不建议设置过大否则可能会消费过多的服务端资源造成不良影响。 Compaction 策略介绍 HBase的compaction policy准确的说有4种，分别是RatioBasedCompactionPolicy、ExploringCompactionPolicy、FIFOCompactionPolicy 以及 StripeCompactionPolicy。其中，HBase使用的压缩策略主要就是前两种，HBase 0.96.x版本之前，默认的压缩策略是RatioBasedCompactionPolicy，HBase 0.96.x以及更新版本中，默认为ExploringCompactionPolicy。ExploringCompactionPoliy要比旧版本中的RatioBasedCompactionPolicy 性能更高，因此一般情况下也不建议改变默认配置。各种压缩策略之间更详细的区别不再介绍。 如果在HBase 0.96.x之后仍想配置RatioBasedCompactionPolicy策略，可以通过修改hbase-site.xml添加hbase.hstore.defaultengine.compactionpolicy.class配置项，配置值为RatioBasedCompactionPolicy，恢复默认配置只需移除该配置项即可。 Compaction 对读写请求的影响 存储上的写入放大 HBase Compaction会带来写入放大，特别是在写多读少的场景下，写入放大就会比较明显，下图简单示意了写入放大的效果。 图片来源：https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2qfx417fJ8QHmfn82uBhSS1fC4mDqSB67JHzGs6kyqHiccrQEu2ryPKJA/640 随着minor compaction以及major Compaction的发生，可以看到，这条数据被反复读取/写入了多次，这是导致写放大的一个关键原因，这里的写放大，涉及到网络IO与磁盘IO，因为数据在HDFS中默认有三个副本。 读路径上的延时毛刺 HBase执行compaction操作结果会使文件数基本稳定，进而IO Seek次数相对稳定，延迟就会稳定在一定范围。然而，compaction操作会带来很大的带宽压力以及短时间IO压力。因此compaction就是使用短时间的IO消耗以及带宽消耗换取后续查询的低延迟。这种短时间的压力就会造成读请求在延时上会有比较大的毛刺。下图是一张示意图，可见读请求延时有很大毛刺，但是总体趋势基本稳定。 图片来源：http://img0.tuicool.com/3m2aIjv.png 写请求上的短暂阻塞 Compaction对写请求也会有比较大的影响。主要体现在HFile比较多的场景下，HBase会限制写请求的速度。如果底层HFile数量超过hbase.hstore.blockingStoreFiles 配置值，默认10，flush操作将会受到阻塞，阻塞时间为hbase.hstore.blockingWaitTime，默认90000，即1.5分钟，在这段时间内，如果compaction操作使得HFile下降到blockingStoreFiles配置值，则停止阻塞。另外阻塞超过时间后，也会恢复执行flush操作。这样做可以有效地控制大量写请求的速度，但同时这也是影响写请求速度的主要原因之一。 Compaction 总结 HBase Compaction操作是为了数据读取做的优化，总的来说是以牺牲磁盘io来换取读性能的基本稳定。Compaction操作分为minor compaction与major compaction，其中major compaction消耗资源较大、对读写请求有一定影响，因此一般是禁用自动周期性执行而选择业务低峰期时手动执行。另外本文也重点介绍了操作相关的各个参数，帮助加强对Compaction的理解以及便于后续调参参考。 参考 http://hbase.apache.org/book.html#compaction https://mp.weixin.qq.com/s/ctnCm3uLCotgRpozbXmVMg https://blog.csdn.net/cangencong/article/details/72763265 https://blog.csdn.net/shenshouniu/article/details/83902291 欢迎关注微信公众号： 大数据手稿笔记，一起死磕大数据！","@type":"BlogPosting","url":"https://uzzz.org/2019/05/28/788152.html","headline":"深入理解 HBase Compaction 机制","dateModified":"2019-05-28T00:00:00+08:00","datePublished":"2019-05-28T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/05/28/788152.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>深入理解 HBase Compaction 机制</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post">  
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-light"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <p>HBase有很多话题可以聊，包括读写路径上涉及到的一些数据结构，性能优化以及优化读写做的一些设计等。今天要探讨的Compaction机制就是HBase架构上做的一个重要优化，其实关于HBase的架构设计、Flush&amp;Compaction等文章已经多不胜数了，本文也是主要参考HBase官网、社区的一些文章总结，从各个关键点进行总结，旨在为了帮助我们更加牢固的掌握Compaction机制。</p> 
+  <h3><a id="_Compaction_2"></a>为什么要执行 Compaction</h3> 
+  <p>熟悉HBase的同学应该知道，HBase是基于一种LSM-Tree（Log-Structured Merge Tree）存储模型设计的，写入路径上是先写入WAL（Write-Ahead-Log）即预写日志，再写入memstore缓存，满足一定条件后执行flush操作将缓存数据刷写到磁盘，生成一个HFile数据文件。随着数据不断写入，磁盘HFile文件就会越来越多，文件太多会影响HBase查询性能，主要体现在查询数据的io次数增加。为了优化查询性能，HBase会合并小的HFile以减少文件数量，这种合并HFile的操作称为Compaction，这也是为什么要进行Compaction的原因。</p> 
+  <h3><a id="Compaction__6"></a>Compaction 作用</h3> 
+  <p>其实Compaction操作属于资源密集型操作特别是IO密集型，这点后面也会提及到，Compaction本质上其实就是牺牲了部分IO，以换取相对稳定的读取性能。</p> 
+  <h3><a id="Compaction__10"></a>Compaction 分类</h3> 
+  <p>HBase Compaction分为两种：Minor Compaction 与 Major Compaction，通常我们简称为小合并、大合并。下面是一个简单示意图</p> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190528091325628.png#pic_center" alt=""><br> 图片来源：<a href="https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2q9R9a7SLbxnvKOmjMdOiazq7DmjwSyyNKEMVV31Hv9eZhlTChPfjA3Nw/640" rel="nofollow">https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2q9R9a7SLbxnvKOmjMdOiazq7DmjwSyyNKEMVV31Hv9eZhlTChPfjA3Nw/640</a></p> 
+  <p>这里有个习惯是在讲述Compaction操作时我们有时以StoreFile来表述HFile，StoreFile底层就是HFile，可以理解为是HFile的一种轻量级封装。</p> 
+  <p>Minor Compaction：指选取一些小的、相邻的StoreFile将他们合并成一个更大的StoreFile，在这个过程中不会处理已经Deleted或Expired的Cell。一次 Minor Compaction 的结果是更少并且更大的StoreFile。</p> 
+  <p>Major Compaction：指将所有的StoreFile合并成一个StoreFile，这个过程会清理三类没有意义的数据：被删除的数据、TTL过期数据、版本号超过设定版本号的数据。另外，一般情况下，major compaction时间会持续比较长，整个过程会消耗大量系统资源，对上层业务有比较大的影响。因此线上业务都会将关闭自动触发major compaction功能，改为手动在业务低峰期触发。</p> 
+  <p>这里值得关注的一点是只有在触发执行major compaction后才会真正删除数据，包含写入的Delete数据、设置TTL的列族中已经过期的数据以及版本号过大的数据。</p> 
+  <h3><a id="Compaction__27"></a>Compaction 触发条件</h3> 
+  <p>HBase触发Compaction的条件有三种：memstore Flush、后台线程周期性检查、手动触发。</p> 
+  <ul> 
+   <li> <p>memstore flush：可以说compaction的根源就在于flush，memstore 达到一定阈值或其他条件时就会触发flush刷写到磁盘生成HFile文件，正是因为HFile文件越来越多才需要compact。HBase每次flush之后，都会判断是否要进行compaction，一旦满足minor compaction或major compaction的条件便会触发执行。</p> </li> 
+   <li> <p>后台线程周期性检查： 后台线程 CompactionChecker 会定期检查是否需要执行compaction，检查周期为<code>hbase.server.thread.wakefrequency</code> * <code>hbase.server.compactchecker.interval.multiplier</code>，这里主要考虑的是一段时间内没有写入请求仍然需要做compact检查。其中参数 hbase.server.thread.wakefrequency 默认值 10000 即 10s，是HBase服务端线程唤醒时间间隔，用于log roller、memstore flusher等操作周期性检查；参数 hbase.server.compactchecker.interval.multiplier 默认值1000，是compaction操作周期性检查乘数因子。10 * 1000 s 时间上约等于2hrs, 46mins, 40sec。</p> </li> 
+   <li> <p>手动触发：是指通过HBase Shell、Master UI界面或者HBase API等任一种方式 执行 compact、major_compact等命令。</p> </li> 
+  </ul> 
+  <h3><a id="Compaction__37"></a>Compaction 参数解析</h3> 
+  <h6><a id="Major_Compaction__39"></a>Major Compaction 参数</h6> 
+  <p>Major Compaction涉及的参数比较少，主要有大合并时间间隔与一个抖动参数因子，如下：</p> 
+  <p><code>1.hbase.hregion.majorcompaction</code></p> 
+  <p>Major compaction周期性时间间隔，默认值604800000，单位ms。表示major compaction默认7天调度一次，HBase 0.96.x及之前默认为1天调度一次。设置为 0 时表示禁用自动触发major compaction。需要强调的是一般major compaction持续时间较长、系统资源消耗较大，对上层业务也有比较大的影响，一般生产环境下为了避免影响读写请求，会禁用自动触发major compaction。</p> 
+  <p><code>2.hbase.hregion.majorcompaction.jitter</code></p> 
+  <p>Major compaction抖动参数，默认值0.5。这个参数是为了避免major compaction同时在各个regionserver上同时发生，避免此操作给集群带来很大压力。 这样节点major compaction就会在 + 或 - 两者乘积的时间范围内随机发生。</p> 
+  <h6><a id="Minor_Compaction__53"></a>Minor Compaction 参数</h6> 
+  <p>Minor compaction涉及的参数比major compaction要多，各个参数的目标是为了选择合适的StoreFile，具体参数如下：</p> 
+  <p><code>1.hbase.hstore.compaction.min</code></p> 
+  <p>一次minor compaction最少合并的StoreFile数量，默认值 3。表示至少有3个符合条件的StoreFile,minor compaction才会启动。一般情况下不建议调整该参数。</p> 
+  <p>如果要调整，不建议调小该参数，这样会带来更频繁的压缩，调大该参数的同时其他相关参数也应该做调整。早期参数名称为 <code>hbase.hstore.compactionthreshold</code>。</p> 
+  <p><code>2.hbase.hstore.compaction.max</code></p> 
+  <p>一次minor compaction最多合并的StoreFile数量，默认值 10。这个参数也是控制着一次压缩的时间。一般情况下不建议调整该参数。调大该值意味着一次compaction将会合并更多的StoreFile，压缩时间将会延长。</p> 
+  <p><code>3.hbase.hstore.compaction.min.size</code></p> 
+  <p>文件大小 &lt; 该参数值的StoreFile一定是适合进行minor compaction文件，默认值 128M（memstore flush size）。意味着小于该大小的StoreFile将会自动加入（automatic include）压缩队列。一般情况下不建议调整该参数。</p> 
+  <p>但是，在write-heavy就是写压力非常大的场景，可能需要微调该参数、减小参数值，假如每次memstore大小达到1~2M时就会flush生成StoreFile，此时生成的每个StoreFile都会加入压缩队列，而且压缩生成的StoreFile仍然可能小于该配置值会再次加入压缩队列，这样将会导致压缩队列持续很长。</p> 
+  <p><code>4.hbase.hstore.compaction.max.size</code></p> 
+  <p>文件大小 &gt; 该参数值的StoreFile将会被排除，不会加入minor compaction，默认值Long.MAX_VALUE，表示没有什么限制。一般情况下也不建议调整该参数。</p> 
+  <p><code>5.hbase.hstore.compaction.ratio</code></p> 
+  <p>这个ratio参数的作用是判断文件大小 &gt; hbase.hstore.compaction.min.size的StoreFile是否也是适合进行minor compaction的，默认值1.2。更大的值将压缩产生更大的StoreFile，建议取值范围在1.0~1.4之间。大多数场景下也不建议调整该参数。</p> 
+  <p><code>6.hbase.hstore.compaction.ratio.offpeak</code></p> 
+  <p>此参数与compaction ratio参数含义相同，是在原有文件选择策略基础上增加了一个非高峰期的ratio控制，默认值5.0。这个参数受另外两个参数 <code>hbase.offpeak.start.hour</code> 与 <code>hbase.offpeak.end.hour</code> 控制，这两个参数值为[0, 23]的整数，用于定义非高峰期时间段，默认值均为-1表示禁用非高峰期ratio设置。</p> 
+  <h3><a id="Compaction__85"></a>Compaction 线程池选择</h3> 
+  <p>HBase RegionServer内部专门有一个 CompactSplitThead 用于维护执行minor compaction、major compaction、split、merge操作的线程池。其中与compaction操作有关的线程池称为 <strong>largeCompactions</strong>（又称longCompactions） 与 <strong>smallCompactions</strong>（又称shortCompactions），前者用来处理大规模compaction，后者处理小规模compaction，线程池大小都默认为 1 即只分别提供了一个线程用于相应的compaction。<br> 这里并不是major compaction就一定会交给largeCompactions线程池处理。关于HBase compaction分配给largeCompactions还是smallCompactions线程池受参数<code>hbase.regionserver.thread.compaction.throttle</code>控制，该参数默认值为2 * hbase.hstore.compaction.max * hbase.hregion.memstore.flush.size，如果flush size 大小是128M，该参数默认值就是2684354560 即2.5G。一次compaction的文件总大小如果超过该配置，就会分配给largeCompactions处理，否则分配给smallCompactions处理。</p> 
+  <p>largeCompactions与smallCompactions的线程池大小可通过参数 <code>hbase.regionserver.thread.compaction.large</code>、<code>hbase.regionserver.thread.compaction.small</code>进行配置。对于compaction压力比较大的场景，如果要调大两种线程池的大小，建议调整范围在2~5之间，不建议设置过大否则可能会消费过多的服务端资源造成不良影响。</p> 
+  <h3><a id="Compaction__93"></a>Compaction 策略介绍</h3> 
+  <p>HBase的compaction policy准确的说有4种，分别是<strong>RatioBasedCompactionPolicy</strong>、<strong>ExploringCompactionPolicy</strong>、FIFOCompactionPolicy 以及 StripeCompactionPolicy。其中，HBase使用的压缩策略主要就是前两种，HBase 0.96.x版本之前，默认的压缩策略是RatioBasedCompactionPolicy，HBase 0.96.x以及更新版本中，默认为ExploringCompactionPolicy。ExploringCompactionPoliy要比旧版本中的RatioBasedCompactionPolicy 性能更高，因此一般情况下也不建议改变默认配置。各种压缩策略之间更详细的区别不再介绍。</p> 
+  <p>如果在HBase 0.96.x之后仍想配置RatioBasedCompactionPolicy策略，可以通过修改hbase-site.xml添加hbase.hstore.defaultengine.compactionpolicy.class配置项，配置值为RatioBasedCompactionPolicy，恢复默认配置只需移除该配置项即可。</p> 
+  <h3><a id="Compaction__100"></a>Compaction 对读写请求的影响</h3> 
+  <h6><a id="_103"></a>存储上的写入放大</h6> 
+  <p>HBase Compaction会带来写入放大，特别是在写多读少的场景下，写入放大就会比较明显，下图简单示意了写入放大的效果。<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190528091806822.png#pic_center" alt=""><br> 图片来源：<a href="https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2qfx417fJ8QHmfn82uBhSS1fC4mDqSB67JHzGs6kyqHiccrQEu2ryPKJA/640" rel="nofollow">https://mmbiz.qpic.cn/mmbiz_png/licvxR9ib9M6D6sDjXPZxHR1ic4LDKyicf2qfx417fJ8QHmfn82uBhSS1fC4mDqSB67JHzGs6kyqHiccrQEu2ryPKJA/640</a></p> 
+  <p>随着minor compaction以及major Compaction的发生，可以看到，这条数据被反复读取/写入了多次，这是导致写放大的一个关键原因，这里的写放大，涉及到网络IO与磁盘IO，因为数据在HDFS中默认有三个副本。</p> 
+  <h6><a id="_111"></a>读路径上的延时毛刺</h6> 
+  <p>HBase执行compaction操作结果会使文件数基本稳定，进而IO Seek次数相对稳定，延迟就会稳定在一定范围。然而，compaction操作会带来很大的带宽压力以及短时间IO压力。因此compaction就是使用短时间的IO消耗以及带宽消耗换取后续查询的低延迟。这种短时间的压力就会造成读请求在延时上会有比较大的毛刺。下图是一张示意图，可见读请求延时有很大毛刺，但是总体趋势基本稳定。<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190528091852202.png#pic_center" alt=""><br> 图片来源：<a href="http://img0.tuicool.com/3m2aIjv.png" rel="nofollow">http://img0.tuicool.com/3m2aIjv.png</a></p> 
+  <h6><a id="_118"></a>写请求上的短暂阻塞</h6> 
+  <p>Compaction对写请求也会有比较大的影响。主要体现在HFile比较多的场景下，HBase会限制写请求的速度。如果底层HFile数量超过<code>hbase.hstore.blockingStoreFiles</code> 配置值，默认10，flush操作将会受到阻塞，阻塞时间为<code>hbase.hstore.blockingWaitTime</code>，默认90000，即1.5分钟，在这段时间内，如果compaction操作使得HFile下降到blockingStoreFiles配置值，则停止阻塞。另外阻塞超过时间后，也会恢复执行flush操作。这样做可以有效地控制大量写请求的速度，但同时这也是影响写请求速度的主要原因之一。</p> 
+  <h3><a id="Compaction__123"></a>Compaction 总结</h3> 
+  <p>HBase Compaction操作是为了数据读取做的优化，总的来说是以牺牲磁盘io来换取读性能的基本稳定。Compaction操作分为minor compaction与major compaction，其中major compaction消耗资源较大、对读写请求有一定影响，因此一般是禁用自动周期性执行而选择业务低峰期时手动执行。另外本文也重点介绍了操作相关的各个参数，帮助加强对Compaction的理解以及便于后续调参参考。</p> 
+  <h6><a id="_129"></a>参考</h6> 
+  <p><a href="http://hbase.apache.org/book.html#compaction" rel="nofollow">http://hbase.apache.org/book.html#compaction</a></p> 
+  <p><a href="https://mp.weixin.qq.com/s/ctnCm3uLCotgRpozbXmVMg" rel="nofollow">https://mp.weixin.qq.com/s/ctnCm3uLCotgRpozbXmVMg</a></p> 
+  <p><a href="https://blog.csdn.net/cangencong/article/details/72763265" rel="nofollow">https://blog.csdn.net/cangencong/article/details/72763265</a></p> 
+  <p><a href="https://blog.csdn.net/shenshouniu/article/details/83902291" rel="nofollow">https://blog.csdn.net/shenshouniu/article/details/83902291</a></p> 
+  <hr> 
+  <p>欢迎关注微信公众号： <strong>大数据手稿笔记</strong>，一起死磕大数据！<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190511093755982.png" alt="" width="210" height="210"></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>BCOS中节点是怎么读到系统合约的？ | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="BCOS中节点是怎么读到系统合约的？" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="我们以节点去读节点列表为例： 首先来读NodeAction.sol，这个合约在用户部署系统合约的时候就已经部署在区块链上了 struct NodeInfo{ string id; string ip; uint port; NodeType category; string desc; // 节点描述 string CAhash; // 节点机构证书哈希 string agencyinfo; uint idx; uint blocknumber; } mapping(string =&gt;NodeInfo) m_nodedata; string[] m_nodeids; 这里定义了一个包含节点信息的结构体和建立了一个全局的键值对映射，这是一个散列表，m_nodedata是全局维护的一个节点列表，所有的节点信息都将加入到这个列表中，然后这个合约还定义了几个函数，包括updateIdx，registerNode，getNode，getNodeIdx等，这些函数提供了对节点列表进行基本的管理功能，实际上就是对这个全局的m_nodedata表进行修改，可是这个列表只是存在与系统合约当中，节点是怎么从合约中读到这个列表的呢？ 现在回到BCOS源码： 在nodeconnparamsManager.cpp中，我们可以找到一个节点配置管理类NodeConnParamsManager，这个类中有一个函数callSysContractData，这个函数可以取得合约中的节点列表，在一系列比较之后维护一个该类中的节点列表_mNodeConnParams，这个列表决定了该节点将和那些节点连成链，现在我们只关心它是怎么取得合约中的节点列表的。 可以看到_pSysContractApi-&gt;getAllNode(blockNum, vNodeParams); 这个getAllNode函数通过块号，读取到了合约中节点列表的数据，将之保存在vNodeParams，那么我们就追踪这个函数。 在nodeconnparamsManagerAPI.h中找到_pSysContractApi的定义 std::shared_ptr&lt;SystemContractApi&gt; _pSysContractApi = nullptr; 这是一个智能指针，指向一个类型为SystemContractApi的对象（当然在这里时为nullptr） 在systemcontractapi.h找到这个SystemContractApi类，果然发现了： virtual void getAllNode(int /*&lt;0 代表最新块*/ ,std::vector&lt; NodeConnParams&gt; &amp; ) { } 在这里这个函数并未实现，在systemcontract.cpp中找到这个函数的实现： { DEV_READ_GUARDED(m_locknode)//锁 { DEV_READ_GUARDED(m_blocklock)//锁 { LOG(TRACE)&lt;&lt; &quot;SystemContract::getAllNode _blocknumber=&quot; &lt;&lt;_blocknumber &lt;&lt;&quot;,m_tempblock.info().number()=&quot;&lt;&lt;m_tempblock-&gt;info().number()&lt;&lt;&quot;,m_nodelist.size()=&quot;&lt;&lt;m_nodelist.size(); if( (_blocknumber == m_tempblock-&gt;info().number()) || ( _blocknumber &lt; 0 ) ) { for( size_t i=0;i&lt;m_nodelist.size();i++) { _nodevector.push_back(m_nodelist[i]); } return; } } //下面指定块号获取节点列表 tempGetAllNode(_blocknumber,_nodevector); } }//function 好啦，现在来分析这个函数，上面和线程有关的操作不去管它，重点看if后面的部分，发现用的俩个变量m_tempblock和m_nodelist不知道是啥，找到定义去看一下： std::shared_ptr&lt;Block&gt; m_tempblock std::vector&lt; NodeConnParams&gt; m_nodelist; m_tempblock是一个指向Block类型的指针，m_tempblock-&gt;info().number()的意思就是从所指的那个区块中找到区块头的信息，然后从区块头中返回区块号，m_nodelist就是一个在SystemContract类中维护的节点列表。 那么这个意思就是首先去判断传进来的块号是不是小于零，或者当前块，是的话就不用那么麻烦的去读了，直接把类里维护的那个列表传出去就行，这里可见这个类的列表是实时更新的。 我们可以找到更新的函数updateNode（） this-&gt;getNodeFromContract(std::bind(&amp;SystemContract::call,this,std::placeholders::_1,std::placeholders::_2,std::placeholders::_3),m_nodelist); 实际从中合约获得节点列表靠的是getNodeFromContract函数，不过不着急，殊途同归，我们继续往下看。 如果传入的块号不是最新块号的话，就调用 tempGetAllNode(_blocknumber,_nodevector); ... Block tempblock = m_client-&gt;block(_blocknumber ); tempblock.setEvmEventLog(true); auto tempCall = [&amp;](Address const&amp; _to, bytes const&amp; _inputdata,bool ) { ExecutionResult ret; try { srand((unsigned)utcTime()); struct timeval tv; gettimeofday(&amp;tv, NULL); u256 nonce = (u256)(rand() + rand() + tv.tv_usec); u256 gas = tempblock.gasLimitRemaining() ; u256 gasPrice = 100000000; Transaction t(0, gasPrice, gas, _to, _inputdata, nonce); t.forceSender(m_god); ret = tempblock.execute(m_client-&gt;blockChain().lastHashes(), t, Permanence::Reverted); } catch (...) { // TODO: Some sort of notification of failure. LOG(ERROR) &lt;&lt; boost::current_exception_diagnostic_information() &lt;&lt; endl; LOG(INFO) &lt;&lt; &quot;SystemContract::tempCall call Fail!&quot; &lt;&lt; toString(_inputdata); } return ret; }; getNodeFromContract(tempCall,_nodelist); ... 分析这个函数 首先通过块号去读块，怎么读的不管它，反正是读到了保存在tempblock 里，接着设置了一个匿名函数，这个函数的实质是生成了一个交易，运行这个交易可以得到一个回复，由刚才得到的那个块tempblock来执行这个交易，这个函数执行了吗？没执行，它实际上是一个交易的模板，作为getNodeFromContract的参数使用 终于到了getNodeFromContract函数了 Address nodeAction; nodeAction = getRoute(&quot;NodeAction&quot;); 首先得到了我们最先分析的NodeAction.sol合约的地址 bytes inputdata1 = abiIn(&quot;getNodeIdsLength()&quot;); ExecutionResult ret1 = _call(nodeAction, inputdata1,false); u256 nodeidslen = abiOut&lt;u256&gt;(ret1.output); 通过刚才的函数模板来生成和执行交易，交易的内容是要调用nodeAction 这个地址下的getNodeIdsLength函数，得到返回值变成节点读的懂的格式放在nodeidslen 中 for ( size_t i = 0; i &lt; (size_t)nodeidslen; i++) { //第一步，先拿到nodeid bytes inputdata2 = abiIn(&quot;getNodeId(uint256)&quot;, (u256)i); ExecutionResult ret2 = _call(nodeAction, inputdata2,false); string nodeid = abiOut&lt;string&gt;(ret2.output); //第二步，拿到node 信息 string ip = &quot;&quot;; //节点ip u256 port = 0; //节点端口 u256 category = 0; //NodeConnParams应该定义枚举 string desc; //节点描述 string cahash = &quot;&quot;; //节点的机构信息 string agencyinfo=&quot;&quot;; u256 idx; //节点索引 u256 blocknumber; bytes inputdata4 = abiIn(&quot;getNode(string)&quot;,nodeid); ExecutionResult ret4 = _call(nodeAction, inputdata4,false); bytesConstRef o(&amp;(ret4.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o,ip,port,category,desc,cahash,agencyinfo,blocknumber); bytes inputdata5 = abiIn(&quot;getNodeIdx(string)&quot;,nodeid); ExecutionResult ret5 = _call(nodeAction, inputdata5,false); bytesConstRef o2(&amp;(ret5.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o2,idx); NodeConnParams nodeconnparam; nodeconnparam._sNodeId = nodeid; nodeconnparam._sAgencyInfo = agencyinfo; nodeconnparam._sIP = ip; nodeconnparam._iPort =(int) port; nodeconnparam._iIdentityType = (int)category; nodeconnparam._sAgencyDesc=desc; nodeconnparam._sCAhash=cahash; nodeconnparam._iIdx=idx; _nodelist.push_back(nodeconnparam); LOG(TRACE) &lt;&lt; &quot;SystemContract::updateNode Node[&quot; &lt;&lt; i &lt;&lt; &quot;]=&quot; &lt;&lt; nodeconnparam.toString(); }//for //排序连续 sort(_nodelist.begin(), _nodelist.end(), [&amp;](const NodeConnParams &amp; a, const NodeConnParams &amp; b) { return a._iIdx &lt; b._iIdx; }); 后面的代码都是一样的逻辑，通过调用部署好的智能合约，获得在合约中维护的那个节点列表，然后转化成节点看的懂的格式，保存在相应的节点参数类中，此时节点内部就有了一个和智能合约上一模一样的节点列表。 最后留一个问题： 节点读合约和我们使用web3.js读合约和明显是不同的，那么块内部究竟是怎么执行交易的呢，下一步就是研究一下tempblock.execute函数到底是个啥。 阅读更多" />
+<meta property="og:description" content="我们以节点去读节点列表为例： 首先来读NodeAction.sol，这个合约在用户部署系统合约的时候就已经部署在区块链上了 struct NodeInfo{ string id; string ip; uint port; NodeType category; string desc; // 节点描述 string CAhash; // 节点机构证书哈希 string agencyinfo; uint idx; uint blocknumber; } mapping(string =&gt;NodeInfo) m_nodedata; string[] m_nodeids; 这里定义了一个包含节点信息的结构体和建立了一个全局的键值对映射，这是一个散列表，m_nodedata是全局维护的一个节点列表，所有的节点信息都将加入到这个列表中，然后这个合约还定义了几个函数，包括updateIdx，registerNode，getNode，getNodeIdx等，这些函数提供了对节点列表进行基本的管理功能，实际上就是对这个全局的m_nodedata表进行修改，可是这个列表只是存在与系统合约当中，节点是怎么从合约中读到这个列表的呢？ 现在回到BCOS源码： 在nodeconnparamsManager.cpp中，我们可以找到一个节点配置管理类NodeConnParamsManager，这个类中有一个函数callSysContractData，这个函数可以取得合约中的节点列表，在一系列比较之后维护一个该类中的节点列表_mNodeConnParams，这个列表决定了该节点将和那些节点连成链，现在我们只关心它是怎么取得合约中的节点列表的。 可以看到_pSysContractApi-&gt;getAllNode(blockNum, vNodeParams); 这个getAllNode函数通过块号，读取到了合约中节点列表的数据，将之保存在vNodeParams，那么我们就追踪这个函数。 在nodeconnparamsManagerAPI.h中找到_pSysContractApi的定义 std::shared_ptr&lt;SystemContractApi&gt; _pSysContractApi = nullptr; 这是一个智能指针，指向一个类型为SystemContractApi的对象（当然在这里时为nullptr） 在systemcontractapi.h找到这个SystemContractApi类，果然发现了： virtual void getAllNode(int /*&lt;0 代表最新块*/ ,std::vector&lt; NodeConnParams&gt; &amp; ) { } 在这里这个函数并未实现，在systemcontract.cpp中找到这个函数的实现： { DEV_READ_GUARDED(m_locknode)//锁 { DEV_READ_GUARDED(m_blocklock)//锁 { LOG(TRACE)&lt;&lt; &quot;SystemContract::getAllNode _blocknumber=&quot; &lt;&lt;_blocknumber &lt;&lt;&quot;,m_tempblock.info().number()=&quot;&lt;&lt;m_tempblock-&gt;info().number()&lt;&lt;&quot;,m_nodelist.size()=&quot;&lt;&lt;m_nodelist.size(); if( (_blocknumber == m_tempblock-&gt;info().number()) || ( _blocknumber &lt; 0 ) ) { for( size_t i=0;i&lt;m_nodelist.size();i++) { _nodevector.push_back(m_nodelist[i]); } return; } } //下面指定块号获取节点列表 tempGetAllNode(_blocknumber,_nodevector); } }//function 好啦，现在来分析这个函数，上面和线程有关的操作不去管它，重点看if后面的部分，发现用的俩个变量m_tempblock和m_nodelist不知道是啥，找到定义去看一下： std::shared_ptr&lt;Block&gt; m_tempblock std::vector&lt; NodeConnParams&gt; m_nodelist; m_tempblock是一个指向Block类型的指针，m_tempblock-&gt;info().number()的意思就是从所指的那个区块中找到区块头的信息，然后从区块头中返回区块号，m_nodelist就是一个在SystemContract类中维护的节点列表。 那么这个意思就是首先去判断传进来的块号是不是小于零，或者当前块，是的话就不用那么麻烦的去读了，直接把类里维护的那个列表传出去就行，这里可见这个类的列表是实时更新的。 我们可以找到更新的函数updateNode（） this-&gt;getNodeFromContract(std::bind(&amp;SystemContract::call,this,std::placeholders::_1,std::placeholders::_2,std::placeholders::_3),m_nodelist); 实际从中合约获得节点列表靠的是getNodeFromContract函数，不过不着急，殊途同归，我们继续往下看。 如果传入的块号不是最新块号的话，就调用 tempGetAllNode(_blocknumber,_nodevector); ... Block tempblock = m_client-&gt;block(_blocknumber ); tempblock.setEvmEventLog(true); auto tempCall = [&amp;](Address const&amp; _to, bytes const&amp; _inputdata,bool ) { ExecutionResult ret; try { srand((unsigned)utcTime()); struct timeval tv; gettimeofday(&amp;tv, NULL); u256 nonce = (u256)(rand() + rand() + tv.tv_usec); u256 gas = tempblock.gasLimitRemaining() ; u256 gasPrice = 100000000; Transaction t(0, gasPrice, gas, _to, _inputdata, nonce); t.forceSender(m_god); ret = tempblock.execute(m_client-&gt;blockChain().lastHashes(), t, Permanence::Reverted); } catch (...) { // TODO: Some sort of notification of failure. LOG(ERROR) &lt;&lt; boost::current_exception_diagnostic_information() &lt;&lt; endl; LOG(INFO) &lt;&lt; &quot;SystemContract::tempCall call Fail!&quot; &lt;&lt; toString(_inputdata); } return ret; }; getNodeFromContract(tempCall,_nodelist); ... 分析这个函数 首先通过块号去读块，怎么读的不管它，反正是读到了保存在tempblock 里，接着设置了一个匿名函数，这个函数的实质是生成了一个交易，运行这个交易可以得到一个回复，由刚才得到的那个块tempblock来执行这个交易，这个函数执行了吗？没执行，它实际上是一个交易的模板，作为getNodeFromContract的参数使用 终于到了getNodeFromContract函数了 Address nodeAction; nodeAction = getRoute(&quot;NodeAction&quot;); 首先得到了我们最先分析的NodeAction.sol合约的地址 bytes inputdata1 = abiIn(&quot;getNodeIdsLength()&quot;); ExecutionResult ret1 = _call(nodeAction, inputdata1,false); u256 nodeidslen = abiOut&lt;u256&gt;(ret1.output); 通过刚才的函数模板来生成和执行交易，交易的内容是要调用nodeAction 这个地址下的getNodeIdsLength函数，得到返回值变成节点读的懂的格式放在nodeidslen 中 for ( size_t i = 0; i &lt; (size_t)nodeidslen; i++) { //第一步，先拿到nodeid bytes inputdata2 = abiIn(&quot;getNodeId(uint256)&quot;, (u256)i); ExecutionResult ret2 = _call(nodeAction, inputdata2,false); string nodeid = abiOut&lt;string&gt;(ret2.output); //第二步，拿到node 信息 string ip = &quot;&quot;; //节点ip u256 port = 0; //节点端口 u256 category = 0; //NodeConnParams应该定义枚举 string desc; //节点描述 string cahash = &quot;&quot;; //节点的机构信息 string agencyinfo=&quot;&quot;; u256 idx; //节点索引 u256 blocknumber; bytes inputdata4 = abiIn(&quot;getNode(string)&quot;,nodeid); ExecutionResult ret4 = _call(nodeAction, inputdata4,false); bytesConstRef o(&amp;(ret4.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o,ip,port,category,desc,cahash,agencyinfo,blocknumber); bytes inputdata5 = abiIn(&quot;getNodeIdx(string)&quot;,nodeid); ExecutionResult ret5 = _call(nodeAction, inputdata5,false); bytesConstRef o2(&amp;(ret5.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o2,idx); NodeConnParams nodeconnparam; nodeconnparam._sNodeId = nodeid; nodeconnparam._sAgencyInfo = agencyinfo; nodeconnparam._sIP = ip; nodeconnparam._iPort =(int) port; nodeconnparam._iIdentityType = (int)category; nodeconnparam._sAgencyDesc=desc; nodeconnparam._sCAhash=cahash; nodeconnparam._iIdx=idx; _nodelist.push_back(nodeconnparam); LOG(TRACE) &lt;&lt; &quot;SystemContract::updateNode Node[&quot; &lt;&lt; i &lt;&lt; &quot;]=&quot; &lt;&lt; nodeconnparam.toString(); }//for //排序连续 sort(_nodelist.begin(), _nodelist.end(), [&amp;](const NodeConnParams &amp; a, const NodeConnParams &amp; b) { return a._iIdx &lt; b._iIdx; }); 后面的代码都是一样的逻辑，通过调用部署好的智能合约，获得在合约中维护的那个节点列表，然后转化成节点看的懂的格式，保存在相应的节点参数类中，此时节点内部就有了一个和智能合约上一模一样的节点列表。 最后留一个问题： 节点读合约和我们使用web3.js读合约和明显是不同的，那么块内部究竟是怎么执行交易的呢，下一步就是研究一下tempblock.execute函数到底是个啥。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/12/28/b8f0b6b9d8b52b3cf44b60d3b682a89f.html" />
+<meta property="og:url" content="https://uzzz.org/2017/12/28/b8f0b6b9d8b52b3cf44b60d3b682a89f.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-12-28T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"我们以节点去读节点列表为例： 首先来读NodeAction.sol，这个合约在用户部署系统合约的时候就已经部署在区块链上了 struct NodeInfo{ string id; string ip; uint port; NodeType category; string desc; // 节点描述 string CAhash; // 节点机构证书哈希 string agencyinfo; uint idx; uint blocknumber; } mapping(string =&gt;NodeInfo) m_nodedata; string[] m_nodeids; 这里定义了一个包含节点信息的结构体和建立了一个全局的键值对映射，这是一个散列表，m_nodedata是全局维护的一个节点列表，所有的节点信息都将加入到这个列表中，然后这个合约还定义了几个函数，包括updateIdx，registerNode，getNode，getNodeIdx等，这些函数提供了对节点列表进行基本的管理功能，实际上就是对这个全局的m_nodedata表进行修改，可是这个列表只是存在与系统合约当中，节点是怎么从合约中读到这个列表的呢？ 现在回到BCOS源码： 在nodeconnparamsManager.cpp中，我们可以找到一个节点配置管理类NodeConnParamsManager，这个类中有一个函数callSysContractData，这个函数可以取得合约中的节点列表，在一系列比较之后维护一个该类中的节点列表_mNodeConnParams，这个列表决定了该节点将和那些节点连成链，现在我们只关心它是怎么取得合约中的节点列表的。 可以看到_pSysContractApi-&gt;getAllNode(blockNum, vNodeParams); 这个getAllNode函数通过块号，读取到了合约中节点列表的数据，将之保存在vNodeParams，那么我们就追踪这个函数。 在nodeconnparamsManagerAPI.h中找到_pSysContractApi的定义 std::shared_ptr&lt;SystemContractApi&gt; _pSysContractApi = nullptr; 这是一个智能指针，指向一个类型为SystemContractApi的对象（当然在这里时为nullptr） 在systemcontractapi.h找到这个SystemContractApi类，果然发现了： virtual void getAllNode(int /*&lt;0 代表最新块*/ ,std::vector&lt; NodeConnParams&gt; &amp; ) { } 在这里这个函数并未实现，在systemcontract.cpp中找到这个函数的实现： { DEV_READ_GUARDED(m_locknode)//锁 { DEV_READ_GUARDED(m_blocklock)//锁 { LOG(TRACE)&lt;&lt; &quot;SystemContract::getAllNode _blocknumber=&quot; &lt;&lt;_blocknumber &lt;&lt;&quot;,m_tempblock.info().number()=&quot;&lt;&lt;m_tempblock-&gt;info().number()&lt;&lt;&quot;,m_nodelist.size()=&quot;&lt;&lt;m_nodelist.size(); if( (_blocknumber == m_tempblock-&gt;info().number()) || ( _blocknumber &lt; 0 ) ) { for( size_t i=0;i&lt;m_nodelist.size();i++) { _nodevector.push_back(m_nodelist[i]); } return; } } //下面指定块号获取节点列表 tempGetAllNode(_blocknumber,_nodevector); } }//function 好啦，现在来分析这个函数，上面和线程有关的操作不去管它，重点看if后面的部分，发现用的俩个变量m_tempblock和m_nodelist不知道是啥，找到定义去看一下： std::shared_ptr&lt;Block&gt; m_tempblock std::vector&lt; NodeConnParams&gt; m_nodelist; m_tempblock是一个指向Block类型的指针，m_tempblock-&gt;info().number()的意思就是从所指的那个区块中找到区块头的信息，然后从区块头中返回区块号，m_nodelist就是一个在SystemContract类中维护的节点列表。 那么这个意思就是首先去判断传进来的块号是不是小于零，或者当前块，是的话就不用那么麻烦的去读了，直接把类里维护的那个列表传出去就行，这里可见这个类的列表是实时更新的。 我们可以找到更新的函数updateNode（） this-&gt;getNodeFromContract(std::bind(&amp;SystemContract::call,this,std::placeholders::_1,std::placeholders::_2,std::placeholders::_3),m_nodelist); 实际从中合约获得节点列表靠的是getNodeFromContract函数，不过不着急，殊途同归，我们继续往下看。 如果传入的块号不是最新块号的话，就调用 tempGetAllNode(_blocknumber,_nodevector); ... Block tempblock = m_client-&gt;block(_blocknumber ); tempblock.setEvmEventLog(true); auto tempCall = [&amp;](Address const&amp; _to, bytes const&amp; _inputdata,bool ) { ExecutionResult ret; try { srand((unsigned)utcTime()); struct timeval tv; gettimeofday(&amp;tv, NULL); u256 nonce = (u256)(rand() + rand() + tv.tv_usec); u256 gas = tempblock.gasLimitRemaining() ; u256 gasPrice = 100000000; Transaction t(0, gasPrice, gas, _to, _inputdata, nonce); t.forceSender(m_god); ret = tempblock.execute(m_client-&gt;blockChain().lastHashes(), t, Permanence::Reverted); } catch (...) { // TODO: Some sort of notification of failure. LOG(ERROR) &lt;&lt; boost::current_exception_diagnostic_information() &lt;&lt; endl; LOG(INFO) &lt;&lt; &quot;SystemContract::tempCall call Fail!&quot; &lt;&lt; toString(_inputdata); } return ret; }; getNodeFromContract(tempCall,_nodelist); ... 分析这个函数 首先通过块号去读块，怎么读的不管它，反正是读到了保存在tempblock 里，接着设置了一个匿名函数，这个函数的实质是生成了一个交易，运行这个交易可以得到一个回复，由刚才得到的那个块tempblock来执行这个交易，这个函数执行了吗？没执行，它实际上是一个交易的模板，作为getNodeFromContract的参数使用 终于到了getNodeFromContract函数了 Address nodeAction; nodeAction = getRoute(&quot;NodeAction&quot;); 首先得到了我们最先分析的NodeAction.sol合约的地址 bytes inputdata1 = abiIn(&quot;getNodeIdsLength()&quot;); ExecutionResult ret1 = _call(nodeAction, inputdata1,false); u256 nodeidslen = abiOut&lt;u256&gt;(ret1.output); 通过刚才的函数模板来生成和执行交易，交易的内容是要调用nodeAction 这个地址下的getNodeIdsLength函数，得到返回值变成节点读的懂的格式放在nodeidslen 中 for ( size_t i = 0; i &lt; (size_t)nodeidslen; i++) { //第一步，先拿到nodeid bytes inputdata2 = abiIn(&quot;getNodeId(uint256)&quot;, (u256)i); ExecutionResult ret2 = _call(nodeAction, inputdata2,false); string nodeid = abiOut&lt;string&gt;(ret2.output); //第二步，拿到node 信息 string ip = &quot;&quot;; //节点ip u256 port = 0; //节点端口 u256 category = 0; //NodeConnParams应该定义枚举 string desc; //节点描述 string cahash = &quot;&quot;; //节点的机构信息 string agencyinfo=&quot;&quot;; u256 idx; //节点索引 u256 blocknumber; bytes inputdata4 = abiIn(&quot;getNode(string)&quot;,nodeid); ExecutionResult ret4 = _call(nodeAction, inputdata4,false); bytesConstRef o(&amp;(ret4.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o,ip,port,category,desc,cahash,agencyinfo,blocknumber); bytes inputdata5 = abiIn(&quot;getNodeIdx(string)&quot;,nodeid); ExecutionResult ret5 = _call(nodeAction, inputdata5,false); bytesConstRef o2(&amp;(ret5.output)); dev::eth::ContractABI().abiOut&lt;&gt;(o2,idx); NodeConnParams nodeconnparam; nodeconnparam._sNodeId = nodeid; nodeconnparam._sAgencyInfo = agencyinfo; nodeconnparam._sIP = ip; nodeconnparam._iPort =(int) port; nodeconnparam._iIdentityType = (int)category; nodeconnparam._sAgencyDesc=desc; nodeconnparam._sCAhash=cahash; nodeconnparam._iIdx=idx; _nodelist.push_back(nodeconnparam); LOG(TRACE) &lt;&lt; &quot;SystemContract::updateNode Node[&quot; &lt;&lt; i &lt;&lt; &quot;]=&quot; &lt;&lt; nodeconnparam.toString(); }//for //排序连续 sort(_nodelist.begin(), _nodelist.end(), [&amp;](const NodeConnParams &amp; a, const NodeConnParams &amp; b) { return a._iIdx &lt; b._iIdx; }); 后面的代码都是一样的逻辑，通过调用部署好的智能合约，获得在合约中维护的那个节点列表，然后转化成节点看的懂的格式，保存在相应的节点参数类中，此时节点内部就有了一个和智能合约上一模一样的节点列表。 最后留一个问题： 节点读合约和我们使用web3.js读合约和明显是不同的，那么块内部究竟是怎么执行交易的呢，下一步就是研究一下tempblock.execute函数到底是个啥。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/12/28/b8f0b6b9d8b52b3cf44b60d3b682a89f.html","headline":"BCOS中节点是怎么读到系统合约的？","dateModified":"2017-12-28T00:00:00+08:00","datePublished":"2017-12-28T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/12/28/b8f0b6b9d8b52b3cf44b60d3b682a89f.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>BCOS中节点是怎么读到系统合约的？</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>我们以节点去读节点列表为例： <br> 首先来读NodeAction.sol，这个合约在用户部署系统合约的时候就已经部署在区块链上了</p> 
+  <pre class="prettyprint"><code class=" hljs cs"> <span class="hljs-keyword">struct</span> NodeInfo{
+        <span class="hljs-keyword">string</span>  id;       
+        <span class="hljs-keyword">string</span>    ip;            
+        <span class="hljs-keyword">uint</span>    port;
+        NodeType    category;
+        <span class="hljs-keyword">string</span>  desc;    <span class="hljs-comment">// 节点描述 </span>
+        <span class="hljs-keyword">string</span>  CAhash;  <span class="hljs-comment">// 节点机构证书哈希</span>
+        <span class="hljs-keyword">string</span> agencyinfo;   
+        <span class="hljs-keyword">uint</span>    idx;
+        <span class="hljs-keyword">uint</span>    blocknumber;
+    }
+
+    mapping(<span class="hljs-keyword">string</span> =&gt;NodeInfo) m_nodedata;
+    <span class="hljs-keyword">string</span>[] m_nodeids;</code></pre> 
+  <p>这里定义了一个包含节点信息的结构体和建立了一个全局的键值对映射，这是一个散列表，m_nodedata是全局维护的一个节点列表，所有的节点信息都将加入到这个列表中，然后这个合约还定义了几个函数，包括updateIdx，registerNode，getNode，getNodeIdx等，这些函数提供了对节点列表进行基本的管理功能，实际上就是对这个全局的m_nodedata表进行修改，可是这个列表只是存在与系统合约当中，节点是怎么从合约中读到这个列表的呢？ <br> 现在回到BCOS源码： <br> 在nodeconnparamsManager.cpp中，我们可以找到一个节点配置管理类NodeConnParamsManager，这个类中有一个函数callSysContractData，这个函数可以取得合约中的节点列表，在一系列比较之后维护一个该类中的节点列表_mNodeConnParams，这个列表决定了该节点将和那些节点连成链，现在我们只关心它是怎么取得合约中的节点列表的。 <br> 可以看到<code>_pSysContractApi-&gt;getAllNode(blockNum, vNodeParams);</code> 这个getAllNode函数通过块号，读取到了合约中节点列表的数据，将之保存在vNodeParams，那么我们就追踪这个函数。 <br> 在nodeconnparamsManagerAPI.h中找到_pSysContractApi的定义</p> 
+  <pre class="prettyprint"><code class=" hljs ruby"><span class="hljs-symbol">std:</span><span class="hljs-symbol">:shared_ptr&lt;SystemContractApi&gt;</span> _pSysContractApi = nullptr;</code></pre> 
+  <p>这是一个智能指针，指向一个类型为SystemContractApi的对象（当然在这里时为nullptr） <br> 在systemcontractapi.h找到这个SystemContractApi类，果然发现了：</p> 
+  <pre class="prettyprint"><code class=" hljs cpp">         <span class="hljs-keyword">virtual</span> <span class="hljs-keyword">void</span> getAllNode(<span class="hljs-keyword">int</span>  <span class="hljs-comment">/*&lt;0 代表最新块*/</span> ,<span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt; NodeConnParams&gt;</span> &amp; )
+            {        
+            }
+</code></pre> 
+  <p>在这里这个函数并未实现，在systemcontract.cpp中找到这个函数的实现：</p> 
+  <pre class="prettyprint"><code class=" hljs mel">            {
+                DEV_READ_GUARDED(m_locknode)<span class="hljs-comment">//锁</span>
+                {
+
+                    DEV_READ_GUARDED(m_blocklock)<span class="hljs-comment">//锁</span>
+                    {
+                     LOG(TRACE)&lt;&lt; <span class="hljs-string">"SystemContract::getAllNode _blocknumber="</span>  &lt;&lt;_blocknumber
+                     &lt;&lt;<span class="hljs-string">",m_tempblock.info().number()="</span>&lt;&lt;m_tempblock-&gt;info().number()&lt;&lt;<span class="hljs-string">",m_nodelist.size()="</span>&lt;&lt;m_nodelist.<span class="hljs-keyword">size</span>();
+
+                        <span class="hljs-keyword">if</span>( (_blocknumber == m_tempblock-&gt;info().number()) || ( _blocknumber &lt; <span class="hljs-number">0</span> )  )
+                        {
+                            <span class="hljs-keyword">for</span>( size_t i=<span class="hljs-number">0</span>;i&lt;m_nodelist.<span class="hljs-keyword">size</span>();i++)
+                            {
+                                _nodevector.push_back(m_nodelist[i]);
+                            }
+                            <span class="hljs-keyword">return</span>;
+                        }
+                    }
+                    <span class="hljs-comment">//下面指定块号获取节点列表</span>
+                    tempGetAllNode(_blocknumber,_nodevector);
+                }
+            }<span class="hljs-comment">//function</span>
+</code></pre> 
+  <p>好啦，现在来分析这个函数，上面和线程有关的操作不去管它，重点看if后面的部分，发现用的俩个变量m_tempblock和m_nodelist不知道是啥，找到定义去看一下：</p> 
+  <pre class="prettyprint"><code class=" hljs cpp"><span class="hljs-built_in">std</span>::<span class="hljs-built_in">shared_ptr</span>&lt;Block&gt; m_tempblock
+<span class="hljs-built_in">std</span>::<span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt; NodeConnParams&gt;</span> m_nodelist;</code></pre> 
+  <p>m_tempblock是一个指向Block类型的指针，m_tempblock-&gt;info().number()的意思就是从所指的那个区块中找到区块头的信息，然后从区块头中返回区块号，m_nodelist就是一个在SystemContract类中维护的节点列表。 <br> 那么这个意思就是首先去判断传进来的块号是不是小于零，或者当前块，是的话就不用那么麻烦的去读了，直接把类里维护的那个列表传出去就行，这里可见这个类的列表是实时更新的。 <br> 我们可以找到更新的函数updateNode（）</p> 
+  <pre class="prettyprint"><code class=" hljs lasso">this<span class="hljs-subst">-&gt;</span>getNodeFromContract(std<span class="hljs-tag">::bind</span>(<span class="hljs-subst">&amp;</span>SystemContract<span class="hljs-tag">::call</span>,this,std<span class="hljs-tag">::placeholders</span><span class="hljs-tag">::_1</span>,std<span class="hljs-tag">::placeholders</span><span class="hljs-tag">::_2</span>,std<span class="hljs-tag">::placeholders</span><span class="hljs-tag">::_3</span>),m_nodelist);</code></pre> 
+  <p>实际从中合约获得节点列表靠的是getNodeFromContract函数，不过不着急，殊途同归，我们继续往下看。 <br> 如果传入的块号不是最新块号的话，就调用 <br> <code>tempGetAllNode(_blocknumber,_nodevector);</code></p> 
+  <pre class="prettyprint"><code class=" hljs r"><span class="hljs-keyword">...</span>
+ Block tempblock = m_client-&gt;block(_blocknumber ); 
+    tempblock.setEvmEventLog(true);
+
+
+    auto tempCall = [&amp;](Address const&amp; _to, bytes const&amp; _inputdata,bool ) {
+        ExecutionResult ret;
+        <span class="hljs-keyword">try</span>
+        {
+            srand((unsigned)utcTime());
+            struct timeval tv;
+            gettimeofday(&amp;tv, <span class="hljs-literal">NULL</span>);
+            u256 nonce = (u256)(rand() + rand() + tv.tv_usec);
+
+            u256 gas = tempblock.gasLimitRemaining() ;
+            u256 gasPrice = <span class="hljs-number">100000000</span>;
+            Transaction t(<span class="hljs-number">0</span>, gasPrice, gas, _to, _inputdata, nonce);
+            t.forceSender(m_god);
+            ret = tempblock.execute(m_client-&gt;blockChain().lastHashes(), t, Permanence::Reverted);
+
+        }
+        catch (<span class="hljs-keyword">...</span>)
+        {
+            // TODO: Some sort of notification of failure.
+            LOG(ERROR) &lt;&lt; boost::current_exception_diagnostic_information() &lt;&lt; endl;
+            LOG(INFO) &lt;&lt; <span class="hljs-string">"SystemContract::tempCall call Fail!"</span> &lt;&lt; toString(_inputdata);
+        }
+        <span class="hljs-keyword">return</span> ret;
+    };
+
+    getNodeFromContract(tempCall,_nodelist);
+    <span class="hljs-keyword">...</span></code></pre> 
+  <p>分析这个函数 <br> 首先通过块号去读块，怎么读的不管它，反正是读到了保存在tempblock 里，接着设置了一个匿名函数，这个函数的实质是生成了一个交易，运行这个交易可以得到一个回复，由刚才得到的那个块tempblock来执行这个交易，这个函数执行了吗？没执行，它实际上是一个交易的模板，作为getNodeFromContract的参数使用 <br> 终于到了getNodeFromContract函数了</p> 
+  <pre class="prettyprint"><code class=" hljs bash">Address nodeAction;
+nodeAction = getRoute(<span class="hljs-string">"NodeAction"</span>);</code></pre> 
+  <p>首先得到了我们最先分析的NodeAction.sol合约的地址</p> 
+  <pre class="prettyprint"><code class=" hljs lasso"> <span class="hljs-built_in">bytes</span> inputdata1 <span class="hljs-subst">=</span> abiIn(<span class="hljs-string">"getNodeIdsLength()"</span>);
+ ExecutionResult ret1 <span class="hljs-subst">=</span> _call(nodeAction, inputdata1,<span class="hljs-literal">false</span>);
+ u256 nodeidslen <span class="hljs-subst">=</span> abiOut<span class="hljs-subst">&lt;</span>u256<span class="hljs-subst">&gt;</span>(ret1<span class="hljs-built_in">.</span>output);</code></pre> 
+  <p>通过刚才的函数模板来生成和执行交易，交易的内容是要调用nodeAction 这个地址下的getNodeIdsLength函数，得到返回值变成节点读的懂的格式放在nodeidslen 中</p> 
+  <pre class="prettyprint"><code class=" hljs lasso"> for ( size_t i <span class="hljs-subst">=</span> <span class="hljs-number">0</span>; i <span class="hljs-subst">&lt;</span> (size_t)nodeidslen; i<span class="hljs-subst">++</span>)
+        {
+            <span class="hljs-comment">//第一步，先拿到nodeid</span>
+            <span class="hljs-built_in">bytes</span> inputdata2 <span class="hljs-subst">=</span> abiIn(<span class="hljs-string">"getNodeId(uint256)"</span>, (u256)i);
+            ExecutionResult ret2 <span class="hljs-subst">=</span> _call(nodeAction, inputdata2,<span class="hljs-literal">false</span>);
+            <span class="hljs-built_in">string</span> nodeid <span class="hljs-subst">=</span> abiOut<span class="hljs-subst">&lt;</span><span class="hljs-built_in">string</span><span class="hljs-subst">&gt;</span>(ret2<span class="hljs-built_in">.</span>output);
+
+            <span class="hljs-comment">//第二步，拿到node 信息 </span>
+
+            <span class="hljs-built_in">string</span> ip <span class="hljs-subst">=</span> <span class="hljs-string">""</span>;     <span class="hljs-comment">//节点ip</span>
+            u256 port <span class="hljs-subst">=</span> <span class="hljs-number">0</span>;              <span class="hljs-comment">//节点端口</span>
+            u256 category <span class="hljs-subst">=</span> <span class="hljs-number">0</span>;  <span class="hljs-comment">//NodeConnParams应该定义枚举</span>
+            <span class="hljs-built_in">string</span> desc;    <span class="hljs-comment">//节点描述</span>
+            <span class="hljs-built_in">string</span> cahash <span class="hljs-subst">=</span> <span class="hljs-string">""</span>; <span class="hljs-comment">//节点的机构信息</span>
+            <span class="hljs-built_in">string</span> agencyinfo<span class="hljs-subst">=</span><span class="hljs-string">""</span>;
+            u256 idx;                   <span class="hljs-comment">//节点索引</span>
+            u256 blocknumber;
+
+            <span class="hljs-built_in">bytes</span> inputdata4 <span class="hljs-subst">=</span> abiIn(<span class="hljs-string">"getNode(string)"</span>,nodeid);
+            ExecutionResult ret4 <span class="hljs-subst">=</span> _call(nodeAction, inputdata4,<span class="hljs-literal">false</span>);
+
+            bytesConstRef o(<span class="hljs-subst">&amp;</span>(ret4<span class="hljs-built_in">.</span>output));
+            dev<span class="hljs-tag">::eth</span><span class="hljs-tag">::ContractABI</span>()<span class="hljs-built_in">.</span>abiOut<span class="hljs-subst">&lt;&gt;</span>(o,ip,port,category,desc,cahash,agencyinfo,blocknumber);
+
+            <span class="hljs-built_in">bytes</span> inputdata5 <span class="hljs-subst">=</span> abiIn(<span class="hljs-string">"getNodeIdx(string)"</span>,nodeid);
+            ExecutionResult ret5 <span class="hljs-subst">=</span> _call(nodeAction, inputdata5,<span class="hljs-literal">false</span>);
+
+            bytesConstRef o2(<span class="hljs-subst">&amp;</span>(ret5<span class="hljs-built_in">.</span>output));
+            dev<span class="hljs-tag">::eth</span><span class="hljs-tag">::ContractABI</span>()<span class="hljs-built_in">.</span>abiOut<span class="hljs-subst">&lt;&gt;</span>(o2,idx);
+
+
+            NodeConnParams nodeconnparam;
+            nodeconnparam<span class="hljs-built_in">.</span>_sNodeId <span class="hljs-subst">=</span> nodeid;
+            nodeconnparam<span class="hljs-built_in">.</span>_sAgencyInfo <span class="hljs-subst">=</span> agencyinfo;
+            nodeconnparam<span class="hljs-built_in">.</span>_sIP <span class="hljs-subst">=</span> ip;
+            nodeconnparam<span class="hljs-built_in">.</span>_iPort <span class="hljs-subst">=</span>(int) port;
+            nodeconnparam<span class="hljs-built_in">.</span>_iIdentityType <span class="hljs-subst">=</span> (int)category;
+            nodeconnparam<span class="hljs-built_in">.</span>_sAgencyDesc<span class="hljs-subst">=</span>desc;
+            nodeconnparam<span class="hljs-built_in">.</span>_sCAhash<span class="hljs-subst">=</span>cahash;
+            nodeconnparam<span class="hljs-built_in">.</span>_iIdx<span class="hljs-subst">=</span>idx;
+
+            _nodelist<span class="hljs-built_in">.</span>push_back(nodeconnparam);
+            <span class="hljs-keyword">LOG</span>(TRACE) <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">"SystemContract::updateNode Node["</span> <span class="hljs-subst">&lt;&lt;</span> i <span class="hljs-subst">&lt;&lt;</span> <span class="hljs-string">"]="</span> <span class="hljs-subst">&lt;&lt;</span> nodeconnparam<span class="hljs-built_in">.</span>toString();
+
+        }<span class="hljs-comment">//for</span>
+
+        <span class="hljs-comment">//排序连续</span>
+        sort(_nodelist<span class="hljs-built_in">.</span>begin(), _nodelist<span class="hljs-built_in">.</span>end(), <span class="hljs-preprocessor">[</span><span class="hljs-subst">&amp;</span><span class="hljs-preprocessor">]</span><span class="hljs-markup">(const NodeConnParams &amp; a, const NodeConnParams &amp; b) { return a._iIdx &lt; b._iIdx; });</span></code></pre> 
+  <p>后面的代码都是一样的逻辑，通过调用部署好的智能合约，获得在合约中维护的那个节点列表，然后转化成节点看的懂的格式，保存在相应的节点参数类中，此时节点内部就有了一个和智能合约上一模一样的节点列表。 <br> 最后留一个问题： <br> 节点读合约和我们使用web3.js读合约和明显是不同的，那么块内部究竟是怎么执行交易的呢，下一步就是研究一下tempblock.execute函数到底是个啥。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/wzc2608/article/details/78919054,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/wzc2608/article/details/78919054,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

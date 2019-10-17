@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>fabric源码解析19——ACC的安装 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="fabric源码解析19——ACC的安装" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="fabric源码解析19——ACC的安装 概述 peer chaincode install命令执行安装命令，命令定义在peer/chaincode/install.go中，这也是安装的起点。另外需要注意的一点是，这个命令是在peer node start，peer channel create，peer channel join命令依次执行完毕之后所执行的，即执行install之时，peer结点的基本的模块（包括SCC）都已初始化完毕，channel也已经建立。 根据实例化的原则，从install_test.go中提取了一句实际的install命令：peer chaincode install -n example02 -p github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02 -v anotherversion，本篇将以此句命令为例子。安装的ACC是example02，存在于-p指定的路径下，版本是anotherversion。-l没有给，自然取默认的值，为go语言。 install安装使用的chaincode数据有两种形式，一种是CDS，一种是chaincode package/signpackage命令形成的ccpackfile包。因为我们没有涉及过这两个命令，因此这里我们只以前一种CDS数据包为例，叙述安装过程。 ACC的安装涉及的图为ACC-Install-DataConstuct.PNG。下文中提及“图中”字眼，均指此图中。 install能够识别的flag有-l，-c，-p，-n，-v。其中-c不常用，其指定的是ACC所要执行的函数和函数的参数，一般在具体执行的时候，如查询或转账的时候再给定。 install最终所要做的事情，就是将example02的源码包放入docker容器的安装目录中。 生成签名申请包 以peer/chaincode/install.go的chaincodeInstall(...)为起点（设定ccpackfile==&quot;&quot;），根据ACC-Install-DataConstuct.PNG，从左上角最原始的命令行数据开始，一路组装数据，至形成下面中路的SignedProposal，然后将SignedProposal通过cf.EndorserClient.ProcessProposal(...)提交至Endorser服务端。这个冗长的过程，不再详述。只提以下几点： chainID在SignedProposal中为空，即安装所要做的仅仅是把example02的压缩包放入容器的指定目录中而已，只有部署的时候才需要指定部署到哪条链上。 CDS的CodePackage是example02的代码压缩包，包括源码和依赖的第三方库。因为SCC的一切都在项目编译时编进peer中了，所以SCC的CDS的这个字段就是空的，而ACC需要安装源码，所以这个字段在正常的情况下肯定不是空的。这个压缩包最终是在core/chaincode/platforms/golang/platform.go中的GetDeploymentPayload()打包的。该程序的复杂之处在于除了要打包example02源码，还要打包example02直接依赖的但go标准库未提供的第三方库，还要打包这些第三方库直接依赖但go标准库未提供的第三方库（即example02间接依赖但go标准库未提供第三方库）。这么做的目的就是让一个chaincode无论放到哪个容器里，不会因为缺少某个第三方库而编译失败。同时这个打包的过程也就要求我们在执行example02安装的时候，要实现把其依赖的第三方库事先放到GOPATH/src下。 txid是在/protos/utils/proputils.go中的CreateChaincodeProposalWithTransient(...)中计算出来的，是哈希（peer结点的MSPID+证书元数据+随机数nonce）的值，可以就把它当作一个唯一的字符串，不用太过深究。 处理安装申请 Endorser服务端在core/endorser/endorser.go中的ProcessProposal(...)处，接收到来自Endorser客户端发送的SignedProposal和一个之后一路都会用到的Context上下文ctxt。 在ProcessProposal(...)中，从开始至var txsim ledger.TxSimulator处，之上的代码全部是一边解压抽取SignedProposal中的数据，一边验证这些数据。至于抽取验证了哪些数据，根据代码对照图回溯，在此不做详述。 var txsim ledger.TxSimulator，var historyQueryExecutor ...，一个是交易模拟工具，一个是历史查询执行工具。由于是Install，且chainID为空，这两个值在之后都一直为空。if chainID != &quot;&quot;的分支也不会进入（当部署example02时，chainID不为空，则会进入此分支，根据chainID获取这两个工具，供之后部署使用）。 ProcessProposal(...)所做的主要的两件事就是：（1）e.simulateProposal(...)，模拟执行申请。（2）e.endorseProposal(...)，背书申请执行的结果。但是由于chainID为空，所以install命令不会执行此步（同样，部署时会用到），而是直接以ProposalResponse的形式返回（1）中执行的结果。下文将对（1）展开详述。 在此撇开一笔说一下chaincode的交易使用的结果。该结果定义在core/chaincode/shim/response.go中，目前定义的还相当的简单（也为以后升级留了空间），只定义了三个：OK，ERRORTHRESHOLD，ERROR。其中ERRORTHRESHOLD算是错误标志线，值为400，即小于它的值，表示成功或者还能勉强接受且无伤大雅的异常，而大于等于它的值，则表示是不能接受的错误。 执行申请 在此罗列一下传入e.simulateProposal(...)的参数：ctx为上文所述的上下文ctxt（至此未有更新）；chainID为空；txid为交易ID；signedProp是客户端发送来的原数据；prop是从signedProp中抽取出来的Proposal；hdrExt.ChaincodeId也是抽取出来的数据，只包含一个值为lscc的Name字段；txsim为空。 在e.simulateProposal(...)中，前期又做了些简单的抽取和检查的事情：cis, err := putils.GetChaincodeInvocationSpec(prop)从prop中抽取出CIS。if err = e.disableJavaCCInst(cid, cis); err != nil通过判断example02的CDS.CS.Type来断定要安装的是否为Java源码，关于这点注释说的很清楚，当前版本不支持Java写的chaincode，但这部分在将来会被移除。if e.checkEsccAndVscc(prop); err != nil，escc和vscc对prop的检查，但是当前版本未作什么实际的检查，以后的版本可能会加入。if !syscc.IsSysCC(cid.Name){...}else{ version = util.GetSysCCVersion() }，由于cid.Name就是lscc，因此只会进入else分支，得到的为lscc的版本值为1.0.0。 最后一步调用了e.callChaincode(...)，执行CIS指定的动作。上文所述的另一个函数endorseProposal()最后也是调用这个函数开始执行申请的任务的。也就是说，e.callChaincode(...)能实现什么效果，做什么事情，完全是传入的参数决定的，这个函数可以算是实际开始执行申请的起点。在此罗列一下进入e.callChaincode(...)的参数：ctx依旧为ctxt；chainID=空；version=1.0.0；txid为交易ID；signedProp/prop/cid/txsim不变；cis是第2步新抽取出的CIS。这些参数均在图中可以找到对应数据。 callChaincode()函数做了三件事：（1）cccid := ccprovider.NewCCContext(...)，根据传入的参数，创建一个CCContext对象供执行申请所用。（2）chaincode.ExecuteChaincode(...)，执行申请。（3）if cid.Name == &quot;lscc&quot; &amp;&amp; len(cis.ChaincodeSpec.Input.Args) &gt;= 3 &amp;&amp; ...，这一步只有部署，升级的交易才会进入此分支，还记得上文的txsim和概述中提到的-c么，这里的分支就是执行这些对象所承载的任务的，在此不做讨论。下文将对（2）展开详述。 ExecuteChaincode(...)函数，在core/chaincode/chaincodeexec.go中定义，这里可以对看《fabric源码分析18》的部署章节第5步所述的线路问题。spec, err = createCIS(cccid.Name, args)又根据传入的参数新建了一个CIS，不过仔细看一下createCIS就可以知道，其新生成的CIS和第2步从prop中抽取出的CIS在内容上是完全一致的，因此我们完全可以将这个spec看作是图中的那个CIS。接着就调用了Execute(ctxt, cccid, spec)，对应到《fabric源码分析18》的部署章节的第6步，殊途同归，ACC也就此进入了类似于SCC部署所述的机制和道路来进行example02的安装。只不过，传入数据所承载的任务不同，执行的方向也会稍微有所不同。由于执行过程在《fabric源码分析18》详述过，因此下文将以粗线条叙述，重点在于提及不同之处。在此罗列一下进入Execute(...)的参数：ctxt依旧未有更新；cccid是第4步生成的，对应图中的CCContext；spec可以将其当作图中的CIS。 Execute(ctxt, cccid, spec)仍依次执行theChaincodeSupport.Launch(...)，theChaincodeSupport.Execute(...)，但这里spec是第5步生成的CIS，因此cctyp的值为ChaincodeMessage_TRANSACTION，进而生成的供theChaincodeSupport.Execute(...)（下文若非特指，凡提到的Execute函数均指此函数）使用的ccMsg是ChaincodeMessage_TRANSACTION类型的消息（对应图中的ChaincodeMessage）。依旧，分开讲解两个函数。 Launch Launch(...)函数在ACC安装的情况下执行不了太久，canName := cccid.GetCanonicalName()等到的canName=lscc:1.0.0，此值会是程序进入if chrte, ok = chaincodeSupport.chaincodeHasBeenLaunched(canName); ok分支，进而进入if chrte.handler.isRunning()分支而返回。因为负责处理安装example02的lscc已经Launch过了，所以这样安排顺理成章。 Execute 继续，在此罗列一下传入Execute(...)函数的参数：ctxt依旧位更新；cccid为图中的CCContext；ccMsg是图中的ChaincodeMessage；executetimeout为超时时间。 Execute(...)函数中，canName := cccid.GetCanonicalName()再次得到lscc:1.0.0，然后通过chrte, ok := chaincodeSupport.chaincodeHasBeenLaunched(canName)，获取了lscc在《fabric源码分析18》中已部署过的ServerHandler，再chrte.handler.sendExecuteMessage(...)开始使用该ServerHandler以触发状态机进入运行，最后进入select-case等待。在此罗列一下传入sendExecuteMessage(...)的参数：ctxt依旧未更新；cccid.ChainID为空；msg为图中的ChaincodeMessage；cccid.SignedProposal为图中的SignedProposal；cccid.Proposal为图中的Proposal。 在sendExecuteMessage(...)中，通过调用handler.triggerNextState(msg, true)，ServerHandler将msg发给自身的handler.nextState通道以触发ServerHandler的状态机进入下一个状态。 ServerHandler的processStream()收到来自handler.nextState通道的msg，先交给handler.HandleMessage(in)处理，ServerHandler状态机无任何变化，然后handler.serialSendAsync(in, errc)给lscc的ShimHandler发送msg。 lscc的ShimHandler的chatWithPeer()收到msg，交由handler.handleMessage(in)处理，触发beforeTransaction事件函数，该事件函数主要调用同文件中的handleTransaction(...)函数。 handleTransaction(...)函数主要做的就是根据ShimHandler收到的msg生成并初始化一个ChaincodeStub，对应图中的ChaincodeStub，然后handler.cc.Invoke(stub)调用lscc的Invoke()方法对example02进行安装。 在lscc的Invoke()中，args := stub.GetArgs()获取到的是CIS.CS.Input.Args。这个数组的值来自于protos/utils/proputils.go中createProposalFromCDS()中的case &quot;install&quot;:中的ccinp。因此Invoke()中，function := string(args[0])得到function的值是&quot;install&quot;，switch function会进入case INSTALL:的分支。 case INSTALL:分支中，首先，lscc.policyChecker.CheckPolicyNoChannel(...)专门使用了检测未指定Channel的chaincode的函数来检查要安装的example02，这也侧面映证了上文生成签名申请包章节中对chainID的描述。接着，depSpec := args[1]取出来的就是example02的CDS，不过此时的CDS仍是被Marshal过的。最后，lscc.executeInstall(stub, depSpec)，调用lscc的函数，依据stub和example02的CDS，执行安装。 在executeInstall(...)中，首先，ccpack,err := ccprovider.GetCCPackage(ccbytes)，根据example02被Marshal过的CDS创建一个CDSPackage（core/common/ccprovider/cdspackage.go中定义），对应图中的CDSPackage。其次，简单的验证了example02的Name和Version。最后，调用ccpack.PutChaincodeToFS()将example02源码写入文件系统。 在PutChaincodeToFS(...)中，一系列if检查之后，先path := fmt.Sprintf(&quot;%s/%s.%s&quot;, chaincodeInstallPath, ccname, ccversion)整合出要写入的路径，即在chaincodeInstallPath目录下放入名为example02.anotherversion的文件。然后os.Stat(path)先查看这个文件名是否可用。最后ioutil.WriteFile(path, ccpack.buf, 0644)将CDSPackage中成员buf写入path指定的地方。这个buf，从图中就可知道，就是example02源码压缩包。至此，example02的安装申请执行完毕。由此，开始一路返回。 一路返回至第6步ShimHandler的事件函数handleTransaction(...)中，handler.cc.Invoke(stub)返回，继续向下执行，将nextStateMsg赋值为ChaincodeMessage_COMPLETED类型的消息，并执行defer中的handler.triggerNextState(nextStateMsg, send)将该消息发送给自己的状态机。ShimHandler只将ChaincodeMessage_COMPLETED消息发送给ServerHandler之后就再无其他动作或变化。 ServerHandler收到ChaincodeMessage_COMPLETED消息，通知仍处于等待之中的Execute(...)函数，然后等待结束，Execute(...)函数成功返回。 一路返回 Execute(...)函数结束之后，就此一路返回，一直返回到core/endorser/endorser.go中的callChaincode(...)，chaincode.ExecuteChaincode(...)执行完毕，对应到上文执行申请章节的第4步的（2），由于这一步的（3）install申请不会执行，因此callChaincode(...)也就此结束。 继续返回到simulateProposal，继续的代码中if txsim != nil分支不会进入，因此也是直接返回至ProcessProposal()。 继续ProcessProposal()，将进入if res != nil分支，但无法进入if res.Status &gt;= shim.ERROR分支。因此继续向下走，进入if chainID == &quot;&quot;分支对要返回给Endorser客户端的应答消息pResp赋值，最后返回pResp给Endorser客户端。 example02安装申请的起点，peer/chaincode/install.go中的chaincodeInstall(...)，所调用的install(...)中的cf.EndorserClient.ProcessProposal()，即是Endorser客户端，收到服务端发来的消息，返回后install(...)随之结束，进而chaincodeInstall(...)结束。至此，整个example02的安装全部结束。 安装后的状态 peer结点的chaincodeInstallPath目录下，会有一个名为example02.anotherversion的文件，该文件即为example02源码压缩包。 阅读更多" />
+<meta property="og:description" content="fabric源码解析19——ACC的安装 概述 peer chaincode install命令执行安装命令，命令定义在peer/chaincode/install.go中，这也是安装的起点。另外需要注意的一点是，这个命令是在peer node start，peer channel create，peer channel join命令依次执行完毕之后所执行的，即执行install之时，peer结点的基本的模块（包括SCC）都已初始化完毕，channel也已经建立。 根据实例化的原则，从install_test.go中提取了一句实际的install命令：peer chaincode install -n example02 -p github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02 -v anotherversion，本篇将以此句命令为例子。安装的ACC是example02，存在于-p指定的路径下，版本是anotherversion。-l没有给，自然取默认的值，为go语言。 install安装使用的chaincode数据有两种形式，一种是CDS，一种是chaincode package/signpackage命令形成的ccpackfile包。因为我们没有涉及过这两个命令，因此这里我们只以前一种CDS数据包为例，叙述安装过程。 ACC的安装涉及的图为ACC-Install-DataConstuct.PNG。下文中提及“图中”字眼，均指此图中。 install能够识别的flag有-l，-c，-p，-n，-v。其中-c不常用，其指定的是ACC所要执行的函数和函数的参数，一般在具体执行的时候，如查询或转账的时候再给定。 install最终所要做的事情，就是将example02的源码包放入docker容器的安装目录中。 生成签名申请包 以peer/chaincode/install.go的chaincodeInstall(...)为起点（设定ccpackfile==&quot;&quot;），根据ACC-Install-DataConstuct.PNG，从左上角最原始的命令行数据开始，一路组装数据，至形成下面中路的SignedProposal，然后将SignedProposal通过cf.EndorserClient.ProcessProposal(...)提交至Endorser服务端。这个冗长的过程，不再详述。只提以下几点： chainID在SignedProposal中为空，即安装所要做的仅仅是把example02的压缩包放入容器的指定目录中而已，只有部署的时候才需要指定部署到哪条链上。 CDS的CodePackage是example02的代码压缩包，包括源码和依赖的第三方库。因为SCC的一切都在项目编译时编进peer中了，所以SCC的CDS的这个字段就是空的，而ACC需要安装源码，所以这个字段在正常的情况下肯定不是空的。这个压缩包最终是在core/chaincode/platforms/golang/platform.go中的GetDeploymentPayload()打包的。该程序的复杂之处在于除了要打包example02源码，还要打包example02直接依赖的但go标准库未提供的第三方库，还要打包这些第三方库直接依赖但go标准库未提供的第三方库（即example02间接依赖但go标准库未提供第三方库）。这么做的目的就是让一个chaincode无论放到哪个容器里，不会因为缺少某个第三方库而编译失败。同时这个打包的过程也就要求我们在执行example02安装的时候，要实现把其依赖的第三方库事先放到GOPATH/src下。 txid是在/protos/utils/proputils.go中的CreateChaincodeProposalWithTransient(...)中计算出来的，是哈希（peer结点的MSPID+证书元数据+随机数nonce）的值，可以就把它当作一个唯一的字符串，不用太过深究。 处理安装申请 Endorser服务端在core/endorser/endorser.go中的ProcessProposal(...)处，接收到来自Endorser客户端发送的SignedProposal和一个之后一路都会用到的Context上下文ctxt。 在ProcessProposal(...)中，从开始至var txsim ledger.TxSimulator处，之上的代码全部是一边解压抽取SignedProposal中的数据，一边验证这些数据。至于抽取验证了哪些数据，根据代码对照图回溯，在此不做详述。 var txsim ledger.TxSimulator，var historyQueryExecutor ...，一个是交易模拟工具，一个是历史查询执行工具。由于是Install，且chainID为空，这两个值在之后都一直为空。if chainID != &quot;&quot;的分支也不会进入（当部署example02时，chainID不为空，则会进入此分支，根据chainID获取这两个工具，供之后部署使用）。 ProcessProposal(...)所做的主要的两件事就是：（1）e.simulateProposal(...)，模拟执行申请。（2）e.endorseProposal(...)，背书申请执行的结果。但是由于chainID为空，所以install命令不会执行此步（同样，部署时会用到），而是直接以ProposalResponse的形式返回（1）中执行的结果。下文将对（1）展开详述。 在此撇开一笔说一下chaincode的交易使用的结果。该结果定义在core/chaincode/shim/response.go中，目前定义的还相当的简单（也为以后升级留了空间），只定义了三个：OK，ERRORTHRESHOLD，ERROR。其中ERRORTHRESHOLD算是错误标志线，值为400，即小于它的值，表示成功或者还能勉强接受且无伤大雅的异常，而大于等于它的值，则表示是不能接受的错误。 执行申请 在此罗列一下传入e.simulateProposal(...)的参数：ctx为上文所述的上下文ctxt（至此未有更新）；chainID为空；txid为交易ID；signedProp是客户端发送来的原数据；prop是从signedProp中抽取出来的Proposal；hdrExt.ChaincodeId也是抽取出来的数据，只包含一个值为lscc的Name字段；txsim为空。 在e.simulateProposal(...)中，前期又做了些简单的抽取和检查的事情：cis, err := putils.GetChaincodeInvocationSpec(prop)从prop中抽取出CIS。if err = e.disableJavaCCInst(cid, cis); err != nil通过判断example02的CDS.CS.Type来断定要安装的是否为Java源码，关于这点注释说的很清楚，当前版本不支持Java写的chaincode，但这部分在将来会被移除。if e.checkEsccAndVscc(prop); err != nil，escc和vscc对prop的检查，但是当前版本未作什么实际的检查，以后的版本可能会加入。if !syscc.IsSysCC(cid.Name){...}else{ version = util.GetSysCCVersion() }，由于cid.Name就是lscc，因此只会进入else分支，得到的为lscc的版本值为1.0.0。 最后一步调用了e.callChaincode(...)，执行CIS指定的动作。上文所述的另一个函数endorseProposal()最后也是调用这个函数开始执行申请的任务的。也就是说，e.callChaincode(...)能实现什么效果，做什么事情，完全是传入的参数决定的，这个函数可以算是实际开始执行申请的起点。在此罗列一下进入e.callChaincode(...)的参数：ctx依旧为ctxt；chainID=空；version=1.0.0；txid为交易ID；signedProp/prop/cid/txsim不变；cis是第2步新抽取出的CIS。这些参数均在图中可以找到对应数据。 callChaincode()函数做了三件事：（1）cccid := ccprovider.NewCCContext(...)，根据传入的参数，创建一个CCContext对象供执行申请所用。（2）chaincode.ExecuteChaincode(...)，执行申请。（3）if cid.Name == &quot;lscc&quot; &amp;&amp; len(cis.ChaincodeSpec.Input.Args) &gt;= 3 &amp;&amp; ...，这一步只有部署，升级的交易才会进入此分支，还记得上文的txsim和概述中提到的-c么，这里的分支就是执行这些对象所承载的任务的，在此不做讨论。下文将对（2）展开详述。 ExecuteChaincode(...)函数，在core/chaincode/chaincodeexec.go中定义，这里可以对看《fabric源码分析18》的部署章节第5步所述的线路问题。spec, err = createCIS(cccid.Name, args)又根据传入的参数新建了一个CIS，不过仔细看一下createCIS就可以知道，其新生成的CIS和第2步从prop中抽取出的CIS在内容上是完全一致的，因此我们完全可以将这个spec看作是图中的那个CIS。接着就调用了Execute(ctxt, cccid, spec)，对应到《fabric源码分析18》的部署章节的第6步，殊途同归，ACC也就此进入了类似于SCC部署所述的机制和道路来进行example02的安装。只不过，传入数据所承载的任务不同，执行的方向也会稍微有所不同。由于执行过程在《fabric源码分析18》详述过，因此下文将以粗线条叙述，重点在于提及不同之处。在此罗列一下进入Execute(...)的参数：ctxt依旧未有更新；cccid是第4步生成的，对应图中的CCContext；spec可以将其当作图中的CIS。 Execute(ctxt, cccid, spec)仍依次执行theChaincodeSupport.Launch(...)，theChaincodeSupport.Execute(...)，但这里spec是第5步生成的CIS，因此cctyp的值为ChaincodeMessage_TRANSACTION，进而生成的供theChaincodeSupport.Execute(...)（下文若非特指，凡提到的Execute函数均指此函数）使用的ccMsg是ChaincodeMessage_TRANSACTION类型的消息（对应图中的ChaincodeMessage）。依旧，分开讲解两个函数。 Launch Launch(...)函数在ACC安装的情况下执行不了太久，canName := cccid.GetCanonicalName()等到的canName=lscc:1.0.0，此值会是程序进入if chrte, ok = chaincodeSupport.chaincodeHasBeenLaunched(canName); ok分支，进而进入if chrte.handler.isRunning()分支而返回。因为负责处理安装example02的lscc已经Launch过了，所以这样安排顺理成章。 Execute 继续，在此罗列一下传入Execute(...)函数的参数：ctxt依旧位更新；cccid为图中的CCContext；ccMsg是图中的ChaincodeMessage；executetimeout为超时时间。 Execute(...)函数中，canName := cccid.GetCanonicalName()再次得到lscc:1.0.0，然后通过chrte, ok := chaincodeSupport.chaincodeHasBeenLaunched(canName)，获取了lscc在《fabric源码分析18》中已部署过的ServerHandler，再chrte.handler.sendExecuteMessage(...)开始使用该ServerHandler以触发状态机进入运行，最后进入select-case等待。在此罗列一下传入sendExecuteMessage(...)的参数：ctxt依旧未更新；cccid.ChainID为空；msg为图中的ChaincodeMessage；cccid.SignedProposal为图中的SignedProposal；cccid.Proposal为图中的Proposal。 在sendExecuteMessage(...)中，通过调用handler.triggerNextState(msg, true)，ServerHandler将msg发给自身的handler.nextState通道以触发ServerHandler的状态机进入下一个状态。 ServerHandler的processStream()收到来自handler.nextState通道的msg，先交给handler.HandleMessage(in)处理，ServerHandler状态机无任何变化，然后handler.serialSendAsync(in, errc)给lscc的ShimHandler发送msg。 lscc的ShimHandler的chatWithPeer()收到msg，交由handler.handleMessage(in)处理，触发beforeTransaction事件函数，该事件函数主要调用同文件中的handleTransaction(...)函数。 handleTransaction(...)函数主要做的就是根据ShimHandler收到的msg生成并初始化一个ChaincodeStub，对应图中的ChaincodeStub，然后handler.cc.Invoke(stub)调用lscc的Invoke()方法对example02进行安装。 在lscc的Invoke()中，args := stub.GetArgs()获取到的是CIS.CS.Input.Args。这个数组的值来自于protos/utils/proputils.go中createProposalFromCDS()中的case &quot;install&quot;:中的ccinp。因此Invoke()中，function := string(args[0])得到function的值是&quot;install&quot;，switch function会进入case INSTALL:的分支。 case INSTALL:分支中，首先，lscc.policyChecker.CheckPolicyNoChannel(...)专门使用了检测未指定Channel的chaincode的函数来检查要安装的example02，这也侧面映证了上文生成签名申请包章节中对chainID的描述。接着，depSpec := args[1]取出来的就是example02的CDS，不过此时的CDS仍是被Marshal过的。最后，lscc.executeInstall(stub, depSpec)，调用lscc的函数，依据stub和example02的CDS，执行安装。 在executeInstall(...)中，首先，ccpack,err := ccprovider.GetCCPackage(ccbytes)，根据example02被Marshal过的CDS创建一个CDSPackage（core/common/ccprovider/cdspackage.go中定义），对应图中的CDSPackage。其次，简单的验证了example02的Name和Version。最后，调用ccpack.PutChaincodeToFS()将example02源码写入文件系统。 在PutChaincodeToFS(...)中，一系列if检查之后，先path := fmt.Sprintf(&quot;%s/%s.%s&quot;, chaincodeInstallPath, ccname, ccversion)整合出要写入的路径，即在chaincodeInstallPath目录下放入名为example02.anotherversion的文件。然后os.Stat(path)先查看这个文件名是否可用。最后ioutil.WriteFile(path, ccpack.buf, 0644)将CDSPackage中成员buf写入path指定的地方。这个buf，从图中就可知道，就是example02源码压缩包。至此，example02的安装申请执行完毕。由此，开始一路返回。 一路返回至第6步ShimHandler的事件函数handleTransaction(...)中，handler.cc.Invoke(stub)返回，继续向下执行，将nextStateMsg赋值为ChaincodeMessage_COMPLETED类型的消息，并执行defer中的handler.triggerNextState(nextStateMsg, send)将该消息发送给自己的状态机。ShimHandler只将ChaincodeMessage_COMPLETED消息发送给ServerHandler之后就再无其他动作或变化。 ServerHandler收到ChaincodeMessage_COMPLETED消息，通知仍处于等待之中的Execute(...)函数，然后等待结束，Execute(...)函数成功返回。 一路返回 Execute(...)函数结束之后，就此一路返回，一直返回到core/endorser/endorser.go中的callChaincode(...)，chaincode.ExecuteChaincode(...)执行完毕，对应到上文执行申请章节的第4步的（2），由于这一步的（3）install申请不会执行，因此callChaincode(...)也就此结束。 继续返回到simulateProposal，继续的代码中if txsim != nil分支不会进入，因此也是直接返回至ProcessProposal()。 继续ProcessProposal()，将进入if res != nil分支，但无法进入if res.Status &gt;= shim.ERROR分支。因此继续向下走，进入if chainID == &quot;&quot;分支对要返回给Endorser客户端的应答消息pResp赋值，最后返回pResp给Endorser客户端。 example02安装申请的起点，peer/chaincode/install.go中的chaincodeInstall(...)，所调用的install(...)中的cf.EndorserClient.ProcessProposal()，即是Endorser客户端，收到服务端发来的消息，返回后install(...)随之结束，进而chaincodeInstall(...)结束。至此，整个example02的安装全部结束。 安装后的状态 peer结点的chaincodeInstallPath目录下，会有一个名为example02.anotherversion的文件，该文件即为example02源码压缩包。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/10/26/ef45ee2ca7e7acc1173ad1fe9af8d972.html" />
+<meta property="og:url" content="https://uzzz.org/2017/10/26/ef45ee2ca7e7acc1173ad1fe9af8d972.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-10-26T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"fabric源码解析19——ACC的安装 概述 peer chaincode install命令执行安装命令，命令定义在peer/chaincode/install.go中，这也是安装的起点。另外需要注意的一点是，这个命令是在peer node start，peer channel create，peer channel join命令依次执行完毕之后所执行的，即执行install之时，peer结点的基本的模块（包括SCC）都已初始化完毕，channel也已经建立。 根据实例化的原则，从install_test.go中提取了一句实际的install命令：peer chaincode install -n example02 -p github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02 -v anotherversion，本篇将以此句命令为例子。安装的ACC是example02，存在于-p指定的路径下，版本是anotherversion。-l没有给，自然取默认的值，为go语言。 install安装使用的chaincode数据有两种形式，一种是CDS，一种是chaincode package/signpackage命令形成的ccpackfile包。因为我们没有涉及过这两个命令，因此这里我们只以前一种CDS数据包为例，叙述安装过程。 ACC的安装涉及的图为ACC-Install-DataConstuct.PNG。下文中提及“图中”字眼，均指此图中。 install能够识别的flag有-l，-c，-p，-n，-v。其中-c不常用，其指定的是ACC所要执行的函数和函数的参数，一般在具体执行的时候，如查询或转账的时候再给定。 install最终所要做的事情，就是将example02的源码包放入docker容器的安装目录中。 生成签名申请包 以peer/chaincode/install.go的chaincodeInstall(...)为起点（设定ccpackfile==&quot;&quot;），根据ACC-Install-DataConstuct.PNG，从左上角最原始的命令行数据开始，一路组装数据，至形成下面中路的SignedProposal，然后将SignedProposal通过cf.EndorserClient.ProcessProposal(...)提交至Endorser服务端。这个冗长的过程，不再详述。只提以下几点： chainID在SignedProposal中为空，即安装所要做的仅仅是把example02的压缩包放入容器的指定目录中而已，只有部署的时候才需要指定部署到哪条链上。 CDS的CodePackage是example02的代码压缩包，包括源码和依赖的第三方库。因为SCC的一切都在项目编译时编进peer中了，所以SCC的CDS的这个字段就是空的，而ACC需要安装源码，所以这个字段在正常的情况下肯定不是空的。这个压缩包最终是在core/chaincode/platforms/golang/platform.go中的GetDeploymentPayload()打包的。该程序的复杂之处在于除了要打包example02源码，还要打包example02直接依赖的但go标准库未提供的第三方库，还要打包这些第三方库直接依赖但go标准库未提供的第三方库（即example02间接依赖但go标准库未提供第三方库）。这么做的目的就是让一个chaincode无论放到哪个容器里，不会因为缺少某个第三方库而编译失败。同时这个打包的过程也就要求我们在执行example02安装的时候，要实现把其依赖的第三方库事先放到GOPATH/src下。 txid是在/protos/utils/proputils.go中的CreateChaincodeProposalWithTransient(...)中计算出来的，是哈希（peer结点的MSPID+证书元数据+随机数nonce）的值，可以就把它当作一个唯一的字符串，不用太过深究。 处理安装申请 Endorser服务端在core/endorser/endorser.go中的ProcessProposal(...)处，接收到来自Endorser客户端发送的SignedProposal和一个之后一路都会用到的Context上下文ctxt。 在ProcessProposal(...)中，从开始至var txsim ledger.TxSimulator处，之上的代码全部是一边解压抽取SignedProposal中的数据，一边验证这些数据。至于抽取验证了哪些数据，根据代码对照图回溯，在此不做详述。 var txsim ledger.TxSimulator，var historyQueryExecutor ...，一个是交易模拟工具，一个是历史查询执行工具。由于是Install，且chainID为空，这两个值在之后都一直为空。if chainID != &quot;&quot;的分支也不会进入（当部署example02时，chainID不为空，则会进入此分支，根据chainID获取这两个工具，供之后部署使用）。 ProcessProposal(...)所做的主要的两件事就是：（1）e.simulateProposal(...)，模拟执行申请。（2）e.endorseProposal(...)，背书申请执行的结果。但是由于chainID为空，所以install命令不会执行此步（同样，部署时会用到），而是直接以ProposalResponse的形式返回（1）中执行的结果。下文将对（1）展开详述。 在此撇开一笔说一下chaincode的交易使用的结果。该结果定义在core/chaincode/shim/response.go中，目前定义的还相当的简单（也为以后升级留了空间），只定义了三个：OK，ERRORTHRESHOLD，ERROR。其中ERRORTHRESHOLD算是错误标志线，值为400，即小于它的值，表示成功或者还能勉强接受且无伤大雅的异常，而大于等于它的值，则表示是不能接受的错误。 执行申请 在此罗列一下传入e.simulateProposal(...)的参数：ctx为上文所述的上下文ctxt（至此未有更新）；chainID为空；txid为交易ID；signedProp是客户端发送来的原数据；prop是从signedProp中抽取出来的Proposal；hdrExt.ChaincodeId也是抽取出来的数据，只包含一个值为lscc的Name字段；txsim为空。 在e.simulateProposal(...)中，前期又做了些简单的抽取和检查的事情：cis, err := putils.GetChaincodeInvocationSpec(prop)从prop中抽取出CIS。if err = e.disableJavaCCInst(cid, cis); err != nil通过判断example02的CDS.CS.Type来断定要安装的是否为Java源码，关于这点注释说的很清楚，当前版本不支持Java写的chaincode，但这部分在将来会被移除。if e.checkEsccAndVscc(prop); err != nil，escc和vscc对prop的检查，但是当前版本未作什么实际的检查，以后的版本可能会加入。if !syscc.IsSysCC(cid.Name){...}else{ version = util.GetSysCCVersion() }，由于cid.Name就是lscc，因此只会进入else分支，得到的为lscc的版本值为1.0.0。 最后一步调用了e.callChaincode(...)，执行CIS指定的动作。上文所述的另一个函数endorseProposal()最后也是调用这个函数开始执行申请的任务的。也就是说，e.callChaincode(...)能实现什么效果，做什么事情，完全是传入的参数决定的，这个函数可以算是实际开始执行申请的起点。在此罗列一下进入e.callChaincode(...)的参数：ctx依旧为ctxt；chainID=空；version=1.0.0；txid为交易ID；signedProp/prop/cid/txsim不变；cis是第2步新抽取出的CIS。这些参数均在图中可以找到对应数据。 callChaincode()函数做了三件事：（1）cccid := ccprovider.NewCCContext(...)，根据传入的参数，创建一个CCContext对象供执行申请所用。（2）chaincode.ExecuteChaincode(...)，执行申请。（3）if cid.Name == &quot;lscc&quot; &amp;&amp; len(cis.ChaincodeSpec.Input.Args) &gt;= 3 &amp;&amp; ...，这一步只有部署，升级的交易才会进入此分支，还记得上文的txsim和概述中提到的-c么，这里的分支就是执行这些对象所承载的任务的，在此不做讨论。下文将对（2）展开详述。 ExecuteChaincode(...)函数，在core/chaincode/chaincodeexec.go中定义，这里可以对看《fabric源码分析18》的部署章节第5步所述的线路问题。spec, err = createCIS(cccid.Name, args)又根据传入的参数新建了一个CIS，不过仔细看一下createCIS就可以知道，其新生成的CIS和第2步从prop中抽取出的CIS在内容上是完全一致的，因此我们完全可以将这个spec看作是图中的那个CIS。接着就调用了Execute(ctxt, cccid, spec)，对应到《fabric源码分析18》的部署章节的第6步，殊途同归，ACC也就此进入了类似于SCC部署所述的机制和道路来进行example02的安装。只不过，传入数据所承载的任务不同，执行的方向也会稍微有所不同。由于执行过程在《fabric源码分析18》详述过，因此下文将以粗线条叙述，重点在于提及不同之处。在此罗列一下进入Execute(...)的参数：ctxt依旧未有更新；cccid是第4步生成的，对应图中的CCContext；spec可以将其当作图中的CIS。 Execute(ctxt, cccid, spec)仍依次执行theChaincodeSupport.Launch(...)，theChaincodeSupport.Execute(...)，但这里spec是第5步生成的CIS，因此cctyp的值为ChaincodeMessage_TRANSACTION，进而生成的供theChaincodeSupport.Execute(...)（下文若非特指，凡提到的Execute函数均指此函数）使用的ccMsg是ChaincodeMessage_TRANSACTION类型的消息（对应图中的ChaincodeMessage）。依旧，分开讲解两个函数。 Launch Launch(...)函数在ACC安装的情况下执行不了太久，canName := cccid.GetCanonicalName()等到的canName=lscc:1.0.0，此值会是程序进入if chrte, ok = chaincodeSupport.chaincodeHasBeenLaunched(canName); ok分支，进而进入if chrte.handler.isRunning()分支而返回。因为负责处理安装example02的lscc已经Launch过了，所以这样安排顺理成章。 Execute 继续，在此罗列一下传入Execute(...)函数的参数：ctxt依旧位更新；cccid为图中的CCContext；ccMsg是图中的ChaincodeMessage；executetimeout为超时时间。 Execute(...)函数中，canName := cccid.GetCanonicalName()再次得到lscc:1.0.0，然后通过chrte, ok := chaincodeSupport.chaincodeHasBeenLaunched(canName)，获取了lscc在《fabric源码分析18》中已部署过的ServerHandler，再chrte.handler.sendExecuteMessage(...)开始使用该ServerHandler以触发状态机进入运行，最后进入select-case等待。在此罗列一下传入sendExecuteMessage(...)的参数：ctxt依旧未更新；cccid.ChainID为空；msg为图中的ChaincodeMessage；cccid.SignedProposal为图中的SignedProposal；cccid.Proposal为图中的Proposal。 在sendExecuteMessage(...)中，通过调用handler.triggerNextState(msg, true)，ServerHandler将msg发给自身的handler.nextState通道以触发ServerHandler的状态机进入下一个状态。 ServerHandler的processStream()收到来自handler.nextState通道的msg，先交给handler.HandleMessage(in)处理，ServerHandler状态机无任何变化，然后handler.serialSendAsync(in, errc)给lscc的ShimHandler发送msg。 lscc的ShimHandler的chatWithPeer()收到msg，交由handler.handleMessage(in)处理，触发beforeTransaction事件函数，该事件函数主要调用同文件中的handleTransaction(...)函数。 handleTransaction(...)函数主要做的就是根据ShimHandler收到的msg生成并初始化一个ChaincodeStub，对应图中的ChaincodeStub，然后handler.cc.Invoke(stub)调用lscc的Invoke()方法对example02进行安装。 在lscc的Invoke()中，args := stub.GetArgs()获取到的是CIS.CS.Input.Args。这个数组的值来自于protos/utils/proputils.go中createProposalFromCDS()中的case &quot;install&quot;:中的ccinp。因此Invoke()中，function := string(args[0])得到function的值是&quot;install&quot;，switch function会进入case INSTALL:的分支。 case INSTALL:分支中，首先，lscc.policyChecker.CheckPolicyNoChannel(...)专门使用了检测未指定Channel的chaincode的函数来检查要安装的example02，这也侧面映证了上文生成签名申请包章节中对chainID的描述。接着，depSpec := args[1]取出来的就是example02的CDS，不过此时的CDS仍是被Marshal过的。最后，lscc.executeInstall(stub, depSpec)，调用lscc的函数，依据stub和example02的CDS，执行安装。 在executeInstall(...)中，首先，ccpack,err := ccprovider.GetCCPackage(ccbytes)，根据example02被Marshal过的CDS创建一个CDSPackage（core/common/ccprovider/cdspackage.go中定义），对应图中的CDSPackage。其次，简单的验证了example02的Name和Version。最后，调用ccpack.PutChaincodeToFS()将example02源码写入文件系统。 在PutChaincodeToFS(...)中，一系列if检查之后，先path := fmt.Sprintf(&quot;%s/%s.%s&quot;, chaincodeInstallPath, ccname, ccversion)整合出要写入的路径，即在chaincodeInstallPath目录下放入名为example02.anotherversion的文件。然后os.Stat(path)先查看这个文件名是否可用。最后ioutil.WriteFile(path, ccpack.buf, 0644)将CDSPackage中成员buf写入path指定的地方。这个buf，从图中就可知道，就是example02源码压缩包。至此，example02的安装申请执行完毕。由此，开始一路返回。 一路返回至第6步ShimHandler的事件函数handleTransaction(...)中，handler.cc.Invoke(stub)返回，继续向下执行，将nextStateMsg赋值为ChaincodeMessage_COMPLETED类型的消息，并执行defer中的handler.triggerNextState(nextStateMsg, send)将该消息发送给自己的状态机。ShimHandler只将ChaincodeMessage_COMPLETED消息发送给ServerHandler之后就再无其他动作或变化。 ServerHandler收到ChaincodeMessage_COMPLETED消息，通知仍处于等待之中的Execute(...)函数，然后等待结束，Execute(...)函数成功返回。 一路返回 Execute(...)函数结束之后，就此一路返回，一直返回到core/endorser/endorser.go中的callChaincode(...)，chaincode.ExecuteChaincode(...)执行完毕，对应到上文执行申请章节的第4步的（2），由于这一步的（3）install申请不会执行，因此callChaincode(...)也就此结束。 继续返回到simulateProposal，继续的代码中if txsim != nil分支不会进入，因此也是直接返回至ProcessProposal()。 继续ProcessProposal()，将进入if res != nil分支，但无法进入if res.Status &gt;= shim.ERROR分支。因此继续向下走，进入if chainID == &quot;&quot;分支对要返回给Endorser客户端的应答消息pResp赋值，最后返回pResp给Endorser客户端。 example02安装申请的起点，peer/chaincode/install.go中的chaincodeInstall(...)，所调用的install(...)中的cf.EndorserClient.ProcessProposal()，即是Endorser客户端，收到服务端发来的消息，返回后install(...)随之结束，进而chaincodeInstall(...)结束。至此，整个example02的安装全部结束。 安装后的状态 peer结点的chaincodeInstallPath目录下，会有一个名为example02.anotherversion的文件，该文件即为example02源码压缩包。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/10/26/ef45ee2ca7e7acc1173ad1fe9af8d972.html","headline":"fabric源码解析19——ACC的安装","dateModified":"2017-10-26T00:00:00+08:00","datePublished":"2017-10-26T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/10/26/ef45ee2ca7e7acc1173ad1fe9af8d972.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>fabric源码解析19——ACC的安装</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="fabric源码解析19acc的安装">fabric源码解析19——ACC的安装</h1> 
+  <h2 id="概述">概述</h2> 
+  <ul> 
+   <li>peer chaincode install命令执行安装命令，命令定义在peer/chaincode/install.go中，这也是安装的起点。另外需要注意的一点是，这个命令是在peer node start，peer channel create，peer channel join命令依次执行完毕之后所执行的，即执行install之时，peer结点的基本的模块（包括SCC）都已初始化完毕，channel也已经建立。</li> 
+   <li>根据实例化的原则，从install_test.go中提取了一句实际的install命令：<code>peer chaincode install -n example02 -p github.com/hyperledger/fabric/examples/chaincode/go/chaincode_example02 -v anotherversion</code>，本篇将以此句命令为例子。安装的ACC是example02，存在于-p指定的路径下，版本是anotherversion。-l没有给，自然取默认的值，为go语言。</li> 
+   <li>install安装使用的chaincode数据有两种形式，一种是CDS，一种是chaincode package/signpackage命令形成的ccpackfile包。因为我们没有涉及过这两个命令，因此这里我们只以前一种CDS数据包为例，叙述安装过程。</li> 
+   <li>ACC的安装涉及的图为<strong>ACC-Install-DataConstuct.PNG</strong>。下文中提及“图中”字眼，均指此图中。</li> 
+   <li>install能够识别的flag有-l，-c，-p，-n，-v。其中-c不常用，其指定的是ACC所要执行的函数和函数的参数，一般在具体执行的时候，如查询或转账的时候再给定。</li> 
+   <li>install最终所要做的事情，就是<strong>将example02的源码包放入docker容器的安装目录中</strong>。</li> 
+  </ul> 
+  <h2 id="生成签名申请包">生成签名申请包</h2> 
+  <p>以peer/chaincode/install.go的<code>chaincodeInstall(...)</code>为起点（设定<code>ccpackfile==""</code>），根据<strong>ACC-Install-DataConstuct.PNG</strong>，从左上角最原始的命令行数据开始，一路组装数据，至形成下面中路的SignedProposal，然后将SignedProposal通过<code>cf.EndorserClient.ProcessProposal(...)</code>提交至Endorser服务端。这个冗长的过程，不再详述。只提以下几点：</p> 
+  <ul> 
+   <li>chainID在SignedProposal中为空，即安装所要做的仅仅是把example02的压缩包放入容器的指定目录中而已，只有部署的时候才需要指定部署到哪条链上。</li> 
+   <li>CDS的CodePackage是example02的代码压缩包，包括源码和依赖的第三方库。因为SCC的一切都在项目编译时编进peer中了，所以SCC的CDS的这个字段就是空的，而ACC需要安装源码，所以这个字段在正常的情况下肯定不是空的。这个压缩包最终是在core/chaincode/platforms/golang/platform.go中的<code>GetDeploymentPayload()</code>打包的。该程序的复杂之处在于除了要打包example02源码，还要打包example02直接依赖的但go标准库未提供的第三方库，还要打包这些第三方库直接依赖但go标准库未提供的第三方库（即example02间接依赖但go标准库未提供第三方库）。这么做的目的就是让一个chaincode无论放到哪个容器里，不会因为缺少某个第三方库而编译失败。同时这个打包的过程也就要求我们在执行example02安装的时候，要实现把其依赖的第三方库事先放到GOPATH/src下。</li> 
+   <li>txid是在/protos/utils/proputils.go中的<code>CreateChaincodeProposalWithTransient(...)</code>中计算出来的，是哈希（peer结点的MSPID+证书元数据+随机数nonce）的值，可以就把它当作一个唯一的字符串，不用太过深究。</li> 
+  </ul> 
+  <h2 id="处理安装申请">处理安装申请</h2> 
+  <ol> 
+   <li>Endorser服务端在core/endorser/endorser.go中的<code>ProcessProposal(...)</code>处，接收到来自Endorser客户端发送的<strong>SignedProposal</strong>和一个之后一路都会用到的Context上下文<strong>ctxt</strong>。</li> 
+   <li>在<code>ProcessProposal(...)</code>中，从开始至<code>var txsim ledger.TxSimulator</code>处，之上的代码全部是<strong>一边解压抽取SignedProposal中的数据，一边验证这些数据</strong>。至于抽取验证了哪些数据，根据代码对照图回溯，在此不做详述。</li> 
+   <li><code>var txsim ledger.TxSimulator</code>，<code>var historyQueryExecutor ...</code>，一个是交易模拟工具，一个是历史查询执行工具。由于是Install，且chainID为空，这两个值在之后都一直为空。<code>if chainID != ""</code>的分支也不会进入（当部署example02时，chainID不为空，则会进入此分支，根据chainID获取这两个工具，供之后部署使用）。</li> 
+   <li><code>ProcessProposal(...)</code>所做的主要的两件事就是：<strong>（1）</strong><code>e.simulateProposal(...)</code>，模拟执行申请。<strong>（2）</strong><code>e.endorseProposal(...)</code>，背书申请执行的结果。但是由于chainID为空，所以install命令不会执行此步（同样，部署时会用到），而是直接以ProposalResponse的形式返回（1）中执行的结果。下文将对（1）展开详述。</li> 
+   <li>在此撇开一笔说一下chaincode的交易使用的结果。该结果定义在core/chaincode/shim/response.go中，目前定义的还相当的简单（也为以后升级留了空间），只定义了三个：OK，ERRORTHRESHOLD，ERROR。其中ERRORTHRESHOLD算是错误标志线，值为400，即小于它的值，表示成功或者还能勉强接受且无伤大雅的异常，而大于等于它的值，则表示是不能接受的错误。</li> 
+  </ol> 
+  <h3 id="执行申请">执行申请</h3> 
+  <ol> 
+   <li>在此罗列一下传入<code>e.simulateProposal(...)</code>的参数：ctx为上文所述的上下文ctxt（至此未有更新）；chainID为空；txid为交易ID；signedProp是客户端发送来的原数据；prop是从signedProp中抽取出来的Proposal；hdrExt.ChaincodeId也是抽取出来的数据，只包含一个值为lscc的Name字段；txsim为空。</li> 
+   <li>在<code>e.simulateProposal(...)</code>中，前期又做了些简单的抽取和检查的事情：<code>cis, err := putils.GetChaincodeInvocationSpec(prop)</code>从prop中抽取出CIS。<code>if err = e.disableJavaCCInst(cid, cis); err != nil</code>通过判断example02的CDS.CS.Type来断定要安装的是否为Java源码，关于这点注释说的很清楚，当前版本不支持Java写的chaincode，但这部分在将来会被移除。<code>if e.checkEsccAndVscc(prop); err != nil</code>，escc和vscc对prop的检查，但是当前版本未作什么实际的检查，以后的版本可能会加入。<code>if !syscc.IsSysCC(cid.Name){...}else{ version = util.GetSysCCVersion() }</code>，由于cid.Name就是lscc，因此只会进入else分支，得到的为lscc的版本值为1.0.0。</li> 
+   <li>最后一步调用了<code>e.callChaincode(...)</code>，执行CIS指定的动作。上文所述的另一个函数<code>endorseProposal()</code>最后也是调用这个函数开始执行申请的任务的。也就是说，<code>e.callChaincode(...)</code>能实现什么效果，做什么事情，完全是传入的参数决定的，这个函数可以算是<strong>实际开始执行申请的起点</strong>。在此罗列一下进入<code>e.callChaincode(...)</code>的参数：ctx依旧为ctxt；chainID=空；version=1.0.0；txid为交易ID；signedProp/prop/cid/txsim不变；cis是第2步新抽取出的CIS。这些参数均在图中可以找到对应数据。</li> 
+   <li><code>callChaincode()</code>函数做了三件事：<strong>（1）</strong><code>cccid := ccprovider.NewCCContext(...)</code>，根据传入的参数，创建一个CCContext对象供执行申请所用。<strong>（2）</strong><code>chaincode.ExecuteChaincode(...)</code>，执行申请。<strong>（3）</strong><code>if cid.Name == "lscc" &amp;&amp; len(cis.ChaincodeSpec.Input.Args) &gt;= 3 &amp;&amp; ...</code>，这一步只有部署，升级的交易才会进入此分支，还记得上文的txsim和概述中提到的-c么，这里的分支就是执行这些对象所承载的任务的，在此不做讨论。下文将对（2）展开详述。</li> 
+   <li><code>ExecuteChaincode(...)</code>函数，在core/chaincode/chaincodeexec.go中定义，这里可以对看《fabric源码分析18》的部署章节第5步所述的线路问题。<code>spec, err = createCIS(cccid.Name, args)</code>又根据传入的参数新建了一个CIS，不过仔细看一下<code>createCIS</code>就可以知道，其新生成的CIS和第2步从prop中抽取出的CIS在内容上是完全一致的，因此我们完全可以将这个spec看作是图中的那个CIS。接着就调用了<code>Execute(ctxt, cccid, spec)</code>，对应到《fabric源码分析18》的部署章节的第6步，殊途同归，<strong>ACC也就此进入了类似于SCC部署所述的机制和道路来进行example02的安装</strong>。只不过，传入数据所承载的任务不同，执行的方向也会稍微有所不同。由于执行过程在《fabric源码分析18》详述过，因此下文将以粗线条叙述，重点在于提及不同之处。在此罗列一下进入<code>Execute(...)</code>的参数：ctxt依旧未有更新；cccid是第4步生成的，对应图中的CCContext；spec可以将其当作图中的CIS。</li> 
+   <li><code>Execute(ctxt, cccid, spec)</code>仍依次执行<code>theChaincodeSupport.Launch(...)</code>，<code>theChaincodeSupport.Execute(...)</code>，但这里spec是第5步生成的CIS，因此cctyp的值为ChaincodeMessage_TRANSACTION，进而生成的供<code>theChaincodeSupport.Execute(...)</code>（下文若非特指，凡提到的Execute函数均指此函数）使用的ccMsg是ChaincodeMessage_TRANSACTION类型的消息（对应图中的ChaincodeMessage）。依旧，分开讲解两个函数。</li> 
+  </ol> 
+  <h4 id="launch">Launch</h4> 
+  <ol> 
+   <li><code>Launch(...)</code>函数在ACC安装的情况下执行不了太久，<code>canName := cccid.GetCanonicalName()</code>等到的canName=lscc:1.0.0，此值会是程序进入<code>if chrte, ok = chaincodeSupport.chaincodeHasBeenLaunched(canName); ok</code>分支，进而进入<code>if chrte.handler.isRunning()</code>分支而返回。因为负责处理安装example02的lscc已经Launch过了，所以这样安排顺理成章。</li> 
+  </ol> 
+  <h4 id="execute">Execute</h4> 
+  <ol> 
+   <li>继续，在此罗列一下传入<code>Execute(...)</code>函数的参数：ctxt依旧位更新；cccid为图中的CCContext；ccMsg是图中的ChaincodeMessage；executetimeout为超时时间。</li> 
+   <li><code>Execute(...)</code>函数中，<code>canName := cccid.GetCanonicalName()</code>再次得到lscc:1.0.0，然后通过<code>chrte, ok := chaincodeSupport.chaincodeHasBeenLaunched(canName)</code>，获取了lscc在《fabric源码分析18》中已部署过的ServerHandler，再<code>chrte.handler.sendExecuteMessage(...)</code>开始使用该ServerHandler以触发状态机进入运行，最后进入<code>select-case</code>等待。在此罗列一下传入<code>sendExecuteMessage(...)</code>的参数：ctxt依旧未更新；cccid.ChainID为空；msg为图中的ChaincodeMessage；cccid.SignedProposal为图中的SignedProposal；cccid.Proposal为图中的Proposal。</li> 
+   <li>在<code>sendExecuteMessage(...)</code>中，通过调用<code>handler.triggerNextState(msg, true)</code>，ServerHandler将msg发给自身的<code>handler.nextState</code>通道以触发ServerHandler的状态机进入下一个状态。</li> 
+   <li>ServerHandler的<code>processStream()</code>收到来自<code>handler.nextState</code>通道的msg，先交给<code>handler.HandleMessage(in)</code>处理，ServerHandler状态机无任何变化，然后<code>handler.serialSendAsync(in, errc)</code>给lscc的ShimHandler发送msg。</li> 
+   <li>lscc的ShimHandler的<code>chatWithPeer()</code>收到msg，交由<code>handler.handleMessage(in)</code>处理，触发<code>beforeTransaction</code>事件函数，该事件函数主要调用同文件中的<code>handleTransaction(...)</code>函数。</li> 
+   <li><code>handleTransaction(...)</code>函数主要做的就是根据ShimHandler收到的msg生成并初始化一个ChaincodeStub，对应图中的ChaincodeStub，然后<code>handler.cc.Invoke(stub)</code>调用lscc的<code>Invoke()</code>方法对example02进行安装。</li> 
+   <li>在lscc的<code>Invoke()</code>中，<code>args := stub.GetArgs()</code>获取到的是CIS.CS.Input.Args。这个数组的值来自于protos/utils/proputils.go中<code>createProposalFromCDS()</code>中的<code>case "install":</code>中的ccinp。因此<code>Invoke()</code>中，<code>function := string(args[0])</code>得到function的值是<code>"install"</code>，<code>switch function</code>会进入<code>case INSTALL:</code>的分支。</li> 
+   <li><code>case INSTALL:</code>分支中，首先，<code>lscc.policyChecker.CheckPolicyNoChannel(...)</code>专门使用了检测未指定Channel的chaincode的函数来检查要安装的example02，这也侧面映证了上文<strong>生成签名申请包</strong>章节中对chainID的描述。接着，<code>depSpec := args[1]</code>取出来的就是example02的CDS，不过此时的CDS仍是被Marshal过的。最后，<code>lscc.executeInstall(stub, depSpec)</code>，调用lscc的函数，依据stub和example02的CDS，执行安装。</li> 
+   <li>在<code>executeInstall(...)</code>中，首先，<code>ccpack,err := ccprovider.GetCCPackage(ccbytes)</code>，根据example02被Marshal过的CDS创建一个CDSPackage（core/common/ccprovider/cdspackage.go中定义），对应图中的CDSPackage。其次，简单的验证了example02的Name和Version。最后，调用<code>ccpack.PutChaincodeToFS()</code>将example02源码写入文件系统。</li> 
+   <li>在<code>PutChaincodeToFS(...)</code>中，一系列if检查之后，先<code>path := fmt.Sprintf("%s/%s.%s", chaincodeInstallPath, ccname, ccversion)</code>整合出要写入的路径，即在chaincodeInstallPath目录下放入名为example02.anotherversion的文件。然后<code>os.Stat(path)</code>先查看这个文件名是否可用。最后<code>ioutil.WriteFile(path, ccpack.buf, 0644)</code>将CDSPackage中成员buf写入path指定的地方。这个buf，从图中就可知道，就是example02源码压缩包。至此，<strong>example02的安装申请执行完毕</strong>。由此，开始一路返回。</li> 
+   <li>一路返回至第6步ShimHandler的事件函数<code>handleTransaction(...)</code>中，<code>handler.cc.Invoke(stub)</code>返回，继续向下执行，将nextStateMsg赋值为ChaincodeMessage_COMPLETED类型的消息，并执行defer中的<code>handler.triggerNextState(nextStateMsg, send)</code>将该消息发送给自己的状态机。ShimHandler只将ChaincodeMessage_COMPLETED消息发送给ServerHandler之后就再无其他动作或变化。</li> 
+   <li>ServerHandler收到ChaincodeMessage_COMPLETED消息，通知仍处于等待之中的<code>Execute(...)</code>函数，然后等待结束，<code>Execute(...)</code>函数成功返回。</li> 
+  </ol> 
+  <h4 id="一路返回">一路返回</h4> 
+  <ol> 
+   <li><code>Execute(...)</code>函数结束之后，就此一路返回，一直返回到core/endorser/endorser.go中的<code>callChaincode(...)</code>，<code>chaincode.ExecuteChaincode(...)</code>执行完毕，对应到上文<strong>执行申请</strong>章节的第4步的（2），由于这一步的（3）install申请不会执行，因此<code>callChaincode(...)</code>也就此结束。</li> 
+   <li>继续返回到<code>simulateProposal</code>，继续的代码中<code>if txsim != nil</code>分支不会进入，因此也是直接返回至<code>ProcessProposal()</code>。</li> 
+   <li>继续<code>ProcessProposal()</code>，将进入<code>if res != nil</code>分支，但无法进入<code>if res.Status &gt;= shim.ERROR</code>分支。因此继续向下走，进入<code>if chainID == ""</code>分支对要返回给Endorser客户端的应答消息pResp赋值，最后返回pResp给Endorser客户端。</li> 
+   <li>example02安装申请的起点，peer/chaincode/install.go中的<code>chaincodeInstall(...)</code>，所调用的<code>install(...)</code>中的<code>cf.EndorserClient.ProcessProposal()</code>，即是Endorser客户端，收到服务端发来的消息，返回后<code>install(...)</code>随之结束，进而<code>chaincodeInstall(...)</code>结束。至此，<strong>整个example02的安装全部结束</strong>。</li> 
+  </ol> 
+  <h2 id="安装后的状态">安装后的状态</h2> 
+  <ol> 
+   <li>peer结点的chaincodeInstallPath目录下，会有一个名为example02.anotherversion的文件，该文件即为example02源码压缩包。</li> 
+  </ol> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/idsuf698987/article/details/78353464,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/idsuf698987/article/details/78353464,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

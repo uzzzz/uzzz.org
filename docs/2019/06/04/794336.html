@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>PointRCNN网络可视化，代码详解 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="PointRCNN网络可视化，代码详解" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="目录 PointRCNN PointRCNN网络结构 训练过程 思考 PointRCNN PointRCNN是CVPR2019中3D目标检测的文章。3D目标检测是一个计算机视觉中比较新的任务，其他的文献综述可以参考我的另外一篇博客3D Object Detection 3D目标检测综述 该文章使用two-stage方式，利用PointNet++作为主干网络，先完成segmentation任务，判断每个三维点的label。对分为前景的每个点，使用feature生成框。然后对框进行roi crop，进行框的优化。该论文网络复杂，代码量巨大，真是佩服论文作者的代码功底，自愧不如。本文着重对网络结构的理解。代码来源是文章作者给出的代码，用的是pytorch，github传送门 接下来，我将先对运算过程进行可视化，然后再列出部分本篇论文我注意到的点。 PointRCNN网络结构 由于PointRCNN使用PointNet++作为主干网络，所以对PointNet++的具体网络结构不是很了解的同学可以参考我的另一篇博客PointNet++具体实现详解，其中也是着重对网络结构的理解。先看PointRCNN的网络结构的可视化： 图1 RPN结构 图2 RCNN.ProposalTargetLayer结构 图3 RCNN的分类和回归部分 图的解释 虚线大框：一个虚线框代表一个完整的子网络，对应代码中的一个class 红色小框：每个子网络的名称 蓝色小块：大多数一个蓝色小块代表一个tensor，蓝色小框的第一行为tensor的名称，第二行为tensor的尺寸。少量未标注尺寸的为一个子网络 橘色小块：一个子网络的输出 箭头：一种操作，没有标的大部分为resize或者permutation操作，也有concatenate操作 RPN RPN.BackBone 输入：点云（batch，number of points，number of channels） 输出：xyz，每个点的 feature，每个点的分类结果 rpn_cls，每个点对框的回归结果 rpn_reg 三维点云xyz经过主干网络得到point-wise的特征feature feature经过分类头和回归头得到point-wise的分类结果rpn_cls和回归结果rpn_reg，分类头和回归头由Conv1d组成 cls_rpn经过sigmoid变换到[0, 1]之间，表示该点为车的score，score大于阈值thres的点被认为是属于车的点，从而构造seg_mask，用于构造RCNN的输入 通过每个点的三维信息xyz计算点距离原点的深度信息depth，用于RCNN的输入 RPN.ProposalLayer 输入：rpn_reg，rpn_cls 输出：roi 将rpn_reg分解，并与三维点xyz和anchor计算proposals 使用Distance Proposal 减小proposal的数量。Distance Proposal： 用雷达点的y坐标以40为界分为两块区域，[0, 40] 和 [40, 80] 按照rpn_cls（代表是box的置信度）进行排序，[0, 40]的区域选取6300个框，[40, 80]选取2700个框 将框转为BEV，然后使用nms，两个区域分别选取前358和154个框（nms后如果框的数量少于这两个值就全部选取，用0补足到512个框） 输出每个batch的512个框roi RCNN RCNN.ProposalTargetLayer 输入：roi，gt_boxes，xyz，seg_mask，depth，feature 输出：采样过后的roi，roi_iou，对应的roi_gt_boxes，roi中包括的pts_sample和feature_sample，batch_cls_mask，reg_valid_mask 使用RoISample再次采样RoI，RoISample： 计算所有roi与真值之间的IoU，并按照IoU分为fg（前景），easy bg（简单背景）和 hard bg（困难背景），中sample数64个，fg最多32个，剩余的由bg补充，其中hard bg占比0.8。 然后对roi做augmentation，更新roi和对应的IoU 将xyz，seg_mask，depth和feature进行concatenate，得到pts_feature 对pts_feature进行RoIPooling，每个RoI中取512个点，得到pooled_feature，并得到不包含点的RoI的flag 将pooled_feature中的坐标和feature分离，然后做roi的augmentation，并将坐标系转到roi中心，更新roi中点的三维坐标和gt_box的坐标 计算batch_cls_mask，reg_valid_mask用于计算loss，batch_cls_mask统计roi不为hard bg且其中包含点的mask，作为cls_label在计算loss中使用；reg_valid_mask统计roi属于fg的mask pts_sample和feature_sample重组，提取直接由三维点云获得的信息xyz_feature（包括xyz，seg_mask和depth），然后使用xyz_up_layer进行特征提取，与rpn得到的feature进行concatenate，然后使用merged_down_layer进行merge，得到merged_feature 将merged_feature送入3个PointNet++中提出的SA层中，得到高级特征 然后使用分类头和回归头进行预测 训练过程 PointRCNN是two-stage结构的网络，所以训练过程也是先训练RPN，再训练RCNN。 RPN label：在通过dataloader构建训练数据的同时，构建label cls_label：将gt_box内的点置1，gt_box之外extended_gt_box之内的点置-1（表示忽略） reg_label：计算gt_box之内的点的reg量 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） RCNN label： cls_label：在RCNN.ProposalTargetLayer中的batch_cls_mask为label reg_label：使用RCNN.ProposalTargetLayer中的roi_gt_boxes计算 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） 思考 文章使用two-stage的方法，在proposal的过程中，每个个三维点都回归一个proposal，使得理论上所有的box都能够被找到 文章使用bin based回归方式，而且是在所有回归的地方都使用bin based的方式，提高了网络的收敛速度和准确率。 文章使用PointNet++作为主干框架，使得不需要在体素化阶段损失信息 其他3D物体检测的文章可以参考我的另一篇博客另外一篇博客3D Object Detection 3D目标检测综述" />
+<meta property="og:description" content="目录 PointRCNN PointRCNN网络结构 训练过程 思考 PointRCNN PointRCNN是CVPR2019中3D目标检测的文章。3D目标检测是一个计算机视觉中比较新的任务，其他的文献综述可以参考我的另外一篇博客3D Object Detection 3D目标检测综述 该文章使用two-stage方式，利用PointNet++作为主干网络，先完成segmentation任务，判断每个三维点的label。对分为前景的每个点，使用feature生成框。然后对框进行roi crop，进行框的优化。该论文网络复杂，代码量巨大，真是佩服论文作者的代码功底，自愧不如。本文着重对网络结构的理解。代码来源是文章作者给出的代码，用的是pytorch，github传送门 接下来，我将先对运算过程进行可视化，然后再列出部分本篇论文我注意到的点。 PointRCNN网络结构 由于PointRCNN使用PointNet++作为主干网络，所以对PointNet++的具体网络结构不是很了解的同学可以参考我的另一篇博客PointNet++具体实现详解，其中也是着重对网络结构的理解。先看PointRCNN的网络结构的可视化： 图1 RPN结构 图2 RCNN.ProposalTargetLayer结构 图3 RCNN的分类和回归部分 图的解释 虚线大框：一个虚线框代表一个完整的子网络，对应代码中的一个class 红色小框：每个子网络的名称 蓝色小块：大多数一个蓝色小块代表一个tensor，蓝色小框的第一行为tensor的名称，第二行为tensor的尺寸。少量未标注尺寸的为一个子网络 橘色小块：一个子网络的输出 箭头：一种操作，没有标的大部分为resize或者permutation操作，也有concatenate操作 RPN RPN.BackBone 输入：点云（batch，number of points，number of channels） 输出：xyz，每个点的 feature，每个点的分类结果 rpn_cls，每个点对框的回归结果 rpn_reg 三维点云xyz经过主干网络得到point-wise的特征feature feature经过分类头和回归头得到point-wise的分类结果rpn_cls和回归结果rpn_reg，分类头和回归头由Conv1d组成 cls_rpn经过sigmoid变换到[0, 1]之间，表示该点为车的score，score大于阈值thres的点被认为是属于车的点，从而构造seg_mask，用于构造RCNN的输入 通过每个点的三维信息xyz计算点距离原点的深度信息depth，用于RCNN的输入 RPN.ProposalLayer 输入：rpn_reg，rpn_cls 输出：roi 将rpn_reg分解，并与三维点xyz和anchor计算proposals 使用Distance Proposal 减小proposal的数量。Distance Proposal： 用雷达点的y坐标以40为界分为两块区域，[0, 40] 和 [40, 80] 按照rpn_cls（代表是box的置信度）进行排序，[0, 40]的区域选取6300个框，[40, 80]选取2700个框 将框转为BEV，然后使用nms，两个区域分别选取前358和154个框（nms后如果框的数量少于这两个值就全部选取，用0补足到512个框） 输出每个batch的512个框roi RCNN RCNN.ProposalTargetLayer 输入：roi，gt_boxes，xyz，seg_mask，depth，feature 输出：采样过后的roi，roi_iou，对应的roi_gt_boxes，roi中包括的pts_sample和feature_sample，batch_cls_mask，reg_valid_mask 使用RoISample再次采样RoI，RoISample： 计算所有roi与真值之间的IoU，并按照IoU分为fg（前景），easy bg（简单背景）和 hard bg（困难背景），中sample数64个，fg最多32个，剩余的由bg补充，其中hard bg占比0.8。 然后对roi做augmentation，更新roi和对应的IoU 将xyz，seg_mask，depth和feature进行concatenate，得到pts_feature 对pts_feature进行RoIPooling，每个RoI中取512个点，得到pooled_feature，并得到不包含点的RoI的flag 将pooled_feature中的坐标和feature分离，然后做roi的augmentation，并将坐标系转到roi中心，更新roi中点的三维坐标和gt_box的坐标 计算batch_cls_mask，reg_valid_mask用于计算loss，batch_cls_mask统计roi不为hard bg且其中包含点的mask，作为cls_label在计算loss中使用；reg_valid_mask统计roi属于fg的mask pts_sample和feature_sample重组，提取直接由三维点云获得的信息xyz_feature（包括xyz，seg_mask和depth），然后使用xyz_up_layer进行特征提取，与rpn得到的feature进行concatenate，然后使用merged_down_layer进行merge，得到merged_feature 将merged_feature送入3个PointNet++中提出的SA层中，得到高级特征 然后使用分类头和回归头进行预测 训练过程 PointRCNN是two-stage结构的网络，所以训练过程也是先训练RPN，再训练RCNN。 RPN label：在通过dataloader构建训练数据的同时，构建label cls_label：将gt_box内的点置1，gt_box之外extended_gt_box之内的点置-1（表示忽略） reg_label：计算gt_box之内的点的reg量 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） RCNN label： cls_label：在RCNN.ProposalTargetLayer中的batch_cls_mask为label reg_label：使用RCNN.ProposalTargetLayer中的roi_gt_boxes计算 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） 思考 文章使用two-stage的方法，在proposal的过程中，每个个三维点都回归一个proposal，使得理论上所有的box都能够被找到 文章使用bin based回归方式，而且是在所有回归的地方都使用bin based的方式，提高了网络的收敛速度和准确率。 文章使用PointNet++作为主干框架，使得不需要在体素化阶段损失信息 其他3D物体检测的文章可以参考我的另一篇博客另外一篇博客3D Object Detection 3D目标检测综述" />
+<link rel="canonical" href="https://uzzz.org/2019/06/04/794336.html" />
+<meta property="og:url" content="https://uzzz.org/2019/06/04/794336.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-06-04T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"目录 PointRCNN PointRCNN网络结构 训练过程 思考 PointRCNN PointRCNN是CVPR2019中3D目标检测的文章。3D目标检测是一个计算机视觉中比较新的任务，其他的文献综述可以参考我的另外一篇博客3D Object Detection 3D目标检测综述 该文章使用two-stage方式，利用PointNet++作为主干网络，先完成segmentation任务，判断每个三维点的label。对分为前景的每个点，使用feature生成框。然后对框进行roi crop，进行框的优化。该论文网络复杂，代码量巨大，真是佩服论文作者的代码功底，自愧不如。本文着重对网络结构的理解。代码来源是文章作者给出的代码，用的是pytorch，github传送门 接下来，我将先对运算过程进行可视化，然后再列出部分本篇论文我注意到的点。 PointRCNN网络结构 由于PointRCNN使用PointNet++作为主干网络，所以对PointNet++的具体网络结构不是很了解的同学可以参考我的另一篇博客PointNet++具体实现详解，其中也是着重对网络结构的理解。先看PointRCNN的网络结构的可视化： 图1 RPN结构 图2 RCNN.ProposalTargetLayer结构 图3 RCNN的分类和回归部分 图的解释 虚线大框：一个虚线框代表一个完整的子网络，对应代码中的一个class 红色小框：每个子网络的名称 蓝色小块：大多数一个蓝色小块代表一个tensor，蓝色小框的第一行为tensor的名称，第二行为tensor的尺寸。少量未标注尺寸的为一个子网络 橘色小块：一个子网络的输出 箭头：一种操作，没有标的大部分为resize或者permutation操作，也有concatenate操作 RPN RPN.BackBone 输入：点云（batch，number of points，number of channels） 输出：xyz，每个点的 feature，每个点的分类结果 rpn_cls，每个点对框的回归结果 rpn_reg 三维点云xyz经过主干网络得到point-wise的特征feature feature经过分类头和回归头得到point-wise的分类结果rpn_cls和回归结果rpn_reg，分类头和回归头由Conv1d组成 cls_rpn经过sigmoid变换到[0, 1]之间，表示该点为车的score，score大于阈值thres的点被认为是属于车的点，从而构造seg_mask，用于构造RCNN的输入 通过每个点的三维信息xyz计算点距离原点的深度信息depth，用于RCNN的输入 RPN.ProposalLayer 输入：rpn_reg，rpn_cls 输出：roi 将rpn_reg分解，并与三维点xyz和anchor计算proposals 使用Distance Proposal 减小proposal的数量。Distance Proposal： 用雷达点的y坐标以40为界分为两块区域，[0, 40] 和 [40, 80] 按照rpn_cls（代表是box的置信度）进行排序，[0, 40]的区域选取6300个框，[40, 80]选取2700个框 将框转为BEV，然后使用nms，两个区域分别选取前358和154个框（nms后如果框的数量少于这两个值就全部选取，用0补足到512个框） 输出每个batch的512个框roi RCNN RCNN.ProposalTargetLayer 输入：roi，gt_boxes，xyz，seg_mask，depth，feature 输出：采样过后的roi，roi_iou，对应的roi_gt_boxes，roi中包括的pts_sample和feature_sample，batch_cls_mask，reg_valid_mask 使用RoISample再次采样RoI，RoISample： 计算所有roi与真值之间的IoU，并按照IoU分为fg（前景），easy bg（简单背景）和 hard bg（困难背景），中sample数64个，fg最多32个，剩余的由bg补充，其中hard bg占比0.8。 然后对roi做augmentation，更新roi和对应的IoU 将xyz，seg_mask，depth和feature进行concatenate，得到pts_feature 对pts_feature进行RoIPooling，每个RoI中取512个点，得到pooled_feature，并得到不包含点的RoI的flag 将pooled_feature中的坐标和feature分离，然后做roi的augmentation，并将坐标系转到roi中心，更新roi中点的三维坐标和gt_box的坐标 计算batch_cls_mask，reg_valid_mask用于计算loss，batch_cls_mask统计roi不为hard bg且其中包含点的mask，作为cls_label在计算loss中使用；reg_valid_mask统计roi属于fg的mask pts_sample和feature_sample重组，提取直接由三维点云获得的信息xyz_feature（包括xyz，seg_mask和depth），然后使用xyz_up_layer进行特征提取，与rpn得到的feature进行concatenate，然后使用merged_down_layer进行merge，得到merged_feature 将merged_feature送入3个PointNet++中提出的SA层中，得到高级特征 然后使用分类头和回归头进行预测 训练过程 PointRCNN是two-stage结构的网络，所以训练过程也是先训练RPN，再训练RCNN。 RPN label：在通过dataloader构建训练数据的同时，构建label cls_label：将gt_box内的点置1，gt_box之外extended_gt_box之内的点置-1（表示忽略） reg_label：计算gt_box之内的点的reg量 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） RCNN label： cls_label：在RCNN.ProposalTargetLayer中的batch_cls_mask为label reg_label：使用RCNN.ProposalTargetLayer中的roi_gt_boxes计算 loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss） 思考 文章使用two-stage的方法，在proposal的过程中，每个个三维点都回归一个proposal，使得理论上所有的box都能够被找到 文章使用bin based回归方式，而且是在所有回归的地方都使用bin based的方式，提高了网络的收敛速度和准确率。 文章使用PointNet++作为主干框架，使得不需要在体素化阶段损失信息 其他3D物体检测的文章可以参考我的另一篇博客另外一篇博客3D Object Detection 3D目标检测综述","@type":"BlogPosting","url":"https://uzzz.org/2019/06/04/794336.html","headline":"PointRCNN网络可视化，代码详解","dateModified":"2019-06-04T00:00:00+08:00","datePublished":"2019-06-04T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/06/04/794336.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>PointRCNN网络可视化，代码详解</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix">  
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <p></p>
+  <div class="toc">
+   <h3>目录</h3>
+   <ul>
+    <li><a href="#PointRCNN_2" rel="nofollow" data-token="00e89abbcb3cdda17762069fe47c744f">PointRCNN</a></li>
+    <ul>
+     <li><a href="#PointRCNN_8" rel="nofollow" data-token="56a22e32f8b92fc222e53f24ad145eef">PointRCNN网络结构</a></li>
+     <li><a href="#_67" rel="nofollow" data-token="51bc1842d729933ad3ae57aab86360a4">训练过程</a></li>
+     <li><a href="#_82" rel="nofollow" data-token="e2c191f339fb1ce7d6a48217bc0ae570">思考</a></li>
+    </ul>
+   </ul>
+  </div>
+  <p></p> 
+  <h1><a id="PointRCNN_2"></a>PointRCNN</h1> 
+  <p>PointRCNN是CVPR2019中3D目标检测的文章。3D目标检测是一个计算机视觉中比较新的任务，其他的文献综述可以参考我的另外一篇博客<a href="https://blog.csdn.net/wqwqqwqw1231/article/details/90693612" rel="nofollow" data-token="43971077333b2c3dc62af3e27cfae54c">3D Object Detection 3D目标检测综述</a><br> 该文章使用two-stage方式，利用PointNet++作为主干网络，先完成segmentation任务，判断每个三维点的label。对分为前景的每个点，使用feature生成框。然后对框进行roi crop，进行框的优化。该论文网络复杂，代码量巨大，真是佩服论文作者的代码功底，自愧不如。本文着重对网络结构的理解。代码来源是文章作者给出的代码，用的是pytorch，<a href="https://github.com/sshaoshuai/PointRCNN" rel="nofollow" data-token="7ddbfead141e431c58114b669b31858c">github传送门</a><br> 接下来，我将先对运算过程进行可视化，然后再列出部分本篇论文我注意到的点。</p> 
+  <h2><a id="PointRCNN_8"></a>PointRCNN网络结构</h2> 
+  <p>由于PointRCNN使用PointNet++作为主干网络，所以对PointNet++的具体网络结构不是很了解的同学可以参考我的另一篇博客<a href="https://blog.csdn.net/wqwqqwqw1231/article/details/90757687" rel="nofollow" data-token="e6fdfc6c78d8175f0de9102dd7d36290">PointNet++具体实现详解</a>，其中也是着重对网络结构的理解。先看PointRCNN的网络结构的可视化：</p> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190604163432854.JPG?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dxd3Fxd3F3MTIzMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <center>
+    图1 RPN结构
+  </center> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190604163446344.JPG?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dxd3Fxd3F3MTIzMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <center>
+    图2 RCNN.ProposalTargetLayer结构
+  </center> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190604163454732.JPG?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dxd3Fxd3F3MTIzMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <center>
+    图3 RCNN的分类和回归部分
+  </center> 
+  <br> 
+  <br> 
+  <ul> 
+   <li>图的解释 
+    <ul> 
+     <li>虚线大框：一个虚线框代表一个完整的子网络，对应代码中的一个class</li> 
+     <li>红色小框：每个子网络的名称</li> 
+     <li>蓝色小块：大多数一个蓝色小块代表一个tensor，蓝色小框的第一行为tensor的名称，第二行为tensor的尺寸。少量未标注尺寸的为一个子网络</li> 
+     <li>橘色小块：一个子网络的输出</li> 
+     <li>箭头：一种操作，没有标的大部分为resize或者permutation操作，也有concatenate操作</li> 
+    </ul> </li> 
+  </ul> 
+  <br> 
+  <ul> 
+   <li>RPN 
+    <ul> 
+     <li>RPN.BackBone 
+      <ul> 
+       <li>输入：点云（batch，number of points，number of channels）</li> 
+       <li>输出：xyz，每个点的 feature，每个点的分类结果 rpn_cls，每个点对框的回归结果 rpn_reg</li> 
+       <li>三维点云xyz经过主干网络得到point-wise的特征feature</li> 
+       <li>feature经过分类头和回归头得到point-wise的分类结果rpn_cls和回归结果rpn_reg，分类头和回归头由Conv1d组成</li> 
+      </ul> </li> 
+     <li>cls_rpn经过sigmoid变换到[0, 1]之间，表示该点为车的score，score大于阈值thres的点被认为是属于车的点，从而构造seg_mask，用于构造RCNN的输入</li> 
+     <li>通过每个点的三维信息xyz计算点距离原点的深度信息depth，用于RCNN的输入</li> 
+     <li>RPN.ProposalLayer 
+      <ul> 
+       <li>输入：rpn_reg，rpn_cls</li> 
+       <li>输出：roi</li> 
+       <li>将rpn_reg分解，并与三维点xyz和anchor计算proposals</li> 
+       <li>使用Distance Proposal 减小proposal的数量。Distance Proposal： 
+        <ul> 
+         <li>用雷达点的y坐标以40为界分为两块区域，[0, 40] 和 [40, 80]</li> 
+         <li>按照rpn_cls（代表是box的置信度）进行排序，[0, 40]的区域选取6300个框，[40, 80]选取2700个框</li> 
+         <li>将框转为BEV，然后使用nms，两个区域分别选取前358和154个框（nms后如果框的数量少于这两个值就全部选取，用0补足到512个框）</li> 
+        </ul> </li> 
+      </ul> </li> 
+     <li>输出每个batch的512个框roi</li> 
+    </ul> </li> 
+  </ul> 
+  <br> 
+  <ul> 
+   <li>RCNN 
+    <ul> 
+     <li>RCNN.ProposalTargetLayer 
+      <ul> 
+       <li>输入：roi，gt_boxes，xyz，seg_mask，depth，feature</li> 
+       <li>输出：采样过后的roi，roi_iou，对应的roi_gt_boxes，roi中包括的pts_sample和feature_sample，batch_cls_mask，reg_valid_mask</li> 
+       <li>使用RoISample再次采样RoI，RoISample： 
+        <ul> 
+         <li>计算所有roi与真值之间的IoU，并按照IoU分为fg（前景），easy bg（简单背景）和 hard bg（困难背景），中sample数64个，fg最多32个，剩余的由bg补充，其中hard bg占比0.8。</li> 
+         <li>然后对roi做augmentation，更新roi和对应的IoU</li> 
+        </ul> </li> 
+       <li>将xyz，seg_mask，depth和feature进行concatenate，得到pts_feature</li> 
+       <li>对pts_feature进行RoIPooling，每个RoI中取512个点，得到pooled_feature，并得到不包含点的RoI的flag</li> 
+       <li>将pooled_feature中的坐标和feature分离，然后做roi的augmentation，并将坐标系转到roi中心，更新roi中点的三维坐标和gt_box的坐标</li> 
+       <li>计算batch_cls_mask，reg_valid_mask用于计算loss，batch_cls_mask统计roi不为hard bg且其中包含点的mask，作为cls_label在计算loss中使用；reg_valid_mask统计roi属于fg的mask</li> 
+      </ul> </li> 
+     <li>pts_sample和feature_sample重组，提取直接由三维点云获得的信息xyz_feature（包括xyz，seg_mask和depth），然后使用xyz_up_layer进行特征提取，与rpn得到的feature进行concatenate，然后使用merged_down_layer进行merge，得到merged_feature</li> 
+     <li>将merged_feature送入3个PointNet++中提出的SA层中，得到高级特征</li> 
+     <li>然后使用分类头和回归头进行预测</li> 
+    </ul> </li> 
+  </ul> 
+  <h2><a id="_67"></a>训练过程</h2> 
+  <p>PointRCNN是two-stage结构的网络，所以训练过程也是先训练RPN，再训练RCNN。</p> 
+  <ul> 
+   <li>RPN 
+    <ul> 
+     <li>label：在通过dataloader构建训练数据的同时，构建label 
+      <ul> 
+       <li>cls_label：将gt_box内的点置1，gt_box之外extended_gt_box之内的点置-1（表示忽略）</li> 
+       <li>reg_label：计算gt_box之内的点的reg量</li> 
+      </ul> </li> 
+     <li>loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss）</li> 
+    </ul> </li> 
+   <li>RCNN 
+    <ul> 
+     <li>label： 
+      <ul> 
+       <li>cls_label：在RCNN.ProposalTargetLayer中的batch_cls_mask为label</li> 
+       <li>reg_label：使用RCNN.ProposalTargetLayer中的roi_gt_boxes计算</li> 
+      </ul> </li> 
+     <li>loss：SigmoidFocalLoss + Full-bin Loss（CrossEntropyLoss + SmoothL1Loss）</li> 
+    </ul> </li> 
+  </ul> 
+  <h2><a id="_82"></a>思考</h2> 
+  <ul> 
+   <li>文章使用two-stage的方法，在proposal的过程中，每个个三维点都回归一个proposal，使得理论上所有的box都能够被找到</li> 
+   <li>文章使用bin based回归方式，而且是在所有回归的地方都使用bin based的方式，提高了网络的收敛速度和准确率。</li> 
+   <li>文章使用PointNet++作为主干框架，使得不需要在体素化阶段损失信息</li> 
+   <li>其他3D物体检测的文章可以参考我的另一篇博客另外一篇博客<a href="https://blog.csdn.net/wqwqqwqw1231/article/details/90693612" rel="nofollow" data-token="43971077333b2c3dc62af3e27cfae54c">3D Object Detection 3D目标检测综述</a></li> 
+  </ul> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-e44c3c0e64.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

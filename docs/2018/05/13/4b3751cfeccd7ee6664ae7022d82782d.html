@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析(18)以太坊交易执行分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析(18)以太坊交易执行分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="#以太坊交易执行分析 在这里，将其整体串起来，从state_processor.Process函数开始，归纳一下其所作的处理。 ##1 Process Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 **处理逻辑：** ~~~ 1. 定义及初始化收据、耗费的gas、区块头、日志、gas池等变量； 2. 如果是DAO事件硬分叉相关的处理，则调用misc.ApplyDAOHardFork(statedb)执行处理； 3. 对区块中的每一个交易，进行迭代处理；处理逻辑： a. 对当前交易做预处理，设置交易的hash、索引、区块hash，供EVM发布新的状态日志使用； b. 执行ApplyTransaction，获取收据； c. 若上一步出错，中断整个Process，返回错误； d. 若正常，累积记录收据及日志。循环进入下一个交易的处理。 4. 调用共识模块做Finalize处理； 5. 返回所有的收据、日志、总共使用的gas。 ~~~ ##2 ApplyTransaction(1.3.b ) ApplyTransaction尝试将交易应用于给定的状态数据库，并使用输入参数作为其环境。 它返回交易的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 **处理逻辑：** ~~~ 1. 将types.Transaction结构变量转为core.Message对象；这过程中会对发送者做签名验证，并获得发送者的地址缓存起来； 2. 创建新的上下文（Context），此上下文将在EVM 环境（EVM environment）中使用；上下文中包含msg，区块头、区块指针、作者（挖矿者、获益者）； 3. 创建新的EVM environment，其中包括了交易相关的所有信息以及调用机制； 4. ApplyMessage， 将交易应用于当前的状态中，也就是执行状态转换，新的状态包含在环境对象中；得到执行结果以及花费的gas； 5. 判断是否分叉情况（ `config.IsByzantium(header.Number)` ），如果不是，获取当前的statedb的状态树根哈希； 6. 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas； 7. 如果是创建合约的交易，那么我们把创建地址存储到收据里面； 8. 拿到所有的日志并创建日志的布隆过滤器；返回。 ~~~ ##3 ApplyMessage（2.4） ApplyMessage将交易应用于当前的状态中，代码里就是创建了一个StateTransition然后调用其TransitionDb()方法。 ApplyMessage返回由任何EVM执行（如果发生）返回的字节（但这个返回值在ApplyTransaction中被忽略了）， 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 ##4 StateTransition.TransitionDb() ~~~ 1. 预检查，出错则函数返回； a. 检查交易的Nonce值是否合规； b. buyGas：根据发送者定的gaslimit和GasPrice，从发送者余额中扣除以太币；从区块gas池中减掉本次gas；并对运行环境做好更新； 2. 支付固定费用 intrinsic gas； 3. 如果是合约创建， 那么调用evm的Create方法创建新的合约，使用交易的data作为新合约的部署代码； 4. 否则不是合约创建，增加发送者的Nonce值，然后调用evm.Call执行交易； 5. 计算并执行退款，将退回的gas对应的以太币退回给交易发送者。 ~~~ ###4.3 evm.Create创建新的合约 ~~~ 1. 检查执行深度，若超过params.CallCreateDepth（即1024）就出错返回；刚开始的执行深度为0，肯定继续往下执行； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 发送者Nonce加1； 4. 创建合约地址并获取hash，若该合约地址已存在，或不合法（空），则出错返回； 5. 保存statedb快照，然后根据合约地址创建账户； 6. 执行转账evm.Transfer（在statedb中，将value所代表的以太币从发送者账户转到新合约账户）； 7. 根据发送者、前面创建的合约账户，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 8. 运行前一步创建的合约 9. 判断运行结果是否有错误。如果合约成功运行并且没有错误返回，则计算存储返回数据所需的GAS。 如果由于没有足够的GAS而导致返回值不能被存储则设置错误，并通过下面的错误检查条件来处理。 10. 若EVM返回错误或上述存储返回值出现错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ ###4.4 evm.Call执行交易 Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 Call方法和evm.Create的逻辑类似，但少了一些步骤。 ~~~ 1. 检查是否允许递归执行以及执行深度，若深度超过params.CallCreateDepth（即1024）就出错返回； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 保存statedb快照，创建接收者账户； 4. 如果接收者在statedb中尚不存在，则执行precompiles预编译，与编译结果为nil时出错返回；无错误则在statedb中创建接收者账户； 5. 执行转账； 6. 根据发送者、接收者，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 7. 运行前一步创建的合约 8. 若EVM返回错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ 虚拟机中合约的执行另行分析。 ### eth源码交易发送接收,校验存储分析： ``` 创建合约指的是将合约部署到区块链上，这也是通过发送交易来实现。在创建合约的交易中，to字段要留空不填，在data字段中指定合约的二进制代码， from字段是交易的发送者也是合约的创建者。 执行合约的交易 调用合约中的方法，需要将交易的to字段指定为要调用的合约的地址，通过data字段指定要调用的方法以及向该方法传递的参数。 所有对账户的变动操作都会先提交到stateDB里面，这个类似一个行为数据库，或者是缓存，最终执行需要提交到底层的数据库当中,底层数据库是levelDB（K,V数据库） core/interface.go定义了stateDB的接口 ProtocolManager主要成员包括： peertSet{}类型成员用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。当然在应用中，订阅也往往利用通道来实现事件通知。 ProtocolManager用到的这些通道的另一端，可能是其他的个体peer，也可能是系统内单例的数据源比如txPool，或者是事件订阅的管理者比如event.Mux。 Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后，安排相应的获取请求。 Downloader类型成员负责所有向相邻个体主动发起的同步流程。 func(pm *ProtocolManager) Start() 以上这四段相对独立的业务流程的逻辑分别是： 1.广播新出现的交易对象。txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件，会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 2.广播新挖掘出的区块。minedBroadcastLoop()持续等待本个体的新挖掘出区块事件，然后立即广播给需要的相邻个体。当不再订阅新挖掘区块事件时，这个函数才会结束等待并返回。很有意思的是,在收到新挖掘出区块事件后，minedBroadcastLoop()会连续调用两次BroadcastBlock()，两次调用仅仅一个bool型参数@propagate不一样，当该参数为true时，会将整个新区块依次发给相邻区块中的一小部分；而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 3.定时与相邻个体进行区块全链的强制同步。syncer()首先启动fetcher成员，然后进入一个无限循环，每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时，发起之；如果没有新peer到达，则以10s为间隔定时的发起之。这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高，由于Td是全链中从创世块到最新头块的Difficulty值总和，所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步，显然改动量是最小的，此即&quot;最优&quot;。 4.将新出现的交易对象均匀的同步给相邻个体。txsyncLoop()主体也是一个无限循环，它的逻辑稍微复杂一些：首先有一个数据类型txsync{p, txs},包含peer和tx列表；通道txsyncCh用来接收txsync{}对象；txsyncLoop()每次循环时，如果从通道txsyncCh中收到新数据，则将它存入一个本地map[]结构，k为peer.ID，v为txsync{}，并将这组tx对象发送给这个peer；每次向peer发送tx对象的上限数目100*1024，如果txsync{}对象中有剩余tx，则该txsync{}对象继续存入map[]并更新tx数目；如果本次循环没有新到达txsync{},则从map[]结构中随机找出一个txsync对象，将其中的tx组发送给相应的peer，重复以上循环。 以上四段流程就是ProtocolManager向相邻peer主动发起的通信过程。尽管上述各函数细节从文字阅读起来容易模糊，不过最重要的内容还是值得留意下的：本个体(peer)向其他peer主动发起的通信中，按照数据类型可分两类：交易tx和区块block；而按照通信方式划分，亦可分为广播新的单个数据和同步一组同类型数据，这样简单的两两配对，便可组成上述四段流程。 在上文的介绍中，出现了多处有关p2p通信协议的结构类型，比如eth.peer，p2p.Peer，Server等等。这里不妨对这些p2p通信协议族的结构一并作个总解。以太坊中用到的p2p通信协议族的结构类型，大致可分为三层： 第一层处于pkg eth中，可以直接被eth.Ethereum，eth.ProtocolManager等顶层管理模块使用，在类型声明上也明显考虑了eth.Ethereum的使用特点。典型的有eth.peer{}, eth.peerSet{}，其中peerSet是peer的集合类型，而eth.peer代表了远端通信对象和其所有通信操作，它封装更底层的p2p.Peer对象以及读写通道等。 第二层属于pkg p2p，可认为是泛化的p2p通信结构，比较典型的结构类型包括代表远端通信对象的p2p.Peer{}, 封装自更底层连接对象的conn{}，通信用通道对象protoRW{}, 以及启动监听、处理新加入连接或断开连接的Server{}。这一层中，各种数据类型的界限比较清晰，尽量不出现揉杂的情况，这也是泛化结构的需求。值得关注的是p2p.Protocol{}，它应该是针对上层应用特意开辟的类型，主要作用包括容纳应用程序所要求的回调函数等，并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。从这个类型所起的作用来看，命名为Protocol还是比较贴切的，尽管不应将其与TCP/IP协议等既有概念混淆。 第三层处于golang自带的网络代码包中，也可分为两部分：第一部分pkg net，包括代表网络连接的&lt;Conn&gt;接口，代表网络地址的&lt;Addr&gt;以及它们的实现类；第二部分pkg syscall，包括更底层的网络相关系统调用类等，可视为封装了网络层(IP)和传输层(TCP)协议的系统实现。 ``` ``` Receiptroot我们刚刚在区块头有看到，那他具体包含的是什么呢？它是一个交易的结果，主要包括了poststate,交易所花费的gas,bloom和logs blockchain无结构化查询需求，仅hash查询,key/value数据库最方便,底层用levelDB存储，性能好 stateDB用来存储世界状态 Core/state/statedb.go 注意：1. StateDB完整记录Transaction的执行情况； 2. StateDB的重点是StateObjects； 3. StateDB中的 stateObjects，Account的Address为 key，记录其Balance、nonce、code、codeHash ，以及tire中的 {string:Hash}等信息； 所有的结构凑明朗了，那具体的验证过程是怎么样的呢 Core/state_processor.go Core/state_transition.go Core/block_validator.go StateProcessor 1. 调用StateTransition，验证（执行）Transaction； 2. 计算Gas、Recipt、Uncle Reward StateTransition 1. 验证（执行）Transaction； 3. 扣除transaction.data.payload计算数据所需要消耗的gas； 4. 在vm中执行code（生成contract or 执行contract）；vm执 行过程中，其gas会被自动消耗。如果gas不足，vm会自 选退出； 5. 将多余的gas退回到sender.balance中； 6. 将消耗的gas换成balance加到当前env.Coinbase()中； BlockValidator 1. 验证UsedGas 2. 验证Bloom 3. 验证receiptSha 4. 验证stateDB.IntermediateRoot /core/vm/evm.go 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 core/vm/contract.go 合约是evm用来执行指令的结构体 入口：/cmd/geth/main.go/main ``` #EVM分析 &gt;EVM不能被重用，非线程安全 Context结构体：为EVM提供辅助信息。一旦提供，不应更改。 ~~~ // Context 为EVM提供辅助信息。一旦提供，不应更改。 type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 返回 账户是否拥有足够的以太币以执行转账&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// Transfer 转账函数，将以太币从一个账户转到另一个账户 &nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// GetHash 返回n对应的哈希 &nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;GasLimit uint64 // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY } ~~~ &gt; state_processor.Process开始执行交易处理，就是在那里为入口进入到evm的执行的，具体见[ core-state-process-analysis.md]( core-state-process-analysis.md) ##EVM的实现 以太坊的EVM整个完全是自己实现的，能够直接执行Solidity字节码，没有使用任何第三方运行时。 运行过程是同步的，没有启用go协程。 1. evm最终是调用Interpreter运行字节码； 2. Interpreter.go实现运行处理；解析出操作码后，通过JumpTable获取操作码对应的函数运行，并维护pc计数器、处理返回值等； 3. jump_table.go定义了操作码的跳转映射； 4. instructions.go实现每一个操作码的具体的处理； 5. opcodes.go中定义了操作码常量 对于EVM的测试，以太坊将测试代码放在了core\vm\runtime目录下，提供了供测试用的运行时及测试用例。 测试用例的示例如： ~~~ func TestExecute(t *testing.T) { &nbsp;&nbsp;&nbsp;&nbsp;ret, _, err := Execute([]byte{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 10, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.MSTORE), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 32, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.RETURN), &nbsp;&nbsp;&nbsp;&nbsp;}, nil, nil) &nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Fatal(&quot;didn&#39;t expect error&quot;, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;num := new(big.Int).SetBytes(ret) &nbsp;&nbsp;&nbsp;&nbsp;if num.Cmp(big.NewInt(10)) != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Error(&quot;Expected 10, got&quot;, num) &nbsp;&nbsp;&nbsp;&nbsp;} } ~~~ 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="#以太坊交易执行分析 在这里，将其整体串起来，从state_processor.Process函数开始，归纳一下其所作的处理。 ##1 Process Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 **处理逻辑：** ~~~ 1. 定义及初始化收据、耗费的gas、区块头、日志、gas池等变量； 2. 如果是DAO事件硬分叉相关的处理，则调用misc.ApplyDAOHardFork(statedb)执行处理； 3. 对区块中的每一个交易，进行迭代处理；处理逻辑： a. 对当前交易做预处理，设置交易的hash、索引、区块hash，供EVM发布新的状态日志使用； b. 执行ApplyTransaction，获取收据； c. 若上一步出错，中断整个Process，返回错误； d. 若正常，累积记录收据及日志。循环进入下一个交易的处理。 4. 调用共识模块做Finalize处理； 5. 返回所有的收据、日志、总共使用的gas。 ~~~ ##2 ApplyTransaction(1.3.b ) ApplyTransaction尝试将交易应用于给定的状态数据库，并使用输入参数作为其环境。 它返回交易的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 **处理逻辑：** ~~~ 1. 将types.Transaction结构变量转为core.Message对象；这过程中会对发送者做签名验证，并获得发送者的地址缓存起来； 2. 创建新的上下文（Context），此上下文将在EVM 环境（EVM environment）中使用；上下文中包含msg，区块头、区块指针、作者（挖矿者、获益者）； 3. 创建新的EVM environment，其中包括了交易相关的所有信息以及调用机制； 4. ApplyMessage， 将交易应用于当前的状态中，也就是执行状态转换，新的状态包含在环境对象中；得到执行结果以及花费的gas； 5. 判断是否分叉情况（ `config.IsByzantium(header.Number)` ），如果不是，获取当前的statedb的状态树根哈希； 6. 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas； 7. 如果是创建合约的交易，那么我们把创建地址存储到收据里面； 8. 拿到所有的日志并创建日志的布隆过滤器；返回。 ~~~ ##3 ApplyMessage（2.4） ApplyMessage将交易应用于当前的状态中，代码里就是创建了一个StateTransition然后调用其TransitionDb()方法。 ApplyMessage返回由任何EVM执行（如果发生）返回的字节（但这个返回值在ApplyTransaction中被忽略了）， 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 ##4 StateTransition.TransitionDb() ~~~ 1. 预检查，出错则函数返回； a. 检查交易的Nonce值是否合规； b. buyGas：根据发送者定的gaslimit和GasPrice，从发送者余额中扣除以太币；从区块gas池中减掉本次gas；并对运行环境做好更新； 2. 支付固定费用 intrinsic gas； 3. 如果是合约创建， 那么调用evm的Create方法创建新的合约，使用交易的data作为新合约的部署代码； 4. 否则不是合约创建，增加发送者的Nonce值，然后调用evm.Call执行交易； 5. 计算并执行退款，将退回的gas对应的以太币退回给交易发送者。 ~~~ ###4.3 evm.Create创建新的合约 ~~~ 1. 检查执行深度，若超过params.CallCreateDepth（即1024）就出错返回；刚开始的执行深度为0，肯定继续往下执行； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 发送者Nonce加1； 4. 创建合约地址并获取hash，若该合约地址已存在，或不合法（空），则出错返回； 5. 保存statedb快照，然后根据合约地址创建账户； 6. 执行转账evm.Transfer（在statedb中，将value所代表的以太币从发送者账户转到新合约账户）； 7. 根据发送者、前面创建的合约账户，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 8. 运行前一步创建的合约 9. 判断运行结果是否有错误。如果合约成功运行并且没有错误返回，则计算存储返回数据所需的GAS。 如果由于没有足够的GAS而导致返回值不能被存储则设置错误，并通过下面的错误检查条件来处理。 10. 若EVM返回错误或上述存储返回值出现错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ ###4.4 evm.Call执行交易 Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 Call方法和evm.Create的逻辑类似，但少了一些步骤。 ~~~ 1. 检查是否允许递归执行以及执行深度，若深度超过params.CallCreateDepth（即1024）就出错返回； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 保存statedb快照，创建接收者账户； 4. 如果接收者在statedb中尚不存在，则执行precompiles预编译，与编译结果为nil时出错返回；无错误则在statedb中创建接收者账户； 5. 执行转账； 6. 根据发送者、接收者，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 7. 运行前一步创建的合约 8. 若EVM返回错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ 虚拟机中合约的执行另行分析。 ### eth源码交易发送接收,校验存储分析： ``` 创建合约指的是将合约部署到区块链上，这也是通过发送交易来实现。在创建合约的交易中，to字段要留空不填，在data字段中指定合约的二进制代码， from字段是交易的发送者也是合约的创建者。 执行合约的交易 调用合约中的方法，需要将交易的to字段指定为要调用的合约的地址，通过data字段指定要调用的方法以及向该方法传递的参数。 所有对账户的变动操作都会先提交到stateDB里面，这个类似一个行为数据库，或者是缓存，最终执行需要提交到底层的数据库当中,底层数据库是levelDB（K,V数据库） core/interface.go定义了stateDB的接口 ProtocolManager主要成员包括： peertSet{}类型成员用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。当然在应用中，订阅也往往利用通道来实现事件通知。 ProtocolManager用到的这些通道的另一端，可能是其他的个体peer，也可能是系统内单例的数据源比如txPool，或者是事件订阅的管理者比如event.Mux。 Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后，安排相应的获取请求。 Downloader类型成员负责所有向相邻个体主动发起的同步流程。 func(pm *ProtocolManager) Start() 以上这四段相对独立的业务流程的逻辑分别是： 1.广播新出现的交易对象。txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件，会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 2.广播新挖掘出的区块。minedBroadcastLoop()持续等待本个体的新挖掘出区块事件，然后立即广播给需要的相邻个体。当不再订阅新挖掘区块事件时，这个函数才会结束等待并返回。很有意思的是,在收到新挖掘出区块事件后，minedBroadcastLoop()会连续调用两次BroadcastBlock()，两次调用仅仅一个bool型参数@propagate不一样，当该参数为true时，会将整个新区块依次发给相邻区块中的一小部分；而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 3.定时与相邻个体进行区块全链的强制同步。syncer()首先启动fetcher成员，然后进入一个无限循环，每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时，发起之；如果没有新peer到达，则以10s为间隔定时的发起之。这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高，由于Td是全链中从创世块到最新头块的Difficulty值总和，所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步，显然改动量是最小的，此即&quot;最优&quot;。 4.将新出现的交易对象均匀的同步给相邻个体。txsyncLoop()主体也是一个无限循环，它的逻辑稍微复杂一些：首先有一个数据类型txsync{p, txs},包含peer和tx列表；通道txsyncCh用来接收txsync{}对象；txsyncLoop()每次循环时，如果从通道txsyncCh中收到新数据，则将它存入一个本地map[]结构，k为peer.ID，v为txsync{}，并将这组tx对象发送给这个peer；每次向peer发送tx对象的上限数目100*1024，如果txsync{}对象中有剩余tx，则该txsync{}对象继续存入map[]并更新tx数目；如果本次循环没有新到达txsync{},则从map[]结构中随机找出一个txsync对象，将其中的tx组发送给相应的peer，重复以上循环。 以上四段流程就是ProtocolManager向相邻peer主动发起的通信过程。尽管上述各函数细节从文字阅读起来容易模糊，不过最重要的内容还是值得留意下的：本个体(peer)向其他peer主动发起的通信中，按照数据类型可分两类：交易tx和区块block；而按照通信方式划分，亦可分为广播新的单个数据和同步一组同类型数据，这样简单的两两配对，便可组成上述四段流程。 在上文的介绍中，出现了多处有关p2p通信协议的结构类型，比如eth.peer，p2p.Peer，Server等等。这里不妨对这些p2p通信协议族的结构一并作个总解。以太坊中用到的p2p通信协议族的结构类型，大致可分为三层： 第一层处于pkg eth中，可以直接被eth.Ethereum，eth.ProtocolManager等顶层管理模块使用，在类型声明上也明显考虑了eth.Ethereum的使用特点。典型的有eth.peer{}, eth.peerSet{}，其中peerSet是peer的集合类型，而eth.peer代表了远端通信对象和其所有通信操作，它封装更底层的p2p.Peer对象以及读写通道等。 第二层属于pkg p2p，可认为是泛化的p2p通信结构，比较典型的结构类型包括代表远端通信对象的p2p.Peer{}, 封装自更底层连接对象的conn{}，通信用通道对象protoRW{}, 以及启动监听、处理新加入连接或断开连接的Server{}。这一层中，各种数据类型的界限比较清晰，尽量不出现揉杂的情况，这也是泛化结构的需求。值得关注的是p2p.Protocol{}，它应该是针对上层应用特意开辟的类型，主要作用包括容纳应用程序所要求的回调函数等，并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。从这个类型所起的作用来看，命名为Protocol还是比较贴切的，尽管不应将其与TCP/IP协议等既有概念混淆。 第三层处于golang自带的网络代码包中，也可分为两部分：第一部分pkg net，包括代表网络连接的&lt;Conn&gt;接口，代表网络地址的&lt;Addr&gt;以及它们的实现类；第二部分pkg syscall，包括更底层的网络相关系统调用类等，可视为封装了网络层(IP)和传输层(TCP)协议的系统实现。 ``` ``` Receiptroot我们刚刚在区块头有看到，那他具体包含的是什么呢？它是一个交易的结果，主要包括了poststate,交易所花费的gas,bloom和logs blockchain无结构化查询需求，仅hash查询,key/value数据库最方便,底层用levelDB存储，性能好 stateDB用来存储世界状态 Core/state/statedb.go 注意：1. StateDB完整记录Transaction的执行情况； 2. StateDB的重点是StateObjects； 3. StateDB中的 stateObjects，Account的Address为 key，记录其Balance、nonce、code、codeHash ，以及tire中的 {string:Hash}等信息； 所有的结构凑明朗了，那具体的验证过程是怎么样的呢 Core/state_processor.go Core/state_transition.go Core/block_validator.go StateProcessor 1. 调用StateTransition，验证（执行）Transaction； 2. 计算Gas、Recipt、Uncle Reward StateTransition 1. 验证（执行）Transaction； 3. 扣除transaction.data.payload计算数据所需要消耗的gas； 4. 在vm中执行code（生成contract or 执行contract）；vm执 行过程中，其gas会被自动消耗。如果gas不足，vm会自 选退出； 5. 将多余的gas退回到sender.balance中； 6. 将消耗的gas换成balance加到当前env.Coinbase()中； BlockValidator 1. 验证UsedGas 2. 验证Bloom 3. 验证receiptSha 4. 验证stateDB.IntermediateRoot /core/vm/evm.go 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 core/vm/contract.go 合约是evm用来执行指令的结构体 入口：/cmd/geth/main.go/main ``` #EVM分析 &gt;EVM不能被重用，非线程安全 Context结构体：为EVM提供辅助信息。一旦提供，不应更改。 ~~~ // Context 为EVM提供辅助信息。一旦提供，不应更改。 type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 返回 账户是否拥有足够的以太币以执行转账&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// Transfer 转账函数，将以太币从一个账户转到另一个账户 &nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// GetHash 返回n对应的哈希 &nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;GasLimit uint64 // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY } ~~~ &gt; state_processor.Process开始执行交易处理，就是在那里为入口进入到evm的执行的，具体见[ core-state-process-analysis.md]( core-state-process-analysis.md) ##EVM的实现 以太坊的EVM整个完全是自己实现的，能够直接执行Solidity字节码，没有使用任何第三方运行时。 运行过程是同步的，没有启用go协程。 1. evm最终是调用Interpreter运行字节码； 2. Interpreter.go实现运行处理；解析出操作码后，通过JumpTable获取操作码对应的函数运行，并维护pc计数器、处理返回值等； 3. jump_table.go定义了操作码的跳转映射； 4. instructions.go实现每一个操作码的具体的处理； 5. opcodes.go中定义了操作码常量 对于EVM的测试，以太坊将测试代码放在了core\vm\runtime目录下，提供了供测试用的运行时及测试用例。 测试用例的示例如： ~~~ func TestExecute(t *testing.T) { &nbsp;&nbsp;&nbsp;&nbsp;ret, _, err := Execute([]byte{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 10, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.MSTORE), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 32, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.RETURN), &nbsp;&nbsp;&nbsp;&nbsp;}, nil, nil) &nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Fatal(&quot;didn&#39;t expect error&quot;, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;num := new(big.Int).SetBytes(ret) &nbsp;&nbsp;&nbsp;&nbsp;if num.Cmp(big.NewInt(10)) != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Error(&quot;Expected 10, got&quot;, num) &nbsp;&nbsp;&nbsp;&nbsp;} } ~~~ 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/13/4b3751cfeccd7ee6664ae7022d82782d.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/13/4b3751cfeccd7ee6664ae7022d82782d.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-13T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"#以太坊交易执行分析 在这里，将其整体串起来，从state_processor.Process函数开始，归纳一下其所作的处理。 ##1 Process Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 **处理逻辑：** ~~~ 1. 定义及初始化收据、耗费的gas、区块头、日志、gas池等变量； 2. 如果是DAO事件硬分叉相关的处理，则调用misc.ApplyDAOHardFork(statedb)执行处理； 3. 对区块中的每一个交易，进行迭代处理；处理逻辑： a. 对当前交易做预处理，设置交易的hash、索引、区块hash，供EVM发布新的状态日志使用； b. 执行ApplyTransaction，获取收据； c. 若上一步出错，中断整个Process，返回错误； d. 若正常，累积记录收据及日志。循环进入下一个交易的处理。 4. 调用共识模块做Finalize处理； 5. 返回所有的收据、日志、总共使用的gas。 ~~~ ##2 ApplyTransaction(1.3.b ) ApplyTransaction尝试将交易应用于给定的状态数据库，并使用输入参数作为其环境。 它返回交易的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 **处理逻辑：** ~~~ 1. 将types.Transaction结构变量转为core.Message对象；这过程中会对发送者做签名验证，并获得发送者的地址缓存起来； 2. 创建新的上下文（Context），此上下文将在EVM 环境（EVM environment）中使用；上下文中包含msg，区块头、区块指针、作者（挖矿者、获益者）； 3. 创建新的EVM environment，其中包括了交易相关的所有信息以及调用机制； 4. ApplyMessage， 将交易应用于当前的状态中，也就是执行状态转换，新的状态包含在环境对象中；得到执行结果以及花费的gas； 5. 判断是否分叉情况（ `config.IsByzantium(header.Number)` ），如果不是，获取当前的statedb的状态树根哈希； 6. 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas； 7. 如果是创建合约的交易，那么我们把创建地址存储到收据里面； 8. 拿到所有的日志并创建日志的布隆过滤器；返回。 ~~~ ##3 ApplyMessage（2.4） ApplyMessage将交易应用于当前的状态中，代码里就是创建了一个StateTransition然后调用其TransitionDb()方法。 ApplyMessage返回由任何EVM执行（如果发生）返回的字节（但这个返回值在ApplyTransaction中被忽略了）， 使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误， 意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。 ##4 StateTransition.TransitionDb() ~~~ 1. 预检查，出错则函数返回； a. 检查交易的Nonce值是否合规； b. buyGas：根据发送者定的gaslimit和GasPrice，从发送者余额中扣除以太币；从区块gas池中减掉本次gas；并对运行环境做好更新； 2. 支付固定费用 intrinsic gas； 3. 如果是合约创建， 那么调用evm的Create方法创建新的合约，使用交易的data作为新合约的部署代码； 4. 否则不是合约创建，增加发送者的Nonce值，然后调用evm.Call执行交易； 5. 计算并执行退款，将退回的gas对应的以太币退回给交易发送者。 ~~~ ###4.3 evm.Create创建新的合约 ~~~ 1. 检查执行深度，若超过params.CallCreateDepth（即1024）就出错返回；刚开始的执行深度为0，肯定继续往下执行； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 发送者Nonce加1； 4. 创建合约地址并获取hash，若该合约地址已存在，或不合法（空），则出错返回； 5. 保存statedb快照，然后根据合约地址创建账户； 6. 执行转账evm.Transfer（在statedb中，将value所代表的以太币从发送者账户转到新合约账户）； 7. 根据发送者、前面创建的合约账户，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 8. 运行前一步创建的合约 9. 判断运行结果是否有错误。如果合约成功运行并且没有错误返回，则计算存储返回数据所需的GAS。 如果由于没有足够的GAS而导致返回值不能被存储则设置错误，并通过下面的错误检查条件来处理。 10. 若EVM返回错误或上述存储返回值出现错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ ###4.4 evm.Call执行交易 Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 Call方法和evm.Create的逻辑类似，但少了一些步骤。 ~~~ 1. 检查是否允许递归执行以及执行深度，若深度超过params.CallCreateDepth（即1024）就出错返回； 2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额； 3. 保存statedb快照，创建接收者账户； 4. 如果接收者在statedb中尚不存在，则执行precompiles预编译，与编译结果为nil时出错返回；无错误则在statedb中创建接收者账户； 5. 执行转账； 6. 根据发送者、接收者，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 7. 运行前一步创建的合约 8. 若EVM返回错误，则回滚到快照的状态，并且消耗完剩下的所有gas。 ~~~ 虚拟机中合约的执行另行分析。 ### eth源码交易发送接收,校验存储分析： ``` 创建合约指的是将合约部署到区块链上，这也是通过发送交易来实现。在创建合约的交易中，to字段要留空不填，在data字段中指定合约的二进制代码， from字段是交易的发送者也是合约的创建者。 执行合约的交易 调用合约中的方法，需要将交易的to字段指定为要调用的合约的地址，通过data字段指定要调用的方法以及向该方法传递的参数。 所有对账户的变动操作都会先提交到stateDB里面，这个类似一个行为数据库，或者是缓存，最终执行需要提交到底层的数据库当中,底层数据库是levelDB（K,V数据库） core/interface.go定义了stateDB的接口 ProtocolManager主要成员包括： peertSet{}类型成员用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。 通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。当然在应用中，订阅也往往利用通道来实现事件通知。 ProtocolManager用到的这些通道的另一端，可能是其他的个体peer，也可能是系统内单例的数据源比如txPool，或者是事件订阅的管理者比如event.Mux。 Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后，安排相应的获取请求。 Downloader类型成员负责所有向相邻个体主动发起的同步流程。 func(pm *ProtocolManager) Start() 以上这四段相对独立的业务流程的逻辑分别是： 1.广播新出现的交易对象。txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件，会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。 2.广播新挖掘出的区块。minedBroadcastLoop()持续等待本个体的新挖掘出区块事件，然后立即广播给需要的相邻个体。当不再订阅新挖掘区块事件时，这个函数才会结束等待并返回。很有意思的是,在收到新挖掘出区块事件后，minedBroadcastLoop()会连续调用两次BroadcastBlock()，两次调用仅仅一个bool型参数@propagate不一样，当该参数为true时，会将整个新区块依次发给相邻区块中的一小部分；而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。 3.定时与相邻个体进行区块全链的强制同步。syncer()首先启动fetcher成员，然后进入一个无限循环，每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时，发起之；如果没有新peer到达，则以10s为间隔定时的发起之。这里所谓&quot;最优&quot;指的是peer中所维护区块链的TotalDifficulty(td)最高，由于Td是全链中从创世块到最新头块的Difficulty值总和，所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步，显然改动量是最小的，此即&quot;最优&quot;。 4.将新出现的交易对象均匀的同步给相邻个体。txsyncLoop()主体也是一个无限循环，它的逻辑稍微复杂一些：首先有一个数据类型txsync{p, txs},包含peer和tx列表；通道txsyncCh用来接收txsync{}对象；txsyncLoop()每次循环时，如果从通道txsyncCh中收到新数据，则将它存入一个本地map[]结构，k为peer.ID，v为txsync{}，并将这组tx对象发送给这个peer；每次向peer发送tx对象的上限数目100*1024，如果txsync{}对象中有剩余tx，则该txsync{}对象继续存入map[]并更新tx数目；如果本次循环没有新到达txsync{},则从map[]结构中随机找出一个txsync对象，将其中的tx组发送给相应的peer，重复以上循环。 以上四段流程就是ProtocolManager向相邻peer主动发起的通信过程。尽管上述各函数细节从文字阅读起来容易模糊，不过最重要的内容还是值得留意下的：本个体(peer)向其他peer主动发起的通信中，按照数据类型可分两类：交易tx和区块block；而按照通信方式划分，亦可分为广播新的单个数据和同步一组同类型数据，这样简单的两两配对，便可组成上述四段流程。 在上文的介绍中，出现了多处有关p2p通信协议的结构类型，比如eth.peer，p2p.Peer，Server等等。这里不妨对这些p2p通信协议族的结构一并作个总解。以太坊中用到的p2p通信协议族的结构类型，大致可分为三层： 第一层处于pkg eth中，可以直接被eth.Ethereum，eth.ProtocolManager等顶层管理模块使用，在类型声明上也明显考虑了eth.Ethereum的使用特点。典型的有eth.peer{}, eth.peerSet{}，其中peerSet是peer的集合类型，而eth.peer代表了远端通信对象和其所有通信操作，它封装更底层的p2p.Peer对象以及读写通道等。 第二层属于pkg p2p，可认为是泛化的p2p通信结构，比较典型的结构类型包括代表远端通信对象的p2p.Peer{}, 封装自更底层连接对象的conn{}，通信用通道对象protoRW{}, 以及启动监听、处理新加入连接或断开连接的Server{}。这一层中，各种数据类型的界限比较清晰，尽量不出现揉杂的情况，这也是泛化结构的需求。值得关注的是p2p.Protocol{}，它应该是针对上层应用特意开辟的类型，主要作用包括容纳应用程序所要求的回调函数等，并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。从这个类型所起的作用来看，命名为Protocol还是比较贴切的，尽管不应将其与TCP/IP协议等既有概念混淆。 第三层处于golang自带的网络代码包中，也可分为两部分：第一部分pkg net，包括代表网络连接的&lt;Conn&gt;接口，代表网络地址的&lt;Addr&gt;以及它们的实现类；第二部分pkg syscall，包括更底层的网络相关系统调用类等，可视为封装了网络层(IP)和传输层(TCP)协议的系统实现。 ``` ``` Receiptroot我们刚刚在区块头有看到，那他具体包含的是什么呢？它是一个交易的结果，主要包括了poststate,交易所花费的gas,bloom和logs blockchain无结构化查询需求，仅hash查询,key/value数据库最方便,底层用levelDB存储，性能好 stateDB用来存储世界状态 Core/state/statedb.go 注意：1. StateDB完整记录Transaction的执行情况； 2. StateDB的重点是StateObjects； 3. StateDB中的 stateObjects，Account的Address为 key，记录其Balance、nonce、code、codeHash ，以及tire中的 {string:Hash}等信息； 所有的结构凑明朗了，那具体的验证过程是怎么样的呢 Core/state_processor.go Core/state_transition.go Core/block_validator.go StateProcessor 1. 调用StateTransition，验证（执行）Transaction； 2. 计算Gas、Recipt、Uncle Reward StateTransition 1. 验证（执行）Transaction； 3. 扣除transaction.data.payload计算数据所需要消耗的gas； 4. 在vm中执行code（生成contract or 执行contract）；vm执 行过程中，其gas会被自动消耗。如果gas不足，vm会自 选退出； 5. 将多余的gas退回到sender.balance中； 6. 将消耗的gas换成balance加到当前env.Coinbase()中； BlockValidator 1. 验证UsedGas 2. 验证Bloom 3. 验证receiptSha 4. 验证stateDB.IntermediateRoot /core/vm/evm.go 交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。 core/vm/contract.go 合约是evm用来执行指令的结构体 入口：/cmd/geth/main.go/main ``` #EVM分析 &gt;EVM不能被重用，非线程安全 Context结构体：为EVM提供辅助信息。一旦提供，不应更改。 ~~~ // Context 为EVM提供辅助信息。一旦提供，不应更改。 type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 返回 账户是否拥有足够的以太币以执行转账&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// Transfer 转账函数，将以太币从一个账户转到另一个账户 &nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;// GetHash 返回n对应的哈希 &nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;GasLimit uint64 // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY } ~~~ &gt; state_processor.Process开始执行交易处理，就是在那里为入口进入到evm的执行的，具体见[ core-state-process-analysis.md]( core-state-process-analysis.md) ##EVM的实现 以太坊的EVM整个完全是自己实现的，能够直接执行Solidity字节码，没有使用任何第三方运行时。 运行过程是同步的，没有启用go协程。 1. evm最终是调用Interpreter运行字节码； 2. Interpreter.go实现运行处理；解析出操作码后，通过JumpTable获取操作码对应的函数运行，并维护pc计数器、处理返回值等； 3. jump_table.go定义了操作码的跳转映射； 4. instructions.go实现每一个操作码的具体的处理； 5. opcodes.go中定义了操作码常量 对于EVM的测试，以太坊将测试代码放在了core\\vm\\runtime目录下，提供了供测试用的运行时及测试用例。 测试用例的示例如： ~~~ func TestExecute(t *testing.T) { &nbsp;&nbsp;&nbsp;&nbsp;ret, _, err := Execute([]byte{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 10, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.MSTORE), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 32, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.RETURN), &nbsp;&nbsp;&nbsp;&nbsp;}, nil, nil) &nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Fatal(&quot;didn&#39;t expect error&quot;, err) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;num := new(big.Int).SetBytes(ret) &nbsp;&nbsp;&nbsp;&nbsp;if num.Cmp(big.NewInt(10)) != 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Error(&quot;Expected 10, got&quot;, num) &nbsp;&nbsp;&nbsp;&nbsp;} } ~~~ 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/13/4b3751cfeccd7ee6664ae7022d82782d.html","headline":"以太坊源码分析(18)以太坊交易执行分析","dateModified":"2018-05-13T00:00:00+08:00","datePublished":"2018-05-13T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/13/4b3751cfeccd7ee6664ae7022d82782d.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析(18)以太坊交易执行分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+   <div>
+    <span style="color:#569cd6;"><strong>#以太坊交易执行分析</strong></span>
+   </div>
+   <div>
+    <br>
+   </div>
+   <div>
+    在这里，将其整体串起来，从state_processor.Process函数开始，归纳一下其所作的处理。
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>##1 Process</strong></span>
+   </div>
+   <div>
+    Process 根据以太坊规则运行交易信息来对statedb进行状态改变，以及奖励挖矿者或者是其他的叔父节点。 
+   </div>
+   <div>
+    Process返回执行过程中累计的收据和日志，并返回过程中使用的Gas。 如果由于Gas不足而导致任何交易执行失败，将返回错误。 
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong>**处理逻辑：**</strong></span>
+   </div>
+   <div>
+    ~~~
+   </div>
+   <div>
+    1. 定义及初始化收据、耗费的gas、区块头、日志、gas池等变量；
+   </div>
+   <div>
+    2. 如果是DAO事件硬分叉相关的处理，则调用misc.ApplyDAOHardFork(statedb)执行处理；
+   </div>
+   <div>
+    3. 对区块中的每一个交易，进行迭代处理；处理逻辑：
+   </div>
+   <div>
+     a. 对当前交易做预处理，设置交易的hash、索引、区块hash，供EVM发布新的状态日志使用； 
+   </div>
+   <div>
+     b. 执行ApplyTransaction，获取收据； 
+   </div>
+   <div>
+     c. 若上一步出错，中断整个Process，返回错误；
+   </div>
+   <div>
+     d. 若正常，累积记录收据及日志。循环进入下一个交易的处理。
+   </div>
+   <div>
+    4. 调用共识模块做Finalize处理；
+   </div>
+   <div>
+    5. 返回所有的收据、日志、总共使用的gas。
+   </div>
+   <div>
+    ~~~
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>##2 ApplyTransaction(1.3.b )</strong></span>
+   </div>
+   <div>
+    ApplyTransaction尝试将交易应用于给定的状态数据库，并使用输入参数作为其环境。 
+   </div>
+   <div>
+    它返回交易的收据，使用的Gas和错误，如果交易失败，表明块是无效的。 
+   </div>
+   <div>
+    <span style="color:#569cd6;"><strong>**处理逻辑：**</strong></span> 
+   </div>
+   <div>
+    ~~~
+   </div>
+   <div>
+    1. 将types.Transaction结构变量转为core.Message对象；这过程中会对发送者做签名验证，并获得发送者的地址缓存起来；
+   </div>
+   <div>
+    2. 创建新的上下文（Context），此上下文将在EVM 环境（EVM environment）中使用；上下文中包含msg，区块头、区块指针、作者（挖矿者、获益者）； 
+   </div>
+   <div>
+    3. 创建新的EVM environment，其中包括了交易相关的所有信息以及调用机制； 
+   </div>
+   <div>
+    4. ApplyMessage， 将交易应用于当前的状态中，也就是执行状态转换，新的状态包含在环境对象中；得到执行结果以及花费的gas；
+   </div>
+   <div>
+    5. 判断是否分叉情况（ `config.IsByzantium(header.Number)` ），如果不是，获取当前的statedb的状态树根哈希； 
+   </div>
+   <div>
+    6. 创建一个收据, 用来存储中间状态的root, 以及交易使用的gas； 
+   </div>
+   <div>
+    7. 如果是创建合约的交易，那么我们把创建地址存储到收据里面； 
+   </div>
+   <div>
+    8. 拿到所有的日志并创建日志的布隆过滤器；返回。
+   </div>
+   <div>
+    ~~~ 
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>##3 ApplyMessage（2.4）</strong></span>
+   </div>
+   <div>
+    ApplyMessage将交易应用于当前的状态中，代码里就是创建了一个StateTransition然后调用其TransitionDb()方法。
+   </div>
+   <div>
+    ApplyMessage返回由任何EVM执行（如果发生）返回的字节（但这个返回值在ApplyTransaction中被忽略了），
+   </div>
+   <div>
+    使用的Gas（包括Gas退款），如果失败则返回错误。 一个错误总是表示一个核心错误，
+   </div>
+   <div>
+    意味着这个消息对于这个特定的状态将总是失败，并且永远不会在一个块中被接受。
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>##4 StateTransition.TransitionDb()</strong></span>
+   </div>
+   <div>
+    ~~~
+   </div>
+   <div>
+    1. 预检查，出错则函数返回；
+   </div>
+   <div>
+     a. 检查交易的Nonce值是否合规；
+   </div>
+   <div>
+     b. buyGas：根据发送者定的gaslimit和GasPrice，从发送者余额中扣除以太币；从区块gas池中减掉本次gas；并对运行环境做好更新； 
+   </div>
+   <div>
+    2. 支付固定费用 intrinsic gas；
+   </div>
+   <div>
+    3. 如果是合约创建， 那么调用evm的Create方法创建新的合约，使用交易的data作为新合约的部署代码； 
+   </div>
+   <div>
+    4. 否则不是合约创建，增加发送者的Nonce值，然后调用evm.Call执行交易； 
+   </div>
+   <div>
+    5. 计算并执行退款，将退回的gas对应的以太币退回给交易发送者。
+   </div>
+   <div>
+    ~~~
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>###4.3 evm.Create创建新的合约</strong></span>
+   </div>
+   <div>
+    ~~~
+   </div>
+   <div>
+    1. 检查执行深度，若超过params.CallCreateDepth（即1024）就出错返回；刚开始的执行深度为0，肯定继续往下执行； 
+   </div>
+   <div>
+    2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额；
+   </div>
+   <div>
+    3. 发送者Nonce加1；
+   </div>
+   <div>
+    4. 创建合约地址并获取hash，若该合约地址已存在，或不合法（空），则出错返回；
+   </div>
+   <div>
+    5. 保存statedb快照，然后根据合约地址创建账户；
+   </div>
+   <div>
+    6. 执行转账evm.Transfer（在statedb中，将value所代表的以太币从发送者账户转到新合约账户）； 
+   </div>
+   <div>
+    7. 根据发送者、前面创建的合约账户，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 
+   </div>
+   <div>
+    8. 运行前一步创建的合约
+   </div>
+   <div>
+    9. 判断运行结果是否有错误。如果合约成功运行并且没有错误返回，则计算存储返回数据所需的GAS。 如果由于没有足够的GAS而导致返回值不能被存储则设置错误，并通过下面的错误检查条件来处理。
+   </div>
+   <div>
+    10. 若EVM返回错误或上述存储返回值出现错误，则回滚到快照的状态，并且消耗完剩下的所有gas。
+   </div>
+   <div>
+    ~~~
+   </div>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>###4.4 evm.Call执行交易</strong></span>
+   </div>
+   <div>
+    Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 
+   </div>
+   <div>
+    Call方法和evm.Create的逻辑类似，但少了一些步骤。
+   </div>
+   <div>
+    ~~~
+   </div>
+   <div>
+    1. 检查是否允许递归执行以及执行深度，若深度超过params.CallCreateDepth（即1024）就出错返回；
+   </div>
+   <div>
+    2. 检查是否可执行转账，即检查账户余额是否≥要转账的数额；
+   </div>
+   <div>
+    3. 保存statedb快照，创建接收者账户；
+   </div>
+   <div>
+    4. 如果接收者在statedb中尚不存在，则执行precompiles预编译，与编译结果为nil时出错返回；无错误则在statedb中创建接收者账户； 
+   </div>
+   <div>
+    5. 执行转账；
+   </div>
+   <div>
+    6. 根据发送者、接收者，转账的钱，已用的gas创建并初始化合约；将交易的data作为合约的代码； 
+   </div>
+   <div>
+    7. 运行前一步创建的合约
+   </div>
+   <div>
+    8. 若EVM返回错误，则回滚到快照的状态，并且消耗完剩下的所有gas。
+   </div>
+   <div>
+    ~~~
+   </div>
+   <br>
+   <div>
+    虚拟机中合约的执行另行分析。
+   </div>
+   <p></p>
+   <p></p>
+   <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+    <div>
+     <span style="color:#569cd6;"><strong>### eth源码交易发送接收,校验存储分析：</strong></span>
+    </div>
+    <br>
+    <div>
+     ```
+    </div>
+    <div>
+     创建合约指的是将合约部署到区块链上，这也是通过发送交易来实现。在创建合约的交易中，to字段要留空不填，在data字段中指定合约的二进制代码，
+    </div>
+    <div>
+     from字段是交易的发送者也是合约的创建者。
+    </div>
+    <br>
+    <div>
+     执行合约的交易
+    </div>
+    <br>
+    <div>
+     调用合约中的方法，需要将交易的to字段指定为要调用的合约的地址，通过data字段指定要调用的方法以及向该方法传递的参数。
+    </div>
+    <br>
+    <div>
+     所有对账户的变动操作都会先提交到stateDB里面，这个类似一个行为数据库，或者是缓存，最终执行需要提交到底层的数据库当中,底层数据库是levelDB（K,V数据库）
+    </div>
+    <br>
+    <div>
+     core/interface.go定义了stateDB的接口
+    </div>
+    <br>
+    <div>
+     ProtocolManager主要成员包括：
+    </div>
+    <div>
+     peertSet{}类型成员用来缓存相邻个体列表，peer{}表示网络中的一个远端个体。
+    </div>
+    <div>
+     通过各种通道(chan)和事件订阅(subscription)的方式，接收和发送包括交易和区块在内的数据更新。当然在应用中，订阅也往往利用通道来实现事件通知。
+    </div>
+    <div>
+     ProtocolManager用到的这些通道的另一端，可能是其他的个体peer，也可能是系统内单例的数据源比如txPool，或者是事件订阅的管理者比如event.Mux。
+    </div>
+    <div>
+     Fetcher类型成员累积所有其他个体发送来的有关新数据的宣布消息，并在自身对照后，安排相应的获取请求。
+    </div>
+    <div>
+     Downloader类型成员负责所有向相邻个体主动发起的同步流程。
+    </div>
+    <br>
+    <div>
+     func(pm *ProtocolManager) Start()
+    </div>
+    <br>
+    <div>
+     以上这四段相对独立的业务流程的逻辑分别是：
+    </div>
+    <div>
+     1.广播新出现的交易对象。txBroadcastLoop()会在txCh通道的收端持续等待，一旦接收到有关新交易的事件，会立即调用BroadcastTx()函数广播给那些尚无该交易对象的相邻个体。
+    </div>
+    <div>
+     2.广播新挖掘出的区块。minedBroadcastLoop()持续等待本个体的新挖掘出区块事件，然后立即广播给需要的相邻个体。当不再订阅新挖掘区块事件时，这个函数才会结束等待并返回。很有意思的是,在收到新挖掘出区块事件后，minedBroadcastLoop()会连续调用两次BroadcastBlock()，两次调用仅仅一个bool型参数@propagate不一样，当该参数为true时，会将整个新区块依次发给相邻区块中的一小部分；而当其为false时，仅仅将新区块的Hash值和Number发送给所有相邻列表。
+    </div>
+    <div>
+     3.定时与相邻个体进行区块全链的强制同步。syncer()首先启动fetcher成员，然后进入一个无限循环，每次循环中都会向相邻peer列表中“最优”的那个peer作一次区块全链同步。发起上述同步的理由分两种：如果有新登记(加入)的相邻个体，则在整个peer列表数目大于5时，发起之；如果没有新peer到达，则以10s为间隔定时的发起之。这里所谓"最优"指的是peer中所维护区块链的TotalDifficulty(td)最高，由于Td是全链中从创世块到最新头块的Difficulty值总和，所以Td值最高就意味着它的区块链是最新的，跟这样的peer作区块全链同步，显然改动量是最小的，此即"最优"。
+    </div>
+    <div>
+     4.将新出现的交易对象均匀的同步给相邻个体。txsyncLoop()主体也是一个无限循环，它的逻辑稍微复杂一些：首先有一个数据类型txsync{p, txs},包含peer和tx列表；通道txsyncCh用来接收txsync{}对象；txsyncLoop()每次循环时，如果从通道txsyncCh中收到新数据，则将它存入一个本地map[]结构，k为peer.ID，v为txsync{}，并将这组tx对象发送给这个peer；每次向peer发送tx对象的上限数目100*1024，如果txsync{}对象中有剩余tx，则该txsync{}对象继续存入map[]并更新tx数目；如果本次循环没有新到达txsync{},则从map[]结构中随机找出一个txsync对象，将其中的tx组发送给相应的peer，重复以上循环。
+    </div>
+    <br>
+    <div>
+     以上四段流程就是ProtocolManager向相邻peer主动发起的通信过程。尽管上述各函数细节从文字阅读起来容易模糊，不过最重要的内容还是值得留意下的：本个体(peer)向其他peer主动发起的通信中，按照数据类型可分两类：交易tx和区块block；而按照通信方式划分，亦可分为广播新的单个数据和同步一组同类型数据，这样简单的两两配对，便可组成上述四段流程。
+    </div>
+    <br>
+    <div>
+     在上文的介绍中，出现了多处有关p2p通信协议的结构类型，比如eth.peer，p2p.Peer，Server等等。这里不妨对这些p2p通信协议族的结构一并作个总解。以太坊中用到的p2p通信协议族的结构类型，大致可分为三层：
+    </div>
+    <br>
+    <div>
+     第一层处于pkg eth中，可以直接被eth.Ethereum，eth.ProtocolManager等顶层管理模块使用，在类型声明上也明显考虑了eth.Ethereum的使用特点。典型的有eth.peer{}, eth.peerSet{}，其中peerSet是peer的集合类型，而eth.peer代表了远端通信对象和其所有通信操作，它封装更底层的p2p.Peer对象以及读写通道等。
+    </div>
+    <div>
+     第二层属于pkg p2p，可认为是泛化的p2p通信结构，比较典型的结构类型包括代表远端通信对象的p2p.Peer{}, 封装自更底层连接对象的conn{}，通信用通道对象protoRW{}, 以及启动监听、处理新加入连接或断开连接的Server{}。这一层中，各种数据类型的界限比较清晰，尽量不出现揉杂的情况，这也是泛化结构的需求。值得关注的是p2p.Protocol{}，它应该是针对上层应用特意开辟的类型，主要作用包括容纳应用程序所要求的回调函数等，并通过p2p.Server{}在新连接建立后，将其传递给通信对象peer。从这个类型所起的作用来看，命名为Protocol还是比较贴切的，尽管不应将其与TCP/IP协议等既有概念混淆。
+    </div>
+    <div>
+     第三层处于golang自带的网络代码包中，也可分为两部分：第一部分pkg net，包括代表网络连接的&lt;Conn&gt;接口，代表网络地址的&lt;Addr&gt;以及它们的实现类；第二部分pkg syscall，包括更底层的网络相关系统调用类等，可视为封装了网络层(IP)和传输层(TCP)协议的系统实现。
+    </div>
+    <br>
+    <div>
+     ```
+    </div>
+    <br>
+    <br>
+    <br>
+    <div>
+     ```
+    </div>
+    <div>
+     Receiptroot我们刚刚在区块头有看到，那他具体包含的是什么呢？它是一个交易的结果，主要包括了poststate,交易所花费的gas,bloom和logs
+    </div>
+    <br>
+    <div>
+     blockchain无结构化查询需求，仅hash查询,key/value数据库最方便,底层用levelDB存储，性能好
+    </div>
+    <br>
+    <div>
+     stateDB用来存储世界状态
+    </div>
+    <div>
+     Core/state/statedb.go
+    </div>
+    <br>
+    <div>
+     注意：1. StateDB完整记录Transaction的执行情况； 2. StateDB的重点是StateObjects； 3. StateDB中的 stateObjects，Account的Address为 key，记录其Balance、nonce、code、codeHash ，以及tire中的 {string:Hash}等信息；
+    </div>
+    <br>
+    <div>
+     所有的结构凑明朗了，那具体的验证过程是怎么样的呢
+    </div>
+    <div>
+     Core/state_processor.go
+    </div>
+    <div>
+     Core/state_transition.go
+    </div>
+    <div>
+     Core/block_validator.go
+    </div>
+    <br>
+    <div>
+     StateProcessor 1. 调用StateTransition，验证（执行）Transaction； 2. 计算Gas、Recipt、Uncle Reward
+    </div>
+    <br>
+    <div>
+     StateTransition
+    </div>
+    <div>
+     1. 验证（执行）Transaction；
+    </div>
+    <div>
+     3. 扣除transaction.data.payload计算数据所需要消耗的gas；
+    </div>
+    <div>
+     4. 在vm中执行code（生成contract or 执行contract）；vm执 行过程中，其gas会被自动消耗。如果gas不足，vm会自 选退出；
+    </div>
+    <div>
+     5. 将多余的gas退回到sender.balance中；
+    </div>
+    <div>
+     6. 将消耗的gas换成balance加到当前env.Coinbase()中；
+    </div>
+    <br>
+    <div>
+     BlockValidator
+    </div>
+    <div>
+     1. 验证UsedGas
+    </div>
+    <div>
+     2. 验证Bloom
+    </div>
+    <div>
+     3. 验证receiptSha
+    </div>
+    <div>
+     4. 验证stateDB.IntermediateRoot
+    </div>
+    <br>
+    <div>
+     /core/vm/evm.go
+    </div>
+    <div>
+     交易的转帐操作由Context对象中的TransferFunc类型函数来实现，类似的函数类型，还有CanTransferFunc, 和GetHashFunc。
+    </div>
+    <div>
+     core/vm/contract.go
+    </div>
+    <div>
+     合约是evm用来执行指令的结构体
+    </div>
+    <br>
+    <div>
+     入口：/cmd/geth/main.go/main
+    </div>
+    <br>
+    <div>
+     ```
+    </div>
+   </div>
+   <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+    <div>
+     <span style="color:#569cd6;"><strong>#EVM分析</strong></span>
+    </div>
+    <br>
+    <div>
+     <span style="color:#608b4e;">&gt;</span>EVM不能被重用，非线程安全
+    </div>
+    <br>
+    <div>
+     Context结构体：为EVM提供辅助信息。一旦提供，不应更改。 
+    </div>
+    <div>
+     ~~~
+    </div>
+    <div>
+     // Context 为EVM提供辅助信息。一旦提供，不应更改。
+    </div>
+    <div>
+     type Context struct {
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 返回 账户是否拥有足够的以太币以执行转账&nbsp;CanTransfer CanTransferFunc
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;// Transfer 转账函数，将以太币从一个账户转到另一个账户
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;// GetHash 返回n对应的哈希
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc
+    </div>
+    <br>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;// Message information
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE
+    </div>
+    <br>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;// Block information
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;GasLimit uint64 // Provides information for GASLIMIT
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY
+    </div>
+    <div>
+     }
+    </div>
+    <div>
+     ~~~
+    </div>
+    <br>
+    <div>
+     <span style="color:#608b4e;">&gt;</span> state_processor.Process开始执行交易处理，就是在那里为入口进入到evm的执行的，具体见[
+     <span style="color:#ce9178;">core-state-process-analysis.md</span>](
+     <span>core-state-process-analysis.md</span>)
+    </div>
+    <br>
+    <br>
+    <div>
+     <span style="color:#569cd6;"><strong>##EVM的实现</strong></span>
+    </div>
+    <div>
+     以太坊的EVM整个完全是自己实现的，能够直接执行Solidity字节码，没有使用任何第三方运行时。 
+    </div>
+    <div>
+     运行过程是同步的，没有启用go协程。
+    </div>
+    <br>
+    <div>
+     <span style="color:#6796e6;">1.</span> evm最终是调用Interpreter运行字节码；
+    </div>
+    <div>
+     <span style="color:#6796e6;">2.</span> Interpreter.go实现运行处理；解析出操作码后，通过JumpTable获取操作码对应的函数运行，并维护pc计数器、处理返回值等； 
+    </div>
+    <div>
+     <span style="color:#6796e6;">3.</span> jump_table.go定义了操作码的跳转映射； 
+    </div>
+    <div>
+     <span style="color:#6796e6;">4.</span> instructions.go实现每一个操作码的具体的处理； 
+    </div>
+    <div>
+     <span style="color:#6796e6;">5.</span> opcodes.go中定义了操作码常量 
+    </div>
+    <br>
+    <br>
+    <div>
+     对于EVM的测试，以太坊将测试代码放在了core\vm\runtime目录下，提供了供测试用的运行时及测试用例。
+    </div>
+    <div>
+     测试用例的示例如：
+    </div>
+    <div>
+     ~~~
+    </div>
+    <div>
+     func TestExecute(t *testing.T) {
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;ret, _, err := Execute([]byte{
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 10,
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0,
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.MSTORE),
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 32,
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.PUSH1), 0,
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;byte(vm.RETURN),
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;}, nil, nil)
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Fatal("didn't expect error", err)
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;}
+    </div>
+    <br>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;num := new(big.Int).SetBytes(ret)
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;if num.Cmp(big.NewInt(10)) != 0 {
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;t.Error("Expected 10, got", num)
+    </div>
+    <div>
+     &nbsp;&nbsp;&nbsp;&nbsp;}
+    </div>
+    <div>
+     }
+    </div>
+    <div>
+     ~~~
+    </div>
+   </div>
+   <br>
+   <h2><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180430224554793?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br><br></h2>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);">网址：http://www.qukuailianxueyuan.io/<br></p>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);">欲领取造币技术与全套虚拟机资料</p>
+   <p><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);background-color:rgb(255,255,255);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></p>
+   <p style="color:rgb(25,25,25);">尹成学院微信：备注：CSDN</p>
+   <p style="color:rgb(25,25,25);text-align:center;"><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+   <br>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80304441,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80304441,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

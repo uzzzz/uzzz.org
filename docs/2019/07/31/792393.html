@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>spark 内存，GC及数据结构调优 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="spark 内存，GC及数据结构调优" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="一，基本概述 调优内存的使用主要有三个方面的考虑：对象的内存占用量(你可能希望整个数据集都适合内存)，访问这些数据的开销，垃圾回收的负载。 默认情况下，java的对象是可以快速访问的，但是相比于内部的原始数据消耗估计2-5倍的空间。主要归于下面三个原因： 1),每个不同的Java对象都有一个“对象头”，它大约是16个字节，包含一个指向它的类的指针。对于一个数据很少的对象（比如一个Int字段），这可以比数据大。 2),Java字符串在原始字符串数据上具有大约40字节的开销（因为它们将它们存储在一个Chars数组中，并保留额外的数据，例如长度），并且由于String的内部使用UTF-16编码而将每个字符存储为两个字节。因此，一个10个字符的字符串可以容易地消耗60个字节。 3),常用集合类（如HashMap和LinkedList）使用链接的数据结构，其中每个条目都有一个“包装器”对象（例如Map.Entry）。该对象不仅具有头部，还包括指针（通常为8个字节）到列表中的下一个对象。 4),原始类型的集合通常将它们存储为“boxed”对象，如java.lang.Integer。 本节将从Spark的内存管理概述开始，然后讨论用户可以采取的具体策略，以便在他/她的应用程序中更有效地使用内存。具体来说，我们将描述如何确定对象的内存使用情况，以及如何改进数据结构，或通过以序列化的格式存储数据。然后我们将介绍调优Spark的缓存大小和Java垃圾回收器。 二，spark的内存管理概述 Spark中的内存使用大部分属于两类：执行和存储。运行内存指的是用于计算的，shuffle，joins，sorts&nbsp;和aggregations，然后存储内存主要用于缓存和在集群中传播的内部数据。在spark内部，存储器和执行器共享一个统一的区域(M)。当没有使用执行器内存的时候，存储器可以获取所有可用的执行器内存，反之亦然。如果有需要执行器可以驱逐存储占用，但是仅仅当存储内存大于一个阈值(R)的时候才会发生。换句话说，R描述了M内部的一个子区域，R中的缓存永远不会被清除。由于实施的复杂性，存储内存不得驱逐执行内存。该设计保证了几个理想的性能。 首先，不使用缓存的应用程序可以将整个空间用于执行，从而避免不必要的磁盘溢写。 其次，使用缓存的应用程序可以保留最小的存储空间（R），其中数据块不受驱逐。 最后，这种方法为各种工作负载提供了合理的开箱即用性能，而不需要用户掌握内部如何分配内存的专业知识。 虽然有两个相关配置，但典型用户不需要调整它们，因为默认值适用于大多数工作负载： 1),spark.memory.fraction将M的大小表示为（JVM堆空间&nbsp;- 300MB）的一部分（默认为0.75，新版本如spark2.2改为0.6）。剩余的空间（25％，对应的新版本是0.4）用于用户数据结构，Spark中的内部元数据，并且在稀疏和异常大的记录的情况下保护OOM错误。 2),spark.memory.storageFraction表示R的大小作为M的一部分（默认为0.5）。R是M内的存储空间，其中缓存的块免于被执行器驱逐。 &nbsp; 三，确定内存的消耗 最好的方式去计算一个数据的的内存消耗，就是创建一个RDD，然后加入cache，这样就可以在web ui中Storage页面看到了。页面会告诉你，这个RDD消耗了多少内存。 要估计特定对象的内存消耗，请使用SizeEstimator的估计方法。这对于尝试使用不同的数据布局来修剪内存使用情况以及确定广播变量在每个执行程序堆中占用的空间量非常有用。 四，调优数据结构 减少内存消耗的第一种方法是避免使用增加负担的java特性，例如基于指针的数据结构和包装对象。下面几种方法可以来避免这个。 1,将数据结构设计为偏好对象数组和原始类型，而不是标准的Java或Scala集合类（例如HashMap）。fastutil库(http://fastutil.di.unimi.it/)为与Java标准库兼容的原始类型提供方便的集合类。 2,尽可能避免使用有很多小对象和指针的嵌套结构。 3,针对关键词，考虑使用数字ID或者枚举对象而不是字符串。 4,如果您的RAM少于32 GB，请设置JVM标志-XX：+ UseCompressedOops使指针为四个字节而不是八个字节。您可以在spark-env.sh中添加这些选项。 五，序列化RDD 尽管进行了调优，当您的对象仍然太大而无法有效存储时，一个简单的方法来减少内存使用是使用RDD持久性API中的序列化StorageLevel（如MEMORY_ONLY_SER）以序列化形式存储它们。Spark将会将每个RDD分区存储为一个大字节数组。以序列化形式存储数据的唯一缺点是数据访问变慢，因为必须对每个对象进行反序列化。如果您想以序列化形式缓存数据，我们强烈建议使用Kryo，因为它会使数据比java序列化后的大小更小（而且肯定比原Java对象更小）。 六，垃圾回收调优 1，基本介绍 当你程序的RDD频繁的变动的时候，垃圾回收将会是一个问题。RDD的一次读入，然后有很多种基于它的计算，这种情况下垃圾回收没啥问题。当JAVA需要驱逐旧的对象，为新对象腾出空间的时候，需要跟踪所有Java对象并找到无用的对象。要记住的要点是，垃圾收集的成本与Java对象的数量成正比，因此使用较少对象的数据结构（例如，Ints数组，代替LinkedList）将大大降低了成本。一个更好的方法是以序列化形式持久化对象，如上所述：每个RDD分区将只有一个对象（一个字节数组）。在尝试其他技术之前，如果GC是一个问题，首先要尝试的是使用序列化缓存。 由于任务的运行内存和RDD的缓存内存的干扰，GC也会是一个问题。 2，测量GC的影响 GC调优的第一步是收集关于垃圾收集发生频率和GC花费的时间的统计信息。通过将-verbose：gc -XX：+ PrintGCDetails -XX：+ PrintGCTimeStamps添加到Java选项来完成。下次运行Spark作业时，每当垃圾收集发生时，都会看到在工作日志中打印的消息。请注意，这些日志将在您的群集的Executor节点上（在其工作目录中的stdout文件中），而不是您的driver功能中。 3，高级GC调优 为了进一步调整垃圾收集，我们首先需要了解一些关于JVM内存管理的基本信息&lt;详细的请看：JVM的垃圾回收算法&gt;： 1),java的堆内存分为两个区域新生代和老年代。新生代保存的是生命周期比较短的对象，老年代保存生命周期比较长的对象。 2),新生代又分为了三个区域(Eden, Survivor1, Survivor2)。 3),垃圾收集过程的简化说明：当Eden已满时，Eden上运行了一个minor GC，并将Eden和Survivor1中存在的对象复制到Survivor2。Survivor&nbsp;将进行交换。如果一个对象足够老，或者Survivor2已满，则会移动到老年代。最后当老年代接近满的时候，会触发full GC。 Spark应用程序GC调优的目标是，确保生命周期比较长的RDD保存在老年代，新生代有足够的空间保存生命周期比较短的对象。这有助于避免触发Full GC去收集task运行期间产生的临时变量。下面列举几个有用的步骤： 1),通过收集垃圾回收信息，判断是否有太多的垃圾回收过程。假如full gc在一个task完成之前触发了好几次，那说明运行task的内存空间不足，需要加内存。 2),在gc的统计信息中，如果老年代接近满了，减少用于缓存的内存(通过减小spark.memory.Fraction)。缓存较少的对象比降低运行速度对我们来说更有好处。另外，可以考虑减少年轻代。可以通过减小-Xmn参数设置的值，假如使用的话。假如没有设置可以修改JVM的NewRation参数。大多数JVMs默认值是2，意思是老年代占用了三分之二的总内存。这个值要足够大，相当于扩展了spark.memory.fraction. 3),如果有太多的minor gc，较少的major gc，增加Eden区内存会有帮助。将Eden区内存设置的比task运行估计内存稍微大一些。如果Eden区大小确定为E，那就将新生代的内存设置为-Xmn=4/3E，按比例增加内存是考虑到survivor区所占用的内存。 4),尝试通过设置-XX:+UseG1GC垃圾回收器为G1。在垃圾回收器是瓶颈的一些情况下，它可以提高性能。请注意，对于大的Executor堆，通过使用-XX:G!HeapRegionSize去增大G1的堆大小，显得尤为重要。 5),例如，如果您的任务是从HDFS读取数据，则可以使用从HDFS读取的数据块的大小来估计任务使用的内存量。请注意，解压缩块的大小通常是块大小的2或3倍。所以如果我们希望有3或4个任务的工作空间，HDFS块的大小是64 MB，我们可以估计Eden的大小是4 * 3 * 64MB。 5),监控垃圾收集的频率和时间如何随着新设置的变化而变化。 经验表明，GC调整的效果取决于您的应用程序和可用的内存量。下面的链接里有更多的在线描述的调优的选项，但在高层次上，管理GC的全面发生频率有助于减少开销。" />
+<meta property="og:description" content="一，基本概述 调优内存的使用主要有三个方面的考虑：对象的内存占用量(你可能希望整个数据集都适合内存)，访问这些数据的开销，垃圾回收的负载。 默认情况下，java的对象是可以快速访问的，但是相比于内部的原始数据消耗估计2-5倍的空间。主要归于下面三个原因： 1),每个不同的Java对象都有一个“对象头”，它大约是16个字节，包含一个指向它的类的指针。对于一个数据很少的对象（比如一个Int字段），这可以比数据大。 2),Java字符串在原始字符串数据上具有大约40字节的开销（因为它们将它们存储在一个Chars数组中，并保留额外的数据，例如长度），并且由于String的内部使用UTF-16编码而将每个字符存储为两个字节。因此，一个10个字符的字符串可以容易地消耗60个字节。 3),常用集合类（如HashMap和LinkedList）使用链接的数据结构，其中每个条目都有一个“包装器”对象（例如Map.Entry）。该对象不仅具有头部，还包括指针（通常为8个字节）到列表中的下一个对象。 4),原始类型的集合通常将它们存储为“boxed”对象，如java.lang.Integer。 本节将从Spark的内存管理概述开始，然后讨论用户可以采取的具体策略，以便在他/她的应用程序中更有效地使用内存。具体来说，我们将描述如何确定对象的内存使用情况，以及如何改进数据结构，或通过以序列化的格式存储数据。然后我们将介绍调优Spark的缓存大小和Java垃圾回收器。 二，spark的内存管理概述 Spark中的内存使用大部分属于两类：执行和存储。运行内存指的是用于计算的，shuffle，joins，sorts&nbsp;和aggregations，然后存储内存主要用于缓存和在集群中传播的内部数据。在spark内部，存储器和执行器共享一个统一的区域(M)。当没有使用执行器内存的时候，存储器可以获取所有可用的执行器内存，反之亦然。如果有需要执行器可以驱逐存储占用，但是仅仅当存储内存大于一个阈值(R)的时候才会发生。换句话说，R描述了M内部的一个子区域，R中的缓存永远不会被清除。由于实施的复杂性，存储内存不得驱逐执行内存。该设计保证了几个理想的性能。 首先，不使用缓存的应用程序可以将整个空间用于执行，从而避免不必要的磁盘溢写。 其次，使用缓存的应用程序可以保留最小的存储空间（R），其中数据块不受驱逐。 最后，这种方法为各种工作负载提供了合理的开箱即用性能，而不需要用户掌握内部如何分配内存的专业知识。 虽然有两个相关配置，但典型用户不需要调整它们，因为默认值适用于大多数工作负载： 1),spark.memory.fraction将M的大小表示为（JVM堆空间&nbsp;- 300MB）的一部分（默认为0.75，新版本如spark2.2改为0.6）。剩余的空间（25％，对应的新版本是0.4）用于用户数据结构，Spark中的内部元数据，并且在稀疏和异常大的记录的情况下保护OOM错误。 2),spark.memory.storageFraction表示R的大小作为M的一部分（默认为0.5）。R是M内的存储空间，其中缓存的块免于被执行器驱逐。 &nbsp; 三，确定内存的消耗 最好的方式去计算一个数据的的内存消耗，就是创建一个RDD，然后加入cache，这样就可以在web ui中Storage页面看到了。页面会告诉你，这个RDD消耗了多少内存。 要估计特定对象的内存消耗，请使用SizeEstimator的估计方法。这对于尝试使用不同的数据布局来修剪内存使用情况以及确定广播变量在每个执行程序堆中占用的空间量非常有用。 四，调优数据结构 减少内存消耗的第一种方法是避免使用增加负担的java特性，例如基于指针的数据结构和包装对象。下面几种方法可以来避免这个。 1,将数据结构设计为偏好对象数组和原始类型，而不是标准的Java或Scala集合类（例如HashMap）。fastutil库(http://fastutil.di.unimi.it/)为与Java标准库兼容的原始类型提供方便的集合类。 2,尽可能避免使用有很多小对象和指针的嵌套结构。 3,针对关键词，考虑使用数字ID或者枚举对象而不是字符串。 4,如果您的RAM少于32 GB，请设置JVM标志-XX：+ UseCompressedOops使指针为四个字节而不是八个字节。您可以在spark-env.sh中添加这些选项。 五，序列化RDD 尽管进行了调优，当您的对象仍然太大而无法有效存储时，一个简单的方法来减少内存使用是使用RDD持久性API中的序列化StorageLevel（如MEMORY_ONLY_SER）以序列化形式存储它们。Spark将会将每个RDD分区存储为一个大字节数组。以序列化形式存储数据的唯一缺点是数据访问变慢，因为必须对每个对象进行反序列化。如果您想以序列化形式缓存数据，我们强烈建议使用Kryo，因为它会使数据比java序列化后的大小更小（而且肯定比原Java对象更小）。 六，垃圾回收调优 1，基本介绍 当你程序的RDD频繁的变动的时候，垃圾回收将会是一个问题。RDD的一次读入，然后有很多种基于它的计算，这种情况下垃圾回收没啥问题。当JAVA需要驱逐旧的对象，为新对象腾出空间的时候，需要跟踪所有Java对象并找到无用的对象。要记住的要点是，垃圾收集的成本与Java对象的数量成正比，因此使用较少对象的数据结构（例如，Ints数组，代替LinkedList）将大大降低了成本。一个更好的方法是以序列化形式持久化对象，如上所述：每个RDD分区将只有一个对象（一个字节数组）。在尝试其他技术之前，如果GC是一个问题，首先要尝试的是使用序列化缓存。 由于任务的运行内存和RDD的缓存内存的干扰，GC也会是一个问题。 2，测量GC的影响 GC调优的第一步是收集关于垃圾收集发生频率和GC花费的时间的统计信息。通过将-verbose：gc -XX：+ PrintGCDetails -XX：+ PrintGCTimeStamps添加到Java选项来完成。下次运行Spark作业时，每当垃圾收集发生时，都会看到在工作日志中打印的消息。请注意，这些日志将在您的群集的Executor节点上（在其工作目录中的stdout文件中），而不是您的driver功能中。 3，高级GC调优 为了进一步调整垃圾收集，我们首先需要了解一些关于JVM内存管理的基本信息&lt;详细的请看：JVM的垃圾回收算法&gt;： 1),java的堆内存分为两个区域新生代和老年代。新生代保存的是生命周期比较短的对象，老年代保存生命周期比较长的对象。 2),新生代又分为了三个区域(Eden, Survivor1, Survivor2)。 3),垃圾收集过程的简化说明：当Eden已满时，Eden上运行了一个minor GC，并将Eden和Survivor1中存在的对象复制到Survivor2。Survivor&nbsp;将进行交换。如果一个对象足够老，或者Survivor2已满，则会移动到老年代。最后当老年代接近满的时候，会触发full GC。 Spark应用程序GC调优的目标是，确保生命周期比较长的RDD保存在老年代，新生代有足够的空间保存生命周期比较短的对象。这有助于避免触发Full GC去收集task运行期间产生的临时变量。下面列举几个有用的步骤： 1),通过收集垃圾回收信息，判断是否有太多的垃圾回收过程。假如full gc在一个task完成之前触发了好几次，那说明运行task的内存空间不足，需要加内存。 2),在gc的统计信息中，如果老年代接近满了，减少用于缓存的内存(通过减小spark.memory.Fraction)。缓存较少的对象比降低运行速度对我们来说更有好处。另外，可以考虑减少年轻代。可以通过减小-Xmn参数设置的值，假如使用的话。假如没有设置可以修改JVM的NewRation参数。大多数JVMs默认值是2，意思是老年代占用了三分之二的总内存。这个值要足够大，相当于扩展了spark.memory.fraction. 3),如果有太多的minor gc，较少的major gc，增加Eden区内存会有帮助。将Eden区内存设置的比task运行估计内存稍微大一些。如果Eden区大小确定为E，那就将新生代的内存设置为-Xmn=4/3E，按比例增加内存是考虑到survivor区所占用的内存。 4),尝试通过设置-XX:+UseG1GC垃圾回收器为G1。在垃圾回收器是瓶颈的一些情况下，它可以提高性能。请注意，对于大的Executor堆，通过使用-XX:G!HeapRegionSize去增大G1的堆大小，显得尤为重要。 5),例如，如果您的任务是从HDFS读取数据，则可以使用从HDFS读取的数据块的大小来估计任务使用的内存量。请注意，解压缩块的大小通常是块大小的2或3倍。所以如果我们希望有3或4个任务的工作空间，HDFS块的大小是64 MB，我们可以估计Eden的大小是4 * 3 * 64MB。 5),监控垃圾收集的频率和时间如何随着新设置的变化而变化。 经验表明，GC调整的效果取决于您的应用程序和可用的内存量。下面的链接里有更多的在线描述的调优的选项，但在高层次上，管理GC的全面发生频率有助于减少开销。" />
+<link rel="canonical" href="https://uzzz.org/2019/07/31/792393.html" />
+<meta property="og:url" content="https://uzzz.org/2019/07/31/792393.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-07-31T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"一，基本概述 调优内存的使用主要有三个方面的考虑：对象的内存占用量(你可能希望整个数据集都适合内存)，访问这些数据的开销，垃圾回收的负载。 默认情况下，java的对象是可以快速访问的，但是相比于内部的原始数据消耗估计2-5倍的空间。主要归于下面三个原因： 1),每个不同的Java对象都有一个“对象头”，它大约是16个字节，包含一个指向它的类的指针。对于一个数据很少的对象（比如一个Int字段），这可以比数据大。 2),Java字符串在原始字符串数据上具有大约40字节的开销（因为它们将它们存储在一个Chars数组中，并保留额外的数据，例如长度），并且由于String的内部使用UTF-16编码而将每个字符存储为两个字节。因此，一个10个字符的字符串可以容易地消耗60个字节。 3),常用集合类（如HashMap和LinkedList）使用链接的数据结构，其中每个条目都有一个“包装器”对象（例如Map.Entry）。该对象不仅具有头部，还包括指针（通常为8个字节）到列表中的下一个对象。 4),原始类型的集合通常将它们存储为“boxed”对象，如java.lang.Integer。 本节将从Spark的内存管理概述开始，然后讨论用户可以采取的具体策略，以便在他/她的应用程序中更有效地使用内存。具体来说，我们将描述如何确定对象的内存使用情况，以及如何改进数据结构，或通过以序列化的格式存储数据。然后我们将介绍调优Spark的缓存大小和Java垃圾回收器。 二，spark的内存管理概述 Spark中的内存使用大部分属于两类：执行和存储。运行内存指的是用于计算的，shuffle，joins，sorts&nbsp;和aggregations，然后存储内存主要用于缓存和在集群中传播的内部数据。在spark内部，存储器和执行器共享一个统一的区域(M)。当没有使用执行器内存的时候，存储器可以获取所有可用的执行器内存，反之亦然。如果有需要执行器可以驱逐存储占用，但是仅仅当存储内存大于一个阈值(R)的时候才会发生。换句话说，R描述了M内部的一个子区域，R中的缓存永远不会被清除。由于实施的复杂性，存储内存不得驱逐执行内存。该设计保证了几个理想的性能。 首先，不使用缓存的应用程序可以将整个空间用于执行，从而避免不必要的磁盘溢写。 其次，使用缓存的应用程序可以保留最小的存储空间（R），其中数据块不受驱逐。 最后，这种方法为各种工作负载提供了合理的开箱即用性能，而不需要用户掌握内部如何分配内存的专业知识。 虽然有两个相关配置，但典型用户不需要调整它们，因为默认值适用于大多数工作负载： 1),spark.memory.fraction将M的大小表示为（JVM堆空间&nbsp;- 300MB）的一部分（默认为0.75，新版本如spark2.2改为0.6）。剩余的空间（25％，对应的新版本是0.4）用于用户数据结构，Spark中的内部元数据，并且在稀疏和异常大的记录的情况下保护OOM错误。 2),spark.memory.storageFraction表示R的大小作为M的一部分（默认为0.5）。R是M内的存储空间，其中缓存的块免于被执行器驱逐。 &nbsp; 三，确定内存的消耗 最好的方式去计算一个数据的的内存消耗，就是创建一个RDD，然后加入cache，这样就可以在web ui中Storage页面看到了。页面会告诉你，这个RDD消耗了多少内存。 要估计特定对象的内存消耗，请使用SizeEstimator的估计方法。这对于尝试使用不同的数据布局来修剪内存使用情况以及确定广播变量在每个执行程序堆中占用的空间量非常有用。 四，调优数据结构 减少内存消耗的第一种方法是避免使用增加负担的java特性，例如基于指针的数据结构和包装对象。下面几种方法可以来避免这个。 1,将数据结构设计为偏好对象数组和原始类型，而不是标准的Java或Scala集合类（例如HashMap）。fastutil库(http://fastutil.di.unimi.it/)为与Java标准库兼容的原始类型提供方便的集合类。 2,尽可能避免使用有很多小对象和指针的嵌套结构。 3,针对关键词，考虑使用数字ID或者枚举对象而不是字符串。 4,如果您的RAM少于32 GB，请设置JVM标志-XX：+ UseCompressedOops使指针为四个字节而不是八个字节。您可以在spark-env.sh中添加这些选项。 五，序列化RDD 尽管进行了调优，当您的对象仍然太大而无法有效存储时，一个简单的方法来减少内存使用是使用RDD持久性API中的序列化StorageLevel（如MEMORY_ONLY_SER）以序列化形式存储它们。Spark将会将每个RDD分区存储为一个大字节数组。以序列化形式存储数据的唯一缺点是数据访问变慢，因为必须对每个对象进行反序列化。如果您想以序列化形式缓存数据，我们强烈建议使用Kryo，因为它会使数据比java序列化后的大小更小（而且肯定比原Java对象更小）。 六，垃圾回收调优 1，基本介绍 当你程序的RDD频繁的变动的时候，垃圾回收将会是一个问题。RDD的一次读入，然后有很多种基于它的计算，这种情况下垃圾回收没啥问题。当JAVA需要驱逐旧的对象，为新对象腾出空间的时候，需要跟踪所有Java对象并找到无用的对象。要记住的要点是，垃圾收集的成本与Java对象的数量成正比，因此使用较少对象的数据结构（例如，Ints数组，代替LinkedList）将大大降低了成本。一个更好的方法是以序列化形式持久化对象，如上所述：每个RDD分区将只有一个对象（一个字节数组）。在尝试其他技术之前，如果GC是一个问题，首先要尝试的是使用序列化缓存。 由于任务的运行内存和RDD的缓存内存的干扰，GC也会是一个问题。 2，测量GC的影响 GC调优的第一步是收集关于垃圾收集发生频率和GC花费的时间的统计信息。通过将-verbose：gc -XX：+ PrintGCDetails -XX：+ PrintGCTimeStamps添加到Java选项来完成。下次运行Spark作业时，每当垃圾收集发生时，都会看到在工作日志中打印的消息。请注意，这些日志将在您的群集的Executor节点上（在其工作目录中的stdout文件中），而不是您的driver功能中。 3，高级GC调优 为了进一步调整垃圾收集，我们首先需要了解一些关于JVM内存管理的基本信息&lt;详细的请看：JVM的垃圾回收算法&gt;： 1),java的堆内存分为两个区域新生代和老年代。新生代保存的是生命周期比较短的对象，老年代保存生命周期比较长的对象。 2),新生代又分为了三个区域(Eden, Survivor1, Survivor2)。 3),垃圾收集过程的简化说明：当Eden已满时，Eden上运行了一个minor GC，并将Eden和Survivor1中存在的对象复制到Survivor2。Survivor&nbsp;将进行交换。如果一个对象足够老，或者Survivor2已满，则会移动到老年代。最后当老年代接近满的时候，会触发full GC。 Spark应用程序GC调优的目标是，确保生命周期比较长的RDD保存在老年代，新生代有足够的空间保存生命周期比较短的对象。这有助于避免触发Full GC去收集task运行期间产生的临时变量。下面列举几个有用的步骤： 1),通过收集垃圾回收信息，判断是否有太多的垃圾回收过程。假如full gc在一个task完成之前触发了好几次，那说明运行task的内存空间不足，需要加内存。 2),在gc的统计信息中，如果老年代接近满了，减少用于缓存的内存(通过减小spark.memory.Fraction)。缓存较少的对象比降低运行速度对我们来说更有好处。另外，可以考虑减少年轻代。可以通过减小-Xmn参数设置的值，假如使用的话。假如没有设置可以修改JVM的NewRation参数。大多数JVMs默认值是2，意思是老年代占用了三分之二的总内存。这个值要足够大，相当于扩展了spark.memory.fraction. 3),如果有太多的minor gc，较少的major gc，增加Eden区内存会有帮助。将Eden区内存设置的比task运行估计内存稍微大一些。如果Eden区大小确定为E，那就将新生代的内存设置为-Xmn=4/3E，按比例增加内存是考虑到survivor区所占用的内存。 4),尝试通过设置-XX:+UseG1GC垃圾回收器为G1。在垃圾回收器是瓶颈的一些情况下，它可以提高性能。请注意，对于大的Executor堆，通过使用-XX:G!HeapRegionSize去增大G1的堆大小，显得尤为重要。 5),例如，如果您的任务是从HDFS读取数据，则可以使用从HDFS读取的数据块的大小来估计任务使用的内存量。请注意，解压缩块的大小通常是块大小的2或3倍。所以如果我们希望有3或4个任务的工作空间，HDFS块的大小是64 MB，我们可以估计Eden的大小是4 * 3 * 64MB。 5),监控垃圾收集的频率和时间如何随着新设置的变化而变化。 经验表明，GC调整的效果取决于您的应用程序和可用的内存量。下面的链接里有更多的在线描述的调优的选项，但在高层次上，管理GC的全面发生频率有助于减少开销。","@type":"BlogPosting","url":"https://uzzz.org/2019/07/31/792393.html","headline":"spark 内存，GC及数据结构调优","dateModified":"2019-07-31T00:00:00+08:00","datePublished":"2019-07-31T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/07/31/792393.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>spark 内存，GC及数据结构调优</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <p><strong>一，基本概述</strong></p> 
+  <p>调优内存的使用主要有三个方面的考虑：对象的内存占用量(你可能希望整个数据集都适合内存)，访问这些数据的开销，垃圾回收的负载。</p> 
+  <p>默认情况下，java的对象是可以快速访问的，但是相比于内部的原始数据消耗估计2-5倍的空间。主要归于下面三个原因：</p> 
+  <p>1),每个不同的Java对象都有一个“对象头”，它大约是16个字节，包含一个指向它的类的指针。对于一个数据很少的对象（比如一个Int字段），这可以比数据大。</p> 
+  <p>2),Java字符串在原始字符串数据上具有大约40字节的开销（因为它们将它们存储在一个Chars数组中，并保留额外的数据，例如长度），并且由于String的内部使用UTF-16编码而将每个字符存储为两个字节。因此，一个10个字符的字符串可以容易地消耗60个字节。</p> 
+  <p>3),常用集合类（如HashMap和LinkedList）使用链接的数据结构，其中每个条目都有一个“包装器”对象（例如Map.Entry）。该对象不仅具有头部，还包括指针（通常为8个字节）到列表中的下一个对象。</p> 
+  <p>4),原始类型的集合通常将它们存储为“boxed”对象，如java.lang.Integer。</p> 
+  <p>本节将从Spark的内存管理概述开始，然后讨论用户可以采取的具体策略，以便在他/她的应用程序中更有效地使用内存。具体来说，我们将描述如何确定对象的内存使用情况，以及如何改进数据结构，或通过以序列化的格式存储数据。然后我们将介绍调优Spark的缓存大小和Java垃圾回收器。</p> 
+  <p><strong>二，spark的内存管理概述</strong></p> 
+  <p>Spark中的内存使用大部分属于两类：执行和存储。运行内存指的是用于计算的，shuffle，joins，sorts&nbsp;和aggregations，然后存储内存主要用于缓存和在集群中传播的内部数据。在spark内部，存储器和执行器共享一个统一的区域(M)。<strong>当没有使用执行器内存的时候，存储器可以获取所有可用的执行器内存，反之亦然。</strong>如果有需要执行器可以驱逐存储占用，但是仅仅当存储内存大于一个阈值(R)的时候才会发生。换句话说，R描述了M内部的一个子区域，R中的缓存永远不会被清除。<strong>由于实施的复杂性，存储内存不得驱逐执行内存</strong>。该设计保证了几个理想的性能。</p> 
+  <p>首先，不使用缓存的应用程序可以将整个空间用于执行，从而避免不必要的磁盘溢写。</p> 
+  <p>其次，使用缓存的应用程序可以保留最小的存储空间（R），其中数据块不受驱逐。</p> 
+  <p>最后，这种方法为各种工作负载提供了合理的开箱即用性能，而不需要用户掌握内部如何分配内存的专业知识。</p> 
+  <p>虽然有两个相关配置，但典型用户不需要调整它们，因为默认值适用于大多数工作负载：</p> 
+  <p>1),spark.memory.fraction将M的大小表示为（JVM堆空间&nbsp;- 300MB）的一部分（默认为0.75，新版本如spark2.2改为0.6）。剩余的空间（25％，对应的新版本是0.4）用于用户数据结构，Spark中的内部元数据，并且在稀疏和异常大的记录的情况下保护OOM错误。</p> 
+  <p>2),spark.memory.storageFraction表示R的大小作为M的一部分（默认为0.5）。R是M内的存储空间，其中缓存的块免于被执行器驱逐。</p> 
+  <p>&nbsp;</p> 
+  <p><strong>三，确定内存的消耗</strong></p> 
+  <p>最好的方式去计算一个数据的的内存消耗，就是创建一个RDD，然后加入cache，这样就可以在web ui中Storage页面看到了。页面会告诉你，这个RDD消耗了多少内存。</p> 
+  <p>要估计特定对象的内存消耗，请使用SizeEstimator的估计方法。这对于尝试使用不同的数据布局来修剪内存使用情况以及确定广播变量在每个执行程序堆中占用的空间量非常有用。</p> 
+  <p><strong>四，调优数据结构</strong></p> 
+  <p>减少内存消耗的第一种方法是避免使用增加负担的java特性，例如基于指针的数据结构和包装对象。下面几种方法可以来避免这个。</p> 
+  <p>1,将数据结构设计为偏好对象数组和原始类型，而不是标准的Java或Scala集合类（例如HashMap）。fastutil库(http://fastutil.di.unimi.it/)为与Java标准库兼容的原始类型提供方便的集合类。</p> 
+  <p>2,尽可能避免使用有很多小对象和指针的嵌套结构。</p> 
+  <p>3,针对关键词，考虑使用数字ID或者枚举对象而不是字符串。</p> 
+  <p>4,如果您的RAM少于32 GB，请设置JVM标志-XX：+ UseCompressedOops使指针为四个字节而不是八个字节。您可以在spark-env.sh中添加这些选项。</p> 
+  <p><strong>五，序列化RDD</strong></p> 
+  <p>尽管进行了调优，当您的对象仍然太大而无法有效存储时，一个简单的方法来减少内存使用是使用RDD持久性API中的序列化StorageLevel（如MEMORY_ONLY_SER）以序列化形式存储它们。Spark将会将每个RDD分区存储为一个大字节数组。以序列化形式存储数据的唯一缺点是数据访问变慢，因为必须对每个对象进行反序列化。如果您想以序列化形式缓存数据，我们强烈建议使用Kryo，因为它会使数据比java序列化后的大小更小（而且肯定比原Java对象更小）。</p> 
+  <p><strong>六，垃圾回收调优</strong></p> 
+  <p><strong>1，基本介绍</strong></p> 
+  <p>当你程序的RDD频繁的变动的时候，垃圾回收将会是一个问题。RDD的一次读入，然后有很多种基于它的计算，这种情况下垃圾回收没啥问题。当JAVA需要驱逐旧的对象，为新对象腾出空间的时候，需要跟踪所有Java对象并找到无用的对象。要记住的要点是，垃圾收集的成本与Java对象的数量成正比，因此使用较少对象的数据结构（例如，Ints数组，代替LinkedList）将大大降低了成本。一个更好的方法是以序列化形式持久化对象，如上所述：每个RDD分区将只有一个对象（一个字节数组）。在尝试其他技术之前，如果GC是一个问题，首先要尝试的是使用序列化缓存。</p> 
+  <p>由于任务的运行内存和RDD的缓存内存的干扰，GC也会是一个问题。</p> 
+  <p><strong>2，测量GC的影响</strong></p> 
+  <p>GC调优的第一步是收集关于垃圾收集发生频率和GC花费的时间的统计信息。通过将-verbose：gc -XX：+ PrintGCDetails -XX：+ PrintGCTimeStamps添加到Java选项来完成。下次运行Spark作业时，每当垃圾收集发生时，都会看到在工作日志中打印的消息。请注意，这些日志将在您的群集的Executor节点上（在其工作目录中的stdout文件中），而不是您的driver功能中。</p> 
+  <p><strong>3，高级GC调优</strong></p> 
+  <p>为了进一步调整垃圾收集，我们首先需要了解一些关于JVM内存管理的基本信息&lt;详细的请看：<a href="http://mp.weixin.qq.com/s?__biz=MzA3MDY0NTMxOQ==&amp;mid=2247483661&amp;idx=1&amp;sn=d6427470f125b58e92a5d6b27085e982&amp;chksm=9f38e225a84f6b3374e48002abc6f86d5190a9cf5ce59fa5ad6ca4bdd2df64c654e8f85c5413&amp;scene=21#wechat_redirect" rel="nofollow" data-token="39502e59e20b2bf4748b0a14e4023c04">JVM的垃圾回收算法</a>&gt;：</p> 
+  <p>1),java的堆内存分为两个区域新生代和老年代。新生代保存的是生命周期比较短的对象，老年代保存生命周期比较长的对象。</p> 
+  <p>2),新生代又分为了三个区域(Eden, Survivor1, Survivor2)。</p> 
+  <p>3),垃圾收集过程的简化说明：当Eden已满时，Eden上运行了一个minor GC，并将Eden和Survivor1中存在的对象复制到Survivor2。Survivor&nbsp;将进行交换。如果一个对象足够老，或者Survivor2已满，则会移动到老年代。最后当老年代接近满的时候，会触发full GC。</p> 
+  <p>Spark应用程序GC调优的目标是，确保生命周期比较长的RDD保存在老年代，新生代有足够的空间保存生命周期比较短的对象。这有助于避免触发Full GC去收集task运行期间产生的临时变量。下面列举几个有用的步骤：</p> 
+  <p>1),通过收集垃圾回收信息，判断是否有太多的垃圾回收过程。假如full gc在一个task完成之前触发了好几次，那说明运行task的内存空间不足，需要加内存。</p> 
+  <p>2),<strong>在gc的统计信息中，如果老年代接近满了，减少用于缓存的内存(通过减小spark.memory.Fraction)。</strong>缓存较少的对象比降低运行速度对我们来说更有好处。另外，可以考虑减少年轻代。可以通过减小-Xmn参数设置的值，假如使用的话。假如没有设置可以修改JVM的NewRation参数。大多数JVMs默认值是2，意思是老年代占用了三分之二的总内存。这个值要足够大，相当于扩展了spark.memory.fraction.</p> 
+  <p>3),如果有太多的minor gc，较少的major gc，增加Eden区内存会有帮助。将Eden区内存设置的比task运行估计内存稍微大一些。如果Eden区大小确定为E，那就将新生代的内存设置为-Xmn=4/3E，按比例增加内存是考虑到survivor区所占用的内存。</p> 
+  <p>4),尝试通过设置-XX:+UseG1GC垃圾回收器为G1。在垃圾回收器是瓶颈的一些情况下，它可以提高性能。请注意，对于大的Executor堆，通过使用-XX:G!HeapRegionSize去增大G1的堆大小，显得尤为重要。</p> 
+  <p>5),例如，如果您的任务是从HDFS读取数据，则可以使用从HDFS读取的数据块的大小来估计任务使用的内存量。请注意，解压缩块的大小通常是块大小的2或3倍。所以如果我们希望有3或4个任务的工作空间，HDFS块的大小是64 MB，我们可以估计Eden的大小是4 * 3 * 64MB。</p> 
+  <p>5),监控垃圾收集的频率和时间如何随着新设置的变化而变化。</p> 
+  <p>经验表明，GC调整的效果取决于您的应用程序和可用的内存量。下面的链接里有更多的在线描述的调优的选项，但在高层次上，管理GC的全面发生频率有助于减少开销。</p> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

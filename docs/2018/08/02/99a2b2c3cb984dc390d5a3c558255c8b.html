@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊（15）交易流程解析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊（15）交易流程解析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊源码分析-交易 机理 先说一点区块链转账的基本概念和流程 用户输入转账的地址和转入的地址和转出的金额 系统通过转出的地址的私钥对转账信息进行签名（用于证明这 笔交易确实有本人进行） 系统对交易信息进行验证 把这笔交易入到本地的txpool中（就是缓存交易池） 把交易信息广播给其它节点 源码分析 正对于上面的流程对以太坊(golang)的源码进行必要的分析 面程序员对自己的区块链进行必要的改动 先来看Geth如何转账的: eth.sendTransaction({&quot;from&quot;:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(10,&#39;ether&#39;)}) geth的前端操作是用js来进行，调用了web3里面的sendTransaction，然后用json进行封装交易信息，最后调用golang里面的=&gt; func (s *PublicTransactionPoolAPI) SendTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) 至于怎么从js 转到golang的不细节将过程有点复杂，有空在专门开一个专题进行说明(JSON-RPC) 由此我们可以看出交易的入门在SendTransaction这个方面里面简单的说一下这个方面做了什么事情: 通过传入的from 来调取对应地址的钱包 通过交易信息生成 type包下面的Transaction结构体 对交易进行签名 最后提交交易 看下签名的方法(大多数要进行修改的地方在这里因为可以根据自己的交易需求来创建不同的交易信息): SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) 此签名方法为一个接口，也就是说 以太坊支持多个不同钱包每个钱包有自己的签名方法 geth 官方的签名在keystore里面实现的 func (ks *KeyStore) SignTx(a accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Look up the key to sign with and abort if it cannot be found ks.mu.RLock() defer ks.mu.RUnlock() unlockedKey, found := ks.unlocked[a.Address] if !found { return nil, ErrLocked } // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), unlockedKey.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, unlockedKey.PrivateKey) } 需要转账的话先要给账户解锁，也就是你如果之前直接调用eth的send方法会出现XXXXX is locked的提示，需要用personal.unlockAccount(…)进行必要解锁，继续跟踪下去 func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return s.WithSignature(tx, sig) } func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } rlp是以太坊的编码规则,155多了一个chainId的字段（也就是把辣个networkid也放进来了），简单来的说就是把所有的信息转为一个byte数组用来签名用,以太坊的签名采用了椭圆曲线的签名。如何签名的就不展开来讲了。再然后就把签名 分成结构体里面的 R S V func (s EIP155Signer) WithSignature(tx *Transaction, sig []byte) (*Transaction, error) { if len(sig) != 65 { panic(fmt.Sprintf(&quot;wrong size for signature: got %d, want 65&quot;, len(sig))) } cpy := &amp;Transaction{data: tx.data} cpy.data.R = new(big.Int).SetBytes(sig[:32]) cpy.data.S = new(big.Int).SetBytes(sig[32:64]) cpy.data.V = new(big.Int).SetBytes([]byte{sig[64]}) if s.chainId.Sign() != 0 { cpy.data.V = big.NewInt(int64(sig[64] + 35)) cpy.data.V.Add(cpy.data.V, s.chainIdMul) } return cpy, nil } 到这里一个交易才算真正的完整(里面的playload是智能合约的代码转为byte数组以后),总结一下一个交易的封装由以下信息. 这里真心要画重点了，目前到这里的时候，在生成的交易信息里面是不存from的，如果好奇的小伙伴直接打印出结果的话会有from的地址，但是那个是因为调用了String()方法，String()方法里面有从RSV里面恢复from 地址然后在赋值的过程,对了这里提醒下 fmt.println(object)的话 其实是调用 String()方法这一点和java一毛一样的。 to 转入地址 amount 金额 playload 只能合约的byte数组 nounce 交易独特的id chainId networkid gasprice gas价格 gaslimit gas限量 交易封装完成那自然要提交了，提交是最重要的一块。跟踪代码 func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, _ := types.Sender(signer, tx) addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 最后返回值是tx的hash值 也就是我们在提交交易后，界面上显示的那一串数组 交易的hash值，也就是去查看SendTx的方法继续跟踪下去会来到这里： func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { state, err := pool.currentState() if err != nil { return err } from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables(state, []common.Address{from}) } return nil } 往txpool里面加入这笔交易，本来以为那个add方法仅仅是简单的数据结构的添加，但是点进去以后发现还是做了特别多的处理，也就是对于这笔交易的验证其实在add里面的验证的 func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all[hash] != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash()) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all[tx.Hash()] = tx pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 昂，这段代码挺多的，一点一点来分析就好： pool.all[hash] != nil 看下当前的缓存池里面有没有这笔交易了，如果通过正常方法来建立的话，那肯定是没有的 pool.validateTx(tx, local), 对当前的交易进行验证 交友大小有没有超过规定大小（32mb） 交易金额不能小于0 gas量不能超过总量 验证签名。签名说过from信息没有录入没，这里签名如果正确的话会从签名里面把pubkey取出来然后组成地址给from 赋值上去。 验证给的gasprice 必须要大于最低的gas price 验证是否可以取出对应的stat database 当前交易的Noce 一定要比当前这个from的Noce大（当然了不然就不对了嘛） 验证交易金额是不是小于当前账户的金额 查看当前的pool有没有满，如果满了的话会把金额最低的交易踢出去，当然了会把这笔交易放进去比较，这个就是为啥以太坊金额越低效率越慢 放入pending 或者 queuelist里面，pending list 是可以直接用来封装区块的，所以在封装的区块的时候会取pending里面的。pending里面的数列必须是有序的从小到大的，中间如果断掉会 先加入到queue list里面，一个交易走到这一步的时候都会进入queue list里面，因为直接进入pending的要求是 有相同的nonce，也就是说除非你是对原有的交易进行修改才会直接覆盖pending里面的某一项。 add方法结束了，也就到了这里交易要么被扔掉（当前缓存池满了），要么就是进入pending要么就是进入queue队列 昂，接着就是addTx的最后一步了，代码也挺长的，慢慢分析： func (pool *TxPool) promoteExecutables(state *state.StateDB, accounts []common.Address) { gaslimit := pool.gasLimit() // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr, _ := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(state.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(state.GetBalance(addr), gaslimit) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash()) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash()) drop-- queuedRateLimitCounter.Inc(1) } } } } 这个方法就是把之前在queue 队列里面的交易往pending 里面移动。 获取gas限定，然后建立一个用于存address的数组,把队列里面的所有地址取出（这个队列由map实现key为地址，value 为一个存交易的list（至于list的数据结构还没来得及去研究） 如果一个账户的交易沉淀太多了没有被取出，会把一些比较沉底的交易暂时不管，先处理nonce比较高的交易，里面nonce 是用了一个最大堆的数据结构， 同理如果沉淀过多把那些交易金额比较低的和gas已经超标的给弄掉弄掉弄掉 剩下的操作就是如果，pending已经超过长度了，会把前面queue里面的东西和pending进行重新排列组合，主要是算法的代码，可以慢慢研究 好了到了这里然后交易就提交完毕啦，然后有人问咧，那么给其它节点传呢，这里不是只有local的麻。在promoteExecutables里面有个方法叫 pool.promoteTx(addr, hash, tx) 这个方法的最后一行 go pool.eventMux.Post(TxPreEvent{tx}) 这里就是给其它节点传了。怎么传的话打算下次在重新整理一章以太坊的p2p模式还是挺复杂的 &nbsp; 原文地址： https://tianyun6655.github.io/2017/09/24/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E6%BA%90%E7%A0%81%E4%BA%A4%E6%98%93/ &nbsp; 阅读更多" />
+<meta property="og:description" content="以太坊源码分析-交易 机理 先说一点区块链转账的基本概念和流程 用户输入转账的地址和转入的地址和转出的金额 系统通过转出的地址的私钥对转账信息进行签名（用于证明这 笔交易确实有本人进行） 系统对交易信息进行验证 把这笔交易入到本地的txpool中（就是缓存交易池） 把交易信息广播给其它节点 源码分析 正对于上面的流程对以太坊(golang)的源码进行必要的分析 面程序员对自己的区块链进行必要的改动 先来看Geth如何转账的: eth.sendTransaction({&quot;from&quot;:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(10,&#39;ether&#39;)}) geth的前端操作是用js来进行，调用了web3里面的sendTransaction，然后用json进行封装交易信息，最后调用golang里面的=&gt; func (s *PublicTransactionPoolAPI) SendTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) 至于怎么从js 转到golang的不细节将过程有点复杂，有空在专门开一个专题进行说明(JSON-RPC) 由此我们可以看出交易的入门在SendTransaction这个方面里面简单的说一下这个方面做了什么事情: 通过传入的from 来调取对应地址的钱包 通过交易信息生成 type包下面的Transaction结构体 对交易进行签名 最后提交交易 看下签名的方法(大多数要进行修改的地方在这里因为可以根据自己的交易需求来创建不同的交易信息): SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) 此签名方法为一个接口，也就是说 以太坊支持多个不同钱包每个钱包有自己的签名方法 geth 官方的签名在keystore里面实现的 func (ks *KeyStore) SignTx(a accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Look up the key to sign with and abort if it cannot be found ks.mu.RLock() defer ks.mu.RUnlock() unlockedKey, found := ks.unlocked[a.Address] if !found { return nil, ErrLocked } // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), unlockedKey.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, unlockedKey.PrivateKey) } 需要转账的话先要给账户解锁，也就是你如果之前直接调用eth的send方法会出现XXXXX is locked的提示，需要用personal.unlockAccount(…)进行必要解锁，继续跟踪下去 func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return s.WithSignature(tx, sig) } func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } rlp是以太坊的编码规则,155多了一个chainId的字段（也就是把辣个networkid也放进来了），简单来的说就是把所有的信息转为一个byte数组用来签名用,以太坊的签名采用了椭圆曲线的签名。如何签名的就不展开来讲了。再然后就把签名 分成结构体里面的 R S V func (s EIP155Signer) WithSignature(tx *Transaction, sig []byte) (*Transaction, error) { if len(sig) != 65 { panic(fmt.Sprintf(&quot;wrong size for signature: got %d, want 65&quot;, len(sig))) } cpy := &amp;Transaction{data: tx.data} cpy.data.R = new(big.Int).SetBytes(sig[:32]) cpy.data.S = new(big.Int).SetBytes(sig[32:64]) cpy.data.V = new(big.Int).SetBytes([]byte{sig[64]}) if s.chainId.Sign() != 0 { cpy.data.V = big.NewInt(int64(sig[64] + 35)) cpy.data.V.Add(cpy.data.V, s.chainIdMul) } return cpy, nil } 到这里一个交易才算真正的完整(里面的playload是智能合约的代码转为byte数组以后),总结一下一个交易的封装由以下信息. 这里真心要画重点了，目前到这里的时候，在生成的交易信息里面是不存from的，如果好奇的小伙伴直接打印出结果的话会有from的地址，但是那个是因为调用了String()方法，String()方法里面有从RSV里面恢复from 地址然后在赋值的过程,对了这里提醒下 fmt.println(object)的话 其实是调用 String()方法这一点和java一毛一样的。 to 转入地址 amount 金额 playload 只能合约的byte数组 nounce 交易独特的id chainId networkid gasprice gas价格 gaslimit gas限量 交易封装完成那自然要提交了，提交是最重要的一块。跟踪代码 func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, _ := types.Sender(signer, tx) addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 最后返回值是tx的hash值 也就是我们在提交交易后，界面上显示的那一串数组 交易的hash值，也就是去查看SendTx的方法继续跟踪下去会来到这里： func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { state, err := pool.currentState() if err != nil { return err } from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables(state, []common.Address{from}) } return nil } 往txpool里面加入这笔交易，本来以为那个add方法仅仅是简单的数据结构的添加，但是点进去以后发现还是做了特别多的处理，也就是对于这笔交易的验证其实在add里面的验证的 func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all[hash] != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash()) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all[tx.Hash()] = tx pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 昂，这段代码挺多的，一点一点来分析就好： pool.all[hash] != nil 看下当前的缓存池里面有没有这笔交易了，如果通过正常方法来建立的话，那肯定是没有的 pool.validateTx(tx, local), 对当前的交易进行验证 交友大小有没有超过规定大小（32mb） 交易金额不能小于0 gas量不能超过总量 验证签名。签名说过from信息没有录入没，这里签名如果正确的话会从签名里面把pubkey取出来然后组成地址给from 赋值上去。 验证给的gasprice 必须要大于最低的gas price 验证是否可以取出对应的stat database 当前交易的Noce 一定要比当前这个from的Noce大（当然了不然就不对了嘛） 验证交易金额是不是小于当前账户的金额 查看当前的pool有没有满，如果满了的话会把金额最低的交易踢出去，当然了会把这笔交易放进去比较，这个就是为啥以太坊金额越低效率越慢 放入pending 或者 queuelist里面，pending list 是可以直接用来封装区块的，所以在封装的区块的时候会取pending里面的。pending里面的数列必须是有序的从小到大的，中间如果断掉会 先加入到queue list里面，一个交易走到这一步的时候都会进入queue list里面，因为直接进入pending的要求是 有相同的nonce，也就是说除非你是对原有的交易进行修改才会直接覆盖pending里面的某一项。 add方法结束了，也就到了这里交易要么被扔掉（当前缓存池满了），要么就是进入pending要么就是进入queue队列 昂，接着就是addTx的最后一步了，代码也挺长的，慢慢分析： func (pool *TxPool) promoteExecutables(state *state.StateDB, accounts []common.Address) { gaslimit := pool.gasLimit() // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr, _ := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(state.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(state.GetBalance(addr), gaslimit) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash()) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash()) drop-- queuedRateLimitCounter.Inc(1) } } } } 这个方法就是把之前在queue 队列里面的交易往pending 里面移动。 获取gas限定，然后建立一个用于存address的数组,把队列里面的所有地址取出（这个队列由map实现key为地址，value 为一个存交易的list（至于list的数据结构还没来得及去研究） 如果一个账户的交易沉淀太多了没有被取出，会把一些比较沉底的交易暂时不管，先处理nonce比较高的交易，里面nonce 是用了一个最大堆的数据结构， 同理如果沉淀过多把那些交易金额比较低的和gas已经超标的给弄掉弄掉弄掉 剩下的操作就是如果，pending已经超过长度了，会把前面queue里面的东西和pending进行重新排列组合，主要是算法的代码，可以慢慢研究 好了到了这里然后交易就提交完毕啦，然后有人问咧，那么给其它节点传呢，这里不是只有local的麻。在promoteExecutables里面有个方法叫 pool.promoteTx(addr, hash, tx) 这个方法的最后一行 go pool.eventMux.Post(TxPreEvent{tx}) 这里就是给其它节点传了。怎么传的话打算下次在重新整理一章以太坊的p2p模式还是挺复杂的 &nbsp; 原文地址： https://tianyun6655.github.io/2017/09/24/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E6%BA%90%E7%A0%81%E4%BA%A4%E6%98%93/ &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/02/99a2b2c3cb984dc390d5a3c558255c8b.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/02/99a2b2c3cb984dc390d5a3c558255c8b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊源码分析-交易 机理 先说一点区块链转账的基本概念和流程 用户输入转账的地址和转入的地址和转出的金额 系统通过转出的地址的私钥对转账信息进行签名（用于证明这 笔交易确实有本人进行） 系统对交易信息进行验证 把这笔交易入到本地的txpool中（就是缓存交易池） 把交易信息广播给其它节点 源码分析 正对于上面的流程对以太坊(golang)的源码进行必要的分析 面程序员对自己的区块链进行必要的改动 先来看Geth如何转账的: eth.sendTransaction({&quot;from&quot;:eth.accounts[0],to:eth.accounts[1],value:web3.toWei(10,&#39;ether&#39;)}) geth的前端操作是用js来进行，调用了web3里面的sendTransaction，然后用json进行封装交易信息，最后调用golang里面的=&gt; func (s *PublicTransactionPoolAPI) SendTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) 至于怎么从js 转到golang的不细节将过程有点复杂，有空在专门开一个专题进行说明(JSON-RPC) 由此我们可以看出交易的入门在SendTransaction这个方面里面简单的说一下这个方面做了什么事情: 通过传入的from 来调取对应地址的钱包 通过交易信息生成 type包下面的Transaction结构体 对交易进行签名 最后提交交易 看下签名的方法(大多数要进行修改的地方在这里因为可以根据自己的交易需求来创建不同的交易信息): SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) 此签名方法为一个接口，也就是说 以太坊支持多个不同钱包每个钱包有自己的签名方法 geth 官方的签名在keystore里面实现的 func (ks *KeyStore) SignTx(a accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Look up the key to sign with and abort if it cannot be found ks.mu.RLock() defer ks.mu.RUnlock() unlockedKey, found := ks.unlocked[a.Address] if !found { return nil, ErrLocked } // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), unlockedKey.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, unlockedKey.PrivateKey) } 需要转账的话先要给账户解锁，也就是你如果之前直接调用eth的send方法会出现XXXXX is locked的提示，需要用personal.unlockAccount(…)进行必要解锁，继续跟踪下去 func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return s.WithSignature(tx, sig) } func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } rlp是以太坊的编码规则,155多了一个chainId的字段（也就是把辣个networkid也放进来了），简单来的说就是把所有的信息转为一个byte数组用来签名用,以太坊的签名采用了椭圆曲线的签名。如何签名的就不展开来讲了。再然后就把签名 分成结构体里面的 R S V func (s EIP155Signer) WithSignature(tx *Transaction, sig []byte) (*Transaction, error) { if len(sig) != 65 { panic(fmt.Sprintf(&quot;wrong size for signature: got %d, want 65&quot;, len(sig))) } cpy := &amp;Transaction{data: tx.data} cpy.data.R = new(big.Int).SetBytes(sig[:32]) cpy.data.S = new(big.Int).SetBytes(sig[32:64]) cpy.data.V = new(big.Int).SetBytes([]byte{sig[64]}) if s.chainId.Sign() != 0 { cpy.data.V = big.NewInt(int64(sig[64] + 35)) cpy.data.V.Add(cpy.data.V, s.chainIdMul) } return cpy, nil } 到这里一个交易才算真正的完整(里面的playload是智能合约的代码转为byte数组以后),总结一下一个交易的封装由以下信息. 这里真心要画重点了，目前到这里的时候，在生成的交易信息里面是不存from的，如果好奇的小伙伴直接打印出结果的话会有from的地址，但是那个是因为调用了String()方法，String()方法里面有从RSV里面恢复from 地址然后在赋值的过程,对了这里提醒下 fmt.println(object)的话 其实是调用 String()方法这一点和java一毛一样的。 to 转入地址 amount 金额 playload 只能合约的byte数组 nounce 交易独特的id chainId networkid gasprice gas价格 gaslimit gas限量 交易封装完成那自然要提交了，提交是最重要的一块。跟踪代码 func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, _ := types.Sender(signer, tx) addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 最后返回值是tx的hash值 也就是我们在提交交易后，界面上显示的那一串数组 交易的hash值，也就是去查看SendTx的方法继续跟踪下去会来到这里： func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { state, err := pool.currentState() if err != nil { return err } from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables(state, []common.Address{from}) } return nil } 往txpool里面加入这笔交易，本来以为那个add方法仅仅是简单的数据结构的添加，但是点进去以后发现还是做了特别多的处理，也就是对于这笔交易的验证其实在add里面的验证的 func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all[hash] != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash()) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { delete(pool.all, old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all[tx.Hash()] = tx pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 昂，这段代码挺多的，一点一点来分析就好： pool.all[hash] != nil 看下当前的缓存池里面有没有这笔交易了，如果通过正常方法来建立的话，那肯定是没有的 pool.validateTx(tx, local), 对当前的交易进行验证 交友大小有没有超过规定大小（32mb） 交易金额不能小于0 gas量不能超过总量 验证签名。签名说过from信息没有录入没，这里签名如果正确的话会从签名里面把pubkey取出来然后组成地址给from 赋值上去。 验证给的gasprice 必须要大于最低的gas price 验证是否可以取出对应的stat database 当前交易的Noce 一定要比当前这个from的Noce大（当然了不然就不对了嘛） 验证交易金额是不是小于当前账户的金额 查看当前的pool有没有满，如果满了的话会把金额最低的交易踢出去，当然了会把这笔交易放进去比较，这个就是为啥以太坊金额越低效率越慢 放入pending 或者 queuelist里面，pending list 是可以直接用来封装区块的，所以在封装的区块的时候会取pending里面的。pending里面的数列必须是有序的从小到大的，中间如果断掉会 先加入到queue list里面，一个交易走到这一步的时候都会进入queue list里面，因为直接进入pending的要求是 有相同的nonce，也就是说除非你是对原有的交易进行修改才会直接覆盖pending里面的某一项。 add方法结束了，也就到了这里交易要么被扔掉（当前缓存池满了），要么就是进入pending要么就是进入queue队列 昂，接着就是addTx的最后一步了，代码也挺长的，慢慢分析： func (pool *TxPool) promoteExecutables(state *state.StateDB, accounts []common.Address) { gaslimit := pool.gasLimit() // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr, _ := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(state.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(state.GetBalance(addr), gaslimit) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) delete(pool.all, hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) pool.promoteTx(addr, hash, tx) } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() delete(pool.all, hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash()) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash()) drop-- queuedRateLimitCounter.Inc(1) } } } } 这个方法就是把之前在queue 队列里面的交易往pending 里面移动。 获取gas限定，然后建立一个用于存address的数组,把队列里面的所有地址取出（这个队列由map实现key为地址，value 为一个存交易的list（至于list的数据结构还没来得及去研究） 如果一个账户的交易沉淀太多了没有被取出，会把一些比较沉底的交易暂时不管，先处理nonce比较高的交易，里面nonce 是用了一个最大堆的数据结构， 同理如果沉淀过多把那些交易金额比较低的和gas已经超标的给弄掉弄掉弄掉 剩下的操作就是如果，pending已经超过长度了，会把前面queue里面的东西和pending进行重新排列组合，主要是算法的代码，可以慢慢研究 好了到了这里然后交易就提交完毕啦，然后有人问咧，那么给其它节点传呢，这里不是只有local的麻。在promoteExecutables里面有个方法叫 pool.promoteTx(addr, hash, tx) 这个方法的最后一行 go pool.eventMux.Post(TxPreEvent{tx}) 这里就是给其它节点传了。怎么传的话打算下次在重新整理一章以太坊的p2p模式还是挺复杂的 &nbsp; 原文地址： https://tianyun6655.github.io/2017/09/24/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E6%BA%90%E7%A0%81%E4%BA%A4%E6%98%93/ &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/02/99a2b2c3cb984dc390d5a3c558255c8b.html","headline":"以太坊（15）交易流程解析","dateModified":"2018-08-02T00:00:00+08:00","datePublished":"2018-08-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/02/99a2b2c3cb984dc390d5a3c558255c8b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊（15）交易流程解析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h1 id="以太坊源码分析-交易">以太坊源码分析-交易</h1> 
+  <h2 id="机理">机理</h2> 
+  <p>先说一点区块链转账的基本概念和流程</p> 
+  <ul>
+   <li>用户输入转账的地址和转入的地址和转出的金额</li> 
+   <li>系统通过转出的地址的私钥对转账信息进行签名（用于证明这 笔交易确实有本人进行）</li> 
+   <li>系统对交易信息进行验证</li> 
+   <li>把这笔交易入到本地的txpool中（就是缓存交易池）</li> 
+   <li>把交易信息广播给其它节点</li> 
+  </ul>
+  <h2 id="源码分析">源码分析</h2> 
+  <p>正对于上面的流程对以太坊(golang)的源码进行必要的分析 面程序员对自己的区块链进行必要的改动</p> 
+  <p>先来看Geth如何转账的:</p> 
+  <pre class="has">
+<code>eth.sendTransaction({"from":eth.accounts[0],to:eth.accounts[1],value:web3.toWei(10,'ether')})
+</code></pre> 
+  <p>geth的前端操作是用js来进行，调用了web3里面的sendTransaction，然后用json进行封装交易信息，最后调用golang里面的=&gt;</p> 
+  <pre class="has">
+<code>func (s *PublicTransactionPoolAPI) SendTransaction(ctx  context.Context, args SendTxArgs) (common.Hash, error) 
+</code></pre> 
+  <p>至于怎么从js 转到golang的不细节将过程有点复杂，有空在专门开一个专题进行说明(JSON-RPC)</p> 
+  <blockquote> 
+   <p>由此我们可以看出交易的入门在SendTransaction这个方面里面简单的说一下这个方面做了什么事情:</p> 
+   <ol>
+    <li>通过传入的from 来调取对应地址的钱包</li> 
+    <li>通过交易信息生成 type包下面的Transaction结构体</li> 
+    <li>对交易进行签名</li> 
+    <li>最后提交交易</li> 
+   </ol>
+  </blockquote> 
+  <p>看下签名的方法(大多数要进行修改的地方在这里因为可以根据自己的交易需求来创建不同的交易信息):</p> 
+  <pre class="has">
+<code>	SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error)
+</code></pre> 
+  <blockquote> 
+   <p>此签名方法为一个接口，也就是说 以太坊支持多个不同钱包每个钱包有自己的签名方法 geth 官方的签名在keystore里面实现的</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func (ks *KeyStore) SignTx(a accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
+	// Look up the key to sign with and abort if it cannot be found
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+
+	unlockedKey, found := ks.unlocked[a.Address]
+	if !found {
+		return nil, ErrLocked
+	}
+	// Depending on the presence of the chain ID, sign with EIP155 or homestead
+	if chainID != nil {
+		return types.SignTx(tx, types.NewEIP155Signer(chainID), unlockedKey.PrivateKey)
+	}
+	return types.SignTx(tx, types.HomesteadSigner{}, unlockedKey.PrivateKey)
+}
+
+</code></pre> 
+  <blockquote> 
+   <p>需要转账的话先要给账户解锁，也就是你如果之前直接调用eth的send方法会出现XXXXX is locked的提示，需要用personal.unlockAccount(…)进行必要解锁，继续跟踪下去</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) {
+	h := s.Hash(tx)
+	sig, err := crypto.Sign(h[:], prv)
+	if err != nil {
+		return nil, err
+	}
+	return s.WithSignature(tx, sig)
+}
+</code></pre> 
+  <pre class="has">
+<code>func (s EIP155Signer) Hash(tx *Transaction) common.Hash {
+	return rlpHash([]interface{}{
+		tx.data.AccountNonce,
+		tx.data.Price,
+		tx.data.GasLimit,
+		tx.data.Recipient,
+		tx.data.Amount,
+		tx.data.Payload,
+		s.chainId, uint(0), uint(0),
+	})
+}
+</code></pre> 
+  <blockquote> 
+   <p>rlp是以太坊的编码规则,155多了一个chainId的字段（也就是把辣个networkid也放进来了），简单来的说就是把所有的信息转为一个byte数组用来签名用,以太坊的签名采用了椭圆曲线的签名。如何签名的就不展开来讲了。再然后就把签名 分成结构体里面的 R S V</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func (s EIP155Signer) WithSignature(tx *Transaction, sig []byte) (*Transaction, error) {
+	if len(sig) != 65 {
+		panic(fmt.Sprintf("wrong size for signature: got %d, want 65", len(sig)))
+	}
+
+	cpy := &amp;Transaction{data: tx.data}
+	cpy.data.R = new(big.Int).SetBytes(sig[:32])
+	cpy.data.S = new(big.Int).SetBytes(sig[32:64])
+	cpy.data.V = new(big.Int).SetBytes([]byte{sig[64]})
+	if s.chainId.Sign() != 0 {
+		cpy.data.V = big.NewInt(int64(sig[64] + 35))
+		cpy.data.V.Add(cpy.data.V, s.chainIdMul)
+	}
+	return cpy, nil
+}
+
+</code></pre> 
+  <blockquote> 
+   <p>到这里一个交易才算真正的完整(里面的playload是智能合约的代码转为byte数组以后),总结一下一个交易的封装由以下信息. 这里真心要画重点了，目前到这里的时候，在生成的交易信息里面是不存from的，如果好奇的小伙伴直接打印出结果的话会有from的地址，但是那个是因为调用了String()方法，String()方法里面有从RSV里面恢复from 地址然后在赋值的过程,对了这里提醒下 fmt.println(object)的话 其实是调用 String()方法这一点和java一毛一样的。</p> 
+   <ul>
+    <li>to 转入地址</li> 
+    <li>amount 金额</li> 
+    <li>playload 只能合约的byte数组</li> 
+    <li>nounce 交易独特的id</li> 
+    <li>chainId networkid</li> 
+    <li>gasprice gas价格</li> 
+    <li>gaslimit gas限量</li> 
+   </ul>
+  </blockquote> 
+  <blockquote> 
+   <p>交易封装完成那自然要提交了，提交是最重要的一块。跟踪代码</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) {
+	if err := b.SendTx(ctx, tx); err != nil {
+		return common.Hash{}, err
+	}
+	if tx.To() == nil {
+		signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number())
+		from, _ := types.Sender(signer, tx)
+		addr := crypto.CreateAddress(from, tx.Nonce())
+		log.Info("Submitted contract creation", "fullhash", tx.Hash().Hex(), "contract", addr.Hex())
+	} else {
+		log.Info("Submitted transaction", "fullhash", tx.Hash().Hex(), "recipient", tx.To())
+	}
+	return tx.Hash(), nil
+}
+</code></pre> 
+  <blockquote> 
+   <p>最后返回值是tx的hash值 也就是我们在提交交易后，界面上显示的那一串数组 交易的hash值，也就是去查看SendTx的方法继续跟踪下去会来到这里：</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func (pool *TxPool) addTx(tx *types.Transaction, local bool) error {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	// Try to inject the transaction and update any state
+	replace, err := pool.add(tx, local)
+	if err != nil {
+		return err
+	}
+	// If we added a new transaction, run promotion checks and return
+	if !replace {
+		state, err := pool.currentState()
+		if err != nil {
+			return err
+		}
+		from, _ := types.Sender(pool.signer, tx) // already validated
+		pool.promoteExecutables(state, []common.Address{from})
+	}
+	return nil
+}
+
+</code></pre> 
+  <blockquote> 
+   <p>往txpool里面加入这笔交易，本来以为那个add方法仅仅是简单的数据结构的添加，但是点进去以后发现还是做了特别多的处理，也就是对于这笔交易的验证其实在add里面的验证的</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) {
+	// If the transaction is already known, discard it
+	hash := tx.Hash()
+	if pool.all[hash] != nil {
+		log.Trace("Discarding already known transaction", "hash", hash)
+		return false, fmt.Errorf("known transaction: %x", hash)
+	}
+	// If the transaction fails basic validation, discard it
+	if err := pool.validateTx(tx, local); err != nil {
+		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
+		invalidTxCounter.Inc(1)
+		return false, err
+	}
+	// If the transaction pool is full, discard underpriced transactions
+	if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue {
+		// If the new transaction is underpriced, don't accept it
+		if pool.priced.Underpriced(tx, pool.locals) {
+			log.Trace("Discarding underpriced transaction", "hash", hash, "price", tx.GasPrice())
+			underpricedTxCounter.Inc(1)
+			return false, ErrUnderpriced
+		}
+		// New transaction is better than our worse ones, make room for it
+		drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals)
+		for _, tx := range drop {
+			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "price", tx.GasPrice())
+			underpricedTxCounter.Inc(1)
+			pool.removeTx(tx.Hash())
+		}
+	}
+	// If the transaction is replacing an already pending one, do directly
+	from, _ := types.Sender(pool.signer, tx) // already validated
+	if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) {
+		// Nonce already pending, check if required price bump is met
+		inserted, old := list.Add(tx, pool.config.PriceBump)
+		if !inserted {
+			pendingDiscardCounter.Inc(1)
+			return false, ErrReplaceUnderpriced
+		}
+		// New transaction is better, replace old one
+		if old != nil {
+			delete(pool.all, old.Hash())
+			pool.priced.Removed()
+			pendingReplaceCounter.Inc(1)
+		}
+		pool.all[tx.Hash()] = tx
+		pool.priced.Put(tx)
+		pool.journalTx(from, tx)
+
+		log.Trace("Pooled new executable transaction", "hash", hash, "from", from, "to", tx.To())
+		return old != nil, nil
+	}
+	// New transaction isn't replacing a pending one, push into queue
+	replace, err := pool.enqueueTx(hash, tx)
+	if err != nil {
+		return false, err
+	}
+	// Mark local addresses and journal local transactions
+	if local {
+		pool.locals.add(from)
+	}
+	pool.journalTx(from, tx)
+
+	log.Trace("Pooled new future transaction", "hash", hash, "from", from, "to", tx.To())
+	return replace, nil
+}
+</code></pre> 
+  <blockquote> 
+   <p>昂，这段代码挺多的，一点一点来分析就好：</p> 
+   <ol>
+    <li>pool.all[hash] != nil 看下当前的缓存池里面有没有这笔交易了，如果通过正常方法来建立的话，那肯定是没有的</li> 
+    <li>pool.validateTx(tx, local), 对当前的交易进行验证 
+     <ul>
+      <li>交友大小有没有超过规定大小（32mb）</li> 
+      <li>交易金额不能小于0</li> 
+      <li>gas量不能超过总量</li> 
+      <li>验证签名。签名说过from信息没有录入没，这里签名如果正确的话会从签名里面把pubkey取出来然后组成地址给from 赋值上去。</li> 
+      <li>验证给的gasprice 必须要大于最低的gas price</li> 
+      <li>验证是否可以取出对应的stat database</li> 
+      <li>当前交易的Noce 一定要比当前这个from的Noce大（当然了不然就不对了嘛）</li> 
+      <li>验证交易金额是不是小于当前账户的金额</li> 
+     </ul></li> 
+    <li>查看当前的pool有没有满，如果满了的话会把金额最低的交易踢出去，当然了会把这笔交易放进去比较，这个就是为啥以太坊金额越低效率越慢</li> 
+    <li>放入pending 或者 queuelist里面，pending list 是可以直接用来封装区块的，所以在封装的区块的时候会取pending里面的。pending里面的数列必须是有序的从小到大的，中间如果断掉会 先加入到queue list里面，一个交易走到这一步的时候都会进入queue list里面，因为直接进入pending的要求是 有相同的nonce，也就是说除非你是对原有的交易进行修改才会直接覆盖pending里面的某一项。</li> 
+    <li>add方法结束了，也就到了这里交易要么被扔掉（当前缓存池满了），要么就是进入pending要么就是进入queue队列</li> 
+   </ol>
+  </blockquote> 
+  <blockquote> 
+   <p>昂，接着就是addTx的最后一步了，代码也挺长的，慢慢分析：</p> 
+  </blockquote> 
+  <pre class="has">
+<code>func (pool *TxPool) promoteExecutables(state *state.StateDB, accounts []common.Address) {
+	gaslimit := pool.gasLimit()
+
+	// Gather all the accounts potentially needing updates
+	if accounts == nil {
+		accounts = make([]common.Address, 0, len(pool.queue))
+		for addr, _ := range pool.queue {
+			accounts = append(accounts, addr)
+		}
+	}
+	// Iterate over all accounts and promote any executable transactions
+	for _, addr := range accounts {
+		list := pool.queue[addr]
+		if list == nil {
+			continue // Just in case someone calls with a non existing account
+		}
+		// Drop all transactions that are deemed too old (low nonce)
+		for _, tx := range list.Forward(state.GetNonce(addr)) {
+			hash := tx.Hash()
+			log.Trace("Removed old queued transaction", "hash", hash)
+			delete(pool.all, hash)
+			pool.priced.Removed()
+		}
+		// Drop all transactions that are too costly (low balance or out of gas)
+		drops, _ := list.Filter(state.GetBalance(addr), gaslimit)
+		for _, tx := range drops {
+			hash := tx.Hash()
+			log.Trace("Removed unpayable queued transaction", "hash", hash)
+			delete(pool.all, hash)
+			pool.priced.Removed()
+			queuedNofundsCounter.Inc(1)
+		}
+		// Gather all executable transactions and promote them
+		for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) {
+			hash := tx.Hash()
+			log.Trace("Promoting queued transaction", "hash", hash)
+			pool.promoteTx(addr, hash, tx)
+		}
+		// Drop all transactions over the allowed limit
+		if !pool.locals.contains(addr) {
+			for _, tx := range list.Cap(int(pool.config.AccountQueue)) {
+				hash := tx.Hash()
+				delete(pool.all, hash)
+				pool.priced.Removed()
+				queuedRateLimitCounter.Inc(1)
+				log.Trace("Removed cap-exceeding queued transaction", "hash", hash)
+			}
+		}
+		// Delete the entire queue entry if it became empty.
+		if list.Empty() {
+			delete(pool.queue, addr)
+		}
+	}
+	// If the pending limit is overflown, start equalizing allowances
+	pending := uint64(0)
+	for _, list := range pool.pending {
+		pending += uint64(list.Len())
+	}
+	if pending &gt; pool.config.GlobalSlots {
+		pendingBeforeCap := pending
+		// Assemble a spam order to penalize large transactors first
+		spammers := prque.New()
+		for addr, list := range pool.pending {
+			// Only evict transactions from high rollers
+			if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots {
+				spammers.Push(addr, float32(list.Len()))
+			}
+		}
+		// Gradually drop transactions from offenders
+		offenders := []common.Address{}
+		for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() {
+			// Retrieve the next offender if not local address
+			offender, _ := spammers.Pop()
+			offenders = append(offenders, offender.(common.Address))
+
+			// Equalize balances until all the same or below threshold
+			if len(offenders) &gt; 1 {
+				// Calculate the equalization threshold for all current offenders
+				threshold := pool.pending[offender.(common.Address)].Len()
+
+				// Iteratively reduce all offenders until below limit or threshold reached
+				for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold {
+					for i := 0; i &lt; len(offenders)-1; i++ {
+						list := pool.pending[offenders[i]]
+						for _, tx := range list.Cap(list.Len() - 1) {
+							// Drop the transaction from the global pools too
+							hash := tx.Hash()
+							delete(pool.all, hash)
+							pool.priced.Removed()
+
+							// Update the account nonce to the dropped transaction
+							if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce {
+								pool.pendingState.SetNonce(offenders[i], nonce)
+							}
+							log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
+						}
+						pending--
+					}
+				}
+			}
+		}
+		// If still above threshold, reduce to limit or min allowance
+		if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 {
+			for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots {
+				for _, addr := range offenders {
+					list := pool.pending[addr]
+					for _, tx := range list.Cap(list.Len() - 1) {
+						// Drop the transaction from the global pools too
+						hash := tx.Hash()
+						delete(pool.all, hash)
+						pool.priced.Removed()
+
+						// Update the account nonce to the dropped transaction
+						if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce {
+							pool.pendingState.SetNonce(addr, nonce)
+						}
+						log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
+					}
+					pending--
+				}
+			}
+		}
+		pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending))
+	}
+	// If we've queued more transactions than the hard limit, drop oldest ones
+	queued := uint64(0)
+	for _, list := range pool.queue {
+		queued += uint64(list.Len())
+	}
+	if queued &gt; pool.config.GlobalQueue {
+		// Sort all accounts with queued transactions by heartbeat
+		addresses := make(addresssByHeartbeat, 0, len(pool.queue))
+		for addr := range pool.queue {
+			if !pool.locals.contains(addr) { // don't drop locals
+				addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]})
+			}
+		}
+		sort.Sort(addresses)
+
+		// Drop transactions until the total is below the limit or only locals remain
+		for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; {
+			addr := addresses[len(addresses)-1]
+			list := pool.queue[addr.address]
+
+			addresses = addresses[:len(addresses)-1]
+
+			// Drop all transactions if they are less than the overflow
+			if size := uint64(list.Len()); size &lt;= drop {
+				for _, tx := range list.Flatten() {
+					pool.removeTx(tx.Hash())
+				}
+				drop -= size
+				queuedRateLimitCounter.Inc(int64(size))
+				continue
+			}
+			// Otherwise drop only last few transactions
+			txs := list.Flatten()
+			for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- {
+				pool.removeTx(txs[i].Hash())
+				drop--
+				queuedRateLimitCounter.Inc(1)
+			}
+		}
+	}
+}
+
+</code></pre> 
+  <blockquote> 
+   <p>这个方法就是把之前在queue 队列里面的交易往pending 里面移动。</p> 
+   <ol>
+    <li>获取gas限定，然后建立一个用于存address的数组,把队列里面的所有地址取出（这个队列由map实现key为地址，value 为一个存交易的list（至于list的数据结构还没来得及去研究）</li> 
+    <li>如果一个账户的交易沉淀太多了没有被取出，会把一些比较沉底的交易暂时不管，先处理nonce比较高的交易，里面nonce 是用了一个最大堆的数据结构，</li> 
+    <li>同理如果沉淀过多把那些交易金额比较低的和gas已经超标的给弄掉弄掉弄掉</li> 
+    <li>剩下的操作就是如果，pending已经超过长度了，会把前面queue里面的东西和pending进行重新排列组合，主要是算法的代码，可以慢慢研究</li> 
+   </ol>
+  </blockquote> 
+  <p>好了到了这里然后交易就提交完毕啦，然后有人问咧，那么给其它节点传呢，这里不是只有local的麻。在promoteExecutables里面有个方法叫</p> 
+  <pre class="has">
+<code>pool.promoteTx(addr, hash, tx)
+</code></pre> 
+  <blockquote> 
+   <p>这个方法的最后一行</p> 
+   <pre class="has">
+<code>go pool.eventMux.Post(TxPreEvent{tx})
+</code></pre> 
+   <p>这里就是给其它节点传了。怎么传的话打算下次在重新整理一章以太坊的p2p模式还是挺复杂的</p> 
+  </blockquote> 
+  <p>&nbsp;</p> 
+  <p>原文地址：</p> 
+  <p><a href="https://tianyun6655.github.io/2017/09/24/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E6%BA%90%E7%A0%81%E4%BA%A4%E6%98%93/" rel="nofollow">https://tianyun6655.github.io/2017/09/24/%E4%BB%A5%E5%A4%AA%E5%9D%8A%E6%BA%90%E7%A0%81%E4%BA%A4%E6%98%93/</a></p> 
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_41806245/article/details/81352411,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_41806245/article/details/81352411,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码解析 - 交易源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码解析 - 交易源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="以太坊交易基本流程： 完整流程分为以下几个步骤： 发起交易：指定目标地址和交易金额，以及需要的gas/gaslimit 交易签名：使用账户私钥对交易进行签名 提交交易：把交易加入到交易缓冲池txpool中（会先对交易签名进行验证） 广播交易：通知EVM执行，同时把交易信息广播给其他结点 发起交易 用户通过JSON RPC发起 eth_sendTransaction 请求，最终会调用 PublicTransactionPoolAPI 的 SendTransaction 实现， 首先根据from地址查找到对应的wallet，检查一下参数值， * 通过SendTxArgs.toTransaction()创建交易 * 通过Wallet.SignTx()对交易进行签名 * 通过submitTransaction()提交交易 //代码位于 `internal/ethapi/api.go` func (s *PrivateAccountAPI) SendTransaction(ctx context.Context, args SendTxArgs, passwd string) (common.Hash, error) { if args.Nonce == nil { // Hold the addresse&#39;s mutex around signing to prevent concurrent assignment of // the same nonce to multiple accounts. s.nonceLock.LockAddr(args.From) defer s.nonceLock.UnlockAddr(args.From) } signed, err := s.signTransaction(ctx, args, passwd) if err != nil { return common.Hash{}, err } return submitTransaction(ctx, s.b, signed) } 交易签名主要实现在 signTransaction，主要功能： toTransaction() ：创建交易 wallet.SignTxWithPassphrase(account, passwd, tx, chainID)：对交易进行签名 func (s *PrivateAccountAPI) signTransaction(ctx context.Context, args SendTxArgs, passwd string) (*types.Transaction, error) { // Look up the wallet containing the requested signer account := accounts.Account{Address: args.From} wallet, err := s.am.Find(account) if err != nil { return nil, err } // Set some sanity defaults and terminate on failure if err := args.setDefaults(ctx, s.b); err != nil { return nil, err } // Assemble the transaction and sign with the wallet tx := args.toTransaction() var chainID *big.Int if config := s.b.ChainConfig(); config.IsEIP155(s.b.CurrentBlock().Number()) { chainID = config.ChainId } return wallet.SignTxWithPassphrase(account, passwd, tx, chainID) } 创建交易 tx := args.toTransaction() 创建交易 先看一下SendTxArgs类型的定义： // 代码 internal/ethapi/api.go // SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool. type SendTxArgs struct { From common.Address `json:&quot;from&quot;` To *common.Address `json:&quot;to&quot;` Gas *hexutil.Uint64 `json:&quot;gas&quot;` GasPrice *hexutil.Big `json:&quot;gasPrice&quot;` Value *hexutil.Big `json:&quot;value&quot;` Nonce *hexutil.Uint64 `json:&quot;nonce&quot;` // We accept &quot;data&quot; and &quot;input&quot; for backwards-compatibility reasons. &quot;input&quot; is the // newer name and should be preferred by clients. Data *hexutil.Bytes `json:&quot;data&quot;` Input *hexutil.Bytes `json:&quot;input&quot;` } 可以看到是和JSON字段相应的，包括了地址、gas、金额这些交易信息，nonce是一个随账户交易次数自增的数字，一般会自动填充。交易还可以携带一些额外数据，存放在data或者input字段中，推荐用input，data是为了向后兼容。 toTransaction()函数： // 代码 internal/ethapi/api.go func (args *SendTxArgs) toTransaction() *types.Transaction { var input []byte if args.Data != nil { input = *args.Data } else if args.Input != nil { input = *args.Input } if args.To == nil { return types.NewContractCreation(uint64(*args.Nonce), (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } return types.NewTransaction(uint64(*args.Nonce), *args.To, (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } 可以看到，如果目标地址为空的话，表示这是一个创建智能合约的交易，调用NewContractCreation()。否则说明这是一个普通交易，调用NewTransaction()。不管调用哪个，最终都会生成一个Transaction实例，我们看一下Transaction类型的定义： // 代码位于core/types/transaction.go type Transaction struct { data txdata // caches hash atomic.Value size atomic.Value from atomic.Value } type txdata struct { AccountNonce uint64 `json:&quot;nonce&quot; gencodec:&quot;required&quot;` Price *big.Int `json:&quot;gasPrice&quot; gencodec:&quot;required&quot;` GasLimit uint64 `json:&quot;gas&quot; gencodec:&quot;required&quot;` Recipient *common.Address `json:&quot;to&quot; rlp:&quot;nil&quot;` // nil means contract creation Amount *big.Int `json:&quot;value&quot; gencodec:&quot;required&quot;` Payload []byte `json:&quot;input&quot; gencodec:&quot;required&quot;` // Signature values V *big.Int `json:&quot;v&quot; gencodec:&quot;required&quot;` R *big.Int `json:&quot;r&quot; gencodec:&quot;required&quot;` S *big.Int `json:&quot;s&quot; gencodec:&quot;required&quot;` // This is only used when marshaling to JSON. Hash *common.Hash `json:&quot;hash&quot; rlp:&quot;-&quot;` } 交易签名 wallet.SignTxWithPassphrase 代码 // accounts/keystore/keystore_wallet.go // SignTxWithPassphrase implements accounts.Wallet, attempting to sign the given // transaction with the given account using passphrase as extra authentication. func (w *keystoreWallet) SignTxWithPassphrase(account accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Make sure the requested account is contained within if account.Address != w.account.Address { return nil, accounts.ErrUnknownAccount } if account.URL != (accounts.URL{}) &amp;&amp; account.URL != w.account.URL { return nil, accounts.ErrUnknownAccount } // Account seems valid, request the keystore to sign return w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) } w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) 代码： 主要就是通过 SignTx 进行签名。 // 代码 accounts/keystore/keystore.go func (ks *KeyStore) SignTxWithPassphrase(a accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { _, key, err := ks.getDecryptedKey(a, passphrase) if err != nil { return nil, err } defer zeroKey(key.PrivateKey) // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), key.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, key.PrivateKey) } 这里会首先判断账户是否已经解锁，如果已经解锁的话就可以获取它的私钥。 然后创建签名器，如果要符合EIP155规范的话，需要把chainID传进去，也就是我们的“–networkid”命令行参数。 最后调用一个全局函数SignTx()完成签名： 代码位于core/types/transaction_signing.go： // SignTx signs the transaction using the given signer and private key func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return tx.WithSignature(s, sig) } 主要分为3个步骤： 生成交易的hash值 根据hash值和私钥生成签名 把签名数据填充到Transaction实例中 生成交易的hash值 以EIP155Signer为例，代码如下： func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } func rlpHash(x interface{}) (h common.Hash) { hw := sha3.NewKeccak256() rlp.Encode(hw, x) hw.Sum(h[:0]) return h } 可以看到，先用SHA3-256生成hash值，然后再进行RLP编码。RLP是一种数据序列化方法。 根据hash值和私钥生成签名-crypto.Sign() // 代码位于crypto/signature_cgo.go： func Sign(hash []byte, prv *ecdsa.PrivateKey) (sig []byte, err error) { if len(hash) != 32 { return nil, fmt.Errorf(&quot;hash is required to be exactly 32 bytes (%d)&quot;, len(hash)) } seckey := math.PaddedBigBytes(prv.D, prv.Params().BitSize/8) defer zeroBytes(seckey) return secp256k1.Sign(hash, seckey) } 这里是通过ECDSA算法生成签名数据。最终会返回的签名是一个字节数组，按R / S / V的顺序排列。 填充签名数据 - WithSignature //代码位于 core/types/transaction.go func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) { r, s, v, err := signer.SignatureValues(tx, sig) if err != nil { return nil, err } cpy := &amp;Transaction{data: tx.data} cpy.data.R, cpy.data.S, cpy.data.V = r, s, v return cpy, nil } 生成的签名数据是字节数组类型，需要通过signer.SignatureValues()函数转换成3个big.Int类型的数据，然后填充到Transaction结构的R / S / V字段上 提交交易 签名完成以后，就需要调用 submitTransaction() 函数提交到交易缓冲池txpool中。 先看下TxPool中的几个重要字段： // 代码 core/tx_pool.go type TxPool struct { config TxPoolConfig chainconfig *params.ChainConfig chain blockChain gasPrice *big.Int txFeed event.Feed scope event.SubscriptionScope chainHeadCh chan ChainHeadEvent chainHeadSub event.Subscription signer types.Signer mu sync.RWMutex currentState *state.StateDB // Current state in the blockchain head pendingState *state.ManagedState // Pending state tracking virtual nonces currentMaxGas uint64 // Current gas limit for transaction caps locals *accountSet // Set of local transaction to exempt from eviction rules journal *txJournal // Journal of local transaction to back up to disk pending map[common.Address]*txList // All currently processable transactions queue map[common.Address]*txList // Queued but non-processable transactions beats map[common.Address]time.Time // Last heartbeat from each known account all *txLookup // All transactions to allow lookups priced *txPricedList // All transactions sorted by price wg sync.WaitGroup // for shutdown sync homestead bool } pending字段中包含了当前所有可被处理的交易列表，而queue字段中包含了所有不可被处理、也就是新加入进来的交易。下面查看一下pending字段 的txList的结构： type txList struct { strict bool // Whether nonces are strictly continuous or not txs *txSortedMap // Heap indexed sorted hash map of the transactions costcap *big.Int // Price of the highest costing transaction (reset only if exceeds balance) gascap uint64 // Gas limit of the highest spending transaction (reset only if exceeds block limit) } txList内部包含一个txSortedMap结构，实现按nonce排序，其内部维护了两张表： 一张是包含了所有Transaction的map，key是Transaction的nonce值。之前提到过，这个nonce是随着账户的交易次数自增的一个数字，所以越新的交易，nonce值越高。 还有一张表是一个数组，包含了所有nonce值，其内部是进行过堆排序的（小顶堆），nonce值按照从大到小排列。每次调用heap.Pop()时会取出最小的nonce值，也就是最老的交易。 all字段 中包含了所有的交易列表，以交易的hash作为key。 priced字段 则是把all中的交易列表按照gas price从大到小排列，如果gas price一样，则按照交易的nonce值从小到大排列。最终的目标是每次取出gas price最大、nonce最小的交易。 我们提交交易的目标是：先把交易放入queue中记录在案，然后再从queue中选一部分放入pending中进行处理。如果发现txpool满了，则依据priced中的排序，剔除低油价的交易。 txpool的默认配置： var DefaultTxPoolConfig = TxPoolConfig{ Journal: &quot;transactions.rlp&quot;, Rejournal: time.Hour, PriceLimit: 1, PriceBump: 10, AccountSlots: 16, GlobalSlots: 4096, AccountQueue: 64, GlobalQueue: 1024, Lifetime: 3 * time.Hour, } GlobalSlots：pending列表的最大长度，默认4096笔 AccountSlots：pending中每个账户存储的交易数的阈值，超过这个数量可能会被认为是垃圾交易或者是攻击者，多余交易可能被丢弃 GlobalQueue：queue列表的最大长度，默认1024笔 AccountQueue：queue中每个账户允许存储的最大交易数，超过会被丢弃，默认64笔 PriceLimit：允许进入txpool的最低gas price，默认1 Gwei PriceBump：如果出现两个nonce相同的交易，gas price的差值超过该阈值则用新交易替换老交易 现在我们分析submitTransaction()函数： //代码位于 `internal/ethapi/api.go` func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, err := types.Sender(signer, tx) if err != nil { return common.Hash{}, err } addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 这里有一个Backend参数，是在eth Service初始化时创建的，具体实现在EthApiBackend中，代码位于eth/api_backend.go。可以看到，这里先调用了SendTx()函数提交交易，然后如果发现目标地址为空，表明这是一个创建智能合约的交易，会创建合约地址。 提交交易到txpool //代码 eth/api_backend.go func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error { return b.eth.txPool.AddLocal(signedTx) } 继续跟踪TxPool的AddLocal()函数： // 代码位于 core/tx_pool.go func (pool *TxPool) AddLocal(tx *types.Transaction) error { return pool.addTx(tx, !pool.config.NoLocals) } // addTx enqueues a single transaction into the pool if it is valid. func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables([]common.Address{from}) } return nil } 这里有两个主要函数：add()和promoteExecuteables()。 add()会判断是否应该把当前交易加入到queue列表中，promoteExecuteables()则会从queue中选取一些交易放入pending列表中等待执行。下面分别讨论这两个函数。 TxPool.add() // 代码位于 core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(pool.all.Count()) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(pool.all.Count()-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all.Add(tx) pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(NewTxsEvent{types.Transactions{tx}}) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 我们分成一段一段的来分析： hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } 这一段是先计算交易的hash值，然后判断是不是已经在txpool 中，在的话就直接退出。 // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } 查看 pool.validateTx(tx, local) 代码 // 代码位于 core/tx_pool.go func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 32*1024 { return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 这一段是验证交易的有效性，主要进行以下几个方面的检查： 数据量必须&lt;32KB 交易金额必须非负（&gt;=0） 交易的gas limit必须低于block的gas limit 签名数据必须有效，能够解析出发送者地址 交易的gas price必须高于pool设定的最低gas price（除非是本地交易） 交易的nonce值必须高于当前链上该账户的nonce值（低于则说明这笔交易已经被打包过了） 当前账户余额必须大于“交易金额 + gasprice * gaslimit” 交易的gas limit必须大于对应数据量所需的最低gas水平 if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } 这一段是在当前txpool已满的情况下，剔除掉低油价的交易。还记得之前有个priced字段存储了按gas price以及nonce排序的交易列表吗？这里会先把当前交易的gas price和当前池中的最低价进行比较： 如果低于最低价，直接丢弃该交易返回 如果高于最低价，则从txpool中剔除一些低价的交易 // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } 如果之前的那些检查都没有问题，就真正调用enqueueTx()函数把交易加入到queue列表中了。 // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) 最后，如果发现这个账户是本地的，就把它加到一个白名单里，默认会保证本地交易优先被加到txpool中。 TxPool.promoteExecuteables() 主要目的是把交易从queue列表“提拔”到pending列表，代码逻辑比较清楚，具体可以参见下面这张图： 根据不同的目的可以分为3块，分别以粉色、紫色、绿色标识。 粉色部分主要是为了把queue中的交易“提拔”到pending中。当然在这之前需要先要进行一番检查： 丢弃nonce &lt; 账户当前nonce的交易，也就是已经被打包过的交易 丢弃转账金额 + gas消耗 &gt; 账户余额的交易，也就是会out-of-gas的交易 丢弃gas limit &gt; block gas limit的交易，这部分交易可能会导致区块生成失败 紫色部分主要是为了清理pending列表，使其满足GlobalSlots和AccountSlots的限制条件： 如果有些账户的交易数超过了AccountSlots，则先按交易数最少的账户进行均衡。举例来说，如果有10个账户交易数超过了AccountSlots（默认16），其中交易数最少的账户包含20笔交易，那么先把其他9个账户的交易数量削减到20。 如果经过上面的步骤，pending的长度还是超过了GlobalSlots，那就严格按照AccountSlots进行均衡，也就是把上面的10个账户的交易数进一步削减到16。 绿色部分主要是为了清理queue列表，使其满足GlobalQueue和AccountQueue的限制条件： 如果每个账户的交易数超过了AccountQueue，丢弃多余交易 如果queue的长度超过了GlobalQueue，则把账户按最后一次心跳时间排序，然后依次去除账户中的交易，直到满足限制条件位置。 // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Track the promoted transactions to broadcast them at once var promoted []*types.Transaction // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash(), true) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash(), true) drop-- queuedRateLimitCounter.Inc(1) } } } } 广播交易 交易提交到txpool中后，还需要广播出去，一方面通知EVM执行该交易，另一方面要把交易信息广播给其他结点。具体调用在 promoteExecutables 提到的promoteTx()函数中： // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { ... // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } } ... // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } promoteTx 详细代码： // 代码 crypto/tx_pool.go func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) bool { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this pool.all.Remove(hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return false } // Otherwise discard any previous transaction and mark this if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all.Get(hash) == nil { pool.all.Add(tx) pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) return true } 先更新了最后一次心跳时间，然后更新账户的nonce值。 pool.txFeed.Send 发送一个TxPreEvent事件，外部可以通过SubscribeNewTxsEvent()函数订阅该事件： func (pool *TxPool) SubscribeNewTxsEvent(ch chan&lt;- core.NewTxsEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 我们只要搜索一下这个函数，就可以知道哪些组件订阅了该事件了。 执行交易 第一个订阅的地方位于miner/worker.go： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { .... // Subscribe NewTxsEvent for tx pool worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) .... } 开启了一个goroutine来接收TxPreEvent，看一下update()函数： func (self *worker) update() { defer self.txsSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { ... // Handle NewTxsEvent case ev := &lt;-self.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(self.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } ... } } } 可以看到，如果结点不挖矿的话，这里会立即调用commitTransactions()提交给EVM执行，获得本地回执。 如果结点挖矿的话，miner会调用commitNewWork()，内部也会调用commitTransactions()执行交易。 广播给其他结点 另一个订阅的地方位于eth/handler.go： func (pm *ProtocolManager) Start(maxPeers int) { ... // broadcast transactions pm.txsCh = make(chan core.NewTxsEvent, txChanSize) pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() ... } 同样也是启动了一个goroutine来接收TxPreEvent事件，看一下txBroadcastLoop()函数： func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txCh: pm.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-pm.txSub.Err(): return } } } 继续跟踪BroadcastTx()函数： func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } 可以看到，这里会通过P2P向所有没有该交易的结点发送该交易。 阅读更多" />
+<meta property="og:description" content="以太坊交易基本流程： 完整流程分为以下几个步骤： 发起交易：指定目标地址和交易金额，以及需要的gas/gaslimit 交易签名：使用账户私钥对交易进行签名 提交交易：把交易加入到交易缓冲池txpool中（会先对交易签名进行验证） 广播交易：通知EVM执行，同时把交易信息广播给其他结点 发起交易 用户通过JSON RPC发起 eth_sendTransaction 请求，最终会调用 PublicTransactionPoolAPI 的 SendTransaction 实现， 首先根据from地址查找到对应的wallet，检查一下参数值， * 通过SendTxArgs.toTransaction()创建交易 * 通过Wallet.SignTx()对交易进行签名 * 通过submitTransaction()提交交易 //代码位于 `internal/ethapi/api.go` func (s *PrivateAccountAPI) SendTransaction(ctx context.Context, args SendTxArgs, passwd string) (common.Hash, error) { if args.Nonce == nil { // Hold the addresse&#39;s mutex around signing to prevent concurrent assignment of // the same nonce to multiple accounts. s.nonceLock.LockAddr(args.From) defer s.nonceLock.UnlockAddr(args.From) } signed, err := s.signTransaction(ctx, args, passwd) if err != nil { return common.Hash{}, err } return submitTransaction(ctx, s.b, signed) } 交易签名主要实现在 signTransaction，主要功能： toTransaction() ：创建交易 wallet.SignTxWithPassphrase(account, passwd, tx, chainID)：对交易进行签名 func (s *PrivateAccountAPI) signTransaction(ctx context.Context, args SendTxArgs, passwd string) (*types.Transaction, error) { // Look up the wallet containing the requested signer account := accounts.Account{Address: args.From} wallet, err := s.am.Find(account) if err != nil { return nil, err } // Set some sanity defaults and terminate on failure if err := args.setDefaults(ctx, s.b); err != nil { return nil, err } // Assemble the transaction and sign with the wallet tx := args.toTransaction() var chainID *big.Int if config := s.b.ChainConfig(); config.IsEIP155(s.b.CurrentBlock().Number()) { chainID = config.ChainId } return wallet.SignTxWithPassphrase(account, passwd, tx, chainID) } 创建交易 tx := args.toTransaction() 创建交易 先看一下SendTxArgs类型的定义： // 代码 internal/ethapi/api.go // SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool. type SendTxArgs struct { From common.Address `json:&quot;from&quot;` To *common.Address `json:&quot;to&quot;` Gas *hexutil.Uint64 `json:&quot;gas&quot;` GasPrice *hexutil.Big `json:&quot;gasPrice&quot;` Value *hexutil.Big `json:&quot;value&quot;` Nonce *hexutil.Uint64 `json:&quot;nonce&quot;` // We accept &quot;data&quot; and &quot;input&quot; for backwards-compatibility reasons. &quot;input&quot; is the // newer name and should be preferred by clients. Data *hexutil.Bytes `json:&quot;data&quot;` Input *hexutil.Bytes `json:&quot;input&quot;` } 可以看到是和JSON字段相应的，包括了地址、gas、金额这些交易信息，nonce是一个随账户交易次数自增的数字，一般会自动填充。交易还可以携带一些额外数据，存放在data或者input字段中，推荐用input，data是为了向后兼容。 toTransaction()函数： // 代码 internal/ethapi/api.go func (args *SendTxArgs) toTransaction() *types.Transaction { var input []byte if args.Data != nil { input = *args.Data } else if args.Input != nil { input = *args.Input } if args.To == nil { return types.NewContractCreation(uint64(*args.Nonce), (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } return types.NewTransaction(uint64(*args.Nonce), *args.To, (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } 可以看到，如果目标地址为空的话，表示这是一个创建智能合约的交易，调用NewContractCreation()。否则说明这是一个普通交易，调用NewTransaction()。不管调用哪个，最终都会生成一个Transaction实例，我们看一下Transaction类型的定义： // 代码位于core/types/transaction.go type Transaction struct { data txdata // caches hash atomic.Value size atomic.Value from atomic.Value } type txdata struct { AccountNonce uint64 `json:&quot;nonce&quot; gencodec:&quot;required&quot;` Price *big.Int `json:&quot;gasPrice&quot; gencodec:&quot;required&quot;` GasLimit uint64 `json:&quot;gas&quot; gencodec:&quot;required&quot;` Recipient *common.Address `json:&quot;to&quot; rlp:&quot;nil&quot;` // nil means contract creation Amount *big.Int `json:&quot;value&quot; gencodec:&quot;required&quot;` Payload []byte `json:&quot;input&quot; gencodec:&quot;required&quot;` // Signature values V *big.Int `json:&quot;v&quot; gencodec:&quot;required&quot;` R *big.Int `json:&quot;r&quot; gencodec:&quot;required&quot;` S *big.Int `json:&quot;s&quot; gencodec:&quot;required&quot;` // This is only used when marshaling to JSON. Hash *common.Hash `json:&quot;hash&quot; rlp:&quot;-&quot;` } 交易签名 wallet.SignTxWithPassphrase 代码 // accounts/keystore/keystore_wallet.go // SignTxWithPassphrase implements accounts.Wallet, attempting to sign the given // transaction with the given account using passphrase as extra authentication. func (w *keystoreWallet) SignTxWithPassphrase(account accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Make sure the requested account is contained within if account.Address != w.account.Address { return nil, accounts.ErrUnknownAccount } if account.URL != (accounts.URL{}) &amp;&amp; account.URL != w.account.URL { return nil, accounts.ErrUnknownAccount } // Account seems valid, request the keystore to sign return w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) } w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) 代码： 主要就是通过 SignTx 进行签名。 // 代码 accounts/keystore/keystore.go func (ks *KeyStore) SignTxWithPassphrase(a accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { _, key, err := ks.getDecryptedKey(a, passphrase) if err != nil { return nil, err } defer zeroKey(key.PrivateKey) // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), key.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, key.PrivateKey) } 这里会首先判断账户是否已经解锁，如果已经解锁的话就可以获取它的私钥。 然后创建签名器，如果要符合EIP155规范的话，需要把chainID传进去，也就是我们的“–networkid”命令行参数。 最后调用一个全局函数SignTx()完成签名： 代码位于core/types/transaction_signing.go： // SignTx signs the transaction using the given signer and private key func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return tx.WithSignature(s, sig) } 主要分为3个步骤： 生成交易的hash值 根据hash值和私钥生成签名 把签名数据填充到Transaction实例中 生成交易的hash值 以EIP155Signer为例，代码如下： func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } func rlpHash(x interface{}) (h common.Hash) { hw := sha3.NewKeccak256() rlp.Encode(hw, x) hw.Sum(h[:0]) return h } 可以看到，先用SHA3-256生成hash值，然后再进行RLP编码。RLP是一种数据序列化方法。 根据hash值和私钥生成签名-crypto.Sign() // 代码位于crypto/signature_cgo.go： func Sign(hash []byte, prv *ecdsa.PrivateKey) (sig []byte, err error) { if len(hash) != 32 { return nil, fmt.Errorf(&quot;hash is required to be exactly 32 bytes (%d)&quot;, len(hash)) } seckey := math.PaddedBigBytes(prv.D, prv.Params().BitSize/8) defer zeroBytes(seckey) return secp256k1.Sign(hash, seckey) } 这里是通过ECDSA算法生成签名数据。最终会返回的签名是一个字节数组，按R / S / V的顺序排列。 填充签名数据 - WithSignature //代码位于 core/types/transaction.go func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) { r, s, v, err := signer.SignatureValues(tx, sig) if err != nil { return nil, err } cpy := &amp;Transaction{data: tx.data} cpy.data.R, cpy.data.S, cpy.data.V = r, s, v return cpy, nil } 生成的签名数据是字节数组类型，需要通过signer.SignatureValues()函数转换成3个big.Int类型的数据，然后填充到Transaction结构的R / S / V字段上 提交交易 签名完成以后，就需要调用 submitTransaction() 函数提交到交易缓冲池txpool中。 先看下TxPool中的几个重要字段： // 代码 core/tx_pool.go type TxPool struct { config TxPoolConfig chainconfig *params.ChainConfig chain blockChain gasPrice *big.Int txFeed event.Feed scope event.SubscriptionScope chainHeadCh chan ChainHeadEvent chainHeadSub event.Subscription signer types.Signer mu sync.RWMutex currentState *state.StateDB // Current state in the blockchain head pendingState *state.ManagedState // Pending state tracking virtual nonces currentMaxGas uint64 // Current gas limit for transaction caps locals *accountSet // Set of local transaction to exempt from eviction rules journal *txJournal // Journal of local transaction to back up to disk pending map[common.Address]*txList // All currently processable transactions queue map[common.Address]*txList // Queued but non-processable transactions beats map[common.Address]time.Time // Last heartbeat from each known account all *txLookup // All transactions to allow lookups priced *txPricedList // All transactions sorted by price wg sync.WaitGroup // for shutdown sync homestead bool } pending字段中包含了当前所有可被处理的交易列表，而queue字段中包含了所有不可被处理、也就是新加入进来的交易。下面查看一下pending字段 的txList的结构： type txList struct { strict bool // Whether nonces are strictly continuous or not txs *txSortedMap // Heap indexed sorted hash map of the transactions costcap *big.Int // Price of the highest costing transaction (reset only if exceeds balance) gascap uint64 // Gas limit of the highest spending transaction (reset only if exceeds block limit) } txList内部包含一个txSortedMap结构，实现按nonce排序，其内部维护了两张表： 一张是包含了所有Transaction的map，key是Transaction的nonce值。之前提到过，这个nonce是随着账户的交易次数自增的一个数字，所以越新的交易，nonce值越高。 还有一张表是一个数组，包含了所有nonce值，其内部是进行过堆排序的（小顶堆），nonce值按照从大到小排列。每次调用heap.Pop()时会取出最小的nonce值，也就是最老的交易。 all字段 中包含了所有的交易列表，以交易的hash作为key。 priced字段 则是把all中的交易列表按照gas price从大到小排列，如果gas price一样，则按照交易的nonce值从小到大排列。最终的目标是每次取出gas price最大、nonce最小的交易。 我们提交交易的目标是：先把交易放入queue中记录在案，然后再从queue中选一部分放入pending中进行处理。如果发现txpool满了，则依据priced中的排序，剔除低油价的交易。 txpool的默认配置： var DefaultTxPoolConfig = TxPoolConfig{ Journal: &quot;transactions.rlp&quot;, Rejournal: time.Hour, PriceLimit: 1, PriceBump: 10, AccountSlots: 16, GlobalSlots: 4096, AccountQueue: 64, GlobalQueue: 1024, Lifetime: 3 * time.Hour, } GlobalSlots：pending列表的最大长度，默认4096笔 AccountSlots：pending中每个账户存储的交易数的阈值，超过这个数量可能会被认为是垃圾交易或者是攻击者，多余交易可能被丢弃 GlobalQueue：queue列表的最大长度，默认1024笔 AccountQueue：queue中每个账户允许存储的最大交易数，超过会被丢弃，默认64笔 PriceLimit：允许进入txpool的最低gas price，默认1 Gwei PriceBump：如果出现两个nonce相同的交易，gas price的差值超过该阈值则用新交易替换老交易 现在我们分析submitTransaction()函数： //代码位于 `internal/ethapi/api.go` func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, err := types.Sender(signer, tx) if err != nil { return common.Hash{}, err } addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 这里有一个Backend参数，是在eth Service初始化时创建的，具体实现在EthApiBackend中，代码位于eth/api_backend.go。可以看到，这里先调用了SendTx()函数提交交易，然后如果发现目标地址为空，表明这是一个创建智能合约的交易，会创建合约地址。 提交交易到txpool //代码 eth/api_backend.go func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error { return b.eth.txPool.AddLocal(signedTx) } 继续跟踪TxPool的AddLocal()函数： // 代码位于 core/tx_pool.go func (pool *TxPool) AddLocal(tx *types.Transaction) error { return pool.addTx(tx, !pool.config.NoLocals) } // addTx enqueues a single transaction into the pool if it is valid. func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables([]common.Address{from}) } return nil } 这里有两个主要函数：add()和promoteExecuteables()。 add()会判断是否应该把当前交易加入到queue列表中，promoteExecuteables()则会从queue中选取一些交易放入pending列表中等待执行。下面分别讨论这两个函数。 TxPool.add() // 代码位于 core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(pool.all.Count()) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(pool.all.Count()-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all.Add(tx) pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(NewTxsEvent{types.Transactions{tx}}) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 我们分成一段一段的来分析： hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } 这一段是先计算交易的hash值，然后判断是不是已经在txpool 中，在的话就直接退出。 // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } 查看 pool.validateTx(tx, local) 代码 // 代码位于 core/tx_pool.go func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 32*1024 { return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 这一段是验证交易的有效性，主要进行以下几个方面的检查： 数据量必须&lt;32KB 交易金额必须非负（&gt;=0） 交易的gas limit必须低于block的gas limit 签名数据必须有效，能够解析出发送者地址 交易的gas price必须高于pool设定的最低gas price（除非是本地交易） 交易的nonce值必须高于当前链上该账户的nonce值（低于则说明这笔交易已经被打包过了） 当前账户余额必须大于“交易金额 + gasprice * gaslimit” 交易的gas limit必须大于对应数据量所需的最低gas水平 if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } 这一段是在当前txpool已满的情况下，剔除掉低油价的交易。还记得之前有个priced字段存储了按gas price以及nonce排序的交易列表吗？这里会先把当前交易的gas price和当前池中的最低价进行比较： 如果低于最低价，直接丢弃该交易返回 如果高于最低价，则从txpool中剔除一些低价的交易 // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } 如果之前的那些检查都没有问题，就真正调用enqueueTx()函数把交易加入到queue列表中了。 // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) 最后，如果发现这个账户是本地的，就把它加到一个白名单里，默认会保证本地交易优先被加到txpool中。 TxPool.promoteExecuteables() 主要目的是把交易从queue列表“提拔”到pending列表，代码逻辑比较清楚，具体可以参见下面这张图： 根据不同的目的可以分为3块，分别以粉色、紫色、绿色标识。 粉色部分主要是为了把queue中的交易“提拔”到pending中。当然在这之前需要先要进行一番检查： 丢弃nonce &lt; 账户当前nonce的交易，也就是已经被打包过的交易 丢弃转账金额 + gas消耗 &gt; 账户余额的交易，也就是会out-of-gas的交易 丢弃gas limit &gt; block gas limit的交易，这部分交易可能会导致区块生成失败 紫色部分主要是为了清理pending列表，使其满足GlobalSlots和AccountSlots的限制条件： 如果有些账户的交易数超过了AccountSlots，则先按交易数最少的账户进行均衡。举例来说，如果有10个账户交易数超过了AccountSlots（默认16），其中交易数最少的账户包含20笔交易，那么先把其他9个账户的交易数量削减到20。 如果经过上面的步骤，pending的长度还是超过了GlobalSlots，那就严格按照AccountSlots进行均衡，也就是把上面的10个账户的交易数进一步削减到16。 绿色部分主要是为了清理queue列表，使其满足GlobalQueue和AccountQueue的限制条件： 如果每个账户的交易数超过了AccountQueue，丢弃多余交易 如果queue的长度超过了GlobalQueue，则把账户按最后一次心跳时间排序，然后依次去除账户中的交易，直到满足限制条件位置。 // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Track the promoted transactions to broadcast them at once var promoted []*types.Transaction // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash(), true) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash(), true) drop-- queuedRateLimitCounter.Inc(1) } } } } 广播交易 交易提交到txpool中后，还需要广播出去，一方面通知EVM执行该交易，另一方面要把交易信息广播给其他结点。具体调用在 promoteExecutables 提到的promoteTx()函数中： // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { ... // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } } ... // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } promoteTx 详细代码： // 代码 crypto/tx_pool.go func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) bool { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this pool.all.Remove(hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return false } // Otherwise discard any previous transaction and mark this if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all.Get(hash) == nil { pool.all.Add(tx) pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) return true } 先更新了最后一次心跳时间，然后更新账户的nonce值。 pool.txFeed.Send 发送一个TxPreEvent事件，外部可以通过SubscribeNewTxsEvent()函数订阅该事件： func (pool *TxPool) SubscribeNewTxsEvent(ch chan&lt;- core.NewTxsEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 我们只要搜索一下这个函数，就可以知道哪些组件订阅了该事件了。 执行交易 第一个订阅的地方位于miner/worker.go： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { .... // Subscribe NewTxsEvent for tx pool worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) .... } 开启了一个goroutine来接收TxPreEvent，看一下update()函数： func (self *worker) update() { defer self.txsSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { ... // Handle NewTxsEvent case ev := &lt;-self.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(self.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } ... } } } 可以看到，如果结点不挖矿的话，这里会立即调用commitTransactions()提交给EVM执行，获得本地回执。 如果结点挖矿的话，miner会调用commitNewWork()，内部也会调用commitTransactions()执行交易。 广播给其他结点 另一个订阅的地方位于eth/handler.go： func (pm *ProtocolManager) Start(maxPeers int) { ... // broadcast transactions pm.txsCh = make(chan core.NewTxsEvent, txChanSize) pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() ... } 同样也是启动了一个goroutine来接收TxPreEvent事件，看一下txBroadcastLoop()函数： func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txCh: pm.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-pm.txSub.Err(): return } } } 继续跟踪BroadcastTx()函数： func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } 可以看到，这里会通过P2P向所有没有该交易的结点发送该交易。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/02/cb2be1121ee65d51fb9ac06c5001f68b.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/02/cb2be1121ee65d51fb9ac06c5001f68b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"以太坊交易基本流程： 完整流程分为以下几个步骤： 发起交易：指定目标地址和交易金额，以及需要的gas/gaslimit 交易签名：使用账户私钥对交易进行签名 提交交易：把交易加入到交易缓冲池txpool中（会先对交易签名进行验证） 广播交易：通知EVM执行，同时把交易信息广播给其他结点 发起交易 用户通过JSON RPC发起 eth_sendTransaction 请求，最终会调用 PublicTransactionPoolAPI 的 SendTransaction 实现， 首先根据from地址查找到对应的wallet，检查一下参数值， * 通过SendTxArgs.toTransaction()创建交易 * 通过Wallet.SignTx()对交易进行签名 * 通过submitTransaction()提交交易 //代码位于 `internal/ethapi/api.go` func (s *PrivateAccountAPI) SendTransaction(ctx context.Context, args SendTxArgs, passwd string) (common.Hash, error) { if args.Nonce == nil { // Hold the addresse&#39;s mutex around signing to prevent concurrent assignment of // the same nonce to multiple accounts. s.nonceLock.LockAddr(args.From) defer s.nonceLock.UnlockAddr(args.From) } signed, err := s.signTransaction(ctx, args, passwd) if err != nil { return common.Hash{}, err } return submitTransaction(ctx, s.b, signed) } 交易签名主要实现在 signTransaction，主要功能： toTransaction() ：创建交易 wallet.SignTxWithPassphrase(account, passwd, tx, chainID)：对交易进行签名 func (s *PrivateAccountAPI) signTransaction(ctx context.Context, args SendTxArgs, passwd string) (*types.Transaction, error) { // Look up the wallet containing the requested signer account := accounts.Account{Address: args.From} wallet, err := s.am.Find(account) if err != nil { return nil, err } // Set some sanity defaults and terminate on failure if err := args.setDefaults(ctx, s.b); err != nil { return nil, err } // Assemble the transaction and sign with the wallet tx := args.toTransaction() var chainID *big.Int if config := s.b.ChainConfig(); config.IsEIP155(s.b.CurrentBlock().Number()) { chainID = config.ChainId } return wallet.SignTxWithPassphrase(account, passwd, tx, chainID) } 创建交易 tx := args.toTransaction() 创建交易 先看一下SendTxArgs类型的定义： // 代码 internal/ethapi/api.go // SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool. type SendTxArgs struct { From common.Address `json:&quot;from&quot;` To *common.Address `json:&quot;to&quot;` Gas *hexutil.Uint64 `json:&quot;gas&quot;` GasPrice *hexutil.Big `json:&quot;gasPrice&quot;` Value *hexutil.Big `json:&quot;value&quot;` Nonce *hexutil.Uint64 `json:&quot;nonce&quot;` // We accept &quot;data&quot; and &quot;input&quot; for backwards-compatibility reasons. &quot;input&quot; is the // newer name and should be preferred by clients. Data *hexutil.Bytes `json:&quot;data&quot;` Input *hexutil.Bytes `json:&quot;input&quot;` } 可以看到是和JSON字段相应的，包括了地址、gas、金额这些交易信息，nonce是一个随账户交易次数自增的数字，一般会自动填充。交易还可以携带一些额外数据，存放在data或者input字段中，推荐用input，data是为了向后兼容。 toTransaction()函数： // 代码 internal/ethapi/api.go func (args *SendTxArgs) toTransaction() *types.Transaction { var input []byte if args.Data != nil { input = *args.Data } else if args.Input != nil { input = *args.Input } if args.To == nil { return types.NewContractCreation(uint64(*args.Nonce), (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } return types.NewTransaction(uint64(*args.Nonce), *args.To, (*big.Int)(args.Value), uint64(*args.Gas), (*big.Int)(args.GasPrice), input) } 可以看到，如果目标地址为空的话，表示这是一个创建智能合约的交易，调用NewContractCreation()。否则说明这是一个普通交易，调用NewTransaction()。不管调用哪个，最终都会生成一个Transaction实例，我们看一下Transaction类型的定义： // 代码位于core/types/transaction.go type Transaction struct { data txdata // caches hash atomic.Value size atomic.Value from atomic.Value } type txdata struct { AccountNonce uint64 `json:&quot;nonce&quot; gencodec:&quot;required&quot;` Price *big.Int `json:&quot;gasPrice&quot; gencodec:&quot;required&quot;` GasLimit uint64 `json:&quot;gas&quot; gencodec:&quot;required&quot;` Recipient *common.Address `json:&quot;to&quot; rlp:&quot;nil&quot;` // nil means contract creation Amount *big.Int `json:&quot;value&quot; gencodec:&quot;required&quot;` Payload []byte `json:&quot;input&quot; gencodec:&quot;required&quot;` // Signature values V *big.Int `json:&quot;v&quot; gencodec:&quot;required&quot;` R *big.Int `json:&quot;r&quot; gencodec:&quot;required&quot;` S *big.Int `json:&quot;s&quot; gencodec:&quot;required&quot;` // This is only used when marshaling to JSON. Hash *common.Hash `json:&quot;hash&quot; rlp:&quot;-&quot;` } 交易签名 wallet.SignTxWithPassphrase 代码 // accounts/keystore/keystore_wallet.go // SignTxWithPassphrase implements accounts.Wallet, attempting to sign the given // transaction with the given account using passphrase as extra authentication. func (w *keystoreWallet) SignTxWithPassphrase(account accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { // Make sure the requested account is contained within if account.Address != w.account.Address { return nil, accounts.ErrUnknownAccount } if account.URL != (accounts.URL{}) &amp;&amp; account.URL != w.account.URL { return nil, accounts.ErrUnknownAccount } // Account seems valid, request the keystore to sign return w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) } w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID) 代码： 主要就是通过 SignTx 进行签名。 // 代码 accounts/keystore/keystore.go func (ks *KeyStore) SignTxWithPassphrase(a accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) { _, key, err := ks.getDecryptedKey(a, passphrase) if err != nil { return nil, err } defer zeroKey(key.PrivateKey) // Depending on the presence of the chain ID, sign with EIP155 or homestead if chainID != nil { return types.SignTx(tx, types.NewEIP155Signer(chainID), key.PrivateKey) } return types.SignTx(tx, types.HomesteadSigner{}, key.PrivateKey) } 这里会首先判断账户是否已经解锁，如果已经解锁的话就可以获取它的私钥。 然后创建签名器，如果要符合EIP155规范的话，需要把chainID传进去，也就是我们的“–networkid”命令行参数。 最后调用一个全局函数SignTx()完成签名： 代码位于core/types/transaction_signing.go： // SignTx signs the transaction using the given signer and private key func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) { h := s.Hash(tx) sig, err := crypto.Sign(h[:], prv) if err != nil { return nil, err } return tx.WithSignature(s, sig) } 主要分为3个步骤： 生成交易的hash值 根据hash值和私钥生成签名 把签名数据填充到Transaction实例中 生成交易的hash值 以EIP155Signer为例，代码如下： func (s EIP155Signer) Hash(tx *Transaction) common.Hash { return rlpHash([]interface{}{ tx.data.AccountNonce, tx.data.Price, tx.data.GasLimit, tx.data.Recipient, tx.data.Amount, tx.data.Payload, s.chainId, uint(0), uint(0), }) } func rlpHash(x interface{}) (h common.Hash) { hw := sha3.NewKeccak256() rlp.Encode(hw, x) hw.Sum(h[:0]) return h } 可以看到，先用SHA3-256生成hash值，然后再进行RLP编码。RLP是一种数据序列化方法。 根据hash值和私钥生成签名-crypto.Sign() // 代码位于crypto/signature_cgo.go： func Sign(hash []byte, prv *ecdsa.PrivateKey) (sig []byte, err error) { if len(hash) != 32 { return nil, fmt.Errorf(&quot;hash is required to be exactly 32 bytes (%d)&quot;, len(hash)) } seckey := math.PaddedBigBytes(prv.D, prv.Params().BitSize/8) defer zeroBytes(seckey) return secp256k1.Sign(hash, seckey) } 这里是通过ECDSA算法生成签名数据。最终会返回的签名是一个字节数组，按R / S / V的顺序排列。 填充签名数据 - WithSignature //代码位于 core/types/transaction.go func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) { r, s, v, err := signer.SignatureValues(tx, sig) if err != nil { return nil, err } cpy := &amp;Transaction{data: tx.data} cpy.data.R, cpy.data.S, cpy.data.V = r, s, v return cpy, nil } 生成的签名数据是字节数组类型，需要通过signer.SignatureValues()函数转换成3个big.Int类型的数据，然后填充到Transaction结构的R / S / V字段上 提交交易 签名完成以后，就需要调用 submitTransaction() 函数提交到交易缓冲池txpool中。 先看下TxPool中的几个重要字段： // 代码 core/tx_pool.go type TxPool struct { config TxPoolConfig chainconfig *params.ChainConfig chain blockChain gasPrice *big.Int txFeed event.Feed scope event.SubscriptionScope chainHeadCh chan ChainHeadEvent chainHeadSub event.Subscription signer types.Signer mu sync.RWMutex currentState *state.StateDB // Current state in the blockchain head pendingState *state.ManagedState // Pending state tracking virtual nonces currentMaxGas uint64 // Current gas limit for transaction caps locals *accountSet // Set of local transaction to exempt from eviction rules journal *txJournal // Journal of local transaction to back up to disk pending map[common.Address]*txList // All currently processable transactions queue map[common.Address]*txList // Queued but non-processable transactions beats map[common.Address]time.Time // Last heartbeat from each known account all *txLookup // All transactions to allow lookups priced *txPricedList // All transactions sorted by price wg sync.WaitGroup // for shutdown sync homestead bool } pending字段中包含了当前所有可被处理的交易列表，而queue字段中包含了所有不可被处理、也就是新加入进来的交易。下面查看一下pending字段 的txList的结构： type txList struct { strict bool // Whether nonces are strictly continuous or not txs *txSortedMap // Heap indexed sorted hash map of the transactions costcap *big.Int // Price of the highest costing transaction (reset only if exceeds balance) gascap uint64 // Gas limit of the highest spending transaction (reset only if exceeds block limit) } txList内部包含一个txSortedMap结构，实现按nonce排序，其内部维护了两张表： 一张是包含了所有Transaction的map，key是Transaction的nonce值。之前提到过，这个nonce是随着账户的交易次数自增的一个数字，所以越新的交易，nonce值越高。 还有一张表是一个数组，包含了所有nonce值，其内部是进行过堆排序的（小顶堆），nonce值按照从大到小排列。每次调用heap.Pop()时会取出最小的nonce值，也就是最老的交易。 all字段 中包含了所有的交易列表，以交易的hash作为key。 priced字段 则是把all中的交易列表按照gas price从大到小排列，如果gas price一样，则按照交易的nonce值从小到大排列。最终的目标是每次取出gas price最大、nonce最小的交易。 我们提交交易的目标是：先把交易放入queue中记录在案，然后再从queue中选一部分放入pending中进行处理。如果发现txpool满了，则依据priced中的排序，剔除低油价的交易。 txpool的默认配置： var DefaultTxPoolConfig = TxPoolConfig{ Journal: &quot;transactions.rlp&quot;, Rejournal: time.Hour, PriceLimit: 1, PriceBump: 10, AccountSlots: 16, GlobalSlots: 4096, AccountQueue: 64, GlobalQueue: 1024, Lifetime: 3 * time.Hour, } GlobalSlots：pending列表的最大长度，默认4096笔 AccountSlots：pending中每个账户存储的交易数的阈值，超过这个数量可能会被认为是垃圾交易或者是攻击者，多余交易可能被丢弃 GlobalQueue：queue列表的最大长度，默认1024笔 AccountQueue：queue中每个账户允许存储的最大交易数，超过会被丢弃，默认64笔 PriceLimit：允许进入txpool的最低gas price，默认1 Gwei PriceBump：如果出现两个nonce相同的交易，gas price的差值超过该阈值则用新交易替换老交易 现在我们分析submitTransaction()函数： //代码位于 `internal/ethapi/api.go` func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) { if err := b.SendTx(ctx, tx); err != nil { return common.Hash{}, err } if tx.To() == nil { signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number()) from, err := types.Sender(signer, tx) if err != nil { return common.Hash{}, err } addr := crypto.CreateAddress(from, tx.Nonce()) log.Info(&quot;Submitted contract creation&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;contract&quot;, addr.Hex()) } else { log.Info(&quot;Submitted transaction&quot;, &quot;fullhash&quot;, tx.Hash().Hex(), &quot;recipient&quot;, tx.To()) } return tx.Hash(), nil } 这里有一个Backend参数，是在eth Service初始化时创建的，具体实现在EthApiBackend中，代码位于eth/api_backend.go。可以看到，这里先调用了SendTx()函数提交交易，然后如果发现目标地址为空，表明这是一个创建智能合约的交易，会创建合约地址。 提交交易到txpool //代码 eth/api_backend.go func (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error { return b.eth.txPool.AddLocal(signedTx) } 继续跟踪TxPool的AddLocal()函数： // 代码位于 core/tx_pool.go func (pool *TxPool) AddLocal(tx *types.Transaction) error { return pool.addTx(tx, !pool.config.NoLocals) } // addTx enqueues a single transaction into the pool if it is valid. func (pool *TxPool) addTx(tx *types.Transaction, local bool) error { pool.mu.Lock() defer pool.mu.Unlock() // Try to inject the transaction and update any state replace, err := pool.add(tx, local) if err != nil { return err } // If we added a new transaction, run promotion checks and return if !replace { from, _ := types.Sender(pool.signer, tx) // already validated pool.promoteExecutables([]common.Address{from}) } return nil } 这里有两个主要函数：add()和promoteExecuteables()。 add()会判断是否应该把当前交易加入到queue列表中，promoteExecuteables()则会从queue中选取一些交易放入pending列表中等待执行。下面分别讨论这两个函数。 TxPool.add() // 代码位于 core/tx_pool.go func (pool *TxPool) add(tx *types.Transaction, local bool) (bool, error) { // If the transaction is already known, discard it hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } // If the transaction pool is full, discard underpriced transactions if uint64(pool.all.Count()) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(pool.all.Count()-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } // If the transaction is replacing an already pending one, do directly from, _ := types.Sender(pool.signer, tx) // already validated if list := pool.pending[from]; list != nil &amp;&amp; list.Overlaps(tx) { // Nonce already pending, check if required price bump is met inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { pendingDiscardCounter.Inc(1) return false, ErrReplaceUnderpriced } // New transaction is better, replace old one if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } pool.all.Add(tx) pool.priced.Put(tx) pool.journalTx(from, tx) log.Trace(&quot;Pooled new executable transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) // We&#39;ve directly injected a replacement transaction, notify subsystems go pool.txFeed.Send(NewTxsEvent{types.Transactions{tx}}) return old != nil, nil } // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) log.Trace(&quot;Pooled new future transaction&quot;, &quot;hash&quot;, hash, &quot;from&quot;, from, &quot;to&quot;, tx.To()) return replace, nil } 我们分成一段一段的来分析： hash := tx.Hash() if pool.all.Get(hash) != nil { log.Trace(&quot;Discarding already known transaction&quot;, &quot;hash&quot;, hash) return false, fmt.Errorf(&quot;known transaction: %x&quot;, hash) } 这一段是先计算交易的hash值，然后判断是不是已经在txpool 中，在的话就直接退出。 // If the transaction fails basic validation, discard it if err := pool.validateTx(tx, local); err != nil { log.Trace(&quot;Discarding invalid transaction&quot;, &quot;hash&quot;, hash, &quot;err&quot;, err) invalidTxCounter.Inc(1) return false, err } 查看 pool.validateTx(tx, local) 代码 // 代码位于 core/tx_pool.go func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error { // Heuristic limit, reject transactions over 32KB to prevent DOS attacks if tx.Size() &gt; 32*1024 { return ErrOversizedData } // Transactions can&#39;t be negative. This may never happen using RLP decoded // transactions but may occur if you create a transaction using the RPC. if tx.Value().Sign() &lt; 0 { return ErrNegativeValue } // Ensure the transaction doesn&#39;t exceed the current block limit gas. if pool.currentMaxGas &lt; tx.Gas() { return ErrGasLimit } // Make sure the transaction is signed properly from, err := types.Sender(pool.signer, tx) if err != nil { return ErrInvalidSender } // Drop non-local transactions under our own minimal accepted gas price local = local || pool.locals.contains(from) // account may be local even if the transaction arrived from the network if !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt; 0 { return ErrUnderpriced } // Ensure the transaction adheres to nonce ordering if pool.currentState.GetNonce(from) &gt; tx.Nonce() { return ErrNonceTooLow } // Transactor should have enough funds to cover the costs // cost == V + GP * GL if pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt; 0 { return ErrInsufficientFunds } intrGas, err := IntrinsicGas(tx.Data(), tx.To() == nil, pool.homestead) if err != nil { return err } if tx.Gas() &lt; intrGas { return ErrIntrinsicGas } return nil } 这一段是验证交易的有效性，主要进行以下几个方面的检查： 数据量必须&lt;32KB 交易金额必须非负（&gt;=0） 交易的gas limit必须低于block的gas limit 签名数据必须有效，能够解析出发送者地址 交易的gas price必须高于pool设定的最低gas price（除非是本地交易） 交易的nonce值必须高于当前链上该账户的nonce值（低于则说明这笔交易已经被打包过了） 当前账户余额必须大于“交易金额 + gasprice * gaslimit” 交易的gas limit必须大于对应数据量所需的最低gas水平 if uint64(len(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue { // If the new transaction is underpriced, don&#39;t accept it if !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) { log.Trace(&quot;Discarding underpriced transaction&quot;, &quot;hash&quot;, hash, &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) return false, ErrUnderpriced } // New transaction is better than our worse ones, make room for it drop := pool.priced.Discard(len(pool.all)-int(pool.config.GlobalSlots+pool.config.GlobalQueue-1), pool.locals) for _, tx := range drop { log.Trace(&quot;Discarding freshly underpriced transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;price&quot;, tx.GasPrice()) underpricedTxCounter.Inc(1) pool.removeTx(tx.Hash(), false) } } 这一段是在当前txpool已满的情况下，剔除掉低油价的交易。还记得之前有个priced字段存储了按gas price以及nonce排序的交易列表吗？这里会先把当前交易的gas price和当前池中的最低价进行比较： 如果低于最低价，直接丢弃该交易返回 如果高于最低价，则从txpool中剔除一些低价的交易 // New transaction isn&#39;t replacing a pending one, push into queue replace, err := pool.enqueueTx(hash, tx) if err != nil { return false, err } 如果之前的那些检查都没有问题，就真正调用enqueueTx()函数把交易加入到queue列表中了。 // Mark local addresses and journal local transactions if local { pool.locals.add(from) } pool.journalTx(from, tx) 最后，如果发现这个账户是本地的，就把它加到一个白名单里，默认会保证本地交易优先被加到txpool中。 TxPool.promoteExecuteables() 主要目的是把交易从queue列表“提拔”到pending列表，代码逻辑比较清楚，具体可以参见下面这张图： 根据不同的目的可以分为3块，分别以粉色、紫色、绿色标识。 粉色部分主要是为了把queue中的交易“提拔”到pending中。当然在这之前需要先要进行一番检查： 丢弃nonce &lt; 账户当前nonce的交易，也就是已经被打包过的交易 丢弃转账金额 + gas消耗 &gt; 账户余额的交易，也就是会out-of-gas的交易 丢弃gas limit &gt; block gas limit的交易，这部分交易可能会导致区块生成失败 紫色部分主要是为了清理pending列表，使其满足GlobalSlots和AccountSlots的限制条件： 如果有些账户的交易数超过了AccountSlots，则先按交易数最少的账户进行均衡。举例来说，如果有10个账户交易数超过了AccountSlots（默认16），其中交易数最少的账户包含20笔交易，那么先把其他9个账户的交易数量削减到20。 如果经过上面的步骤，pending的长度还是超过了GlobalSlots，那就严格按照AccountSlots进行均衡，也就是把上面的10个账户的交易数进一步削减到16。 绿色部分主要是为了清理queue列表，使其满足GlobalQueue和AccountQueue的限制条件： 如果每个账户的交易数超过了AccountQueue，丢弃多余交易 如果queue的长度超过了GlobalQueue，则把账户按最后一次心跳时间排序，然后依次去除账户中的交易，直到满足限制条件位置。 // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { // Track the promoted transactions to broadcast them at once var promoted []*types.Transaction // Gather all the accounts potentially needing updates if accounts == nil { accounts = make([]common.Address, 0, len(pool.queue)) for addr := range pool.queue { accounts = append(accounts, addr) } } // Iterate over all accounts and promote any executable transactions for _, addr := range accounts { list := pool.queue[addr] if list == nil { continue // Just in case someone calls with a non existing account } // Drop all transactions that are deemed too old (low nonce) for _, tx := range list.Forward(pool.currentState.GetNonce(addr)) { hash := tx.Hash() log.Trace(&quot;Removed old queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() } // Drop all transactions that are too costly (low balance or out of gas) drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas) for _, tx := range drops { hash := tx.Hash() log.Trace(&quot;Removed unpayable queued transaction&quot;, &quot;hash&quot;, hash) pool.all.Remove(hash) pool.priced.Removed() queuedNofundsCounter.Inc(1) } // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } // Drop all transactions over the allowed limit if !pool.locals.contains(addr) { for _, tx := range list.Cap(int(pool.config.AccountQueue)) { hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() queuedRateLimitCounter.Inc(1) log.Trace(&quot;Removed cap-exceeding queued transaction&quot;, &quot;hash&quot;, hash) } } // Delete the entire queue entry if it became empty. if list.Empty() { delete(pool.queue, addr) } } // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } // If the pending limit is overflown, start equalizing allowances pending := uint64(0) for _, list := range pool.pending { pending += uint64(list.Len()) } if pending &gt; pool.config.GlobalSlots { pendingBeforeCap := pending // Assemble a spam order to penalize large transactors first spammers := prque.New() for addr, list := range pool.pending { // Only evict transactions from high rollers if !pool.locals.contains(addr) &amp;&amp; uint64(list.Len()) &gt; pool.config.AccountSlots { spammers.Push(addr, float32(list.Len())) } } // Gradually drop transactions from offenders offenders := []common.Address{} for pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() { // Retrieve the next offender if not local address offender, _ := spammers.Pop() offenders = append(offenders, offender.(common.Address)) // Equalize balances until all the same or below threshold if len(offenders) &gt; 1 { // Calculate the equalization threshold for all current offenders threshold := pool.pending[offender.(common.Address)].Len() // Iteratively reduce all offenders until below limit or threshold reached for pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[len(offenders)-2]].Len() &gt; threshold { for i := 0; i &lt; len(offenders)-1; i++ { list := pool.pending[offenders[i]] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce { pool.pendingState.SetNonce(offenders[i], nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } } // If still above threshold, reduce to limit or min allowance if pending &gt; pool.config.GlobalSlots &amp;&amp; len(offenders) &gt; 0 { for pending &gt; pool.config.GlobalSlots &amp;&amp; uint64(pool.pending[offenders[len(offenders)-1]].Len()) &gt; pool.config.AccountSlots { for _, addr := range offenders { list := pool.pending[addr] for _, tx := range list.Cap(list.Len() - 1) { // Drop the transaction from the global pools too hash := tx.Hash() pool.all.Remove(hash) pool.priced.Removed() // Update the account nonce to the dropped transaction if nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce { pool.pendingState.SetNonce(addr, nonce) } log.Trace(&quot;Removed fairness-exceeding pending transaction&quot;, &quot;hash&quot;, hash) } pending-- } } } pendingRateLimitCounter.Inc(int64(pendingBeforeCap - pending)) } // If we&#39;ve queued more transactions than the hard limit, drop oldest ones queued := uint64(0) for _, list := range pool.queue { queued += uint64(list.Len()) } if queued &gt; pool.config.GlobalQueue { // Sort all accounts with queued transactions by heartbeat addresses := make(addresssByHeartbeat, 0, len(pool.queue)) for addr := range pool.queue { if !pool.locals.contains(addr) { // don&#39;t drop locals addresses = append(addresses, addressByHeartbeat{addr, pool.beats[addr]}) } } sort.Sort(addresses) // Drop transactions until the total is below the limit or only locals remain for drop := queued - pool.config.GlobalQueue; drop &gt; 0 &amp;&amp; len(addresses) &gt; 0; { addr := addresses[len(addresses)-1] list := pool.queue[addr.address] addresses = addresses[:len(addresses)-1] // Drop all transactions if they are less than the overflow if size := uint64(list.Len()); size &lt;= drop { for _, tx := range list.Flatten() { pool.removeTx(tx.Hash(), true) } drop -= size queuedRateLimitCounter.Inc(int64(size)) continue } // Otherwise drop only last few transactions txs := list.Flatten() for i := len(txs) - 1; i &gt;= 0 &amp;&amp; drop &gt; 0; i-- { pool.removeTx(txs[i].Hash(), true) drop-- queuedRateLimitCounter.Inc(1) } } } } 广播交易 交易提交到txpool中后，还需要广播出去，一方面通知EVM执行该交易，另一方面要把交易信息广播给其他结点。具体调用在 promoteExecutables 提到的promoteTx()函数中： // 代码位于 core/tx_pool.go func (pool *TxPool) promoteExecutables(accounts []common.Address) { ... // Gather all executable transactions and promote them for _, tx := range list.Ready(pool.pendingState.GetNonce(addr)) { hash := tx.Hash() if pool.promoteTx(addr, hash, tx) { log.Trace(&quot;Promoting queued transaction&quot;, &quot;hash&quot;, hash) promoted = append(promoted, tx) } } } ... // Notify subsystem for new promoted transactions. if len(promoted) &gt; 0 { pool.txFeed.Send(NewTxsEvent{promoted}) } promoteTx 详细代码： // 代码 crypto/tx_pool.go func (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) bool { // Try to insert the transaction into the pending queue if pool.pending[addr] == nil { pool.pending[addr] = newTxList(true) } list := pool.pending[addr] inserted, old := list.Add(tx, pool.config.PriceBump) if !inserted { // An older transaction was better, discard this pool.all.Remove(hash) pool.priced.Removed() pendingDiscardCounter.Inc(1) return false } // Otherwise discard any previous transaction and mark this if old != nil { pool.all.Remove(old.Hash()) pool.priced.Removed() pendingReplaceCounter.Inc(1) } // Failsafe to work around direct pending inserts (tests) if pool.all.Get(hash) == nil { pool.all.Add(tx) pool.priced.Put(tx) } // Set the potentially new pending nonce and notify any subsystems of the new tx pool.beats[addr] = time.Now() pool.pendingState.SetNonce(addr, tx.Nonce()+1) return true } 先更新了最后一次心跳时间，然后更新账户的nonce值。 pool.txFeed.Send 发送一个TxPreEvent事件，外部可以通过SubscribeNewTxsEvent()函数订阅该事件： func (pool *TxPool) SubscribeNewTxsEvent(ch chan&lt;- core.NewTxsEvent) event.Subscription { return pool.scope.Track(pool.txFeed.Subscribe(ch)) } 我们只要搜索一下这个函数，就可以知道哪些组件订阅了该事件了。 执行交易 第一个订阅的地方位于miner/worker.go： func newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker { .... // Subscribe NewTxsEvent for tx pool worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh) .... } 开启了一个goroutine来接收TxPreEvent，看一下update()函数： func (self *worker) update() { defer self.txsSub.Unsubscribe() defer self.chainHeadSub.Unsubscribe() defer self.chainSideSub.Unsubscribe() for { ... // Handle NewTxsEvent case ev := &lt;-self.txsCh: // Apply transactions to the pending state if we&#39;re not mining. // // Note all transactions received may not be continuous with transactions // already included in the current mining block. These transactions will // be automatically eliminated. if atomic.LoadInt32(&amp;self.mining) == 0 { self.currentMu.Lock() txs := make(map[common.Address]types.Transactions) for _, tx := range ev.Txs { acc, _ := types.Sender(self.current.signer, tx) txs[acc] = append(txs[acc], tx) } txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs) self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase) self.updateSnapshot() self.currentMu.Unlock() } else { // If we&#39;re mining, but nothing is being processed, wake on new transactions if self.config.Clique != nil &amp;&amp; self.config.Clique.Period == 0 { self.commitNewWork() } } ... } } } 可以看到，如果结点不挖矿的话，这里会立即调用commitTransactions()提交给EVM执行，获得本地回执。 如果结点挖矿的话，miner会调用commitNewWork()，内部也会调用commitTransactions()执行交易。 广播给其他结点 另一个订阅的地方位于eth/handler.go： func (pm *ProtocolManager) Start(maxPeers int) { ... // broadcast transactions pm.txsCh = make(chan core.NewTxsEvent, txChanSize) pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh) go pm.txBroadcastLoop() ... } 同样也是启动了一个goroutine来接收TxPreEvent事件，看一下txBroadcastLoop()函数： func (pm *ProtocolManager) txBroadcastLoop() { for { select { case event := &lt;-pm.txCh: pm.BroadcastTx(event.Tx.Hash(), event.Tx) // Err() channel will be closed when unsubscribing. case &lt;-pm.txSub.Err(): return } } } 继续跟踪BroadcastTx()函数： func (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) { var txset = make(map[*peer]types.Transactions) // Broadcast transactions to a batch of peers not knowing about it for _, tx := range txs { peers := pm.peers.PeersWithoutTx(tx.Hash()) for _, peer := range peers { txset[peer] = append(txset[peer], tx) } log.Trace(&quot;Broadcast transaction&quot;, &quot;hash&quot;, tx.Hash(), &quot;recipients&quot;, len(peers)) } // FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))] for peer, txs := range txset { peer.AsyncSendTransactions(txs) } } 可以看到，这里会通过P2P向所有没有该交易的结点发送该交易。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/02/cb2be1121ee65d51fb9ac06c5001f68b.html","headline":"以太坊源码解析 - 交易源码分析","dateModified":"2018-06-02T00:00:00+08:00","datePublished":"2018-06-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/02/cb2be1121ee65d51fb9ac06c5001f68b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码解析 - 交易源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>以太坊交易基本流程：</p> 
+  <p><img src="http://olgjbx93m.bkt.clouddn.com/20180201-40511" alt="" title=""></p> 
+  <p>完整流程分为以下几个步骤：</p> 
+  <ul> 
+   <li>发起交易：指定目标地址和交易金额，以及需要的gas/gaslimit</li> 
+   <li>交易签名：使用账户私钥对交易进行签名</li> 
+   <li>提交交易：把交易加入到交易缓冲池txpool中（会先对交易签名进行验证）</li> 
+   <li>广播交易：通知EVM执行，同时把交易信息广播给其他结点</li> 
+  </ul> 
+  <h2 id="发起交易">发起交易</h2> 
+  <p>用户通过JSON RPC发起 <code>eth_sendTransaction</code> 请求，最终会调用 <code>PublicTransactionPoolAPI</code> 的 <code>SendTransaction</code> 实现， <br> 首先根据from地址查找到对应的wallet，检查一下参数值， <br> * 通过SendTxArgs.toTransaction()创建交易 <br> * 通过Wallet.SignTx()对交易进行签名 <br> * 通过submitTransaction()提交交易</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">//代码位于 `internal/ethapi/api.go`</span>
+
+<span class="hljs-keyword">func</span> (s *PrivateAccountAPI) SendTransaction(ctx context.Context, args SendTxArgs, passwd <span class="hljs-typename">string</span>) (common.Hash, error) {
+    <span class="hljs-keyword">if</span> args.Nonce == <span class="hljs-constant">nil</span> {
+        <span class="hljs-comment">// Hold the addresse's mutex around signing to prevent concurrent assignment of</span>
+        <span class="hljs-comment">// the same nonce to multiple accounts.</span>
+        s.nonceLock.LockAddr(args.From)
+        <span class="hljs-keyword">defer</span> s.nonceLock.UnlockAddr(args.From)
+    }
+    signed, err := s.signTransaction(ctx, args, passwd)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> common.Hash{}, err
+    }
+    <span class="hljs-keyword">return</span> submitTransaction(ctx, s.b, signed)
+}</code></pre> 
+  <p>交易签名主要实现在 <code>signTransaction</code>，主要功能：</p> 
+  <p><code>toTransaction()</code> ：创建交易 <br> <code>wallet.SignTxWithPassphrase(account, passwd, tx, chainID)</code>：对交易进行签名</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (s *PrivateAccountAPI) signTransaction(ctx context.Context, args SendTxArgs, passwd <span class="hljs-typename">string</span>) (*types.Transaction, error) {
+    <span class="hljs-comment">// Look up the wallet containing the requested signer</span>
+    account := accounts.Account{Address: args.From}
+    wallet, err := s.am.Find(account)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    <span class="hljs-comment">// Set some sanity defaults and terminate on failure</span>
+    <span class="hljs-keyword">if</span> err := args.setDefaults(ctx, s.b); err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    <span class="hljs-comment">// Assemble the transaction and sign with the wallet</span>
+    tx := args.toTransaction()
+
+    <span class="hljs-keyword">var</span> chainID *big.Int
+    <span class="hljs-keyword">if</span> config := s.b.ChainConfig(); config.IsEIP155(s.b.CurrentBlock().Number()) {
+        chainID = config.ChainId
+    }
+    <span class="hljs-keyword">return</span> wallet.SignTxWithPassphrase(account, passwd, tx, chainID)
+}</code></pre> 
+  <h2 id="创建交易">创建交易</h2> 
+  <p><strong>tx := args.toTransaction()</strong> 创建交易</p> 
+  <p>先看一下SendTxArgs类型的定义：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码 internal/ethapi/api.go</span>
+
+<span class="hljs-comment">// SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool.</span>
+<span class="hljs-keyword">type</span> SendTxArgs <span class="hljs-keyword">struct</span> {
+    From     common.Address  <span class="hljs-string">`json:"from"`</span>
+    To       *common.Address <span class="hljs-string">`json:"to"`</span>
+    Gas      *hexutil.Uint64 <span class="hljs-string">`json:"gas"`</span>
+    GasPrice *hexutil.Big    <span class="hljs-string">`json:"gasPrice"`</span>
+    Value    *hexutil.Big    <span class="hljs-string">`json:"value"`</span>
+    Nonce    *hexutil.Uint64 <span class="hljs-string">`json:"nonce"`</span>
+    <span class="hljs-comment">// We accept "data" and "input" for backwards-compatibility reasons. "input" is the</span>
+    <span class="hljs-comment">// newer name and should be preferred by clients.</span>
+    Data  *hexutil.Bytes <span class="hljs-string">`json:"data"`</span>
+    Input *hexutil.Bytes <span class="hljs-string">`json:"input"`</span>
+}</code></pre> 
+  <p>可以看到是和JSON字段相应的，包括了地址、gas、金额这些交易信息，nonce是一个随账户交易次数自增的数字，一般会自动填充。交易还可以携带一些额外数据，存放在data或者input字段中，推荐用input，data是为了向后兼容。</p> 
+  <p>toTransaction()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码 internal/ethapi/api.go</span>
+
+<span class="hljs-keyword">func</span> (args *SendTxArgs) toTransaction() *types.Transaction {
+    <span class="hljs-keyword">var</span> input []<span class="hljs-typename">byte</span>
+    <span class="hljs-keyword">if</span> args.Data != <span class="hljs-constant">nil</span> {
+        input = *args.Data
+    } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> args.Input != <span class="hljs-constant">nil</span> {
+        input = *args.Input
+    }
+    <span class="hljs-keyword">if</span> args.To == <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> types.NewContractCreation(<span class="hljs-typename">uint64</span>(*args.Nonce), (*big.Int)(args.Value), <span class="hljs-typename">uint64</span>(*args.Gas), (*big.Int)(args.GasPrice), input)
+    }
+    <span class="hljs-keyword">return</span> types.NewTransaction(<span class="hljs-typename">uint64</span>(*args.Nonce), *args.To, (*big.Int)(args.Value), <span class="hljs-typename">uint64</span>(*args.Gas), (*big.Int)(args.GasPrice), input)
+}</code></pre> 
+  <p>可以看到，如果目标地址为空的话，表示这是一个创建智能合约的交易，调用NewContractCreation()。否则说明这是一个普通交易，调用NewTransaction()。不管调用哪个，最终都会生成一个Transaction实例，我们看一下Transaction类型的定义：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于core/types/transaction.go</span>
+
+<span class="hljs-keyword">type</span> Transaction <span class="hljs-keyword">struct</span> {
+    data txdata
+    <span class="hljs-comment">// caches</span>
+    hash atomic.Value
+    size atomic.Value
+    from atomic.Value
+}
+
+<span class="hljs-keyword">type</span> txdata <span class="hljs-keyword">struct</span> {
+    AccountNonce <span class="hljs-typename">uint64</span>          <span class="hljs-string">`json:"nonce" gencodec:"required"`</span>
+    Price        *big.Int        <span class="hljs-string">`json:"gasPrice" gencodec:"required"`</span>
+    GasLimit     <span class="hljs-typename">uint64</span>          <span class="hljs-string">`json:"gas" gencodec:"required"`</span>
+    Recipient    *common.Address <span class="hljs-string">`json:"to" rlp:"nil"`</span> <span class="hljs-comment">// nil means contract creation</span>
+    Amount       *big.Int        <span class="hljs-string">`json:"value" gencodec:"required"`</span>
+    Payload      []<span class="hljs-typename">byte</span>          <span class="hljs-string">`json:"input" gencodec:"required"`</span>
+
+    <span class="hljs-comment">// Signature values</span>
+    V *big.Int <span class="hljs-string">`json:"v" gencodec:"required"`</span>
+    R *big.Int <span class="hljs-string">`json:"r" gencodec:"required"`</span>
+    S *big.Int <span class="hljs-string">`json:"s" gencodec:"required"`</span>
+
+    <span class="hljs-comment">// This is only used when marshaling to JSON.</span>
+    Hash *common.Hash <span class="hljs-string">`json:"hash" rlp:"-"`</span>
+}</code></pre> 
+  <h2 id="交易签名">交易签名</h2> 
+  <p><strong>wallet.SignTxWithPassphrase</strong> 代码</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// accounts/keystore/keystore_wallet.go</span>
+
+<span class="hljs-comment">// SignTxWithPassphrase implements accounts.Wallet, attempting to sign the given</span>
+<span class="hljs-comment">// transaction with the given account using passphrase as extra authentication.</span>
+<span class="hljs-keyword">func</span> (w *keystoreWallet) SignTxWithPassphrase(account accounts.Account, passphrase <span class="hljs-typename">string</span>, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
+    <span class="hljs-comment">// Make sure the requested account is contained within</span>
+    <span class="hljs-keyword">if</span> account.Address != w.account.Address {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, accounts.ErrUnknownAccount
+    }
+    <span class="hljs-keyword">if</span> account.URL != (accounts.URL{}) &amp;&amp; account.URL != w.account.URL {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, accounts.ErrUnknownAccount
+    }
+    <span class="hljs-comment">// Account seems valid, request the keystore to sign</span>
+    <span class="hljs-keyword">return</span> w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID)
+}</code></pre> 
+  <p><strong>w.keystore.SignTxWithPassphrase(account, passphrase, tx, chainID)</strong> 代码： <br> 主要就是通过 <code>SignTx</code> 进行签名。</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码 accounts/keystore/keystore.go</span>
+
+<span class="hljs-keyword">func</span> (ks *KeyStore) SignTxWithPassphrase(a accounts.Account, passphrase <span class="hljs-typename">string</span>, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
+    _, key, err := ks.getDecryptedKey(a, passphrase)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    <span class="hljs-keyword">defer</span> zeroKey(key.PrivateKey)
+
+    <span class="hljs-comment">// Depending on the presence of the chain ID, sign with EIP155 or homestead</span>
+    <span class="hljs-keyword">if</span> chainID != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> types.SignTx(tx, types.NewEIP155Signer(chainID), key.PrivateKey)
+    }
+    <span class="hljs-keyword">return</span> types.SignTx(tx, types.HomesteadSigner{}, key.PrivateKey)
+}</code></pre> 
+  <p>这里会首先判断账户是否已经解锁，如果已经解锁的话就可以获取它的私钥。</p> 
+  <p>然后创建签名器，如果要符合EIP155规范的话，需要把chainID传进去，也就是我们的“–networkid”命令行参数。</p> 
+  <p>最后调用一个全局函数SignTx()完成签名：</p> 
+  <pre class="prettyprint"><code class="language-go hljs ">代码位于core/types/transaction_signing.<span class="hljs-keyword">go</span>：
+
+<span class="hljs-comment">// SignTx signs the transaction using the given signer and private key</span>
+<span class="hljs-keyword">func</span> SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, error) {
+    h := s.Hash(tx)
+    sig, err := crypto.Sign(h[:], prv)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    <span class="hljs-keyword">return</span> tx.WithSignature(s, sig)
+}</code></pre> 
+  <p>主要分为3个步骤：</p> 
+  <ul> 
+   <li>生成交易的hash值</li> 
+   <li>根据hash值和私钥生成签名</li> 
+   <li>把签名数据填充到Transaction实例中</li> 
+  </ul> 
+  <p><strong>生成交易的hash值</strong></p> 
+  <p>以EIP155Signer为例，代码如下：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (s EIP155Signer) Hash(tx *Transaction) common.Hash {  
+    <span class="hljs-keyword">return</span> rlpHash([]<span class="hljs-keyword">interface</span>{}{  
+        tx.data.AccountNonce,  
+        tx.data.Price,  
+        tx.data.GasLimit,  
+        tx.data.Recipient,  
+        tx.data.Amount,  
+        tx.data.Payload,  
+        s.chainId, <span class="hljs-typename">uint</span><span class="hljs-number">(0</span>), <span class="hljs-typename">uint</span><span class="hljs-number">(0</span>),  
+    })  
+}  
+
+<span class="hljs-keyword">func</span> rlpHash(x <span class="hljs-keyword">interface</span>{}) (h common.Hash) {  
+    hw := sha3.NewKeccak256()  
+    rlp.Encode(hw, x)  
+    hw.Sum(h[<span class="hljs-number">:0</span>])  
+    <span class="hljs-keyword">return</span> h  
+}  </code></pre> 
+  <p>可以看到，先用SHA3-256生成hash值，然后再进行RLP编码。RLP是一种数据序列化方法。</p> 
+  <p><strong>根据hash值和私钥生成签名-crypto.Sign()</strong></p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于crypto/signature_cgo.go：</span>
+
+<span class="hljs-keyword">func</span> Sign(hash []<span class="hljs-typename">byte</span>, prv *ecdsa.PrivateKey) (sig []<span class="hljs-typename">byte</span>, err error) {  
+    <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(hash) !=<span class="hljs-number"> 32</span> {  
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, fmt.Errorf(<span class="hljs-string">"hash is required to be exactly 32 bytes (%d)"</span>, <span class="hljs-built_in">len</span>(hash))  
+    }  
+    seckey := math.PaddedBigBytes(prv.D, prv.Params().BitSize<span class="hljs-number">/8</span>)  
+    <span class="hljs-keyword">defer</span> zeroBytes(seckey)  
+    <span class="hljs-keyword">return</span> secp256k1.Sign(hash, seckey)  
+}  </code></pre> 
+  <p>这里是通过ECDSA算法生成签名数据。最终会返回的签名是一个字节数组，按R / S / V的顺序排列。</p> 
+  <p><strong>填充签名数据 - WithSignature</strong></p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">//代码位于 core/types/transaction.go</span>
+
+<span class="hljs-keyword">func</span> (tx *Transaction) WithSignature(signer Signer, sig []<span class="hljs-typename">byte</span>) (*Transaction, error) {
+    r, s, v, err := signer.SignatureValues(tx, sig)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>, err
+    }
+    cpy := &amp;Transaction{data: tx.data}
+    cpy.data.R, cpy.data.S, cpy.data.V = r, s, v
+    <span class="hljs-keyword">return</span> cpy, <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>生成的签名数据是字节数组类型，需要通过signer.SignatureValues()函数转换成3个big.Int类型的数据，然后填充到Transaction结构的R / S / V字段上</p> 
+  <h2 id="提交交易">提交交易</h2> 
+  <p>签名完成以后，就需要调用 <code>submitTransaction()</code> 函数提交到交易缓冲池txpool中。</p> 
+  <p>先看下TxPool中的几个重要字段：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码 core/tx_pool.go</span>
+
+<span class="hljs-keyword">type</span> TxPool <span class="hljs-keyword">struct</span> {
+    config       TxPoolConfig
+    chainconfig  *params.ChainConfig
+    chain        blockChain
+    gasPrice     *big.Int
+    txFeed       event.Feed
+    scope        event.SubscriptionScope
+    chainHeadCh  <span class="hljs-keyword">chan</span> ChainHeadEvent
+    chainHeadSub event.Subscription
+    signer       types.Signer
+    mu           sync.RWMutex
+
+    currentState  *state.StateDB      <span class="hljs-comment">// Current state in the blockchain head</span>
+    pendingState  *state.ManagedState <span class="hljs-comment">// Pending state tracking virtual nonces</span>
+    currentMaxGas <span class="hljs-typename">uint64</span>              <span class="hljs-comment">// Current gas limit for transaction caps</span>
+
+    locals  *accountSet <span class="hljs-comment">// Set of local transaction to exempt from eviction rules</span>
+    journal *txJournal  <span class="hljs-comment">// Journal of local transaction to back up to disk</span>
+
+    pending <span class="hljs-keyword">map</span>[common.Address]*txList   <span class="hljs-comment">// All currently processable transactions</span>
+    queue   <span class="hljs-keyword">map</span>[common.Address]*txList   <span class="hljs-comment">// Queued but non-processable transactions</span>
+    beats   <span class="hljs-keyword">map</span>[common.Address]time.Time <span class="hljs-comment">// Last heartbeat from each known account</span>
+    all     *txLookup                    <span class="hljs-comment">// All transactions to allow lookups</span>
+    priced  *txPricedList                <span class="hljs-comment">// All transactions sorted by price</span>
+
+    wg sync.WaitGroup <span class="hljs-comment">// for shutdown sync</span>
+
+    homestead <span class="hljs-typename">bool</span>
+}</code></pre> 
+  <p><strong>pending字段</strong>中包含了当前所有可被处理的交易列表，而<strong>queue字段</strong>中包含了所有不可被处理、也就是新加入进来的交易。下面查看一下<strong>pending字段</strong> 的txList的结构：</p> 
+  <pre class="prettyprint"><code class=" hljs perl">type txList struct {
+    strict bool         // Whether nonces are strictly continuous <span class="hljs-keyword">or</span> <span class="hljs-keyword">not</span>
+    txs    <span class="hljs-variable">*txSortedMap</span> // Heap indexed sorted hash <span class="hljs-keyword">map</span> of the transactions
+
+    costcap <span class="hljs-variable">*big</span>.Int // Price of the highest costing transaction (<span class="hljs-keyword">reset</span> only <span class="hljs-keyword">if</span> exceeds balance)
+    gascap  uint64   // Gas limit of the highest spending transaction (<span class="hljs-keyword">reset</span> only <span class="hljs-keyword">if</span> exceeds block limit)
+}
+</code></pre> 
+  <p>txList内部包含一个txSortedMap结构，实现按nonce排序，其内部维护了两张表：</p> 
+  <ul> 
+   <li>一张是包含了所有Transaction的map，key是Transaction的nonce值。之前提到过，这个nonce是随着账户的交易次数自增的一个数字，所以越新的交易，nonce值越高。</li> 
+   <li>还有一张表是一个数组，包含了所有nonce值，其内部是进行过堆排序的（小顶堆），nonce值按照从大到小排列。每次调用heap.Pop()时会取出最小的nonce值，也就是最老的交易。</li> 
+  </ul> 
+  <p><strong>all字段</strong> 中包含了所有的交易列表，以交易的hash作为key。</p> 
+  <p><strong>priced字段</strong> 则是把all中的交易列表按照gas price从大到小排列，如果gas price一样，则按照交易的nonce值从小到大排列。最终的目标是每次取出gas price最大、nonce最小的交易。</p> 
+  <p>我们提交交易的目标是：先把交易放入queue中记录在案，然后再从queue中选一部分放入pending中进行处理。如果发现txpool满了，则依据priced中的排序，剔除低油价的交易。</p> 
+  <p>txpool的默认配置：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">var</span> DefaultTxPoolConfig = TxPoolConfig{
+    Journal:   <span class="hljs-string">"transactions.rlp"</span>,
+    Rejournal: time.Hour,
+
+    PriceLimit:<span class="hljs-number"> 1</span>,
+    PriceBump: <span class="hljs-number"> 10</span>,
+
+    AccountSlots:<span class="hljs-number"> 16</span>,
+    GlobalSlots: <span class="hljs-number"> 4096</span>,
+    AccountQueue:<span class="hljs-number"> 64</span>,
+    GlobalQueue: <span class="hljs-number"> 1024</span>,
+
+    Lifetime:<span class="hljs-number"> 3</span> * time.Hour,
+}</code></pre> 
+  <ul> 
+   <li>GlobalSlots：pending列表的最大长度，默认4096笔</li> 
+   <li>AccountSlots：pending中每个账户存储的交易数的阈值，超过这个数量可能会被认为是垃圾交易或者是攻击者，多余交易可能被丢弃</li> 
+   <li>GlobalQueue：queue列表的最大长度，默认1024笔</li> 
+   <li>AccountQueue：queue中每个账户允许存储的最大交易数，超过会被丢弃，默认64笔</li> 
+   <li>PriceLimit：允许进入txpool的最低gas price，默认1 Gwei</li> 
+   <li>PriceBump：如果出现两个nonce相同的交易，gas price的差值超过该阈值则用新交易替换老交易</li> 
+  </ul> 
+  <p>现在我们分析submitTransaction()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">//代码位于 `internal/ethapi/api.go`</span>
+
+<span class="hljs-keyword">func</span> submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) {
+    <span class="hljs-keyword">if</span> err := b.SendTx(ctx, tx); err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> common.Hash{}, err
+    }
+    <span class="hljs-keyword">if</span> tx.To() == <span class="hljs-constant">nil</span> {
+        signer := types.MakeSigner(b.ChainConfig(), b.CurrentBlock().Number())
+        from, err := types.Sender(signer, tx)
+        <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+            <span class="hljs-keyword">return</span> common.Hash{}, err
+        }
+        addr := crypto.CreateAddress(from, tx.Nonce())
+        log.Info(<span class="hljs-string">"Submitted contract creation"</span>, <span class="hljs-string">"fullhash"</span>, tx.Hash().Hex(), <span class="hljs-string">"contract"</span>, addr.Hex())
+    } <span class="hljs-keyword">else</span> {
+        log.Info(<span class="hljs-string">"Submitted transaction"</span>, <span class="hljs-string">"fullhash"</span>, tx.Hash().Hex(), <span class="hljs-string">"recipient"</span>, tx.To())
+    }
+    <span class="hljs-keyword">return</span> tx.Hash(), <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>这里有一个Backend参数，是在eth Service初始化时创建的，具体实现在EthApiBackend中，代码位于eth/api_backend.go。可以看到，这里先调用了SendTx()函数提交交易，然后如果发现目标地址为空，表明这是一个创建智能合约的交易，会创建合约地址。</p> 
+  <h3 id="提交交易到txpool">提交交易到txpool</h3> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">//代码 eth/api_backend.go</span>
+
+<span class="hljs-keyword">func</span> (b *EthAPIBackend) SendTx(ctx context.Context, signedTx *types.Transaction) error {
+    <span class="hljs-keyword">return</span> b.eth.txPool.AddLocal(signedTx)
+}</code></pre> 
+  <p>继续跟踪TxPool的AddLocal()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于 core/tx_pool.go</span>
+
+<span class="hljs-keyword">func</span> (pool *TxPool) AddLocal(tx *types.Transaction) error {
+    <span class="hljs-keyword">return</span> pool.addTx(tx, !pool.config.NoLocals)
+}
+
+<span class="hljs-comment">// addTx enqueues a single transaction into the pool if it is valid.</span>
+<span class="hljs-keyword">func</span> (pool *TxPool) addTx(tx *types.Transaction, local <span class="hljs-typename">bool</span>) error {
+    pool.mu.Lock()
+    <span class="hljs-keyword">defer</span> pool.mu.Unlock()
+
+    <span class="hljs-comment">// Try to inject the transaction and update any state</span>
+    replace, err := pool.add(tx, local)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> err
+    }
+    <span class="hljs-comment">// If we added a new transaction, run promotion checks and return</span>
+    <span class="hljs-keyword">if</span> !replace {
+        from, _ := types.Sender(pool.signer, tx) <span class="hljs-comment">// already validated</span>
+        pool.promoteExecutables([]common.Address{from})
+    }
+    <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>这里有两个主要函数：add()和promoteExecuteables()。 <br> add()会判断是否应该把当前交易加入到queue列表中，promoteExecuteables()则会从queue中选取一些交易放入pending列表中等待执行。下面分别讨论这两个函数。</p> 
+  <h4 id="txpooladd">TxPool.add()</h4> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于 core/tx_pool.go </span>
+
+<span class="hljs-keyword">func</span> (pool *TxPool) add(tx *types.Transaction, local <span class="hljs-typename">bool</span>) (<span class="hljs-typename">bool</span>, error) {
+    <span class="hljs-comment">// If the transaction is already known, discard it</span>
+    hash := tx.Hash()
+    <span class="hljs-keyword">if</span> pool.all.Get(hash) != <span class="hljs-constant">nil</span> {
+        log.Trace(<span class="hljs-string">"Discarding already known transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, fmt.Errorf(<span class="hljs-string">"known transaction: %x"</span>, hash)
+    }
+    <span class="hljs-comment">// If the transaction fails basic validation, discard it</span>
+    <span class="hljs-keyword">if</span> err := pool.validateTx(tx, local); err != <span class="hljs-constant">nil</span> {
+        log.Trace(<span class="hljs-string">"Discarding invalid transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"err"</span>, err)
+        invalidTxCounter.Inc<span class="hljs-number">(1</span>)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, err
+    }
+    <span class="hljs-comment">// If the transaction pool is full, discard underpriced transactions</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-typename">uint64</span>(pool.all.Count()) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue {
+        <span class="hljs-comment">// If the new transaction is underpriced, don't accept it</span>
+        <span class="hljs-keyword">if</span> !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) {
+            log.Trace(<span class="hljs-string">"Discarding underpriced transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"price"</span>, tx.GasPrice())
+            underpricedTxCounter.Inc<span class="hljs-number">(1</span>)
+            <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, ErrUnderpriced
+        }
+        <span class="hljs-comment">// New transaction is better than our worse ones, make room for it</span>
+        drop := pool.priced.Discard(pool.all.Count()-<span class="hljs-typename">int</span>(pool.config.GlobalSlots+pool.config.GlobalQueue<span class="hljs-number">-1</span>), pool.locals)
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> drop {
+            log.Trace(<span class="hljs-string">"Discarding freshly underpriced transaction"</span>, <span class="hljs-string">"hash"</span>, tx.Hash(), <span class="hljs-string">"price"</span>, tx.GasPrice())
+            underpricedTxCounter.Inc<span class="hljs-number">(1</span>)
+            pool.removeTx(tx.Hash(), <span class="hljs-constant">false</span>)
+        }
+    }
+    <span class="hljs-comment">// If the transaction is replacing an already pending one, do directly</span>
+    from, _ := types.Sender(pool.signer, tx) <span class="hljs-comment">// already validated</span>
+    <span class="hljs-keyword">if</span> list := pool.pending[from]; list != <span class="hljs-constant">nil</span> &amp;&amp; list.Overlaps(tx) {
+        <span class="hljs-comment">// Nonce already pending, check if required price bump is met</span>
+        inserted, old := list.Add(tx, pool.config.PriceBump)
+        <span class="hljs-keyword">if</span> !inserted {
+            pendingDiscardCounter.Inc<span class="hljs-number">(1</span>)
+            <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, ErrReplaceUnderpriced
+        }
+        <span class="hljs-comment">// New transaction is better, replace old one</span>
+        <span class="hljs-keyword">if</span> old != <span class="hljs-constant">nil</span> {
+            pool.all.Remove(old.Hash())
+            pool.priced.Removed()
+            pendingReplaceCounter.Inc<span class="hljs-number">(1</span>)
+        }
+        pool.all.Add(tx)
+        pool.priced.Put(tx)
+        pool.journalTx(from, tx)
+
+        log.Trace(<span class="hljs-string">"Pooled new executable transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"from"</span>, from, <span class="hljs-string">"to"</span>, tx.To())
+
+        <span class="hljs-comment">// We've directly injected a replacement transaction, notify subsystems</span>
+        <span class="hljs-keyword">go</span> pool.txFeed.Send(NewTxsEvent{types.Transactions{tx}})
+
+        <span class="hljs-keyword">return</span> old != <span class="hljs-constant">nil</span>, <span class="hljs-constant">nil</span>
+    }
+    <span class="hljs-comment">// New transaction isn't replacing a pending one, push into queue</span>
+    replace, err := pool.enqueueTx(hash, tx)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, err
+    }
+    <span class="hljs-comment">// Mark local addresses and journal local transactions</span>
+    <span class="hljs-keyword">if</span> local {
+        pool.locals.add(from)
+    }
+    pool.journalTx(from, tx)
+
+    log.Trace(<span class="hljs-string">"Pooled new future transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"from"</span>, from, <span class="hljs-string">"to"</span>, tx.To())
+    <span class="hljs-keyword">return</span> replace, <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>我们分成一段一段的来分析：</p> 
+  <pre class="prettyprint"><code class="language-go hljs ">hash := tx.Hash()
+    <span class="hljs-keyword">if</span> pool.all.Get(hash) != <span class="hljs-constant">nil</span> {
+        log.Trace(<span class="hljs-string">"Discarding already known transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, fmt.Errorf(<span class="hljs-string">"known transaction: %x"</span>, hash)
+    }</code></pre> 
+  <p>这一段是先计算交易的hash值，然后判断是不是已经在txpool 中，在的话就直接退出。</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// If the transaction fails basic validation, discard it</span>
+    <span class="hljs-keyword">if</span> err := pool.validateTx(tx, local); err != <span class="hljs-constant">nil</span> {
+        log.Trace(<span class="hljs-string">"Discarding invalid transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"err"</span>, err)
+        invalidTxCounter.Inc<span class="hljs-number">(1</span>)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, err
+    }</code></pre> 
+  <p>查看 <code>pool.validateTx(tx, local)</code> 代码</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于 core/tx_pool.go</span>
+
+<span class="hljs-keyword">func</span> (pool *TxPool) validateTx(tx *types.Transaction, local <span class="hljs-typename">bool</span>) error {
+    <span class="hljs-comment">// Heuristic limit, reject transactions over 32KB to prevent DOS attacks</span>
+    <span class="hljs-keyword">if</span> tx.Size() &gt;<span class="hljs-number"> 32</span><span class="hljs-number">*1024</span> {
+        <span class="hljs-keyword">return</span> ErrOversizedData
+    }
+    <span class="hljs-comment">// Transactions can't be negative. This may never happen using RLP decoded</span>
+    <span class="hljs-comment">// transactions but may occur if you create a transaction using the RPC.</span>
+    <span class="hljs-keyword">if</span> tx.Value().Sign() &lt;<span class="hljs-number"> 0</span> {
+        <span class="hljs-keyword">return</span> ErrNegativeValue
+    }
+    <span class="hljs-comment">// Ensure the transaction doesn't exceed the current block limit gas.</span>
+    <span class="hljs-keyword">if</span> pool.currentMaxGas &lt; tx.Gas() {
+        <span class="hljs-keyword">return</span> ErrGasLimit
+    }
+    <span class="hljs-comment">// Make sure the transaction is signed properly</span>
+    from, err := types.Sender(pool.signer, tx)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> ErrInvalidSender
+    }
+    <span class="hljs-comment">// Drop non-local transactions under our own minimal accepted gas price</span>
+    local = local || pool.locals.contains(from) <span class="hljs-comment">// account may be local even if the transaction arrived from the network</span>
+    <span class="hljs-keyword">if</span> !local &amp;&amp; pool.gasPrice.Cmp(tx.GasPrice()) &gt;<span class="hljs-number"> 0</span> {
+        <span class="hljs-keyword">return</span> ErrUnderpriced
+    }
+    <span class="hljs-comment">// Ensure the transaction adheres to nonce ordering</span>
+    <span class="hljs-keyword">if</span> pool.currentState.GetNonce(from) &gt; tx.Nonce() {
+        <span class="hljs-keyword">return</span> ErrNonceTooLow
+    }
+    <span class="hljs-comment">// Transactor should have enough funds to cover the costs</span>
+    <span class="hljs-comment">// cost == V + GP * GL</span>
+    <span class="hljs-keyword">if</span> pool.currentState.GetBalance(from).Cmp(tx.Cost()) &lt;<span class="hljs-number"> 0</span> {
+        <span class="hljs-keyword">return</span> ErrInsufficientFunds
+    }
+    intrGas, err := IntrinsicGas(tx.Data(), tx.To() == <span class="hljs-constant">nil</span>, pool.homestead)
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {
+        <span class="hljs-keyword">return</span> err
+    }
+    <span class="hljs-keyword">if</span> tx.Gas() &lt; intrGas {
+        <span class="hljs-keyword">return</span> ErrIntrinsicGas
+    }
+    <span class="hljs-keyword">return</span> <span class="hljs-constant">nil</span>
+}</code></pre> 
+  <p>这一段是验证交易的有效性，主要进行以下几个方面的检查：</p> 
+  <ul> 
+   <li>数据量必须&lt;32KB</li> 
+   <li>交易金额必须非负（&gt;=0）</li> 
+   <li>交易的gas limit必须低于block的gas limit</li> 
+   <li>签名数据必须有效，能够解析出发送者地址</li> 
+   <li>交易的gas price必须高于pool设定的最低gas price（除非是本地交易）</li> 
+   <li>交易的nonce值必须高于当前链上该账户的nonce值（低于则说明这笔交易已经被打包过了）</li> 
+   <li>当前账户余额必须大于<code>“交易金额 + gasprice * gaslimit”</code></li> 
+   <li>交易的gas limit必须大于对应数据量所需的最低gas水平</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-go hljs ">    <span class="hljs-keyword">if</span> <span class="hljs-typename">uint64</span>(<span class="hljs-built_in">len</span>(pool.all)) &gt;= pool.config.GlobalSlots+pool.config.GlobalQueue {  
+        <span class="hljs-comment">// If the new transaction is underpriced, don't accept it </span>
+        <span class="hljs-keyword">if</span> !local &amp;&amp; pool.priced.Underpriced(tx, pool.locals) {  
+            log.Trace(<span class="hljs-string">"Discarding underpriced transaction"</span>, <span class="hljs-string">"hash"</span>, hash, <span class="hljs-string">"price"</span>, tx.GasPrice())  
+            underpricedTxCounter.Inc<span class="hljs-number">(1</span>)  
+            <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, ErrUnderpriced  
+        }  
+        <span class="hljs-comment">// New transaction is better than our worse ones, make room for it </span>
+        drop := pool.priced.Discard(<span class="hljs-built_in">len</span>(pool.all)-<span class="hljs-typename">int</span>(pool.config.GlobalSlots+pool.config.GlobalQueue<span class="hljs-number">-1</span>), pool.locals)  
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> drop {  
+            log.Trace(<span class="hljs-string">"Discarding freshly underpriced transaction"</span>, <span class="hljs-string">"hash"</span>, tx.Hash(), <span class="hljs-string">"price"</span>, tx.GasPrice())  
+            underpricedTxCounter.Inc<span class="hljs-number">(1</span>)  
+            pool.removeTx(tx.Hash(), <span class="hljs-constant">false</span>)  
+        }  
+    }  </code></pre> 
+  <p>这一段是在当前txpool已满的情况下，剔除掉低油价的交易。还记得之前有个priced字段存储了按gas price以及nonce排序的交易列表吗？这里会先把当前交易的gas price和当前池中的最低价进行比较：</p> 
+  <ul> 
+   <li>如果低于最低价，直接丢弃该交易返回</li> 
+   <li>如果高于最低价，则从txpool中剔除一些低价的交易</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// New transaction isn't replacing a pending one, push into queue </span>
+    replace, err := pool.enqueueTx(hash, tx)  
+    <span class="hljs-keyword">if</span> err != <span class="hljs-constant">nil</span> {  
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>, err  
+    }  </code></pre> 
+  <p>如果之前的那些检查都没有问题，就真正调用enqueueTx()函数把交易加入到queue列表中了。</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// Mark local addresses and journal local transactions </span>
+    <span class="hljs-keyword">if</span> local {  
+        pool.locals.add(from)  
+    }  
+    pool.journalTx(from, tx)</code></pre> 
+  <p>最后，如果发现这个账户是本地的，就把它加到一个白名单里，默认会保证本地交易优先被加到txpool中。</p> 
+  <h4 id="txpoolpromoteexecuteables">TxPool.promoteExecuteables()</h4> 
+  <p>主要目的是把交易从queue列表“提拔”到pending列表，代码逻辑比较清楚，具体可以参见下面这张图：</p> 
+  <p><img src="http://olgjbx93m.bkt.clouddn.com/20180201-125715.png" alt="" title=""></p> 
+  <p>根据不同的目的可以分为3块，分别以粉色、紫色、绿色标识。</p> 
+  <p>粉色部分主要是为了把queue中的交易“提拔”到pending中。当然在这之前需要先要进行一番检查：</p> 
+  <ul> 
+   <li>丢弃nonce &lt; 账户当前nonce的交易，也就是已经被打包过的交易</li> 
+   <li>丢弃转账金额 + gas消耗 &gt; 账户余额的交易，也就是会out-of-gas的交易</li> 
+   <li>丢弃gas limit &gt; block gas limit的交易，这部分交易可能会导致区块生成失败</li> 
+  </ul> 
+  <p>紫色部分主要是为了清理pending列表，使其满足GlobalSlots和AccountSlots的限制条件：</p> 
+  <ul> 
+   <li>如果有些账户的交易数超过了AccountSlots，则先按交易数最少的账户进行均衡。举例来说，如果有10个账户交易数超过了AccountSlots（默认16），其中交易数最少的账户包含20笔交易，那么先把其他9个账户的交易数量削减到20。</li> 
+   <li>如果经过上面的步骤，pending的长度还是超过了GlobalSlots，那就严格按照AccountSlots进行均衡，也就是把上面的10个账户的交易数进一步削减到16。</li> 
+  </ul> 
+  <p>绿色部分主要是为了清理queue列表，使其满足GlobalQueue和AccountQueue的限制条件：</p> 
+  <ul> 
+   <li>如果每个账户的交易数超过了AccountQueue，丢弃多余交易</li> 
+   <li>如果queue的长度超过了GlobalQueue，则把账户按最后一次心跳时间排序，然后依次去除账户中的交易，直到满足限制条件位置。</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于 core/tx_pool.go</span>
+
+<span class="hljs-keyword">func</span> (pool *TxPool) promoteExecutables(accounts []common.Address) {
+    <span class="hljs-comment">// Track the promoted transactions to broadcast them at once</span>
+    <span class="hljs-keyword">var</span> promoted []*types.Transaction
+
+    <span class="hljs-comment">// Gather all the accounts potentially needing updates</span>
+    <span class="hljs-keyword">if</span> accounts == <span class="hljs-constant">nil</span> {
+        accounts = <span class="hljs-built_in">make</span>([]common.Address,<span class="hljs-number"> 0</span>, <span class="hljs-built_in">len</span>(pool.queue))
+        <span class="hljs-keyword">for</span> addr := <span class="hljs-keyword">range</span> pool.queue {
+            accounts = <span class="hljs-built_in">append</span>(accounts, addr)
+        }
+    }
+    <span class="hljs-comment">// Iterate over all accounts and promote any executable transactions</span>
+    <span class="hljs-keyword">for</span> _, addr := <span class="hljs-keyword">range</span> accounts {
+        list := pool.queue[addr]
+        <span class="hljs-keyword">if</span> list == <span class="hljs-constant">nil</span> {
+            <span class="hljs-keyword">continue</span> <span class="hljs-comment">// Just in case someone calls with a non existing account</span>
+        }
+        <span class="hljs-comment">// Drop all transactions that are deemed too old (low nonce)</span>
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Forward(pool.currentState.GetNonce(addr)) {
+            hash := tx.Hash()
+            log.Trace(<span class="hljs-string">"Removed old queued transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+            pool.all.Remove(hash)
+            pool.priced.Removed()
+        }
+        <span class="hljs-comment">// Drop all transactions that are too costly (low balance or out of gas)</span>
+        drops, _ := list.Filter(pool.currentState.GetBalance(addr), pool.currentMaxGas)
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> drops {
+            hash := tx.Hash()
+            log.Trace(<span class="hljs-string">"Removed unpayable queued transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+            pool.all.Remove(hash)
+            pool.priced.Removed()
+            queuedNofundsCounter.Inc<span class="hljs-number">(1</span>)
+        }
+        <span class="hljs-comment">// Gather all executable transactions and promote them</span>
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Ready(pool.pendingState.GetNonce(addr)) {
+            hash := tx.Hash()
+            <span class="hljs-keyword">if</span> pool.promoteTx(addr, hash, tx) {
+                log.Trace(<span class="hljs-string">"Promoting queued transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+                promoted = <span class="hljs-built_in">append</span>(promoted, tx)
+            }
+        }
+        <span class="hljs-comment">// Drop all transactions over the allowed limit</span>
+        <span class="hljs-keyword">if</span> !pool.locals.contains(addr) {
+            <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Cap(<span class="hljs-typename">int</span>(pool.config.AccountQueue)) {
+                hash := tx.Hash()
+                pool.all.Remove(hash)
+                pool.priced.Removed()
+                queuedRateLimitCounter.Inc<span class="hljs-number">(1</span>)
+                log.Trace(<span class="hljs-string">"Removed cap-exceeding queued transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+            }
+        }
+        <span class="hljs-comment">// Delete the entire queue entry if it became empty.</span>
+        <span class="hljs-keyword">if</span> list.Empty() {
+            <span class="hljs-built_in">delete</span>(pool.queue, addr)
+        }
+    }
+    <span class="hljs-comment">// Notify subsystem for new promoted transactions.</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(promoted) &gt;<span class="hljs-number"> 0</span> {
+        pool.txFeed.Send(NewTxsEvent{promoted})
+    }
+    <span class="hljs-comment">// If the pending limit is overflown, start equalizing allowances</span>
+    pending := <span class="hljs-typename">uint64</span><span class="hljs-number">(0</span>)
+    <span class="hljs-keyword">for</span> _, list := <span class="hljs-keyword">range</span> pool.pending {
+        pending += <span class="hljs-typename">uint64</span>(list.Len())
+    }
+    <span class="hljs-keyword">if</span> pending &gt; pool.config.GlobalSlots {
+        pendingBeforeCap := pending
+        <span class="hljs-comment">// Assemble a spam order to penalize large transactors first</span>
+        spammers := prque.New()
+        <span class="hljs-keyword">for</span> addr, list := <span class="hljs-keyword">range</span> pool.pending {
+            <span class="hljs-comment">// Only evict transactions from high rollers</span>
+            <span class="hljs-keyword">if</span> !pool.locals.contains(addr) &amp;&amp; <span class="hljs-typename">uint64</span>(list.Len()) &gt; pool.config.AccountSlots {
+                spammers.Push(addr, <span class="hljs-typename">float32</span>(list.Len()))
+            }
+        }
+        <span class="hljs-comment">// Gradually drop transactions from offenders</span>
+        offenders := []common.Address{}
+        <span class="hljs-keyword">for</span> pending &gt; pool.config.GlobalSlots &amp;&amp; !spammers.Empty() {
+            <span class="hljs-comment">// Retrieve the next offender if not local address</span>
+            offender, _ := spammers.Pop()
+            offenders = <span class="hljs-built_in">append</span>(offenders, offender.(common.Address))
+
+            <span class="hljs-comment">// Equalize balances until all the same or below threshold</span>
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(offenders) &gt;<span class="hljs-number"> 1</span> {
+                <span class="hljs-comment">// Calculate the equalization threshold for all current offenders</span>
+                threshold := pool.pending[offender.(common.Address)].Len()
+
+                <span class="hljs-comment">// Iteratively reduce all offenders until below limit or threshold reached</span>
+                <span class="hljs-keyword">for</span> pending &gt; pool.config.GlobalSlots &amp;&amp; pool.pending[offenders[<span class="hljs-built_in">len</span>(offenders<span class="hljs-number">)-2</span>]].Len() &gt; threshold {
+                    <span class="hljs-keyword">for</span> i :=<span class="hljs-number"> 0</span>; i &lt; <span class="hljs-built_in">len</span>(offenders<span class="hljs-number">)-1</span>; i++ {
+                        list := pool.pending[offenders[i]]
+                        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Cap(list.Len() -<span class="hljs-number"> 1</span>) {
+                            <span class="hljs-comment">// Drop the transaction from the global pools too</span>
+                            hash := tx.Hash()
+                            pool.all.Remove(hash)
+                            pool.priced.Removed()
+
+                            <span class="hljs-comment">// Update the account nonce to the dropped transaction</span>
+                            <span class="hljs-keyword">if</span> nonce := tx.Nonce(); pool.pendingState.GetNonce(offenders[i]) &gt; nonce {
+                                pool.pendingState.SetNonce(offenders[i], nonce)
+                            }
+                            log.Trace(<span class="hljs-string">"Removed fairness-exceeding pending transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+                        }
+                        pending--
+                    }
+                }
+            }
+        }
+        <span class="hljs-comment">// If still above threshold, reduce to limit or min allowance</span>
+        <span class="hljs-keyword">if</span> pending &gt; pool.config.GlobalSlots &amp;&amp; <span class="hljs-built_in">len</span>(offenders) &gt;<span class="hljs-number"> 0</span> {
+            <span class="hljs-keyword">for</span> pending &gt; pool.config.GlobalSlots &amp;&amp; <span class="hljs-typename">uint64</span>(pool.pending[offenders[<span class="hljs-built_in">len</span>(offenders<span class="hljs-number">)-1</span>]].Len()) &gt; pool.config.AccountSlots {
+                <span class="hljs-keyword">for</span> _, addr := <span class="hljs-keyword">range</span> offenders {
+                    list := pool.pending[addr]
+                    <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Cap(list.Len() -<span class="hljs-number"> 1</span>) {
+                        <span class="hljs-comment">// Drop the transaction from the global pools too</span>
+                        hash := tx.Hash()
+                        pool.all.Remove(hash)
+                        pool.priced.Removed()
+
+                        <span class="hljs-comment">// Update the account nonce to the dropped transaction</span>
+                        <span class="hljs-keyword">if</span> nonce := tx.Nonce(); pool.pendingState.GetNonce(addr) &gt; nonce {
+                            pool.pendingState.SetNonce(addr, nonce)
+                        }
+                        log.Trace(<span class="hljs-string">"Removed fairness-exceeding pending transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+                    }
+                    pending--
+                }
+            }
+        }
+        pendingRateLimitCounter.Inc(<span class="hljs-typename">int64</span>(pendingBeforeCap - pending))
+    }
+    <span class="hljs-comment">// If we've queued more transactions than the hard limit, drop oldest ones</span>
+    queued := <span class="hljs-typename">uint64</span><span class="hljs-number">(0</span>)
+    <span class="hljs-keyword">for</span> _, list := <span class="hljs-keyword">range</span> pool.queue {
+        queued += <span class="hljs-typename">uint64</span>(list.Len())
+    }
+    <span class="hljs-keyword">if</span> queued &gt; pool.config.GlobalQueue {
+        <span class="hljs-comment">// Sort all accounts with queued transactions by heartbeat</span>
+        addresses := <span class="hljs-built_in">make</span>(addresssByHeartbeat,<span class="hljs-number"> 0</span>, <span class="hljs-built_in">len</span>(pool.queue))
+        <span class="hljs-keyword">for</span> addr := <span class="hljs-keyword">range</span> pool.queue {
+            <span class="hljs-keyword">if</span> !pool.locals.contains(addr) { <span class="hljs-comment">// don't drop locals</span>
+                addresses = <span class="hljs-built_in">append</span>(addresses, addressByHeartbeat{addr, pool.beats[addr]})
+            }
+        }
+        sort.Sort(addresses)
+
+        <span class="hljs-comment">// Drop transactions until the total is below the limit or only locals remain</span>
+        <span class="hljs-keyword">for</span> drop := queued - pool.config.GlobalQueue; drop &gt;<span class="hljs-number"> 0</span> &amp;&amp; <span class="hljs-built_in">len</span>(addresses) &gt;<span class="hljs-number"> 0</span>; {
+            addr := addresses[<span class="hljs-built_in">len</span>(addresses<span class="hljs-number">)-1</span>]
+            list := pool.queue[addr.address]
+
+            addresses = addresses[:<span class="hljs-built_in">len</span>(addresses<span class="hljs-number">)-1</span>]
+
+            <span class="hljs-comment">// Drop all transactions if they are less than the overflow</span>
+            <span class="hljs-keyword">if</span> size := <span class="hljs-typename">uint64</span>(list.Len()); size &lt;= drop {
+                <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Flatten() {
+                    pool.removeTx(tx.Hash(), <span class="hljs-constant">true</span>)
+                }
+                drop -= size
+                queuedRateLimitCounter.Inc(<span class="hljs-typename">int64</span>(size))
+                <span class="hljs-keyword">continue</span>
+            }
+            <span class="hljs-comment">// Otherwise drop only last few transactions</span>
+            txs := list.Flatten()
+            <span class="hljs-keyword">for</span> i := <span class="hljs-built_in">len</span>(txs) -<span class="hljs-number"> 1</span>; i &gt;=<span class="hljs-number"> 0</span> &amp;&amp; drop &gt;<span class="hljs-number"> 0</span>; i-- {
+                pool.removeTx(txs[i].Hash(), <span class="hljs-constant">true</span>)
+                drop--
+                queuedRateLimitCounter.Inc<span class="hljs-number">(1</span>)
+            }
+        }
+    }
+}</code></pre> 
+  <h2 id="广播交易">广播交易</h2> 
+  <p>交易提交到txpool中后，还需要广播出去，一方面通知EVM执行该交易，另一方面要把交易信息广播给其他结点。具体调用在 <code>promoteExecutables</code> 提到的promoteTx()函数中：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码位于 core/tx_pool.go</span>
+
+<span class="hljs-keyword">func</span> (pool *TxPool) promoteExecutables(accounts []common.Address) {
+
+...
+ <span class="hljs-comment">// Gather all executable transactions and promote them</span>
+        <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> list.Ready(pool.pendingState.GetNonce(addr)) {
+            hash := tx.Hash()
+            <span class="hljs-keyword">if</span> pool.promoteTx(addr, hash, tx) {
+                log.Trace(<span class="hljs-string">"Promoting queued transaction"</span>, <span class="hljs-string">"hash"</span>, hash)
+                promoted = <span class="hljs-built_in">append</span>(promoted, tx)
+            }
+        }
+    }
+
+    ...
+    <span class="hljs-comment">// Notify subsystem for new promoted transactions.</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(promoted) &gt;<span class="hljs-number"> 0</span> {
+        pool.txFeed.Send(NewTxsEvent{promoted})
+    }</code></pre> 
+  <p>promoteTx 详细代码：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-comment">// 代码 crypto/tx_pool.go</span>
+<span class="hljs-keyword">func</span> (pool *TxPool) promoteTx(addr common.Address, hash common.Hash, tx *types.Transaction) <span class="hljs-typename">bool</span> {
+    <span class="hljs-comment">// Try to insert the transaction into the pending queue</span>
+    <span class="hljs-keyword">if</span> pool.pending[addr] == <span class="hljs-constant">nil</span> {
+        pool.pending[addr] = newTxList(<span class="hljs-constant">true</span>)
+    }
+    list := pool.pending[addr]
+
+    inserted, old := list.Add(tx, pool.config.PriceBump)
+    <span class="hljs-keyword">if</span> !inserted {
+        <span class="hljs-comment">// An older transaction was better, discard this</span>
+        pool.all.Remove(hash)
+        pool.priced.Removed()
+
+        pendingDiscardCounter.Inc<span class="hljs-number">(1</span>)
+        <span class="hljs-keyword">return</span> <span class="hljs-constant">false</span>
+    }
+    <span class="hljs-comment">// Otherwise discard any previous transaction and mark this</span>
+    <span class="hljs-keyword">if</span> old != <span class="hljs-constant">nil</span> {
+        pool.all.Remove(old.Hash())
+        pool.priced.Removed()
+
+        pendingReplaceCounter.Inc<span class="hljs-number">(1</span>)
+    }
+    <span class="hljs-comment">// Failsafe to work around direct pending inserts (tests)</span>
+    <span class="hljs-keyword">if</span> pool.all.Get(hash) == <span class="hljs-constant">nil</span> {
+        pool.all.Add(tx)
+        pool.priced.Put(tx)
+    }
+    <span class="hljs-comment">// Set the potentially new pending nonce and notify any subsystems of the new tx</span>
+    pool.beats[addr] = time.Now()
+    pool.pendingState.SetNonce(addr, tx.Nonce(<span class="hljs-number">)+1</span>)
+
+    <span class="hljs-keyword">return</span> <span class="hljs-constant">true</span>
+}</code></pre> 
+  <p>先更新了最后一次心跳时间，然后更新账户的nonce值。</p> 
+  <p><strong>pool.txFeed.Send</strong> 发送一个TxPreEvent事件，外部可以通过SubscribeNewTxsEvent()函数订阅该事件：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (pool *TxPool) SubscribeNewTxsEvent(ch <span class="hljs-keyword">chan</span>&lt;- core.NewTxsEvent) event.Subscription {
+    <span class="hljs-keyword">return</span> pool.scope.Track(pool.txFeed.Subscribe(ch))
+}</code></pre> 
+  <p>我们只要搜索一下这个函数，就可以知道哪些组件订阅了该事件了。</p> 
+  <h3 id="执行交易">执行交易</h3> 
+  <p>第一个订阅的地方位于miner/worker.go：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> newWorker(config *params.ChainConfig, engine consensus.Engine, coinbase common.Address, eth Backend, mux *event.TypeMux) *worker {
+    ....
+
+    <span class="hljs-comment">// Subscribe NewTxsEvent for tx pool</span>
+    worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
+    ....
+}
+</code></pre> 
+  <p>开启了一个goroutine来接收TxPreEvent，看一下update()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (self *worker) update() {
+    <span class="hljs-keyword">defer</span> self.txsSub.Unsubscribe()
+    <span class="hljs-keyword">defer</span> self.chainHeadSub.Unsubscribe()
+    <span class="hljs-keyword">defer</span> self.chainSideSub.Unsubscribe()
+
+    <span class="hljs-keyword">for</span> {
+        ...
+
+        <span class="hljs-comment">// Handle NewTxsEvent</span>
+        <span class="hljs-keyword">case</span> ev := &lt;-self.txsCh:
+            <span class="hljs-comment">// Apply transactions to the pending state if we're not mining.</span>
+            <span class="hljs-comment">//</span>
+            <span class="hljs-comment">// Note all transactions received may not be continuous with transactions</span>
+            <span class="hljs-comment">// already included in the current mining block. These transactions will</span>
+            <span class="hljs-comment">// be automatically eliminated.</span>
+            <span class="hljs-keyword">if</span> atomic.LoadInt32(&amp;self.mining) ==<span class="hljs-number"> 0</span> {
+                self.currentMu.Lock()
+                txs := <span class="hljs-built_in">make</span>(<span class="hljs-keyword">map</span>[common.Address]types.Transactions)
+                <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> ev.Txs {
+                    acc, _ := types.Sender(self.current.signer, tx)
+                    txs[acc] = <span class="hljs-built_in">append</span>(txs[acc], tx)
+                }
+                txset := types.NewTransactionsByPriceAndNonce(self.current.signer, txs)
+                self.current.commitTransactions(self.mux, txset, self.chain, self.coinbase)
+                self.updateSnapshot()
+                self.currentMu.Unlock()
+            } <span class="hljs-keyword">else</span> {
+                <span class="hljs-comment">// If we're mining, but nothing is being processed, wake on new transactions</span>
+                <span class="hljs-keyword">if</span> self.config.Clique != <span class="hljs-constant">nil</span> &amp;&amp; self.config.Clique.Period ==<span class="hljs-number"> 0</span> {
+                    self.commitNewWork()
+                }
+            }
+
+        ...
+        }
+    }
+}</code></pre> 
+  <p>可以看到，如果结点不挖矿的话，这里会立即调用commitTransactions()提交给EVM执行，获得本地回执。</p> 
+  <p>如果结点挖矿的话，miner会调用commitNewWork()，内部也会调用commitTransactions()执行交易。</p> 
+  <h3 id="广播给其他结点">广播给其他结点</h3> 
+  <p>另一个订阅的地方位于eth/handler.go：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (pm *ProtocolManager) Start(maxPeers <span class="hljs-typename">int</span>) {
+...
+
+    <span class="hljs-comment">// broadcast transactions</span>
+    pm.txsCh = <span class="hljs-built_in">make</span>(<span class="hljs-keyword">chan</span> core.NewTxsEvent, txChanSize)
+    pm.txsSub = pm.txpool.SubscribeNewTxsEvent(pm.txsCh)
+    <span class="hljs-keyword">go</span> pm.txBroadcastLoop()
+
+...
+}</code></pre> 
+  <p>同样也是启动了一个goroutine来接收TxPreEvent事件，看一下txBroadcastLoop()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (pm *ProtocolManager) txBroadcastLoop() {  
+    <span class="hljs-keyword">for</span> {  
+        <span class="hljs-keyword">select</span> {  
+        <span class="hljs-keyword">case</span> event := &lt;-pm.txCh:  
+            pm.BroadcastTx(event.Tx.Hash(), event.Tx)  
+
+        <span class="hljs-comment">// Err() channel will be closed when unsubscribing. </span>
+        <span class="hljs-keyword">case</span> &lt;-pm.txSub.Err():  
+            <span class="hljs-keyword">return</span>  
+        }  
+    }  
+}</code></pre> 
+  <p>继续跟踪BroadcastTx()函数：</p> 
+  <pre class="prettyprint"><code class="language-go hljs "><span class="hljs-keyword">func</span> (pm *ProtocolManager) BroadcastTxs(txs types.Transactions) {
+    <span class="hljs-keyword">var</span> txset = <span class="hljs-built_in">make</span>(<span class="hljs-keyword">map</span>[*peer]types.Transactions)
+
+    <span class="hljs-comment">// Broadcast transactions to a batch of peers not knowing about it</span>
+    <span class="hljs-keyword">for</span> _, tx := <span class="hljs-keyword">range</span> txs {
+        peers := pm.peers.PeersWithoutTx(tx.Hash())
+        <span class="hljs-keyword">for</span> _, peer := <span class="hljs-keyword">range</span> peers {
+            txset[peer] = <span class="hljs-built_in">append</span>(txset[peer], tx)
+        }
+        log.Trace(<span class="hljs-string">"Broadcast transaction"</span>, <span class="hljs-string">"hash"</span>, tx.Hash(), <span class="hljs-string">"recipients"</span>, <span class="hljs-built_in">len</span>(peers))
+    }
+    <span class="hljs-comment">// FIXME include this again: peers = peers[:int(math.Sqrt(float64(len(peers))))]</span>
+    <span class="hljs-keyword">for</span> peer, txs := <span class="hljs-keyword">range</span> txset {
+        peer.AsyncSendTransactions(txs)
+    }
+}</code></pre> 
+  <p>可以看到，这里会通过P2P向所有没有该交易的结点发送该交易。</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/luckydog612/article/details/80546989,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/luckydog612/article/details/80546989,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

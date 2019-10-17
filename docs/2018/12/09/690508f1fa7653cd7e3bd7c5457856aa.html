@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码解读（19）通过EVM创建智能合约——Create() | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码解读（19）通过EVM创建智能合约——Create()" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="我们要知道，evm解释器的执行上下文是stateTransition，是交易，但evm的服务对象是智能合约。智能合约与evm的解释器有紧密的联系，所以我们这一节先从智能合约的创建和执行开始学习。 合约创建函数的调用时机，一是Worker执行交易的过程，交易如果是合约创建，则会在EVM执行交易时生成智能合约地址并部署智能合约；二是通过opCreate指令，这个指令使得在智能合约内部创建新的智能合约成为可能。 1、交易执行前的检查 2、确保当前要创建的地址在世界状态中没有合约存在，如果存在，直接返回； 3、创建一个新账户，设置新账户为nonce为1； 4、进行转账 5、创建一个待执行的合约对象，并执行； 6、处理返回值 我们首先看一看创建一个合约所需要的参数： func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address())) return evm.create(caller, &amp;codeAndHash{code: code}, gas, value, contractAddr) } caller：转出方地址； code：代码（input） gas：当前交易的剩余gas； value：转账额度； Create()方法首先对发送者地址（caller.Address）和账户的nonce进行keccak256计算得到合约地址，然后将合约地址传入create()方法，后者是合约创建的真正函数。 首先，在执行交易之前需要进行检查：1、深度判断；2、余额是否足够； // 如果递归深度大于1024，直接退出 if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } // 判断交易发起方账户余额是否足够，否则直接退出 if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } 然后，给交易发送者的账户nonce加1（普通转账时，是在外面加1的，即在TransitionDb中），然后判断当前要创建的地址在是世界状态中没有合约存在，如果存在直接返回。 nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) // 传入的合约地址nonce不为0，或contractHash不为空 contractHash := evm.StateDB.GetCodeHash(address) if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } 第三步，如果上面两个检查都没有问题，那么我们就可以创建新的合约账户了。先用合约地址创建一个合约账户，然后给合约账户设置nonce为1。 // 先对当前StateDB进行快照 snapshot := evm.StateDB.Snapshot() // 创建新合约并将合约的nonce设置为1 evm.StateDB.CreateAccount(address) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(address, 1) } 下图比较直观的看到我们的合约储存在什么地方以及账户的结构： 第四步是进行转账，将我们构建合约交易时的value转入智能合约账户。转账的过程很简单，就是sender的账户减减（--），合约账户加加（++）。 evm.Transfer(evm.StateDB, caller.Address(), address, value) 第五步是创建合约对象，并执行。 contract := NewContract(caller, AccountRef(address), value, gas) contract.SetCodeOptionalHash(&amp;address, codeAndHash) // 如果vm配置规定不允许递归，但递归深度大于0，则直接退出 if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, address, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), address, true, codeAndHash.code, gas, value) } start := time.Now() 使用caller地址 、合约地址、转账额和交易余额传入NewContract()方法。然后执行contract.SetCodeOptionalHash()，将合约代码code设置到合约中： func (c *Contract) SetCodeOptionalHash(addr *common.Address, codeAndHash *codeAndHash) { c.Code = codeAndHash.code c.CodeHash = codeAndHash.hash c.CodeAddr = addr } 执行合约初始化代码 ret, err := run(evm, contract, nil, false) run()函数将contract交给了evm解释器，返回interpreter.Run（contract, input, readOnly）的执行结果。至于interpreter如何执行合约，我们后面再分析。 func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, error) { if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } for _, interpreter := range evm.interpreters { if interpreter.CanRun(contract.Code) { if evm.interpreter != interpreter { // Ensure that the interpreter pointer is set back // to its current value upon return. defer func(i Interpreter) { evm.interpreter = i }(evm.interpreter) evm.interpreter = interpreter } return interpreter.Run(contract, input, readOnly) } } return nil, ErrNoCompatibleInterpreter } 第六步，处理返回值 run函数的两个返回值分别是ret（合约代码）和err，我们需要判断合约代码的长度以及err是否为nil： // 约定合约代码最大长度为24576 maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // 如果执行没有错且代码长度不超过24576 if err == nil &amp;&amp; !maxCodeSizeExceeded { // 计算本次合约创建消耗的gas，每字节200gas createDataGas := uint64(len(ret)) * params.CreateDataGas // 如果交易gas余额足够，则成功部署合约，将合约代码设置到账户储存中 if contract.UseGas(createDataGas) { evm.StateDB.SetCode(address, ret) // 否则返回余额不足 } else { err = ErrCodeStoreOutOfGas } } // 如果代码长度受限或执行错误 if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { // 则恢复之前的快照 evm.StateDB.RevertToSnapshot(snapshot) // 如果不是revert指令导致的错误，要扣除所有的gas if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // 如果只是代码过长，则返回相应的错误 if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } // 最后返回合约代码、合约地址、gas余额和错误 return ret, address, contract.Gas, err 值得注意的是，如果代码执行错误是revert错误，则不会收取gas，否则gas会被扣除。那么这个revert是什么？revert是evm中的一条指令，在我们智能函数编程语言中（solidity）中有require和revert这两个判断。如果require和revert判断错误，那么就会返回一个revert指令错误，此时就不会收取gas。这也就是为什么solidity中require和revert执行不会扣除gas的原因。当然，这个方法是在拜占庭分叉后出现的。 最后，一张图看看智能合约创建的过程：" />
+<meta property="og:description" content="我们要知道，evm解释器的执行上下文是stateTransition，是交易，但evm的服务对象是智能合约。智能合约与evm的解释器有紧密的联系，所以我们这一节先从智能合约的创建和执行开始学习。 合约创建函数的调用时机，一是Worker执行交易的过程，交易如果是合约创建，则会在EVM执行交易时生成智能合约地址并部署智能合约；二是通过opCreate指令，这个指令使得在智能合约内部创建新的智能合约成为可能。 1、交易执行前的检查 2、确保当前要创建的地址在世界状态中没有合约存在，如果存在，直接返回； 3、创建一个新账户，设置新账户为nonce为1； 4、进行转账 5、创建一个待执行的合约对象，并执行； 6、处理返回值 我们首先看一看创建一个合约所需要的参数： func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address())) return evm.create(caller, &amp;codeAndHash{code: code}, gas, value, contractAddr) } caller：转出方地址； code：代码（input） gas：当前交易的剩余gas； value：转账额度； Create()方法首先对发送者地址（caller.Address）和账户的nonce进行keccak256计算得到合约地址，然后将合约地址传入create()方法，后者是合约创建的真正函数。 首先，在执行交易之前需要进行检查：1、深度判断；2、余额是否足够； // 如果递归深度大于1024，直接退出 if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } // 判断交易发起方账户余额是否足够，否则直接退出 if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } 然后，给交易发送者的账户nonce加1（普通转账时，是在外面加1的，即在TransitionDb中），然后判断当前要创建的地址在是世界状态中没有合约存在，如果存在直接返回。 nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) // 传入的合约地址nonce不为0，或contractHash不为空 contractHash := evm.StateDB.GetCodeHash(address) if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } 第三步，如果上面两个检查都没有问题，那么我们就可以创建新的合约账户了。先用合约地址创建一个合约账户，然后给合约账户设置nonce为1。 // 先对当前StateDB进行快照 snapshot := evm.StateDB.Snapshot() // 创建新合约并将合约的nonce设置为1 evm.StateDB.CreateAccount(address) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(address, 1) } 下图比较直观的看到我们的合约储存在什么地方以及账户的结构： 第四步是进行转账，将我们构建合约交易时的value转入智能合约账户。转账的过程很简单，就是sender的账户减减（--），合约账户加加（++）。 evm.Transfer(evm.StateDB, caller.Address(), address, value) 第五步是创建合约对象，并执行。 contract := NewContract(caller, AccountRef(address), value, gas) contract.SetCodeOptionalHash(&amp;address, codeAndHash) // 如果vm配置规定不允许递归，但递归深度大于0，则直接退出 if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, address, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), address, true, codeAndHash.code, gas, value) } start := time.Now() 使用caller地址 、合约地址、转账额和交易余额传入NewContract()方法。然后执行contract.SetCodeOptionalHash()，将合约代码code设置到合约中： func (c *Contract) SetCodeOptionalHash(addr *common.Address, codeAndHash *codeAndHash) { c.Code = codeAndHash.code c.CodeHash = codeAndHash.hash c.CodeAddr = addr } 执行合约初始化代码 ret, err := run(evm, contract, nil, false) run()函数将contract交给了evm解释器，返回interpreter.Run（contract, input, readOnly）的执行结果。至于interpreter如何执行合约，我们后面再分析。 func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, error) { if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } for _, interpreter := range evm.interpreters { if interpreter.CanRun(contract.Code) { if evm.interpreter != interpreter { // Ensure that the interpreter pointer is set back // to its current value upon return. defer func(i Interpreter) { evm.interpreter = i }(evm.interpreter) evm.interpreter = interpreter } return interpreter.Run(contract, input, readOnly) } } return nil, ErrNoCompatibleInterpreter } 第六步，处理返回值 run函数的两个返回值分别是ret（合约代码）和err，我们需要判断合约代码的长度以及err是否为nil： // 约定合约代码最大长度为24576 maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // 如果执行没有错且代码长度不超过24576 if err == nil &amp;&amp; !maxCodeSizeExceeded { // 计算本次合约创建消耗的gas，每字节200gas createDataGas := uint64(len(ret)) * params.CreateDataGas // 如果交易gas余额足够，则成功部署合约，将合约代码设置到账户储存中 if contract.UseGas(createDataGas) { evm.StateDB.SetCode(address, ret) // 否则返回余额不足 } else { err = ErrCodeStoreOutOfGas } } // 如果代码长度受限或执行错误 if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { // 则恢复之前的快照 evm.StateDB.RevertToSnapshot(snapshot) // 如果不是revert指令导致的错误，要扣除所有的gas if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // 如果只是代码过长，则返回相应的错误 if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } // 最后返回合约代码、合约地址、gas余额和错误 return ret, address, contract.Gas, err 值得注意的是，如果代码执行错误是revert错误，则不会收取gas，否则gas会被扣除。那么这个revert是什么？revert是evm中的一条指令，在我们智能函数编程语言中（solidity）中有require和revert这两个判断。如果require和revert判断错误，那么就会返回一个revert指令错误，此时就不会收取gas。这也就是为什么solidity中require和revert执行不会扣除gas的原因。当然，这个方法是在拜占庭分叉后出现的。 最后，一张图看看智能合约创建的过程：" />
+<link rel="canonical" href="https://uzzz.org/2018/12/09/690508f1fa7653cd7e3bd7c5457856aa.html" />
+<meta property="og:url" content="https://uzzz.org/2018/12/09/690508f1fa7653cd7e3bd7c5457856aa.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-12-09T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"我们要知道，evm解释器的执行上下文是stateTransition，是交易，但evm的服务对象是智能合约。智能合约与evm的解释器有紧密的联系，所以我们这一节先从智能合约的创建和执行开始学习。 合约创建函数的调用时机，一是Worker执行交易的过程，交易如果是合约创建，则会在EVM执行交易时生成智能合约地址并部署智能合约；二是通过opCreate指令，这个指令使得在智能合约内部创建新的智能合约成为可能。 1、交易执行前的检查 2、确保当前要创建的地址在世界状态中没有合约存在，如果存在，直接返回； 3、创建一个新账户，设置新账户为nonce为1； 4、进行转账 5、创建一个待执行的合约对象，并执行； 6、处理返回值 我们首先看一看创建一个合约所需要的参数： func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address())) return evm.create(caller, &amp;codeAndHash{code: code}, gas, value, contractAddr) } caller：转出方地址； code：代码（input） gas：当前交易的剩余gas； value：转账额度； Create()方法首先对发送者地址（caller.Address）和账户的nonce进行keccak256计算得到合约地址，然后将合约地址传入create()方法，后者是合约创建的真正函数。 首先，在执行交易之前需要进行检查：1、深度判断；2、余额是否足够； // 如果递归深度大于1024，直接退出 if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } // 判断交易发起方账户余额是否足够，否则直接退出 if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } 然后，给交易发送者的账户nonce加1（普通转账时，是在外面加1的，即在TransitionDb中），然后判断当前要创建的地址在是世界状态中没有合约存在，如果存在直接返回。 nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) // 传入的合约地址nonce不为0，或contractHash不为空 contractHash := evm.StateDB.GetCodeHash(address) if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } 第三步，如果上面两个检查都没有问题，那么我们就可以创建新的合约账户了。先用合约地址创建一个合约账户，然后给合约账户设置nonce为1。 // 先对当前StateDB进行快照 snapshot := evm.StateDB.Snapshot() // 创建新合约并将合约的nonce设置为1 evm.StateDB.CreateAccount(address) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(address, 1) } 下图比较直观的看到我们的合约储存在什么地方以及账户的结构： 第四步是进行转账，将我们构建合约交易时的value转入智能合约账户。转账的过程很简单，就是sender的账户减减（--），合约账户加加（++）。 evm.Transfer(evm.StateDB, caller.Address(), address, value) 第五步是创建合约对象，并执行。 contract := NewContract(caller, AccountRef(address), value, gas) contract.SetCodeOptionalHash(&amp;address, codeAndHash) // 如果vm配置规定不允许递归，但递归深度大于0，则直接退出 if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, address, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), address, true, codeAndHash.code, gas, value) } start := time.Now() 使用caller地址 、合约地址、转账额和交易余额传入NewContract()方法。然后执行contract.SetCodeOptionalHash()，将合约代码code设置到合约中： func (c *Contract) SetCodeOptionalHash(addr *common.Address, codeAndHash *codeAndHash) { c.Code = codeAndHash.code c.CodeHash = codeAndHash.hash c.CodeAddr = addr } 执行合约初始化代码 ret, err := run(evm, contract, nil, false) run()函数将contract交给了evm解释器，返回interpreter.Run（contract, input, readOnly）的执行结果。至于interpreter如何执行合约，我们后面再分析。 func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, error) { if contract.CodeAddr != nil { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if p := precompiles[*contract.CodeAddr]; p != nil { return RunPrecompiledContract(p, input, contract) } } for _, interpreter := range evm.interpreters { if interpreter.CanRun(contract.Code) { if evm.interpreter != interpreter { // Ensure that the interpreter pointer is set back // to its current value upon return. defer func(i Interpreter) { evm.interpreter = i }(evm.interpreter) evm.interpreter = interpreter } return interpreter.Run(contract, input, readOnly) } } return nil, ErrNoCompatibleInterpreter } 第六步，处理返回值 run函数的两个返回值分别是ret（合约代码）和err，我们需要判断合约代码的长度以及err是否为nil： // 约定合约代码最大长度为24576 maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // 如果执行没有错且代码长度不超过24576 if err == nil &amp;&amp; !maxCodeSizeExceeded { // 计算本次合约创建消耗的gas，每字节200gas createDataGas := uint64(len(ret)) * params.CreateDataGas // 如果交易gas余额足够，则成功部署合约，将合约代码设置到账户储存中 if contract.UseGas(createDataGas) { evm.StateDB.SetCode(address, ret) // 否则返回余额不足 } else { err = ErrCodeStoreOutOfGas } } // 如果代码长度受限或执行错误 if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { // 则恢复之前的快照 evm.StateDB.RevertToSnapshot(snapshot) // 如果不是revert指令导致的错误，要扣除所有的gas if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // 如果只是代码过长，则返回相应的错误 if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } // 最后返回合约代码、合约地址、gas余额和错误 return ret, address, contract.Gas, err 值得注意的是，如果代码执行错误是revert错误，则不会收取gas，否则gas会被扣除。那么这个revert是什么？revert是evm中的一条指令，在我们智能函数编程语言中（solidity）中有require和revert这两个判断。如果require和revert判断错误，那么就会返回一个revert指令错误，此时就不会收取gas。这也就是为什么solidity中require和revert执行不会扣除gas的原因。当然，这个方法是在拜占庭分叉后出现的。 最后，一张图看看智能合约创建的过程：","@type":"BlogPosting","url":"https://uzzz.org/2018/12/09/690508f1fa7653cd7e3bd7c5457856aa.html","headline":"以太坊源码解读（19）通过EVM创建智能合约——Create()","dateModified":"2018-12-09T00:00:00+08:00","datePublished":"2018-12-09T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/12/09/690508f1fa7653cd7e3bd7c5457856aa.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码解读（19）通过EVM创建智能合约——Create()</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <p>我们要知道，evm解释器的执行上下文是stateTransition，是交易，但evm的服务对象是智能合约。智能合约与evm的解释器有紧密的联系，所以我们这一节先从智能合约的创建和执行开始学习。</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20181209133805852.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xqOTAwOTEx,size_16,color_FFFFFF,t_70"></p> 
+  <p>合约创建函数的调用时机，一是Worker执行交易的过程，交易如果是合约创建，则会在EVM执行交易时生成智能合约地址并部署智能合约；二是通过opCreate指令，这个指令使得在智能合约内部创建新的智能合约成为可能。</p> 
+  <p><span style="color:#3399ea;">1、交易执行前的检查<br> 2、确保当前要创建的地址在世界状态中没有合约存在，如果存在，直接返回；<br> 3、创建一个新账户，设置新账户为nonce为1；<br> 4、进行转账<br> 5、创建一个待执行的合约对象，并执行；<br> 6、处理返回值</span></p> 
+  <p>我们首先看一看创建一个合约所需要的参数：</p> 
+  <pre class="has">
+<code class="language-Go">func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, 
+contractAddr common.Address, leftOverGas uint64, err error) {
+	contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
+	return evm.create(caller, &amp;codeAndHash{code: code}, gas, value, contractAddr)
+}</code></pre> 
+  <p>caller：转出方地址；<br> code：代码（input）<br> gas：当前交易的剩余gas；<br> value：转账额度；</p> 
+  <p><strong>Create()方法</strong>首先对发送者地址（caller.Address）和账户的nonce进行keccak256计算得到合约地址，然后将合约地址传入<strong>create()方法</strong>，后者是合约创建的真正函数。</p> 
+  <p><strong>首先，在执行交易之前需要进行检查：1、深度判断；2、余额是否足够；</strong></p> 
+  <pre class="has">
+<code class="language-Go">// 如果递归深度大于1024，直接退出
+if evm.depth &gt; int(params.CallCreateDepth) {
+	return nil, common.Address{}, gas, ErrDepth
+}
+// 判断交易发起方账户余额是否足够，否则直接退出
+if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
+	return nil, common.Address{}, gas, ErrInsufficientBalance
+}</code></pre> 
+  <p><strong>然后，给交易发送者的账户nonce加1（普通转账时，是在外面加1的，即在TransitionDb中），然后判断当前要创建的地址在是世界状态中没有合约存在，如果存在直接返回。</strong></p> 
+  <pre class="has">
+<code class="language-Go">nonce := evm.StateDB.GetNonce(caller.Address())
+evm.StateDB.SetNonce(caller.Address(), nonce+1)
+
+// 传入的合约地址nonce不为0，或contractHash不为空
+contractHash := evm.StateDB.GetCodeHash(address)
+if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) {
+	return nil, common.Address{}, 0, ErrContractAddressCollision
+}</code></pre> 
+  <p><strong>第三步，如果上面两个检查都没有问题，那么我们就可以创建新的合约账户了。</strong>先用合约地址创建一个合约账户，然后给合约账户设置nonce为1。</p> 
+  <pre class="has">
+<code class="language-Go">// 先对当前StateDB进行快照
+snapshot := evm.StateDB.Snapshot()
+// 创建新合约并将合约的nonce设置为1
+evm.StateDB.CreateAccount(address)
+if evm.ChainConfig().IsEIP158(evm.BlockNumber) {
+    evm.StateDB.SetNonce(address, 1)
+}</code></pre> 
+  <p>下图比较直观的看到我们的合约储存在什么地方以及账户的结构：</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20181209125713439.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xqOTAwOTEx,size_16,color_FFFFFF,t_70"></p> 
+  <p><strong>第四步是进行转账，将我们构建合约交易时的value转入智能合约账户。</strong>转账的过程很简单，就是sender的账户减减（--），合约账户加加（++）。</p> 
+  <pre class="has">
+<code class="language-Go">evm.Transfer(evm.StateDB, caller.Address(), address, value)</code></pre> 
+  <p><strong>第五步是创建合约对象，并执行。</strong></p> 
+  <pre class="has">
+<code class="language-Go">contract := NewContract(caller, AccountRef(address), value, gas)
+contract.SetCodeOptionalHash(&amp;address, codeAndHash)
+
+// 如果vm配置规定不允许递归，但递归深度大于0，则直接退出
+if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+    return nil, address, gas, nil
+}
+
+if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+    evm.vmConfig.Tracer.CaptureStart(caller.Address(), address, true, codeAndHash.code, gas, value)
+}
+
+start := time.Now()</code></pre> 
+  <p style="text-align:center;"><img alt="" class="has" height="321" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20181209135736248.png" width="281"></p> 
+  <p>使用caller地址 、合约地址、转账额和交易余额传入NewContract()方法。然后执行contract.SetCodeOptionalHash()，将合约代码code设置到合约中：</p> 
+  <pre class="has">
+<code class="language-Go">func (c *Contract) SetCodeOptionalHash(addr *common.Address, codeAndHash *codeAndHash) {
+	c.Code = codeAndHash.code
+	c.CodeHash = codeAndHash.hash
+	c.CodeAddr = addr
+}</code></pre> 
+  <p>执行合约初始化代码</p> 
+  <pre class="has">
+<code class="language-Go">ret, err := run(evm, contract, nil, false)</code></pre> 
+  <p>run()函数将contract交给了evm解释器，返回interpreter.Run（contract, input, readOnly）的执行结果。至于interpreter如何执行合约，我们后面再分析。</p> 
+  <pre class="has">
+<code class="language-Go">func run(evm *EVM, contract *Contract, input []byte, readOnly bool) ([]byte, error) {
+	if contract.CodeAddr != nil {
+		precompiles := PrecompiledContractsHomestead
+		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
+			precompiles = PrecompiledContractsByzantium
+		}
+		if p := precompiles[*contract.CodeAddr]; p != nil {
+			return RunPrecompiledContract(p, input, contract)
+		}
+	}
+	for _, interpreter := range evm.interpreters {
+		if interpreter.CanRun(contract.Code) {
+			if evm.interpreter != interpreter {
+				// Ensure that the interpreter pointer is set back
+				// to its current value upon return.
+				defer func(i Interpreter) {
+					evm.interpreter = i
+				}(evm.interpreter)
+				evm.interpreter = interpreter
+			}
+			return interpreter.Run(contract, input, readOnly)
+		}
+	}
+	return nil, ErrNoCompatibleInterpreter
+}</code></pre> 
+  <p><strong>第六步，处理返回值</strong></p> 
+  <p>run函数的两个返回值分别是ret（合约代码）和err，我们需要判断合约代码的长度以及err是否为nil：</p> 
+  <pre class="has">
+<code class="language-Go">// 约定合约代码最大长度为24576
+maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize
+// 如果执行没有错且代码长度不超过24576
+if err == nil &amp;&amp; !maxCodeSizeExceeded {
+    // 计算本次合约创建消耗的gas，每字节200gas
+    createDataGas := uint64(len(ret)) * params.CreateDataGas
+    // 如果交易gas余额足够，则成功部署合约，将合约代码设置到账户储存中
+    if contract.UseGas(createDataGas) {
+        evm.StateDB.SetCode(address, ret)
+    // 否则返回余额不足
+    } else {
+        err = ErrCodeStoreOutOfGas
+    }
+}
+
+// 如果代码长度受限或执行错误
+if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) {
+    // 则恢复之前的快照
+    evm.StateDB.RevertToSnapshot(snapshot)
+    // 如果不是revert指令导致的错误，要扣除所有的gas
+    if err != errExecutionReverted {
+        contract.UseGas(contract.Gas)
+    }
+}
+// 如果只是代码过长，则返回相应的错误
+if maxCodeSizeExceeded &amp;&amp; err == nil {
+    err = errMaxCodeSizeExceeded
+}
+if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+    evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err)
+}
+// 最后返回合约代码、合约地址、gas余额和错误
+return ret, address, contract.Gas, err</code></pre> 
+  <p>值得注意的是，如果代码执行错误是revert错误，则不会收取gas，否则gas会被扣除。那么这个revert是什么？revert是evm中的一条指令，在我们智能函数编程语言中（solidity）中有require和revert这两个判断。如果require和revert判断错误，那么就会返回一个revert指令错误，此时就不会收取gas。这也就是为什么solidity中require和revert执行不会扣除gas的原因。当然，这个方法是在拜占庭分叉后出现的。</p> 
+  <p><strong>最后，一张图看看智能合约创建的过程：</strong></p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20181209153153853.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xqOTAwOTEx,size_16,color_FFFFFF,t_70"></p> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

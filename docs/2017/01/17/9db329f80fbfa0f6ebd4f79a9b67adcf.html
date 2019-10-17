@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Hyperledger Fabric处理Peer与Peer之间通信的源码解析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Hyperledger Fabric处理Peer与Peer之间通信的源码解析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1.网络初始化的过程中执行以下内容，在创建节点Engine过程中该节点作为客户端的身份连接到其他Peer peerServer, err = peer.NewPeerWithEngine(secHelperFunc, helper.GetEngine) 2.返回一个使用提供的handler工厂函数,在新的聊天服务调用上创建新的handler句柄的Peer func NewPeerWithEngine(secHelperFunc func() crypto.Peer, engFactory EngineFactory) (peer *Impl, err error) { peer = new(Impl) peerNodes := peer.initDiscovery() peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.isValidator = ValidatorEnabled() peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } // 在引擎之前初始化账本，因为共识可能希望立即开始询问账本 ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.engine, err = engFactory(peer) if err != nil { return nil, err } peer.handlerFactory = peer.engine.GetHandlerFactory() if peer.handlerFactory == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.chatWithSomePeers(peerNodes) return peer, nil } 2.1.NewPeerWithHandler返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handlers句柄的Peer， func NewPeerWithHandler(secHelperFunc func() crypto.Peer, handlerFact HandlerFactory) (*Impl, error) { peer := new(Impl) peerNodes := peer.initDiscovery() if handlerFact == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.handlerFactory = handlerFact peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.chatWithSomePeers(peerNodes) return peer, nil } 2.2.Discovery是合并引导peer成员选择和对于NVP节点的VP节点选择接口 type Discovery interface { AddNode(string) bool // 添加一个地址到discovery列表 RemoveNode(string) bool // 从discovery列表中移出一个地址 GetAllNodes() []string // 返回这个节点维护的所有地址 GetRandomNodes(n int) []string // 返回这个peer连接的随机地址 FindNode(string) bool // 在discovery列表中找一个节点 } // DiscoveryImpl是一个Discovery的实现 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } // NewDiscoveryImpl 是一个Discovery实现的构造器 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } // AddNode添加一个地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } // RemoveNode从discovery列表中移出一个地址 func (di *DiscoveryImpl) RemoveNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; ok { di.nodes[address] = false return true } return false } // GetAllNodes返回这个节点维护的所有地址 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } // GetRandomNodes 返回n个随机节点 func (di *DiscoveryImpl) GetRandomNodes(n int) []string { var pick string randomNodes := make([]string, n) di.RLock() defer di.RUnlock() for i := 0; i &lt; n; i++ { for { pick = di.seq[di.random.Intn(len(di.nodes))] if di.nodes[pick] &amp;&amp; !inArray(pick, randomNodes) { break } } randomNodes[i] = pick } return randomNodes } // FindNode 如果地址存储在discovery列表中就返回true func (di *DiscoveryImpl) FindNode(address string) bool { di.RLock() defer di.RUnlock() _, ok := di.nodes[address] return ok } func inArray(element string, array []string) bool { for _, val := range array { if val == element { return true } } return false } 2.3.Peer是一个能够验证transactions的实体 type Peer interface { Node // GetID返回一个peer的验证标识符 GetID() []byte // GetEnrollmentID返回这个peer的登记id GetEnrollmentID() string // Sign 如果没有错误出现的话用这个验证器签名密钥签名消息和到处签名 Sign(msg []byte) ([]byte, error) // Verify 检查签名是否是vkID的验证密钥下的消息的有效签名 // 如果检查成功，Verify返回空意味着没有错误出现 // 如果vkID是空，然后针对该验证者的验证密钥验证签名. Verify(vkID, signature, message []byte) error } 3.从discovery列表中加载地址之前保存到磁盘并将它们添加到当前discovery列表 func (p *Impl) initDiscovery() []string { p.discHelper = discovery.NewDiscoveryImpl() p.discPersist = viper.GetBool(&quot;peer.discovery.persist&quot;) if !p.discPersist { peerLogger.Warning(&quot;Discovery list will not be persisted to disk&quot;) } // 加载一些预先保存的地址 addresses, err := p.LoadDiscoveryList() if err != nil { peerLogger.Errorf(&quot;%s&quot;, err) } for _, address := range addresses { // add them to the current discovery list _ = p.discHelper.AddNode(address) } peerLogger.Debugf(&quot;Retrieved discovery list from disk: %v&quot;, addresses) //解析配置文件, ENV标志, 等等. rootNodes := strings.Split(viper.GetString(&quot;peer.discovery.rootnode&quot;), &quot;,&quot;) if !(len(rootNodes) == 1 &amp;&amp; strings.Compare(rootNodes[0], &quot;&quot;) == 0) { addresses = append(rootNodes, p.discHelper.GetAllNodes()...) } return addresses } 4.NewDiscoveryImpl是一个Discovery构造器的实现 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } 4.1.相关结构体。 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } 5.加载一些预先保存的地址,LoadDiscoveryList使一个peer从数据库中加载到discovery列表 func (p *Impl) LoadDiscoveryList() ([]string, error) { var err error packed, err := p.Load(&quot;discovery&quot;) if err != nil { err = fmt.Errorf(&quot;Unable to load discovery list from DB: %s&quot;, err) peerLogger.Error(err) return nil, err } addresses := &amp;pb.PeersAddresses{} err = proto.Unmarshal(packed, addresses) if err != nil { err = fmt.Errorf(&quot;Could not unmarshal discovery list message: %s&quot;, err) peerLogger.Error(err) } return addresses.Addresses, err } 5.1.PeersAddresses定义 type PeersAddresses struct { Addresses []string `protobuf:&quot;bytes,1,rep,name=addresses&quot; json:&quot;addresses,omitempty&quot;` } 5.2 Unmarshaler是表示可以解组本身的对象的接口。 该方法应该在解码开始之前复位接收机。 参数指向可能被覆盖的数据，因此实现不应该保留对缓冲区的引用。 type Unmarshaler interface { Unmarshal([]byte) error } 6.Load 使一个peer能够读取与给定数据库键相对应的值 func (p *Impl) Load(key string) ([]byte, error) { db := db.GetDBHandle() return db.Get(db.PersistCF, []byte(key)) } 7.AddNode添加地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } 8.ValidatorEnabled返回peer.validator.enabled是否可用 func ValidatorEnabled() bool { if !configurationCached { cacheConfiguration() } return validatorEnabled } 9.SecurityEnabled 从配置中返回安全可用性能 func SecurityEnabled() bool { if !configurationCached { cacheConfiguration() } return securityEnabled } 10.Engine接口负责管理Peer通信（Handlers）和交易的进程， GetHandlerFactory 返回一个handler句柄来接收聊天流 type Engine interface { TransactionProccesor GetHandlerFactory() HandlerFactory } 11.chatWithSomePeers根据是不是验证节点的情况启动与1个或所有peer聊天的节点 func (p *Impl) chatWithSomePeers(addresses []string) { p.reconnectOnce.Do(func() { go p.ensureConnected() }) if len(addresses) == 0 { peerLogger.Debug(&quot;Starting up the first peer of a new network&quot;) return // 没什么事做 } for _, address := range addresses { if pe, err := GetPeerEndpoint(); err == nil { if address == pe.Address { peerLogger.Debugf(&quot;Skipping own address: %v&quot;, address) continue } } else { peerLogger.Errorf(&quot;Failed to obtain peer endpoint, %v&quot;, err) return } go p.chatWithPeer(address) } } 12.确保节点之间是已经连接好的 func (p *Impl) ensureConnected() { touchPeriod := viper.GetDuration(&quot;peer.discovery.touchPeriod&quot;) touchMaxNodes := viper.GetInt(&quot;peer.discovery.touchMaxNodes&quot;) tickChan := time.NewTicker(touchPeriod).C peerLogger.Debugf(&quot;Starting Peer reconnect service (touch service), with period = %s&quot;, touchPeriod) for { // 简单循环和检查是否需要从新连接 &lt;-tickChan peersMsg, err := p.GetPeers() if err != nil { peerLogger.Errorf(&quot;Error in touch service: %s&quot;, err.Error()) } allNodes := p.discHelper.GetAllNodes() // these will always be returned in random order if len(peersMsg.Peers) &lt; len(allNodes) { peerLogger.Warning(&quot;Touch service indicates dropped connections, attempting to reconnect...&quot;) delta := util.FindMissingElements(allNodes, getPeerAddresses(peersMsg)) if len(delta) &gt; touchMaxNodes { delta = delta[:touchMaxNodes] } p.chatWithSomePeers(delta) } else { peerLogger.Debug(&quot;Touch service indicates no dropped connections&quot;) } peerLogger.Debugf(&quot;Connected to: %v&quot;, getPeerAddresses(peersMsg)) peerLogger.Debugf(&quot;Discovery knows about: %v&quot;, allNodes) } } 13.GetPeerEndpoint 从缓存配置中返回peerEndpoint func GetPeerEndpoint() (*pb.PeerEndpoint, error) { if !configurationCached { cacheConfiguration() } return peerEndpoint, peerEndpointError } 14.Peer节点之间通信处理 func (p *Impl) chatWithPeer(address string) error { peerLogger.Debugf(&quot;Initiating Chat with peer address: %s&quot;, address) conn, err := NewPeerClientConnectionWithAddress(address) if err != nil { peerLogger.Errorf(&quot;Error creating connection to peer address %s: %s&quot;, address, err) return err } serverClient := pb.NewPeerClient(conn) ctx := context.Background() stream, err := serverClient.Chat(ctx) if err != nil { peerLogger.Errorf(&quot;Error establishing chat with peer address %s: %s&quot;, address, err) return err } peerLogger.Debugf(&quot;Established Chat with peer address: %s&quot;, address) err = p.handleChat(ctx, stream, true) stream.CloseSend() if err != nil { peerLogger.Errorf(&quot;Ending Chat with peer address %s due to error: %s&quot;, address, err) return err } return nil } 15.返回目前已经注册的PeerEndpoints func (p *Impl) GetPeers() (*pb.PeersMessage, error) { p.handlerMap.RLock() defer p.handlerMap.RUnlock() peers := []*pb.PeerEndpoint{} for _, msgHandler := range p.handlerMap.m { peerEndpoint, err := msgHandler.To() if err != nil { return nil, fmt.Errorf(&quot;Error getting peers: %s&quot;, err) } peers = append(peers, &amp;peerEndpoint) } peersMessage := &amp;pb.PeersMessage{Peers: peers} return peersMessage, nil } 15.1.处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 16.GetAllNodes返回存储在discovery列表中所有地址的一个数组 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } 17.FindMissingElements标识第一个切片中不存在于第二个切片中的元素，第二切片预期为第一切片的子集 func FindMissingElements(all []string, some []string) (delta []string) { all: for _, v1 := range all { for _, v2 := range some { if strings.Compare(v1, v2) == 0 { continue all } } delta = append(delta, v1) } return } 18. NewPeerClientConnectionWithAddress返回一个新的grpc.ClientConn来配置本地PEER func NewPeerClientConnectionWithAddress(peerAddress string) (*grpc.ClientConn, error) { if comm.TLSEnabled() { return comm.NewClientConnectionWithAddress(peerAddress, true, true, comm.InitTLSForPeer()) } return comm.NewClientConnectionWithAddress(peerAddress, true, false, nil) } 19.在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的 peer） type PeerClient interface { // 在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的peer） Chat(ctx context.Context, opts ...grpc.CallOption) (Peer_ChatClient, error) // 处理来自远程源的事务 ProcessTransaction(ctx context.Context, in *Transaction, opts ...grpc.CallOption) (*Response, error) } 20. handleChat执行过程中，建立消息循环，而这里的handler.HandleMessage。这个handler是Engine的消息响应句柄，该消息响应处理来自于Consensus模块 func (p *Impl) handleChat(ctx context.Context, stream ChatStream, initiatedStream bool) error { deadline, ok := ctx.Deadline() peerLogger.Debugf(&quot;Current context deadline = %s, ok = %v&quot;, deadline, ok) handler, err := p.handlerFactory(p, stream, initiatedStream) if err != nil { return fmt.Errorf(&quot;Error creating handler during handleChat initiation: %s&quot;, err) } defer handler.Stop() for { in, err := stream.Recv() if err == io.EOF { peerLogger.Debug(&quot;Received EOF, ending Chat&quot;) return nil } if err != nil { e := fmt.Errorf(&quot;Error during Chat, stopping handler: %s&quot;, err) peerLogger.Error(e.Error()) return e } err = handler.HandleMessage(in) if err != nil { peerLogger.Errorf(&quot;Error handling message: %s&quot;, err) //return err } } } 21.Impl是peer服务的实现 type Impl struct { handlerFactory HandlerFactory handlerMap *handlerMap ledgerWrapper *ledgerWrapper secHelper crypto.Peer engine Engine isValidator bool reconnectOnce sync.Once discHelper discovery.Discovery discPersist bool } 22.MessageHandler处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 23.ChatStream两个Peer之间的流支持接口 type ChatStream interface { Send(*pb.Message) error Recv() (*pb.Message, error) } 阅读更多" />
+<meta property="og:description" content="1.网络初始化的过程中执行以下内容，在创建节点Engine过程中该节点作为客户端的身份连接到其他Peer peerServer, err = peer.NewPeerWithEngine(secHelperFunc, helper.GetEngine) 2.返回一个使用提供的handler工厂函数,在新的聊天服务调用上创建新的handler句柄的Peer func NewPeerWithEngine(secHelperFunc func() crypto.Peer, engFactory EngineFactory) (peer *Impl, err error) { peer = new(Impl) peerNodes := peer.initDiscovery() peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.isValidator = ValidatorEnabled() peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } // 在引擎之前初始化账本，因为共识可能希望立即开始询问账本 ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.engine, err = engFactory(peer) if err != nil { return nil, err } peer.handlerFactory = peer.engine.GetHandlerFactory() if peer.handlerFactory == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.chatWithSomePeers(peerNodes) return peer, nil } 2.1.NewPeerWithHandler返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handlers句柄的Peer， func NewPeerWithHandler(secHelperFunc func() crypto.Peer, handlerFact HandlerFactory) (*Impl, error) { peer := new(Impl) peerNodes := peer.initDiscovery() if handlerFact == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.handlerFactory = handlerFact peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.chatWithSomePeers(peerNodes) return peer, nil } 2.2.Discovery是合并引导peer成员选择和对于NVP节点的VP节点选择接口 type Discovery interface { AddNode(string) bool // 添加一个地址到discovery列表 RemoveNode(string) bool // 从discovery列表中移出一个地址 GetAllNodes() []string // 返回这个节点维护的所有地址 GetRandomNodes(n int) []string // 返回这个peer连接的随机地址 FindNode(string) bool // 在discovery列表中找一个节点 } // DiscoveryImpl是一个Discovery的实现 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } // NewDiscoveryImpl 是一个Discovery实现的构造器 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } // AddNode添加一个地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } // RemoveNode从discovery列表中移出一个地址 func (di *DiscoveryImpl) RemoveNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; ok { di.nodes[address] = false return true } return false } // GetAllNodes返回这个节点维护的所有地址 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } // GetRandomNodes 返回n个随机节点 func (di *DiscoveryImpl) GetRandomNodes(n int) []string { var pick string randomNodes := make([]string, n) di.RLock() defer di.RUnlock() for i := 0; i &lt; n; i++ { for { pick = di.seq[di.random.Intn(len(di.nodes))] if di.nodes[pick] &amp;&amp; !inArray(pick, randomNodes) { break } } randomNodes[i] = pick } return randomNodes } // FindNode 如果地址存储在discovery列表中就返回true func (di *DiscoveryImpl) FindNode(address string) bool { di.RLock() defer di.RUnlock() _, ok := di.nodes[address] return ok } func inArray(element string, array []string) bool { for _, val := range array { if val == element { return true } } return false } 2.3.Peer是一个能够验证transactions的实体 type Peer interface { Node // GetID返回一个peer的验证标识符 GetID() []byte // GetEnrollmentID返回这个peer的登记id GetEnrollmentID() string // Sign 如果没有错误出现的话用这个验证器签名密钥签名消息和到处签名 Sign(msg []byte) ([]byte, error) // Verify 检查签名是否是vkID的验证密钥下的消息的有效签名 // 如果检查成功，Verify返回空意味着没有错误出现 // 如果vkID是空，然后针对该验证者的验证密钥验证签名. Verify(vkID, signature, message []byte) error } 3.从discovery列表中加载地址之前保存到磁盘并将它们添加到当前discovery列表 func (p *Impl) initDiscovery() []string { p.discHelper = discovery.NewDiscoveryImpl() p.discPersist = viper.GetBool(&quot;peer.discovery.persist&quot;) if !p.discPersist { peerLogger.Warning(&quot;Discovery list will not be persisted to disk&quot;) } // 加载一些预先保存的地址 addresses, err := p.LoadDiscoveryList() if err != nil { peerLogger.Errorf(&quot;%s&quot;, err) } for _, address := range addresses { // add them to the current discovery list _ = p.discHelper.AddNode(address) } peerLogger.Debugf(&quot;Retrieved discovery list from disk: %v&quot;, addresses) //解析配置文件, ENV标志, 等等. rootNodes := strings.Split(viper.GetString(&quot;peer.discovery.rootnode&quot;), &quot;,&quot;) if !(len(rootNodes) == 1 &amp;&amp; strings.Compare(rootNodes[0], &quot;&quot;) == 0) { addresses = append(rootNodes, p.discHelper.GetAllNodes()...) } return addresses } 4.NewDiscoveryImpl是一个Discovery构造器的实现 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } 4.1.相关结构体。 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } 5.加载一些预先保存的地址,LoadDiscoveryList使一个peer从数据库中加载到discovery列表 func (p *Impl) LoadDiscoveryList() ([]string, error) { var err error packed, err := p.Load(&quot;discovery&quot;) if err != nil { err = fmt.Errorf(&quot;Unable to load discovery list from DB: %s&quot;, err) peerLogger.Error(err) return nil, err } addresses := &amp;pb.PeersAddresses{} err = proto.Unmarshal(packed, addresses) if err != nil { err = fmt.Errorf(&quot;Could not unmarshal discovery list message: %s&quot;, err) peerLogger.Error(err) } return addresses.Addresses, err } 5.1.PeersAddresses定义 type PeersAddresses struct { Addresses []string `protobuf:&quot;bytes,1,rep,name=addresses&quot; json:&quot;addresses,omitempty&quot;` } 5.2 Unmarshaler是表示可以解组本身的对象的接口。 该方法应该在解码开始之前复位接收机。 参数指向可能被覆盖的数据，因此实现不应该保留对缓冲区的引用。 type Unmarshaler interface { Unmarshal([]byte) error } 6.Load 使一个peer能够读取与给定数据库键相对应的值 func (p *Impl) Load(key string) ([]byte, error) { db := db.GetDBHandle() return db.Get(db.PersistCF, []byte(key)) } 7.AddNode添加地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } 8.ValidatorEnabled返回peer.validator.enabled是否可用 func ValidatorEnabled() bool { if !configurationCached { cacheConfiguration() } return validatorEnabled } 9.SecurityEnabled 从配置中返回安全可用性能 func SecurityEnabled() bool { if !configurationCached { cacheConfiguration() } return securityEnabled } 10.Engine接口负责管理Peer通信（Handlers）和交易的进程， GetHandlerFactory 返回一个handler句柄来接收聊天流 type Engine interface { TransactionProccesor GetHandlerFactory() HandlerFactory } 11.chatWithSomePeers根据是不是验证节点的情况启动与1个或所有peer聊天的节点 func (p *Impl) chatWithSomePeers(addresses []string) { p.reconnectOnce.Do(func() { go p.ensureConnected() }) if len(addresses) == 0 { peerLogger.Debug(&quot;Starting up the first peer of a new network&quot;) return // 没什么事做 } for _, address := range addresses { if pe, err := GetPeerEndpoint(); err == nil { if address == pe.Address { peerLogger.Debugf(&quot;Skipping own address: %v&quot;, address) continue } } else { peerLogger.Errorf(&quot;Failed to obtain peer endpoint, %v&quot;, err) return } go p.chatWithPeer(address) } } 12.确保节点之间是已经连接好的 func (p *Impl) ensureConnected() { touchPeriod := viper.GetDuration(&quot;peer.discovery.touchPeriod&quot;) touchMaxNodes := viper.GetInt(&quot;peer.discovery.touchMaxNodes&quot;) tickChan := time.NewTicker(touchPeriod).C peerLogger.Debugf(&quot;Starting Peer reconnect service (touch service), with period = %s&quot;, touchPeriod) for { // 简单循环和检查是否需要从新连接 &lt;-tickChan peersMsg, err := p.GetPeers() if err != nil { peerLogger.Errorf(&quot;Error in touch service: %s&quot;, err.Error()) } allNodes := p.discHelper.GetAllNodes() // these will always be returned in random order if len(peersMsg.Peers) &lt; len(allNodes) { peerLogger.Warning(&quot;Touch service indicates dropped connections, attempting to reconnect...&quot;) delta := util.FindMissingElements(allNodes, getPeerAddresses(peersMsg)) if len(delta) &gt; touchMaxNodes { delta = delta[:touchMaxNodes] } p.chatWithSomePeers(delta) } else { peerLogger.Debug(&quot;Touch service indicates no dropped connections&quot;) } peerLogger.Debugf(&quot;Connected to: %v&quot;, getPeerAddresses(peersMsg)) peerLogger.Debugf(&quot;Discovery knows about: %v&quot;, allNodes) } } 13.GetPeerEndpoint 从缓存配置中返回peerEndpoint func GetPeerEndpoint() (*pb.PeerEndpoint, error) { if !configurationCached { cacheConfiguration() } return peerEndpoint, peerEndpointError } 14.Peer节点之间通信处理 func (p *Impl) chatWithPeer(address string) error { peerLogger.Debugf(&quot;Initiating Chat with peer address: %s&quot;, address) conn, err := NewPeerClientConnectionWithAddress(address) if err != nil { peerLogger.Errorf(&quot;Error creating connection to peer address %s: %s&quot;, address, err) return err } serverClient := pb.NewPeerClient(conn) ctx := context.Background() stream, err := serverClient.Chat(ctx) if err != nil { peerLogger.Errorf(&quot;Error establishing chat with peer address %s: %s&quot;, address, err) return err } peerLogger.Debugf(&quot;Established Chat with peer address: %s&quot;, address) err = p.handleChat(ctx, stream, true) stream.CloseSend() if err != nil { peerLogger.Errorf(&quot;Ending Chat with peer address %s due to error: %s&quot;, address, err) return err } return nil } 15.返回目前已经注册的PeerEndpoints func (p *Impl) GetPeers() (*pb.PeersMessage, error) { p.handlerMap.RLock() defer p.handlerMap.RUnlock() peers := []*pb.PeerEndpoint{} for _, msgHandler := range p.handlerMap.m { peerEndpoint, err := msgHandler.To() if err != nil { return nil, fmt.Errorf(&quot;Error getting peers: %s&quot;, err) } peers = append(peers, &amp;peerEndpoint) } peersMessage := &amp;pb.PeersMessage{Peers: peers} return peersMessage, nil } 15.1.处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 16.GetAllNodes返回存储在discovery列表中所有地址的一个数组 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } 17.FindMissingElements标识第一个切片中不存在于第二个切片中的元素，第二切片预期为第一切片的子集 func FindMissingElements(all []string, some []string) (delta []string) { all: for _, v1 := range all { for _, v2 := range some { if strings.Compare(v1, v2) == 0 { continue all } } delta = append(delta, v1) } return } 18. NewPeerClientConnectionWithAddress返回一个新的grpc.ClientConn来配置本地PEER func NewPeerClientConnectionWithAddress(peerAddress string) (*grpc.ClientConn, error) { if comm.TLSEnabled() { return comm.NewClientConnectionWithAddress(peerAddress, true, true, comm.InitTLSForPeer()) } return comm.NewClientConnectionWithAddress(peerAddress, true, false, nil) } 19.在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的 peer） type PeerClient interface { // 在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的peer） Chat(ctx context.Context, opts ...grpc.CallOption) (Peer_ChatClient, error) // 处理来自远程源的事务 ProcessTransaction(ctx context.Context, in *Transaction, opts ...grpc.CallOption) (*Response, error) } 20. handleChat执行过程中，建立消息循环，而这里的handler.HandleMessage。这个handler是Engine的消息响应句柄，该消息响应处理来自于Consensus模块 func (p *Impl) handleChat(ctx context.Context, stream ChatStream, initiatedStream bool) error { deadline, ok := ctx.Deadline() peerLogger.Debugf(&quot;Current context deadline = %s, ok = %v&quot;, deadline, ok) handler, err := p.handlerFactory(p, stream, initiatedStream) if err != nil { return fmt.Errorf(&quot;Error creating handler during handleChat initiation: %s&quot;, err) } defer handler.Stop() for { in, err := stream.Recv() if err == io.EOF { peerLogger.Debug(&quot;Received EOF, ending Chat&quot;) return nil } if err != nil { e := fmt.Errorf(&quot;Error during Chat, stopping handler: %s&quot;, err) peerLogger.Error(e.Error()) return e } err = handler.HandleMessage(in) if err != nil { peerLogger.Errorf(&quot;Error handling message: %s&quot;, err) //return err } } } 21.Impl是peer服务的实现 type Impl struct { handlerFactory HandlerFactory handlerMap *handlerMap ledgerWrapper *ledgerWrapper secHelper crypto.Peer engine Engine isValidator bool reconnectOnce sync.Once discHelper discovery.Discovery discPersist bool } 22.MessageHandler处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 23.ChatStream两个Peer之间的流支持接口 type ChatStream interface { Send(*pb.Message) error Recv() (*pb.Message, error) } 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/01/17/9db329f80fbfa0f6ebd4f79a9b67adcf.html" />
+<meta property="og:url" content="https://uzzz.org/2017/01/17/9db329f80fbfa0f6ebd4f79a9b67adcf.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-01-17T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"1.网络初始化的过程中执行以下内容，在创建节点Engine过程中该节点作为客户端的身份连接到其他Peer peerServer, err = peer.NewPeerWithEngine(secHelperFunc, helper.GetEngine) 2.返回一个使用提供的handler工厂函数,在新的聊天服务调用上创建新的handler句柄的Peer func NewPeerWithEngine(secHelperFunc func() crypto.Peer, engFactory EngineFactory) (peer *Impl, err error) { peer = new(Impl) peerNodes := peer.initDiscovery() peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.isValidator = ValidatorEnabled() peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } // 在引擎之前初始化账本，因为共识可能希望立即开始询问账本 ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.engine, err = engFactory(peer) if err != nil { return nil, err } peer.handlerFactory = peer.engine.GetHandlerFactory() if peer.handlerFactory == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.chatWithSomePeers(peerNodes) return peer, nil } 2.1.NewPeerWithHandler返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handlers句柄的Peer， func NewPeerWithHandler(secHelperFunc func() crypto.Peer, handlerFact HandlerFactory) (*Impl, error) { peer := new(Impl) peerNodes := peer.initDiscovery() if handlerFact == nil { return nil, errors.New(&quot;Cannot supply nil handler factory&quot;) } peer.handlerFactory = handlerFact peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)} peer.secHelper = secHelperFunc() // 为peer安装安全对象 if SecurityEnabled() { if peer.secHelper == nil { return nil, fmt.Errorf(&quot;Security helper not provided&quot;) } } ledgerPtr, err := ledger.GetLedger() if err != nil { return nil, fmt.Errorf(&quot;Error constructing NewPeerWithHandler: %s&quot;, err) } peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr} peer.chatWithSomePeers(peerNodes) return peer, nil } 2.2.Discovery是合并引导peer成员选择和对于NVP节点的VP节点选择接口 type Discovery interface { AddNode(string) bool // 添加一个地址到discovery列表 RemoveNode(string) bool // 从discovery列表中移出一个地址 GetAllNodes() []string // 返回这个节点维护的所有地址 GetRandomNodes(n int) []string // 返回这个peer连接的随机地址 FindNode(string) bool // 在discovery列表中找一个节点 } // DiscoveryImpl是一个Discovery的实现 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } // NewDiscoveryImpl 是一个Discovery实现的构造器 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } // AddNode添加一个地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } // RemoveNode从discovery列表中移出一个地址 func (di *DiscoveryImpl) RemoveNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; ok { di.nodes[address] = false return true } return false } // GetAllNodes返回这个节点维护的所有地址 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } // GetRandomNodes 返回n个随机节点 func (di *DiscoveryImpl) GetRandomNodes(n int) []string { var pick string randomNodes := make([]string, n) di.RLock() defer di.RUnlock() for i := 0; i &lt; n; i++ { for { pick = di.seq[di.random.Intn(len(di.nodes))] if di.nodes[pick] &amp;&amp; !inArray(pick, randomNodes) { break } } randomNodes[i] = pick } return randomNodes } // FindNode 如果地址存储在discovery列表中就返回true func (di *DiscoveryImpl) FindNode(address string) bool { di.RLock() defer di.RUnlock() _, ok := di.nodes[address] return ok } func inArray(element string, array []string) bool { for _, val := range array { if val == element { return true } } return false } 2.3.Peer是一个能够验证transactions的实体 type Peer interface { Node // GetID返回一个peer的验证标识符 GetID() []byte // GetEnrollmentID返回这个peer的登记id GetEnrollmentID() string // Sign 如果没有错误出现的话用这个验证器签名密钥签名消息和到处签名 Sign(msg []byte) ([]byte, error) // Verify 检查签名是否是vkID的验证密钥下的消息的有效签名 // 如果检查成功，Verify返回空意味着没有错误出现 // 如果vkID是空，然后针对该验证者的验证密钥验证签名. Verify(vkID, signature, message []byte) error } 3.从discovery列表中加载地址之前保存到磁盘并将它们添加到当前discovery列表 func (p *Impl) initDiscovery() []string { p.discHelper = discovery.NewDiscoveryImpl() p.discPersist = viper.GetBool(&quot;peer.discovery.persist&quot;) if !p.discPersist { peerLogger.Warning(&quot;Discovery list will not be persisted to disk&quot;) } // 加载一些预先保存的地址 addresses, err := p.LoadDiscoveryList() if err != nil { peerLogger.Errorf(&quot;%s&quot;, err) } for _, address := range addresses { // add them to the current discovery list _ = p.discHelper.AddNode(address) } peerLogger.Debugf(&quot;Retrieved discovery list from disk: %v&quot;, addresses) //解析配置文件, ENV标志, 等等. rootNodes := strings.Split(viper.GetString(&quot;peer.discovery.rootnode&quot;), &quot;,&quot;) if !(len(rootNodes) == 1 &amp;&amp; strings.Compare(rootNodes[0], &quot;&quot;) == 0) { addresses = append(rootNodes, p.discHelper.GetAllNodes()...) } return addresses } 4.NewDiscoveryImpl是一个Discovery构造器的实现 func NewDiscoveryImpl() *DiscoveryImpl { di := DiscoveryImpl{} di.nodes = make(map[string]bool) di.random = rand.New(rand.NewSource(time.Now().Unix())) return &amp;di } 4.1.相关结构体。 type DiscoveryImpl struct { sync.RWMutex nodes map[string]bool seq []string random *rand.Rand } 5.加载一些预先保存的地址,LoadDiscoveryList使一个peer从数据库中加载到discovery列表 func (p *Impl) LoadDiscoveryList() ([]string, error) { var err error packed, err := p.Load(&quot;discovery&quot;) if err != nil { err = fmt.Errorf(&quot;Unable to load discovery list from DB: %s&quot;, err) peerLogger.Error(err) return nil, err } addresses := &amp;pb.PeersAddresses{} err = proto.Unmarshal(packed, addresses) if err != nil { err = fmt.Errorf(&quot;Could not unmarshal discovery list message: %s&quot;, err) peerLogger.Error(err) } return addresses.Addresses, err } 5.1.PeersAddresses定义 type PeersAddresses struct { Addresses []string `protobuf:&quot;bytes,1,rep,name=addresses&quot; json:&quot;addresses,omitempty&quot;` } 5.2 Unmarshaler是表示可以解组本身的对象的接口。 该方法应该在解码开始之前复位接收机。 参数指向可能被覆盖的数据，因此实现不应该保留对缓冲区的引用。 type Unmarshaler interface { Unmarshal([]byte) error } 6.Load 使一个peer能够读取与给定数据库键相对应的值 func (p *Impl) Load(key string) ([]byte, error) { db := db.GetDBHandle() return db.Get(db.PersistCF, []byte(key)) } 7.AddNode添加地址到discovery列表 func (di *DiscoveryImpl) AddNode(address string) bool { di.Lock() defer di.Unlock() if _, ok := di.nodes[address]; !ok { di.seq = append(di.seq, address) di.nodes[address] = true } return di.nodes[address] } 8.ValidatorEnabled返回peer.validator.enabled是否可用 func ValidatorEnabled() bool { if !configurationCached { cacheConfiguration() } return validatorEnabled } 9.SecurityEnabled 从配置中返回安全可用性能 func SecurityEnabled() bool { if !configurationCached { cacheConfiguration() } return securityEnabled } 10.Engine接口负责管理Peer通信（Handlers）和交易的进程， GetHandlerFactory 返回一个handler句柄来接收聊天流 type Engine interface { TransactionProccesor GetHandlerFactory() HandlerFactory } 11.chatWithSomePeers根据是不是验证节点的情况启动与1个或所有peer聊天的节点 func (p *Impl) chatWithSomePeers(addresses []string) { p.reconnectOnce.Do(func() { go p.ensureConnected() }) if len(addresses) == 0 { peerLogger.Debug(&quot;Starting up the first peer of a new network&quot;) return // 没什么事做 } for _, address := range addresses { if pe, err := GetPeerEndpoint(); err == nil { if address == pe.Address { peerLogger.Debugf(&quot;Skipping own address: %v&quot;, address) continue } } else { peerLogger.Errorf(&quot;Failed to obtain peer endpoint, %v&quot;, err) return } go p.chatWithPeer(address) } } 12.确保节点之间是已经连接好的 func (p *Impl) ensureConnected() { touchPeriod := viper.GetDuration(&quot;peer.discovery.touchPeriod&quot;) touchMaxNodes := viper.GetInt(&quot;peer.discovery.touchMaxNodes&quot;) tickChan := time.NewTicker(touchPeriod).C peerLogger.Debugf(&quot;Starting Peer reconnect service (touch service), with period = %s&quot;, touchPeriod) for { // 简单循环和检查是否需要从新连接 &lt;-tickChan peersMsg, err := p.GetPeers() if err != nil { peerLogger.Errorf(&quot;Error in touch service: %s&quot;, err.Error()) } allNodes := p.discHelper.GetAllNodes() // these will always be returned in random order if len(peersMsg.Peers) &lt; len(allNodes) { peerLogger.Warning(&quot;Touch service indicates dropped connections, attempting to reconnect...&quot;) delta := util.FindMissingElements(allNodes, getPeerAddresses(peersMsg)) if len(delta) &gt; touchMaxNodes { delta = delta[:touchMaxNodes] } p.chatWithSomePeers(delta) } else { peerLogger.Debug(&quot;Touch service indicates no dropped connections&quot;) } peerLogger.Debugf(&quot;Connected to: %v&quot;, getPeerAddresses(peersMsg)) peerLogger.Debugf(&quot;Discovery knows about: %v&quot;, allNodes) } } 13.GetPeerEndpoint 从缓存配置中返回peerEndpoint func GetPeerEndpoint() (*pb.PeerEndpoint, error) { if !configurationCached { cacheConfiguration() } return peerEndpoint, peerEndpointError } 14.Peer节点之间通信处理 func (p *Impl) chatWithPeer(address string) error { peerLogger.Debugf(&quot;Initiating Chat with peer address: %s&quot;, address) conn, err := NewPeerClientConnectionWithAddress(address) if err != nil { peerLogger.Errorf(&quot;Error creating connection to peer address %s: %s&quot;, address, err) return err } serverClient := pb.NewPeerClient(conn) ctx := context.Background() stream, err := serverClient.Chat(ctx) if err != nil { peerLogger.Errorf(&quot;Error establishing chat with peer address %s: %s&quot;, address, err) return err } peerLogger.Debugf(&quot;Established Chat with peer address: %s&quot;, address) err = p.handleChat(ctx, stream, true) stream.CloseSend() if err != nil { peerLogger.Errorf(&quot;Ending Chat with peer address %s due to error: %s&quot;, address, err) return err } return nil } 15.返回目前已经注册的PeerEndpoints func (p *Impl) GetPeers() (*pb.PeersMessage, error) { p.handlerMap.RLock() defer p.handlerMap.RUnlock() peers := []*pb.PeerEndpoint{} for _, msgHandler := range p.handlerMap.m { peerEndpoint, err := msgHandler.To() if err != nil { return nil, fmt.Errorf(&quot;Error getting peers: %s&quot;, err) } peers = append(peers, &amp;peerEndpoint) } peersMessage := &amp;pb.PeersMessage{Peers: peers} return peersMessage, nil } 15.1.处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 16.GetAllNodes返回存储在discovery列表中所有地址的一个数组 func (di *DiscoveryImpl) GetAllNodes() []string { di.RLock() defer di.RUnlock() var addresses []string for address, valid := range di.nodes { if valid { addresses = append(addresses, address) // TODO Expensive, don&#39;t quite like it } } return addresses } 17.FindMissingElements标识第一个切片中不存在于第二个切片中的元素，第二切片预期为第一切片的子集 func FindMissingElements(all []string, some []string) (delta []string) { all: for _, v1 := range all { for _, v2 := range some { if strings.Compare(v1, v2) == 0 { continue all } } delta = append(delta, v1) } return } 18. NewPeerClientConnectionWithAddress返回一个新的grpc.ClientConn来配置本地PEER func NewPeerClientConnectionWithAddress(peerAddress string) (*grpc.ClientConn, error) { if comm.TLSEnabled() { return comm.NewClientConnectionWithAddress(peerAddress, true, true, comm.InitTLSForPeer()) } return comm.NewClientConnectionWithAddress(peerAddress, true, false, nil) } 19.在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的 peer） type PeerClient interface { // 在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的peer） Chat(ctx context.Context, opts ...grpc.CallOption) (Peer_ChatClient, error) // 处理来自远程源的事务 ProcessTransaction(ctx context.Context, in *Transaction, opts ...grpc.CallOption) (*Response, error) } 20. handleChat执行过程中，建立消息循环，而这里的handler.HandleMessage。这个handler是Engine的消息响应句柄，该消息响应处理来自于Consensus模块 func (p *Impl) handleChat(ctx context.Context, stream ChatStream, initiatedStream bool) error { deadline, ok := ctx.Deadline() peerLogger.Debugf(&quot;Current context deadline = %s, ok = %v&quot;, deadline, ok) handler, err := p.handlerFactory(p, stream, initiatedStream) if err != nil { return fmt.Errorf(&quot;Error creating handler during handleChat initiation: %s&quot;, err) } defer handler.Stop() for { in, err := stream.Recv() if err == io.EOF { peerLogger.Debug(&quot;Received EOF, ending Chat&quot;) return nil } if err != nil { e := fmt.Errorf(&quot;Error during Chat, stopping handler: %s&quot;, err) peerLogger.Error(e.Error()) return e } err = handler.HandleMessage(in) if err != nil { peerLogger.Errorf(&quot;Error handling message: %s&quot;, err) //return err } } } 21.Impl是peer服务的实现 type Impl struct { handlerFactory HandlerFactory handlerMap *handlerMap ledgerWrapper *ledgerWrapper secHelper crypto.Peer engine Engine isValidator bool reconnectOnce sync.Once discHelper discovery.Discovery discPersist bool } 22.MessageHandler处理开链消息的标准接口 type MessageHandler interface { RemoteLedger HandleMessage(msg *pb.Message) error SendMessage(msg *pb.Message) error To() (pb.PeerEndpoint, error) Stop() error } 23.ChatStream两个Peer之间的流支持接口 type ChatStream interface { Send(*pb.Message) error Recv() (*pb.Message, error) } 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/01/17/9db329f80fbfa0f6ebd4f79a9b67adcf.html","headline":"Hyperledger Fabric处理Peer与Peer之间通信的源码解析","dateModified":"2017-01-17T00:00:00+08:00","datePublished":"2017-01-17T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/01/17/9db329f80fbfa0f6ebd4f79a9b67adcf.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Hyperledger Fabric处理Peer与Peer之间通信的源码解析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20170117175958468?watermark/2/text/aHR0cDovL2Jsb2cuY3Nkbi5uZXQvamlhbmdfeGlueGluZw==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70/gravity/SouthEast" alt="这里写图片描述" title=""></p> 
+  <h4 id="1网络初始化的过程中执行以下内容在创建节点engine过程中该节点作为客户端的身份连接到其他peer">1.网络初始化的过程中执行以下内容，在创建节点Engine过程中该节点作为客户端的身份连接到其他Peer</h4> 
+  <pre><code>peerServer, err = peer.NewPeerWithEngine(secHelperFunc, helper.GetEngine)
+</code></pre> 
+  <h4 id="2返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handler句柄的peer">2.返回一个使用提供的handler工厂函数,在新的聊天服务调用上创建新的handler句柄的Peer</h4> 
+  <pre><code>func NewPeerWithEngine(secHelperFunc func() crypto.Peer, engFactory EngineFactory) (peer *Impl, err error) {
+    peer = new(Impl)
+    peerNodes := peer.initDiscovery()
+
+    peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)}
+
+    peer.isValidator = ValidatorEnabled()
+    peer.secHelper = secHelperFunc()
+
+    // 为peer安装安全对象
+    if SecurityEnabled() {
+        if peer.secHelper == nil {
+            return nil, fmt.Errorf("Security helper not provided")
+        }
+    }
+
+    // 在引擎之前初始化账本，因为共识可能希望立即开始询问账本
+    ledgerPtr, err := ledger.GetLedger()
+    if err != nil {
+        return nil, fmt.Errorf("Error constructing NewPeerWithHandler: %s", err)
+    }
+    peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr}
+
+    peer.engine, err = engFactory(peer)
+    if err != nil {
+        return nil, err
+    }
+    peer.handlerFactory = peer.engine.GetHandlerFactory()
+    if peer.handlerFactory == nil {
+        return nil, errors.New("Cannot supply nil handler factory")
+    }
+
+    peer.chatWithSomePeers(peerNodes)
+    return peer, nil
+
+}
+</code></pre> 
+  <h4 id="21newpeerwithhandler返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handlers句柄的peer">2.1.NewPeerWithHandler返回一个使用提供的handler工厂函数在新的聊天服务调用上创建新的handlers句柄的Peer，</h4> 
+  <pre><code>func NewPeerWithHandler(secHelperFunc func() crypto.Peer, handlerFact HandlerFactory) (*Impl, error) {
+    peer := new(Impl)
+    peerNodes := peer.initDiscovery()
+
+    if handlerFact == nil {
+        return nil, errors.New("Cannot supply nil handler factory")
+    }
+    peer.handlerFactory = handlerFact
+    peer.handlerMap = &amp;handlerMap{m: make(map[pb.PeerID]MessageHandler)}
+
+    peer.secHelper = secHelperFunc()
+
+    // 为peer安装安全对象
+    if SecurityEnabled() {
+        if peer.secHelper == nil {
+            return nil, fmt.Errorf("Security helper not provided")
+        }
+    }
+
+    ledgerPtr, err := ledger.GetLedger()
+    if err != nil {
+        return nil, fmt.Errorf("Error constructing NewPeerWithHandler: %s", err)
+    }
+    peer.ledgerWrapper = &amp;ledgerWrapper{ledger: ledgerPtr}
+
+    peer.chatWithSomePeers(peerNodes)
+    return peer, nil
+}
+</code></pre> 
+  <h4 id="22discovery是合并引导peer成员选择和对于nvp节点的vp节点选择接口">2.2.Discovery是合并引导peer成员选择和对于NVP节点的VP节点选择接口</h4> 
+  <pre><code>type Discovery interface {
+    AddNode(string) bool           // 添加一个地址到discovery列表
+    RemoveNode(string) bool        // 从discovery列表中移出一个地址
+    GetAllNodes() []string         // 返回这个节点维护的所有地址
+    GetRandomNodes(n int) []string // 返回这个peer连接的随机地址
+    FindNode(string) bool          // 在discovery列表中找一个节点
+}
+
+// DiscoveryImpl是一个Discovery的实现
+type DiscoveryImpl struct {
+    sync.RWMutex
+    nodes  map[string]bool
+    seq    []string
+    random *rand.Rand
+}
+
+// NewDiscoveryImpl 是一个Discovery实现的构造器
+func NewDiscoveryImpl() *DiscoveryImpl {
+    di := DiscoveryImpl{}
+    di.nodes = make(map[string]bool)
+    di.random = rand.New(rand.NewSource(time.Now().Unix()))
+    return &amp;di
+}
+
+// AddNode添加一个地址到discovery列表
+func (di *DiscoveryImpl) AddNode(address string) bool {
+    di.Lock()
+    defer di.Unlock()
+    if _, ok := di.nodes[address]; !ok {
+        di.seq = append(di.seq, address)
+        di.nodes[address] = true
+    }
+    return di.nodes[address]
+}
+
+// RemoveNode从discovery列表中移出一个地址
+func (di *DiscoveryImpl) RemoveNode(address string) bool {
+    di.Lock()
+    defer di.Unlock()
+    if _, ok := di.nodes[address]; ok {
+        di.nodes[address] = false
+        return true
+    }
+    return false
+}
+
+// GetAllNodes返回这个节点维护的所有地址
+func (di *DiscoveryImpl) GetAllNodes() []string {
+    di.RLock()
+    defer di.RUnlock()
+    var addresses []string
+    for address, valid := range di.nodes {
+        if valid {
+            addresses = append(addresses, address) // TODO Expensive, don't quite like it
+        }
+    }
+    return addresses
+}
+
+// GetRandomNodes 返回n个随机节点
+func (di *DiscoveryImpl) GetRandomNodes(n int) []string {
+    var pick string
+    randomNodes := make([]string, n)
+    di.RLock()
+    defer di.RUnlock()
+    for i := 0; i &lt; n; i++ {
+        for {
+            pick = di.seq[di.random.Intn(len(di.nodes))]
+            if di.nodes[pick] &amp;&amp; !inArray(pick, randomNodes) {
+                break
+            }
+        }
+        randomNodes[i] = pick
+    }
+    return randomNodes
+}
+
+// FindNode 如果地址存储在discovery列表中就返回true
+func (di *DiscoveryImpl) FindNode(address string) bool {
+    di.RLock()
+    defer di.RUnlock()
+    _, ok := di.nodes[address]
+    return ok
+}
+
+func inArray(element string, array []string) bool {
+    for _, val := range array {
+        if val == element {
+            return true
+        }
+    }
+    return false
+}
+</code></pre> 
+  <h4 id="23peer是一个能够验证transactions的实体">2.3.Peer是一个能够验证transactions的实体</h4> 
+  <pre><code>type Peer interface {
+    Node
+
+    // GetID返回一个peer的验证标识符
+    GetID() []byte
+
+    // GetEnrollmentID返回这个peer的登记id
+    GetEnrollmentID() string
+
+    // Sign 如果没有错误出现的话用这个验证器签名密钥签名消息和到处签名
+    Sign(msg []byte) ([]byte, error)
+
+    // Verify 检查签名是否是vkID的验证密钥下的消息的有效签名
+    // 如果检查成功，Verify返回空意味着没有错误出现
+    // 如果vkID是空，然后针对该验证者的验证密钥验证签名.
+    Verify(vkID, signature, message []byte) error
+}
+</code></pre> 
+  <h4 id="3从discovery列表中加载地址之前保存到磁盘并将它们添加到当前discovery列表">3.从discovery列表中加载地址之前保存到磁盘并将它们添加到当前discovery列表</h4> 
+  <pre><code>func (p *Impl) initDiscovery() []string {
+    p.discHelper = discovery.NewDiscoveryImpl()
+    p.discPersist = viper.GetBool("peer.discovery.persist")
+    if !p.discPersist {
+        peerLogger.Warning("Discovery list will not be persisted to disk")
+    }
+    // 加载一些预先保存的地址
+    addresses, err := p.LoadDiscoveryList()
+    if err != nil {
+        peerLogger.Errorf("%s", err)
+    }
+    for _, address := range addresses { // add them to the current discovery list
+        _ = p.discHelper.AddNode(address)
+    }
+    peerLogger.Debugf("Retrieved discovery list from disk: %v", addresses)
+    //解析配置文件, ENV标志, 等等.
+    rootNodes := strings.Split(viper.GetString("peer.discovery.rootnode"), ",")
+    if !(len(rootNodes) == 1 &amp;&amp; strings.Compare(rootNodes[0], "") == 0) {
+        addresses = append(rootNodes, p.discHelper.GetAllNodes()...)
+    }
+    return addresses
+}
+</code></pre> 
+  <h4 id="4newdiscoveryimpl是一个discovery构造器的实现">4.NewDiscoveryImpl是一个Discovery构造器的实现</h4> 
+  <pre><code>func NewDiscoveryImpl() *DiscoveryImpl {
+    di := DiscoveryImpl{}
+    di.nodes = make(map[string]bool)
+    di.random = rand.New(rand.NewSource(time.Now().Unix()))
+    return &amp;di
+}
+</code></pre> 
+  <h4 id="41相关结构体">4.1.相关结构体。</h4> 
+  <pre><code>type DiscoveryImpl struct {
+    sync.RWMutex
+    nodes  map[string]bool
+    seq    []string
+    random *rand.Rand
+}
+</code></pre> 
+  <h4 id="5加载一些预先保存的地址loaddiscoverylist使一个peer从数据库中加载到discovery列表">5.加载一些预先保存的地址,LoadDiscoveryList使一个peer从数据库中加载到discovery列表</h4> 
+  <pre><code>func (p *Impl) LoadDiscoveryList() ([]string, error) {
+    var err error
+    packed, err := p.Load("discovery")
+    if err != nil {
+        err = fmt.Errorf("Unable to load discovery list from DB: %s", err)
+        peerLogger.Error(err)
+        return nil, err
+    }
+    addresses := &amp;pb.PeersAddresses{}
+    err = proto.Unmarshal(packed, addresses)
+    if err != nil {
+        err = fmt.Errorf("Could not unmarshal discovery list message: %s", err)
+        peerLogger.Error(err)
+    }
+    return addresses.Addresses, err
+}
+</code></pre> 
+  <h4 id="51peersaddresses定义">5.1.PeersAddresses定义</h4> 
+  <pre><code>type PeersAddresses struct {
+    Addresses []string `protobuf:"bytes,1,rep,name=addresses" json:"addresses,omitempty"`
+}
+</code></pre> 
+  <h4 id="52-unmarshaler是表示可以解组本身的对象的接口-该方法应该在解码开始之前复位接收机-参数指向可能被覆盖的数据因此实现不应该保留对缓冲区的引用">5.2 Unmarshaler是表示可以解组本身的对象的接口。 该方法应该在解码开始之前复位接收机。 参数指向可能被覆盖的数据，因此实现不应该保留对缓冲区的引用。</h4> 
+  <pre><code>type Unmarshaler interface {
+    Unmarshal([]byte) error
+}
+</code></pre> 
+  <h4 id="6load-使一个peer能够读取与给定数据库键相对应的值">6.Load 使一个peer能够读取与给定数据库键相对应的值</h4> 
+  <pre><code>func (p *Impl) Load(key string) ([]byte, error) {
+    db := db.GetDBHandle()
+    return db.Get(db.PersistCF, []byte(key))
+}
+</code></pre> 
+  <h4 id="7addnode添加地址到discovery列表">7.AddNode添加地址到discovery列表</h4> 
+  <pre><code>func (di *DiscoveryImpl) AddNode(address string) bool {
+    di.Lock()
+    defer di.Unlock()
+    if _, ok := di.nodes[address]; !ok {
+        di.seq = append(di.seq, address)
+        di.nodes[address] = true
+    }
+    return di.nodes[address]
+}
+</code></pre> 
+  <h4 id="8validatorenabled返回peervalidatorenabled是否可用">8.ValidatorEnabled返回peer.validator.enabled是否可用</h4> 
+  <pre><code>func ValidatorEnabled() bool {
+    if !configurationCached {
+        cacheConfiguration()
+    }
+    return validatorEnabled
+}
+</code></pre> 
+  <h4 id="9securityenabled-从配置中返回安全可用性能">9.SecurityEnabled 从配置中返回安全可用性能</h4> 
+  <pre><code>func SecurityEnabled() bool {
+    if !configurationCached {
+        cacheConfiguration()
+    }
+    return securityEnabled
+}
+</code></pre> 
+  <h4 id="10engine接口负责管理peer通信handlers和交易的进程-gethandlerfactory-返回一个handler句柄来接收聊天流">10.Engine接口负责管理Peer通信（Handlers）和交易的进程， GetHandlerFactory 返回一个handler句柄来接收聊天流</h4> 
+  <pre><code>type Engine interface {
+    TransactionProccesor
+    GetHandlerFactory() HandlerFactory
+}
+</code></pre> 
+  <h4 id="11chatwithsomepeers根据是不是验证节点的情况启动与1个或所有peer聊天的节点">11.chatWithSomePeers根据是不是验证节点的情况启动与1个或所有peer聊天的节点</h4> 
+  <pre><code>func (p *Impl) chatWithSomePeers(addresses []string) {
+    p.reconnectOnce.Do(func() {
+        go p.ensureConnected()
+    })
+    if len(addresses) == 0 {
+        peerLogger.Debug("Starting up the first peer of a new network")
+        return // 没什么事做
+    }
+    for _, address := range addresses {
+        if pe, err := GetPeerEndpoint(); err == nil {
+            if address == pe.Address {
+                peerLogger.Debugf("Skipping own address: %v", address)
+                continue
+            }
+        } else {
+            peerLogger.Errorf("Failed to obtain peer endpoint, %v", err)
+            return
+        }
+        go p.chatWithPeer(address)
+    }
+}
+</code></pre> 
+  <h4 id="12确保节点之间是已经连接好的">12.确保节点之间是已经连接好的</h4> 
+  <pre><code>func (p *Impl) ensureConnected() {
+    touchPeriod := viper.GetDuration("peer.discovery.touchPeriod")
+    touchMaxNodes := viper.GetInt("peer.discovery.touchMaxNodes")
+    tickChan := time.NewTicker(touchPeriod).C
+    peerLogger.Debugf("Starting Peer reconnect service (touch service), with period = %s", touchPeriod)
+    for {
+        // 简单循环和检查是否需要从新连接
+        &lt;-tickChan
+        peersMsg, err := p.GetPeers()
+        if err != nil {
+            peerLogger.Errorf("Error in touch service: %s", err.Error())
+        }
+        allNodes := p.discHelper.GetAllNodes() // these will always be returned in random order
+        if len(peersMsg.Peers) &lt; len(allNodes) {
+            peerLogger.Warning("Touch service indicates dropped connections, attempting to reconnect...")
+            delta := util.FindMissingElements(allNodes, getPeerAddresses(peersMsg))
+            if len(delta) &gt; touchMaxNodes {
+                delta = delta[:touchMaxNodes]
+            }
+            p.chatWithSomePeers(delta)
+        } else {
+            peerLogger.Debug("Touch service indicates no dropped connections")
+        }
+        peerLogger.Debugf("Connected to: %v", getPeerAddresses(peersMsg))
+        peerLogger.Debugf("Discovery knows about: %v", allNodes)
+    }
+
+}
+</code></pre> 
+  <h4 id="13getpeerendpoint-从缓存配置中返回peerendpoint">13.GetPeerEndpoint 从缓存配置中返回peerEndpoint</h4> 
+  <pre><code>func GetPeerEndpoint() (*pb.PeerEndpoint, error) {
+    if !configurationCached {
+        cacheConfiguration()
+    }
+    return peerEndpoint, peerEndpointError
+}
+</code></pre> 
+  <h4 id="14peer节点之间通信处理">14.Peer节点之间通信处理</h4> 
+  <pre><code>func (p *Impl) chatWithPeer(address string) error {
+    peerLogger.Debugf("Initiating Chat with peer address: %s", address)
+    conn, err := NewPeerClientConnectionWithAddress(address)
+    if err != nil {
+        peerLogger.Errorf("Error creating connection to peer address %s: %s", address, err)
+        return err
+    }
+    serverClient := pb.NewPeerClient(conn)
+    ctx := context.Background()
+    stream, err := serverClient.Chat(ctx)
+    if err != nil {
+        peerLogger.Errorf("Error establishing chat with peer address %s: %s", address, err)
+        return err
+    }
+    peerLogger.Debugf("Established Chat with peer address: %s", address)
+    err = p.handleChat(ctx, stream, true)
+    stream.CloseSend()
+    if err != nil {
+        peerLogger.Errorf("Ending Chat with peer address %s due to error: %s", address, err)
+        return err
+    }
+    return nil
+}
+</code></pre> 
+  <h4 id="15返回目前已经注册的peerendpoints">15.返回目前已经注册的PeerEndpoints</h4> 
+  <pre><code>func (p *Impl) GetPeers() (*pb.PeersMessage, error) {
+    p.handlerMap.RLock()
+    defer p.handlerMap.RUnlock()
+    peers := []*pb.PeerEndpoint{}
+    for _, msgHandler := range p.handlerMap.m {
+        peerEndpoint, err := msgHandler.To()
+        if err != nil {
+            return nil, fmt.Errorf("Error getting peers: %s", err)
+        }
+        peers = append(peers, &amp;peerEndpoint)
+    }
+    peersMessage := &amp;pb.PeersMessage{Peers: peers}
+    return peersMessage, nil
+}
+</code></pre> 
+  <h4 id="151处理开链消息的标准接口">15.1.处理开链消息的标准接口</h4> 
+  <pre><code>type MessageHandler interface {
+    RemoteLedger
+    HandleMessage(msg *pb.Message) error
+    SendMessage(msg *pb.Message) error
+    To() (pb.PeerEndpoint, error)
+    Stop() error
+}
+</code></pre> 
+  <h4 id="16getallnodes返回存储在discovery列表中所有地址的一个数组">16.GetAllNodes返回存储在discovery列表中所有地址的一个数组</h4> 
+  <pre><code>func (di *DiscoveryImpl) GetAllNodes() []string {
+    di.RLock()
+    defer di.RUnlock()
+    var addresses []string
+    for address, valid := range di.nodes {
+        if valid {
+            addresses = append(addresses, address) // TODO Expensive, don't quite like it
+        }
+    }
+    return addresses
+}
+</code></pre> 
+  <h4 id="17findmissingelements标识第一个切片中不存在于第二个切片中的元素第二切片预期为第一切片的子集">17.FindMissingElements标识第一个切片中不存在于第二个切片中的元素，第二切片预期为第一切片的子集</h4> 
+  <pre><code>func FindMissingElements(all []string, some []string) (delta []string) {
+all:
+    for _, v1 := range all {
+        for _, v2 := range some {
+            if strings.Compare(v1, v2) == 0 {
+                continue all
+            }
+        }
+        delta = append(delta, v1)
+    }
+    return
+}
+</code></pre> 
+  <h4 id="18-newpeerclientconnectionwithaddress返回一个新的grpcclientconn来配置本地peer">18. NewPeerClientConnectionWithAddress返回一个新的grpc.ClientConn来配置本地PEER</h4> 
+  <pre><code>func NewPeerClientConnectionWithAddress(peerAddress string) (*grpc.ClientConn, error) {
+    if comm.TLSEnabled() {
+        return comm.NewClientConnectionWithAddress(peerAddress, true, true, comm.InitTLSForPeer())
+    }
+    return comm.NewClientConnectionWithAddress(peerAddress, true, false, nil)
+}
+</code></pre> 
+  <h4 id="19在chat会话期间接受一个流消息同时接收其他消息例如来自其他的-peer">19.在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的 peer）</h4> 
+  <pre><code>type PeerClient interface {
+    // 在chat会话期间接受一个流消息，同时接收其他消息（例如来自其他的peer）
+    Chat(ctx context.Context, opts ...grpc.CallOption) (Peer_ChatClient, error)
+    // 处理来自远程源的事务
+    ProcessTransaction(ctx context.Context, in *Transaction, opts ...grpc.CallOption) (*Response, error)
+}
+</code></pre> 
+  <h4 id="20-handlechat执行过程中建立消息循环而这里的handlerhandlemessage这个handler是engine的消息响应句柄该消息响应处理来自于consensus模块">20. handleChat执行过程中，建立消息循环，而这里的handler.HandleMessage。这个handler是Engine的消息响应句柄，该消息响应处理来自于Consensus模块</h4> 
+  <pre><code>func (p *Impl) handleChat(ctx context.Context, stream ChatStream, initiatedStream bool) error {
+    deadline, ok := ctx.Deadline()
+    peerLogger.Debugf("Current context deadline = %s, ok = %v", deadline, ok)
+    handler, err := p.handlerFactory(p, stream, initiatedStream)
+    if err != nil {
+        return fmt.Errorf("Error creating handler during handleChat initiation: %s", err)
+    }
+    defer handler.Stop()
+    for {
+        in, err := stream.Recv()
+        if err == io.EOF {
+            peerLogger.Debug("Received EOF, ending Chat")
+            return nil
+        }
+        if err != nil {
+            e := fmt.Errorf("Error during Chat, stopping handler: %s", err)
+            peerLogger.Error(e.Error())
+            return e
+        }
+        err = handler.HandleMessage(in)
+        if err != nil {
+            peerLogger.Errorf("Error handling message: %s", err)
+            //return err
+        }
+    }
+}
+</code></pre> 
+  <h4 id="21impl是peer服务的实现">21.Impl是peer服务的实现</h4> 
+  <pre><code>type Impl struct {
+    handlerFactory HandlerFactory
+    handlerMap     *handlerMap
+    ledgerWrapper  *ledgerWrapper
+    secHelper      crypto.Peer
+    engine         Engine
+    isValidator    bool
+    reconnectOnce  sync.Once
+    discHelper     discovery.Discovery
+    discPersist    bool
+}
+</code></pre> 
+  <h4 id="22messagehandler处理开链消息的标准接口">22.MessageHandler处理开链消息的标准接口</h4> 
+  <pre><code>type MessageHandler interface {
+    RemoteLedger
+    HandleMessage(msg *pb.Message) error
+    SendMessage(msg *pb.Message) error
+    To() (pb.PeerEndpoint, error)
+    Stop() error
+}
+</code></pre> 
+  <h4 id="23chatstream两个peer之间的流支持接口">23.ChatStream两个Peer之间的流支持接口</h4> 
+  <pre><code>type ChatStream interface {
+    Send(*pb.Message) error
+    Recv() (*pb.Message, error)
+}
+</code></pre> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/jiang_xinxing/article/details/54585452,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/jiang_xinxing/article/details/54585452,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

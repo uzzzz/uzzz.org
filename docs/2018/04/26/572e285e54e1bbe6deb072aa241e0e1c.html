@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>比特币bitcoin源码解析之重要流程详解 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="比特币bitcoin源码解析之重要流程详解" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1. 重要处理流程详解 1.1交易 1.1.1 交易连接输入ConnectInputs Ctransaction:: ConnectInputs对应的处理流程 对交易的输入进行判断，并对交易输入在对应交易输入索引中进行占用（标记为花费），并将对应的交易保存起来。源码如下： // 交易输入链接，将对应的交易输入占用对应的交易输入的花费标记 bool CTransaction::ConnectInputs(CTxDB&amp; txdb, map&lt;uint256, CTxIndex&gt;&amp; mapTestPool, CDiskTxPos posThisTx, int nHeight, int64&amp; nFees, bool fBlock, bool fMiner, int64 nMinFee) { // 占用前一个交易对应的花费指针 // Take over previous transactions&#39; spent pointers if (!IsCoinBase()) { int64 nValueIn = 0; for (int i = 0; i &lt; vin.size(); i++) { COutPoint prevout = vin[i].prevout; // Read txindex CTxIndex txindex; bool fFound = true; if (fMiner &amp;&amp; mapTestPool.count(prevout.hash)) { // Get txindex from current proposed changes txindex = mapTestPool[prevout.hash]; } else { // Read txindex from txdb fFound = txdb.ReadTxIndex(prevout.hash, txindex); } if (!fFound &amp;&amp; (fBlock || fMiner)) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx %s index entry not found&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); // Read txPrev CTransaction txPrev; if (!fFound || txindex.pos == CDiskTxPos(1,1,1)) { // Get prev tx from single transactions in memory CRITICAL_BLOCK(cs_mapTransactions) { if (!mapTransactions.count(prevout.hash)) return error(&quot;ConnectInputs() : %s mapTransactions prev not found %s&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); txPrev = mapTransactions[prevout.hash]; } if (!fFound) txindex.vSpent.resize(txPrev.vout.size()); } else { // Get prev tx from disk if (!txPrev.ReadFromDisk(txindex.pos)) return error(&quot;ConnectInputs() : %s ReadFromDisk prev tx %s failed&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); } if (prevout.n &gt;= txPrev.vout.size() || prevout.n &gt;= txindex.vSpent.size()) return error(&quot;ConnectInputs() : %s prevout.n out of range %d %d %d&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size()); // If prev is coinbase, check that it&#39;s matured if (txPrev.IsCoinBase()) for (CBlockIndex* pindex = pindexBest; pindex &amp;&amp; nBestHeight - pindex-&gt;nHeight &lt; COINBASE_MATURITY-1; pindex = pindex-&gt;pprev) if (pindex-&gt;nBlockPos == txindex.pos.nBlockPos &amp;&amp; pindex-&gt;nFile == txindex.pos.nFile) return error(&quot;ConnectInputs() : tried to spend coinbase at depth %d&quot;, nBestHeight - pindex-&gt;nHeight); // Verify signature if (!VerifySignature(txPrev, *this, i)) return error(&quot;ConnectInputs() : %s VerifySignature failed&quot;, GetHash().ToString().substr(0,6).c_str()); // Check for conflicts if (!txindex.vSpent[prevout.n].IsNull()) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx already used at %s&quot;, GetHash().ToString().substr(0,6).c_str(), txindex.vSpent[prevout.n].ToString().c_str()); // 标记前一个交易对应的交易索引对应的花费标记 // Mark outpoints as spent txindex.vSpent[prevout.n] = posThisTx; // Write back if (fBlock) txdb.UpdateTxIndex(prevout.hash, txindex); else if (fMiner) mapTestPool[prevout.hash] = txindex; nValueIn += txPrev.vout[prevout.n].nValue; } // Tally transaction fees int64 nTxFee = nValueIn - GetValueOut(); if (nTxFee &lt; 0) return error(&quot;ConnectInputs() : %s nTxFee &lt; 0&quot;, GetHash().ToString().substr(0,6).c_str()); if (nTxFee &lt; nMinFee) return false; nFees += nTxFee; } if (fBlock) { // Add transaction to disk index if (!txdb.AddTxIndex(*this, posThisTx, nHeight)) return error(&quot;ConnectInputs() : AddTxPos failed&quot;); } else if (fMiner) { // 如果是矿工，将对应的交易放入对应的交易测试池中 // Add transaction to test pool mapTestPool[GetHash()] = CTxIndex(CDiskTxPos(1,1,1), vout.size()); } return true; } 1.1.2 交易断开连接输入DisconnectInputs Ctransaction:: DisconnectInputs对应的处理流程 释放交易对应的输入占用的标记，即是释放交易输入对应的交易索引中的标记，并将交易从库或者mapTestPool中进行移除。源码如下: // 断开连接输入，就是释放交易对应的输入的占用：即是释放交易输入对应的交易索引的标记占用 bool CTransaction::DisconnectInputs(CTxDB&amp; txdb) { // 放弃或者让出前一个交易对应的花费标记指针 // Relinquish previous transactions&#39; spent pointers if (!IsCoinBase()) // 币基 { foreach(const CTxIn&amp; txin, vin) { COutPoint prevout = txin.prevout; // Get prev txindex from disk CTxIndex txindex; // 从数据库中读取对应的交易的索引 if (!txdb.ReadTxIndex(prevout.hash, txindex)) return error(&quot;DisconnectInputs() : ReadTxIndex failed&quot;); if (prevout.n &gt;= txindex.vSpent.size()) return error(&quot;DisconnectInputs() : prevout.n out of range&quot;); // Mark outpoint as not spent txindex.vSpent[prevout.n].SetNull(); // Write back txdb.UpdateTxIndex(prevout.hash, txindex); } } // 将当前交易从交易索引表中移除 // Remove transaction from index if (!txdb.EraseTxIndex(*this)) return error(&quot;DisconnectInputs() : EraseTxPos failed&quot;); return true; } 1.1.3 交易接受处理 CTransaction::AcceptTransaction对应的处理流程 判断交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中源码如下: // 判断这边交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中 bool CTransaction::AcceptTransaction(CTxDB&amp; txdb, bool fCheckInputs, bool* pfMissingInputs) { if (pfMissingInputs) *pfMissingInputs = false; // 币基交易仅仅在块中有效，币基交易不能做为一个单独的交易 // Coinbase is only valid in a block, not as a loose transaction if (IsCoinBase()) return error(&quot;AcceptTransaction() : coinbase as individual tx&quot;); if (!CheckTransaction()) return error(&quot;AcceptTransaction() : CheckTransaction failed&quot;); // 判断当前交易是否我们已经接收到过了 // Do we already have it? uint256 hash = GetHash(); CRITICAL_BLOCK(cs_mapTransactions) if (mapTransactions.count(hash)) // 判断内存对象map中是否已经存在 return false; if (fCheckInputs) if (txdb.ContainsTx(hash)) // 判断交易db中是否已经存在 return false; // 判断当前交易对象是否和内存中的交易对象列表冲突 // Check for conflicts with in-memory transactions CTransaction* ptxOld = NULL; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 根据当前交易对应的输入交易，获得对应输入交易对应的输出交易 if (mapNextTx.count(outpoint)) { // Allow replacing with a newer version of the same transaction // i ==0 为coinbase，也就是coinbase可以替换 if (i != 0) return false; // 相对于当前交易更老的交易 ptxOld = mapNextTx[outpoint].ptx; if (!IsNewerThan(*ptxOld)) // 判断是否比原来交易更新，通过nSequences判断 return false; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 当前交易的输入在内存对象mapNextTx对应的输出如果都存在，且都指向原来老的交易，则接收此交易 if (!mapNextTx.count(outpoint) || mapNextTx[outpoint].ptx != ptxOld) return false; } break; } } // 对前交易进行校验和设置前交易对应的输出为花费标记 // Check against previous transactions map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; if (fCheckInputs &amp;&amp; !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false)) { if (pfMissingInputs) *pfMissingInputs = true; return error(&quot;AcceptTransaction() : ConnectInputs failed %s&quot;, hash.ToString().substr(0,6).c_str()); } // 将当前交易存储在内存，如果老的交易存在，则从内存中将对应的交易移除 // Store transaction in memory CRITICAL_BLOCK(cs_mapTransactions) { if (ptxOld) { printf(&quot;mapTransaction.erase(%s) replacing with new version\n&quot;, ptxOld-&gt;GetHash().ToString().c_str()); mapTransactions.erase(ptxOld-&gt;GetHash()); } // 将当前交易存储到内存对象中 AddToMemoryPool(); } // 如果老的交易存在，则从钱包中将老的交易移除 ///// are we sure this is ok when loading transactions or restoring block txes // If updated, erase old tx from wallet if (ptxOld) // 将交易从钱包映射对象mapWallet中移除，同时将交易从CWalletDB中移除 EraseFromWallet(ptxOld-&gt;GetHash()); printf(&quot;AcceptTransaction(): accepted %s\n&quot;, hash.ToString().substr(0,6).c_str()); return true; } 1.2 工作量难度获得 对应的方法是： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) 看源码更清晰，主要是保证对应的区块10分钟产生一个，14天更新一下对应的工作量难度（即是产生2016区块就要更新一下工作量难度），源码如下： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) { const unsigned int nTargetTimespan = 14 * 24 * 60 * 60; // two weeks const unsigned int nTargetSpacing = 10 * 60; // 10分钟产生一个block // 每隔2016个块对应的工作量难度就需要重新计算一次 const unsigned int nInterval = nTargetTimespan / nTargetSpacing; // 中间隔了多少个block 2016个块 // 说明当前块是一个创世区块，因为当前块对应的前一个区块为空 // Genesis block if (pindexLast == NULL) return bnProofOfWorkLimit.GetCompact(); // 如果不等于0不进行工作量难度改变 // Only change once per interval if ((pindexLast-&gt;nHeight+1) % nInterval != 0) return pindexLast-&gt;nBits; // 往前推2016个区块 // Go back by what we want to be 14 days worth of blocks const CBlockIndex* pindexFirst = pindexLast; for (int i = 0; pindexFirst &amp;&amp; i &lt; nInterval-1; I++) pindexFirst = pindexFirst-&gt;pprev; assert(pindexFirst); // 当前区块的前一个区块创建时间 减去 从当前区块向前推2016个区块得到区块创建时间 // Limit adjustment step unsigned int nActualTimespan = pindexLast-&gt;nTime - pindexFirst-&gt;nTime; printf(&quot; nActualTimespan = %d before bounds\n&quot;, nActualTimespan); // 控制目标难度调整的跨度不能太大 if (nActualTimespan &lt; nTargetTimespan/4) nActualTimespan = nTargetTimespan/4; if (nActualTimespan &gt; nTargetTimespan*4) nActualTimespan = nTargetTimespan*4; // 重新目标计算难度：当前区块对应的前一个区块对应的目标难度 * 实际2016区块对应的创建时间间隔 / 目标时间跨度14天 // Retarget CBigNum bnNew; bnNew.SetCompact(pindexLast-&gt;nBits); bnNew *= nActualTimespan; bnNew /= nTargetTimespan; // 如果计算的工作量难度（值越大对应的工作难度越小）小于当前对应的工作量难度 if (bnNew &gt; bnProofOfWorkLimit) bnNew = bnProofOfWorkLimit; /// debug print printf(&quot;\n\n\nGetNextWorkRequired RETARGET *****\n&quot;); printf(&quot;nTargetTimespan = %d nActualTimespan = %d\n&quot;, nTargetTimespan, nActualTimespan); printf(&quot;Before: %08x %s\n&quot;, pindexLast-&gt;nBits, CBigNum().SetCompact(pindexLast-&gt;nBits).getuint256().ToString().c_str()); printf(&quot;After: %08x %s\n&quot;, bnNew.GetCompact(), bnNew.getuint256().ToString().c_str()); return bnNew.GetCompact(); } 1.3 区块对应的创建时间 在新建区块的时候，要设置对应区块的时间，由于是P2P的，没有中心化节点能够获得对应的时间，所以需要从对应的区块链中区块的时间中取中位数，然后和当前时间去最大值，对应的代码就是： pblock-&gt;nTime = max((pindexPrev ? pindexPrev-&gt;GetMedianTimePast()+1 : 0), GetAdjustedTime()); 1.4 block接收处理 1.4.1 区块连接处理 对应的方法是: // 区块链接：每一个交易链接，增加到区块索引链中 bool CBlock::ConnectBlock(CTxDB&amp; txdb, CBlockIndex* pindex) { //// issue here: it doesn&#39;t know the version unsigned int nTxPos = pindex-&gt;nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size()); map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; foreach(CTransaction&amp; tx, vtx) { CDiskTxPos posThisTx(pindex-&gt;nFile, pindex-&gt;nBlockPos, nTxPos); nTxPos += ::GetSerializeSize(tx, SER_DISK); // 对每一个交易进行输入链接判断 if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex-&gt;nHeight, nFees, true, false)) return false; } // 币基交易中对应的输出不能大于整个对应的奖励+交易手续费 if (vtx[0].GetValueOut() &gt; GetBlockValue(nFees)) return false; // Update block index on disk without changing it in memory. // The memory index structure will be changed after the db commits. if (pindex-&gt;pprev) { // 将当前区块索引 挂在 前一个区块索引之后 CDiskBlockIndex blockindexPrev(pindex-&gt;pprev); blockindexPrev.hashNext = pindex-&gt;GetBlockHash(); txdb.WriteBlockIndex(blockindexPrev); } // 监视在block中哪些 // Watch for transactions paying to me foreach(CTransaction&amp; tx, vtx) AddToWalletIfMine(tx, this); return true; } 1.4.2区块分叉处理 方法如下： // 重新组织区块的索引：因为此时已经出现区块链分叉 bool Reorganize(CTxDB&amp; txdb, CBlockIndex* pindexNew) { printf(&quot;*** REORGANIZE ***\n&quot;); // 找到区块分叉点 // Find the fork CBlockIndex* pfork = pindexBest; CBlockIndex* plonger = pindexNew; // 找到主链和分叉链对应的交叉点 while (pfork != plonger) { if (!(pfork = pfork-&gt;pprev)) return error(&quot;Reorganize() : pfork-&gt;pprev is null&quot;); while (plonger-&gt;nHeight &gt; pfork-&gt;nHeight) if (!(plonger = plonger-&gt;pprev)) return error(&quot;Reorganize() : plonger-&gt;pprev is null&quot;); } // 列举出当前节点认为的最长链中（从当前最长链到交叉点）失去连接的块 // List of what to disconnect vector&lt;CBlockIndex*&gt; vDisconnect; for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex-&gt;pprev) vDisconnect.push_back(pindex); // 获取需要连接的块，因为自己认为的最长链实际上不是最长链 // List of what to connect vector&lt;CBlockIndex*&gt; vConnect; for (CBlockIndex* pindex = pindexNew; pindex != pfork; pindex = pindex-&gt;pprev) vConnect.push_back(pindex); // 因为上面放入的时候是倒着放的，所以这里在将这个逆序，得到正向的 reverse(vConnect.begin(), vConnect.end()); // 释放断链（仅仅释放对应的block链，对应的block索引链还没有释放） // Disconnect shorter branch vector&lt;CTransaction&gt; vResurrect; foreach(CBlockIndex* pindex, vDisconnect) { CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for disconnect failed&quot;); if (!block.DisconnectBlock(txdb, pindex)) return error(&quot;Reorganize() : DisconnectBlock failed&quot;); // 将释放块中的交易放入vResurrect，等待复活 // Queue memory transactions to resurrect foreach(const CTransaction&amp; tx, block.vtx) if (!tx.IsCoinBase()) vResurrect.push_back(tx); } // 连接最长的分支 // Connect longer branch vector&lt;CTransaction&gt; vDelete; for (int i = 0; i &lt; vConnect.size(); i++) { CBlockIndex* pindex = vConnect[i]; CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for connect failed&quot;); if (!block.ConnectBlock(txdb, pindex)) { // 如果block连接失败之后，说明这个block无效，则删除这块之后的分支 // Invalid block, delete the rest of this branch txdb.TxnAbort(); for (int j = i; j &lt; vConnect.size(); j++) { CBlockIndex* pindex = vConnect[j]; pindex-&gt;EraseBlockFromDisk(); txdb.EraseBlockIndex(pindex-&gt;GetBlockHash()); mapBlockIndex.erase(pindex-&gt;GetBlockHash()); delete pindex; } return error(&quot;Reorganize() : ConnectBlock failed&quot;); } // 将加入区块链的块中的交易从对应的内存中删除 // Queue memory transactions to delete foreach(const CTransaction&amp; tx, block.vtx) vDelete.push_back(tx); } // 写入最长链 if (!txdb.WriteHashBestChain(pindexNew-&gt;GetBlockHash())) return error(&quot;Reorganize() : WriteHashBestChain failed&quot;); // Commit now because resurrecting 复活could take some time txdb.TxnCommit(); // 释放对应的块索引链 // Disconnect shorter branch foreach(CBlockIndex* pindex, vDisconnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = NULL; // 表示这些块没有在主链上 // 形成一条主链的块索引链 // Connect longer branch foreach(CBlockIndex* pindex, vConnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = pindex; // 从释放链接的分支中获取对应的交易，将这些交易放入对应的全局变量中得到复活 // Resurrect memory transactions that were in the disconnected branch foreach(CTransaction&amp; tx, vResurrect) tx.AcceptTransaction(txdb, false); // 从全局变量中删除那些已经在主链中的交易 // Delete redundant memory transactions that are in the connected branch foreach(CTransaction&amp; tx, vDelete) tx.RemoveFromMemoryPool(); return true; } 1.4.3将区块新增到区块索引链中 // 将当前区块增加到对应的区块索引链中mapBlockIndex bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos) { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AddToBlockIndex() : %s already exists&quot;, hash.ToString().substr(0,14).c_str()); // Construct new block index object CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this); if (!pindexNew) return error(&quot;AddToBlockIndex() : new CBlockIndex failed&quot;); map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first; pindexNew-&gt;phashBlock = &amp;((*mi).first); map&lt;uint256, CBlockIndex*&gt;::iterator miPrev = mapBlockIndex.find(hashPrevBlock); if (miPrev != mapBlockIndex.end()) { pindexNew-&gt;pprev = (*miPrev).second; // 增加前一个区块索引对应的高度 pindexNew-&gt;nHeight = pindexNew-&gt;pprev-&gt;nHeight + 1; } CTxDB txdb; txdb.TxnBegin(); txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew)); // 更新最长链对应的指针 // New best // 新链的高度已经超过主链了（即是新链到创世区块的长度 大于 本节点认为的最长链到创世区块的长度 if (pindexNew-&gt;nHeight &gt; nBestHeight) { // 判断是否是创世区块 if (pindexGenesisBlock == NULL &amp;&amp; hash == hashGenesisBlock) { pindexGenesisBlock = pindexNew; txdb.WriteHashBestChain(hash); } else if (hashPrevBlock == hashBestChain) { // 如果当前块对应的前一个块是最长的链 // Adding to current best branch if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash)) { txdb.TxnAbort(); pindexNew-&gt;EraseBlockFromDisk(); mapBlockIndex.erase(pindexNew-&gt;GetBlockHash()); delete pindexNew; return error(&quot;AddToBlockIndex() : ConnectBlock failed&quot;); } txdb.TxnCommit(); // 如果在最长链中，才设置对应区块索引的pnext字段，将当前区块索引设置在前一个区块索引的后面 pindexNew-&gt;pprev-&gt;pnext = pindexNew; // 如果对应的区块已经放入到主链中，则对应的区块交易应该要从本节点保存的交易内存池中删除 // Delete redundant memory transactions foreach(CTransaction&amp; tx, vtx) tx.RemoveFromMemoryPool(); } else { // 当前区块既不是创世区块，且当前区块对应的前一个区块也不在最长主链上的情况 // 再加上新区块所在链的长度大于本节点认为主链的长度，所有将进行分叉处理 // New best branch if (!Reorganize(txdb, pindexNew)) { txdb.TxnAbort(); return error(&quot;AddToBlockIndex() : Reorganize failed&quot;); } } // New best link hashBestChain = hash; pindexBest = pindexNew; nBestHeight = pindexBest-&gt;nHeight; nTransactionsUpdated++; printf(&quot;AddToBlockIndex: new best=%s height=%d\n&quot;, hashBestChain.ToString().substr(0,14).c_str(), nBestHeight); } txdb.TxnCommit(); txdb.Close(); // 转播那些到目前为止还没有进入block中的钱包交易 // Relay wallet transactions that haven&#39;t gotten in yet if (pindexNew == pindexBest) RelayWalletTransactions();// 在节点之间进行转播 MainFrameRepaint(); return true; } 1.4.4区块接受处理 对应的方法如下： // 判断当前区块能够被接收 bool CBlock::AcceptBlock() { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AcceptBlock() : block already in mapBlockIndex&quot;); // Get prev block index map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.find(hashPrevBlock); if (mi == mapBlockIndex.end()) return error(&quot;AcceptBlock() : prev block not found&quot;); CBlockIndex* pindexPrev = (*mi).second; // 当前块创建的时间要大于前一个块对应的中位数时间 // Check timestamp against prev if (nTime &lt;= pindexPrev-&gt;GetMedianTimePast()) return error(&quot;AcceptBlock() : block&#39;s timestamp is too early&quot;); //工作量证明校验：每一个节点自己计算对应的工作量难度 // Check proof of work if (nBits != GetNextWorkRequired(pindexPrev)) return error(&quot;AcceptBlock() : incorrect proof of work&quot;); // Write block to history file unsigned int nFile; unsigned int nBlockPos; // 将块信息写入文件中 if (!WriteToDisk(!fClient, nFile, nBlockPos)) return error(&quot;AcceptBlock() : WriteToDisk failed&quot;); // 增加块对应的快索引信息 if (!AddToBlockIndex(nFile, nBlockPos)) return error(&quot;AcceptBlock() : AddToBlockIndex failed&quot;); if (hashBestChain == hash) RelayInventory(CInv(MSG_BLOCK, hash)); // // Add atoms to user reviews for coins created // vector&lt;unsigned char&gt; vchPubKey; // if (ExtractPubKey(vtx[0].vout[0].scriptPubKey, false, vchPubKey)) // { // unsigned short nAtom = GetRand(USHRT_MAX - 100) + 100; // vector&lt;unsigned short&gt; vAtoms(1, nAtom); // AddAtomsAndPropagate(Hash(vchPubKey.begin(), vchPubKey.end()), vAtoms, true); // } return true; } 2. 源码地址 我对比特币bitcoin-0.1.0源码加了详细的注释，对应的下载地址：https://github.com/lwjaiyjk/bitcoin-comment-0.1.0.git 转载请说明出处 阅读更多" />
+<meta property="og:description" content="1. 重要处理流程详解 1.1交易 1.1.1 交易连接输入ConnectInputs Ctransaction:: ConnectInputs对应的处理流程 对交易的输入进行判断，并对交易输入在对应交易输入索引中进行占用（标记为花费），并将对应的交易保存起来。源码如下： // 交易输入链接，将对应的交易输入占用对应的交易输入的花费标记 bool CTransaction::ConnectInputs(CTxDB&amp; txdb, map&lt;uint256, CTxIndex&gt;&amp; mapTestPool, CDiskTxPos posThisTx, int nHeight, int64&amp; nFees, bool fBlock, bool fMiner, int64 nMinFee) { // 占用前一个交易对应的花费指针 // Take over previous transactions&#39; spent pointers if (!IsCoinBase()) { int64 nValueIn = 0; for (int i = 0; i &lt; vin.size(); i++) { COutPoint prevout = vin[i].prevout; // Read txindex CTxIndex txindex; bool fFound = true; if (fMiner &amp;&amp; mapTestPool.count(prevout.hash)) { // Get txindex from current proposed changes txindex = mapTestPool[prevout.hash]; } else { // Read txindex from txdb fFound = txdb.ReadTxIndex(prevout.hash, txindex); } if (!fFound &amp;&amp; (fBlock || fMiner)) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx %s index entry not found&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); // Read txPrev CTransaction txPrev; if (!fFound || txindex.pos == CDiskTxPos(1,1,1)) { // Get prev tx from single transactions in memory CRITICAL_BLOCK(cs_mapTransactions) { if (!mapTransactions.count(prevout.hash)) return error(&quot;ConnectInputs() : %s mapTransactions prev not found %s&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); txPrev = mapTransactions[prevout.hash]; } if (!fFound) txindex.vSpent.resize(txPrev.vout.size()); } else { // Get prev tx from disk if (!txPrev.ReadFromDisk(txindex.pos)) return error(&quot;ConnectInputs() : %s ReadFromDisk prev tx %s failed&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); } if (prevout.n &gt;= txPrev.vout.size() || prevout.n &gt;= txindex.vSpent.size()) return error(&quot;ConnectInputs() : %s prevout.n out of range %d %d %d&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size()); // If prev is coinbase, check that it&#39;s matured if (txPrev.IsCoinBase()) for (CBlockIndex* pindex = pindexBest; pindex &amp;&amp; nBestHeight - pindex-&gt;nHeight &lt; COINBASE_MATURITY-1; pindex = pindex-&gt;pprev) if (pindex-&gt;nBlockPos == txindex.pos.nBlockPos &amp;&amp; pindex-&gt;nFile == txindex.pos.nFile) return error(&quot;ConnectInputs() : tried to spend coinbase at depth %d&quot;, nBestHeight - pindex-&gt;nHeight); // Verify signature if (!VerifySignature(txPrev, *this, i)) return error(&quot;ConnectInputs() : %s VerifySignature failed&quot;, GetHash().ToString().substr(0,6).c_str()); // Check for conflicts if (!txindex.vSpent[prevout.n].IsNull()) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx already used at %s&quot;, GetHash().ToString().substr(0,6).c_str(), txindex.vSpent[prevout.n].ToString().c_str()); // 标记前一个交易对应的交易索引对应的花费标记 // Mark outpoints as spent txindex.vSpent[prevout.n] = posThisTx; // Write back if (fBlock) txdb.UpdateTxIndex(prevout.hash, txindex); else if (fMiner) mapTestPool[prevout.hash] = txindex; nValueIn += txPrev.vout[prevout.n].nValue; } // Tally transaction fees int64 nTxFee = nValueIn - GetValueOut(); if (nTxFee &lt; 0) return error(&quot;ConnectInputs() : %s nTxFee &lt; 0&quot;, GetHash().ToString().substr(0,6).c_str()); if (nTxFee &lt; nMinFee) return false; nFees += nTxFee; } if (fBlock) { // Add transaction to disk index if (!txdb.AddTxIndex(*this, posThisTx, nHeight)) return error(&quot;ConnectInputs() : AddTxPos failed&quot;); } else if (fMiner) { // 如果是矿工，将对应的交易放入对应的交易测试池中 // Add transaction to test pool mapTestPool[GetHash()] = CTxIndex(CDiskTxPos(1,1,1), vout.size()); } return true; } 1.1.2 交易断开连接输入DisconnectInputs Ctransaction:: DisconnectInputs对应的处理流程 释放交易对应的输入占用的标记，即是释放交易输入对应的交易索引中的标记，并将交易从库或者mapTestPool中进行移除。源码如下: // 断开连接输入，就是释放交易对应的输入的占用：即是释放交易输入对应的交易索引的标记占用 bool CTransaction::DisconnectInputs(CTxDB&amp; txdb) { // 放弃或者让出前一个交易对应的花费标记指针 // Relinquish previous transactions&#39; spent pointers if (!IsCoinBase()) // 币基 { foreach(const CTxIn&amp; txin, vin) { COutPoint prevout = txin.prevout; // Get prev txindex from disk CTxIndex txindex; // 从数据库中读取对应的交易的索引 if (!txdb.ReadTxIndex(prevout.hash, txindex)) return error(&quot;DisconnectInputs() : ReadTxIndex failed&quot;); if (prevout.n &gt;= txindex.vSpent.size()) return error(&quot;DisconnectInputs() : prevout.n out of range&quot;); // Mark outpoint as not spent txindex.vSpent[prevout.n].SetNull(); // Write back txdb.UpdateTxIndex(prevout.hash, txindex); } } // 将当前交易从交易索引表中移除 // Remove transaction from index if (!txdb.EraseTxIndex(*this)) return error(&quot;DisconnectInputs() : EraseTxPos failed&quot;); return true; } 1.1.3 交易接受处理 CTransaction::AcceptTransaction对应的处理流程 判断交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中源码如下: // 判断这边交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中 bool CTransaction::AcceptTransaction(CTxDB&amp; txdb, bool fCheckInputs, bool* pfMissingInputs) { if (pfMissingInputs) *pfMissingInputs = false; // 币基交易仅仅在块中有效，币基交易不能做为一个单独的交易 // Coinbase is only valid in a block, not as a loose transaction if (IsCoinBase()) return error(&quot;AcceptTransaction() : coinbase as individual tx&quot;); if (!CheckTransaction()) return error(&quot;AcceptTransaction() : CheckTransaction failed&quot;); // 判断当前交易是否我们已经接收到过了 // Do we already have it? uint256 hash = GetHash(); CRITICAL_BLOCK(cs_mapTransactions) if (mapTransactions.count(hash)) // 判断内存对象map中是否已经存在 return false; if (fCheckInputs) if (txdb.ContainsTx(hash)) // 判断交易db中是否已经存在 return false; // 判断当前交易对象是否和内存中的交易对象列表冲突 // Check for conflicts with in-memory transactions CTransaction* ptxOld = NULL; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 根据当前交易对应的输入交易，获得对应输入交易对应的输出交易 if (mapNextTx.count(outpoint)) { // Allow replacing with a newer version of the same transaction // i ==0 为coinbase，也就是coinbase可以替换 if (i != 0) return false; // 相对于当前交易更老的交易 ptxOld = mapNextTx[outpoint].ptx; if (!IsNewerThan(*ptxOld)) // 判断是否比原来交易更新，通过nSequences判断 return false; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 当前交易的输入在内存对象mapNextTx对应的输出如果都存在，且都指向原来老的交易，则接收此交易 if (!mapNextTx.count(outpoint) || mapNextTx[outpoint].ptx != ptxOld) return false; } break; } } // 对前交易进行校验和设置前交易对应的输出为花费标记 // Check against previous transactions map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; if (fCheckInputs &amp;&amp; !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false)) { if (pfMissingInputs) *pfMissingInputs = true; return error(&quot;AcceptTransaction() : ConnectInputs failed %s&quot;, hash.ToString().substr(0,6).c_str()); } // 将当前交易存储在内存，如果老的交易存在，则从内存中将对应的交易移除 // Store transaction in memory CRITICAL_BLOCK(cs_mapTransactions) { if (ptxOld) { printf(&quot;mapTransaction.erase(%s) replacing with new version\n&quot;, ptxOld-&gt;GetHash().ToString().c_str()); mapTransactions.erase(ptxOld-&gt;GetHash()); } // 将当前交易存储到内存对象中 AddToMemoryPool(); } // 如果老的交易存在，则从钱包中将老的交易移除 ///// are we sure this is ok when loading transactions or restoring block txes // If updated, erase old tx from wallet if (ptxOld) // 将交易从钱包映射对象mapWallet中移除，同时将交易从CWalletDB中移除 EraseFromWallet(ptxOld-&gt;GetHash()); printf(&quot;AcceptTransaction(): accepted %s\n&quot;, hash.ToString().substr(0,6).c_str()); return true; } 1.2 工作量难度获得 对应的方法是： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) 看源码更清晰，主要是保证对应的区块10分钟产生一个，14天更新一下对应的工作量难度（即是产生2016区块就要更新一下工作量难度），源码如下： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) { const unsigned int nTargetTimespan = 14 * 24 * 60 * 60; // two weeks const unsigned int nTargetSpacing = 10 * 60; // 10分钟产生一个block // 每隔2016个块对应的工作量难度就需要重新计算一次 const unsigned int nInterval = nTargetTimespan / nTargetSpacing; // 中间隔了多少个block 2016个块 // 说明当前块是一个创世区块，因为当前块对应的前一个区块为空 // Genesis block if (pindexLast == NULL) return bnProofOfWorkLimit.GetCompact(); // 如果不等于0不进行工作量难度改变 // Only change once per interval if ((pindexLast-&gt;nHeight+1) % nInterval != 0) return pindexLast-&gt;nBits; // 往前推2016个区块 // Go back by what we want to be 14 days worth of blocks const CBlockIndex* pindexFirst = pindexLast; for (int i = 0; pindexFirst &amp;&amp; i &lt; nInterval-1; I++) pindexFirst = pindexFirst-&gt;pprev; assert(pindexFirst); // 当前区块的前一个区块创建时间 减去 从当前区块向前推2016个区块得到区块创建时间 // Limit adjustment step unsigned int nActualTimespan = pindexLast-&gt;nTime - pindexFirst-&gt;nTime; printf(&quot; nActualTimespan = %d before bounds\n&quot;, nActualTimespan); // 控制目标难度调整的跨度不能太大 if (nActualTimespan &lt; nTargetTimespan/4) nActualTimespan = nTargetTimespan/4; if (nActualTimespan &gt; nTargetTimespan*4) nActualTimespan = nTargetTimespan*4; // 重新目标计算难度：当前区块对应的前一个区块对应的目标难度 * 实际2016区块对应的创建时间间隔 / 目标时间跨度14天 // Retarget CBigNum bnNew; bnNew.SetCompact(pindexLast-&gt;nBits); bnNew *= nActualTimespan; bnNew /= nTargetTimespan; // 如果计算的工作量难度（值越大对应的工作难度越小）小于当前对应的工作量难度 if (bnNew &gt; bnProofOfWorkLimit) bnNew = bnProofOfWorkLimit; /// debug print printf(&quot;\n\n\nGetNextWorkRequired RETARGET *****\n&quot;); printf(&quot;nTargetTimespan = %d nActualTimespan = %d\n&quot;, nTargetTimespan, nActualTimespan); printf(&quot;Before: %08x %s\n&quot;, pindexLast-&gt;nBits, CBigNum().SetCompact(pindexLast-&gt;nBits).getuint256().ToString().c_str()); printf(&quot;After: %08x %s\n&quot;, bnNew.GetCompact(), bnNew.getuint256().ToString().c_str()); return bnNew.GetCompact(); } 1.3 区块对应的创建时间 在新建区块的时候，要设置对应区块的时间，由于是P2P的，没有中心化节点能够获得对应的时间，所以需要从对应的区块链中区块的时间中取中位数，然后和当前时间去最大值，对应的代码就是： pblock-&gt;nTime = max((pindexPrev ? pindexPrev-&gt;GetMedianTimePast()+1 : 0), GetAdjustedTime()); 1.4 block接收处理 1.4.1 区块连接处理 对应的方法是: // 区块链接：每一个交易链接，增加到区块索引链中 bool CBlock::ConnectBlock(CTxDB&amp; txdb, CBlockIndex* pindex) { //// issue here: it doesn&#39;t know the version unsigned int nTxPos = pindex-&gt;nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size()); map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; foreach(CTransaction&amp; tx, vtx) { CDiskTxPos posThisTx(pindex-&gt;nFile, pindex-&gt;nBlockPos, nTxPos); nTxPos += ::GetSerializeSize(tx, SER_DISK); // 对每一个交易进行输入链接判断 if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex-&gt;nHeight, nFees, true, false)) return false; } // 币基交易中对应的输出不能大于整个对应的奖励+交易手续费 if (vtx[0].GetValueOut() &gt; GetBlockValue(nFees)) return false; // Update block index on disk without changing it in memory. // The memory index structure will be changed after the db commits. if (pindex-&gt;pprev) { // 将当前区块索引 挂在 前一个区块索引之后 CDiskBlockIndex blockindexPrev(pindex-&gt;pprev); blockindexPrev.hashNext = pindex-&gt;GetBlockHash(); txdb.WriteBlockIndex(blockindexPrev); } // 监视在block中哪些 // Watch for transactions paying to me foreach(CTransaction&amp; tx, vtx) AddToWalletIfMine(tx, this); return true; } 1.4.2区块分叉处理 方法如下： // 重新组织区块的索引：因为此时已经出现区块链分叉 bool Reorganize(CTxDB&amp; txdb, CBlockIndex* pindexNew) { printf(&quot;*** REORGANIZE ***\n&quot;); // 找到区块分叉点 // Find the fork CBlockIndex* pfork = pindexBest; CBlockIndex* plonger = pindexNew; // 找到主链和分叉链对应的交叉点 while (pfork != plonger) { if (!(pfork = pfork-&gt;pprev)) return error(&quot;Reorganize() : pfork-&gt;pprev is null&quot;); while (plonger-&gt;nHeight &gt; pfork-&gt;nHeight) if (!(plonger = plonger-&gt;pprev)) return error(&quot;Reorganize() : plonger-&gt;pprev is null&quot;); } // 列举出当前节点认为的最长链中（从当前最长链到交叉点）失去连接的块 // List of what to disconnect vector&lt;CBlockIndex*&gt; vDisconnect; for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex-&gt;pprev) vDisconnect.push_back(pindex); // 获取需要连接的块，因为自己认为的最长链实际上不是最长链 // List of what to connect vector&lt;CBlockIndex*&gt; vConnect; for (CBlockIndex* pindex = pindexNew; pindex != pfork; pindex = pindex-&gt;pprev) vConnect.push_back(pindex); // 因为上面放入的时候是倒着放的，所以这里在将这个逆序，得到正向的 reverse(vConnect.begin(), vConnect.end()); // 释放断链（仅仅释放对应的block链，对应的block索引链还没有释放） // Disconnect shorter branch vector&lt;CTransaction&gt; vResurrect; foreach(CBlockIndex* pindex, vDisconnect) { CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for disconnect failed&quot;); if (!block.DisconnectBlock(txdb, pindex)) return error(&quot;Reorganize() : DisconnectBlock failed&quot;); // 将释放块中的交易放入vResurrect，等待复活 // Queue memory transactions to resurrect foreach(const CTransaction&amp; tx, block.vtx) if (!tx.IsCoinBase()) vResurrect.push_back(tx); } // 连接最长的分支 // Connect longer branch vector&lt;CTransaction&gt; vDelete; for (int i = 0; i &lt; vConnect.size(); i++) { CBlockIndex* pindex = vConnect[i]; CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for connect failed&quot;); if (!block.ConnectBlock(txdb, pindex)) { // 如果block连接失败之后，说明这个block无效，则删除这块之后的分支 // Invalid block, delete the rest of this branch txdb.TxnAbort(); for (int j = i; j &lt; vConnect.size(); j++) { CBlockIndex* pindex = vConnect[j]; pindex-&gt;EraseBlockFromDisk(); txdb.EraseBlockIndex(pindex-&gt;GetBlockHash()); mapBlockIndex.erase(pindex-&gt;GetBlockHash()); delete pindex; } return error(&quot;Reorganize() : ConnectBlock failed&quot;); } // 将加入区块链的块中的交易从对应的内存中删除 // Queue memory transactions to delete foreach(const CTransaction&amp; tx, block.vtx) vDelete.push_back(tx); } // 写入最长链 if (!txdb.WriteHashBestChain(pindexNew-&gt;GetBlockHash())) return error(&quot;Reorganize() : WriteHashBestChain failed&quot;); // Commit now because resurrecting 复活could take some time txdb.TxnCommit(); // 释放对应的块索引链 // Disconnect shorter branch foreach(CBlockIndex* pindex, vDisconnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = NULL; // 表示这些块没有在主链上 // 形成一条主链的块索引链 // Connect longer branch foreach(CBlockIndex* pindex, vConnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = pindex; // 从释放链接的分支中获取对应的交易，将这些交易放入对应的全局变量中得到复活 // Resurrect memory transactions that were in the disconnected branch foreach(CTransaction&amp; tx, vResurrect) tx.AcceptTransaction(txdb, false); // 从全局变量中删除那些已经在主链中的交易 // Delete redundant memory transactions that are in the connected branch foreach(CTransaction&amp; tx, vDelete) tx.RemoveFromMemoryPool(); return true; } 1.4.3将区块新增到区块索引链中 // 将当前区块增加到对应的区块索引链中mapBlockIndex bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos) { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AddToBlockIndex() : %s already exists&quot;, hash.ToString().substr(0,14).c_str()); // Construct new block index object CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this); if (!pindexNew) return error(&quot;AddToBlockIndex() : new CBlockIndex failed&quot;); map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first; pindexNew-&gt;phashBlock = &amp;((*mi).first); map&lt;uint256, CBlockIndex*&gt;::iterator miPrev = mapBlockIndex.find(hashPrevBlock); if (miPrev != mapBlockIndex.end()) { pindexNew-&gt;pprev = (*miPrev).second; // 增加前一个区块索引对应的高度 pindexNew-&gt;nHeight = pindexNew-&gt;pprev-&gt;nHeight + 1; } CTxDB txdb; txdb.TxnBegin(); txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew)); // 更新最长链对应的指针 // New best // 新链的高度已经超过主链了（即是新链到创世区块的长度 大于 本节点认为的最长链到创世区块的长度 if (pindexNew-&gt;nHeight &gt; nBestHeight) { // 判断是否是创世区块 if (pindexGenesisBlock == NULL &amp;&amp; hash == hashGenesisBlock) { pindexGenesisBlock = pindexNew; txdb.WriteHashBestChain(hash); } else if (hashPrevBlock == hashBestChain) { // 如果当前块对应的前一个块是最长的链 // Adding to current best branch if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash)) { txdb.TxnAbort(); pindexNew-&gt;EraseBlockFromDisk(); mapBlockIndex.erase(pindexNew-&gt;GetBlockHash()); delete pindexNew; return error(&quot;AddToBlockIndex() : ConnectBlock failed&quot;); } txdb.TxnCommit(); // 如果在最长链中，才设置对应区块索引的pnext字段，将当前区块索引设置在前一个区块索引的后面 pindexNew-&gt;pprev-&gt;pnext = pindexNew; // 如果对应的区块已经放入到主链中，则对应的区块交易应该要从本节点保存的交易内存池中删除 // Delete redundant memory transactions foreach(CTransaction&amp; tx, vtx) tx.RemoveFromMemoryPool(); } else { // 当前区块既不是创世区块，且当前区块对应的前一个区块也不在最长主链上的情况 // 再加上新区块所在链的长度大于本节点认为主链的长度，所有将进行分叉处理 // New best branch if (!Reorganize(txdb, pindexNew)) { txdb.TxnAbort(); return error(&quot;AddToBlockIndex() : Reorganize failed&quot;); } } // New best link hashBestChain = hash; pindexBest = pindexNew; nBestHeight = pindexBest-&gt;nHeight; nTransactionsUpdated++; printf(&quot;AddToBlockIndex: new best=%s height=%d\n&quot;, hashBestChain.ToString().substr(0,14).c_str(), nBestHeight); } txdb.TxnCommit(); txdb.Close(); // 转播那些到目前为止还没有进入block中的钱包交易 // Relay wallet transactions that haven&#39;t gotten in yet if (pindexNew == pindexBest) RelayWalletTransactions();// 在节点之间进行转播 MainFrameRepaint(); return true; } 1.4.4区块接受处理 对应的方法如下： // 判断当前区块能够被接收 bool CBlock::AcceptBlock() { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AcceptBlock() : block already in mapBlockIndex&quot;); // Get prev block index map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.find(hashPrevBlock); if (mi == mapBlockIndex.end()) return error(&quot;AcceptBlock() : prev block not found&quot;); CBlockIndex* pindexPrev = (*mi).second; // 当前块创建的时间要大于前一个块对应的中位数时间 // Check timestamp against prev if (nTime &lt;= pindexPrev-&gt;GetMedianTimePast()) return error(&quot;AcceptBlock() : block&#39;s timestamp is too early&quot;); //工作量证明校验：每一个节点自己计算对应的工作量难度 // Check proof of work if (nBits != GetNextWorkRequired(pindexPrev)) return error(&quot;AcceptBlock() : incorrect proof of work&quot;); // Write block to history file unsigned int nFile; unsigned int nBlockPos; // 将块信息写入文件中 if (!WriteToDisk(!fClient, nFile, nBlockPos)) return error(&quot;AcceptBlock() : WriteToDisk failed&quot;); // 增加块对应的快索引信息 if (!AddToBlockIndex(nFile, nBlockPos)) return error(&quot;AcceptBlock() : AddToBlockIndex failed&quot;); if (hashBestChain == hash) RelayInventory(CInv(MSG_BLOCK, hash)); // // Add atoms to user reviews for coins created // vector&lt;unsigned char&gt; vchPubKey; // if (ExtractPubKey(vtx[0].vout[0].scriptPubKey, false, vchPubKey)) // { // unsigned short nAtom = GetRand(USHRT_MAX - 100) + 100; // vector&lt;unsigned short&gt; vAtoms(1, nAtom); // AddAtomsAndPropagate(Hash(vchPubKey.begin(), vchPubKey.end()), vAtoms, true); // } return true; } 2. 源码地址 我对比特币bitcoin-0.1.0源码加了详细的注释，对应的下载地址：https://github.com/lwjaiyjk/bitcoin-comment-0.1.0.git 转载请说明出处 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/04/26/572e285e54e1bbe6deb072aa241e0e1c.html" />
+<meta property="og:url" content="https://uzzz.org/2018/04/26/572e285e54e1bbe6deb072aa241e0e1c.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-04-26T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"1. 重要处理流程详解 1.1交易 1.1.1 交易连接输入ConnectInputs Ctransaction:: ConnectInputs对应的处理流程 对交易的输入进行判断，并对交易输入在对应交易输入索引中进行占用（标记为花费），并将对应的交易保存起来。源码如下： // 交易输入链接，将对应的交易输入占用对应的交易输入的花费标记 bool CTransaction::ConnectInputs(CTxDB&amp; txdb, map&lt;uint256, CTxIndex&gt;&amp; mapTestPool, CDiskTxPos posThisTx, int nHeight, int64&amp; nFees, bool fBlock, bool fMiner, int64 nMinFee) { // 占用前一个交易对应的花费指针 // Take over previous transactions&#39; spent pointers if (!IsCoinBase()) { int64 nValueIn = 0; for (int i = 0; i &lt; vin.size(); i++) { COutPoint prevout = vin[i].prevout; // Read txindex CTxIndex txindex; bool fFound = true; if (fMiner &amp;&amp; mapTestPool.count(prevout.hash)) { // Get txindex from current proposed changes txindex = mapTestPool[prevout.hash]; } else { // Read txindex from txdb fFound = txdb.ReadTxIndex(prevout.hash, txindex); } if (!fFound &amp;&amp; (fBlock || fMiner)) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx %s index entry not found&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); // Read txPrev CTransaction txPrev; if (!fFound || txindex.pos == CDiskTxPos(1,1,1)) { // Get prev tx from single transactions in memory CRITICAL_BLOCK(cs_mapTransactions) { if (!mapTransactions.count(prevout.hash)) return error(&quot;ConnectInputs() : %s mapTransactions prev not found %s&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); txPrev = mapTransactions[prevout.hash]; } if (!fFound) txindex.vSpent.resize(txPrev.vout.size()); } else { // Get prev tx from disk if (!txPrev.ReadFromDisk(txindex.pos)) return error(&quot;ConnectInputs() : %s ReadFromDisk prev tx %s failed&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.hash.ToString().substr(0,6).c_str()); } if (prevout.n &gt;= txPrev.vout.size() || prevout.n &gt;= txindex.vSpent.size()) return error(&quot;ConnectInputs() : %s prevout.n out of range %d %d %d&quot;, GetHash().ToString().substr(0,6).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size()); // If prev is coinbase, check that it&#39;s matured if (txPrev.IsCoinBase()) for (CBlockIndex* pindex = pindexBest; pindex &amp;&amp; nBestHeight - pindex-&gt;nHeight &lt; COINBASE_MATURITY-1; pindex = pindex-&gt;pprev) if (pindex-&gt;nBlockPos == txindex.pos.nBlockPos &amp;&amp; pindex-&gt;nFile == txindex.pos.nFile) return error(&quot;ConnectInputs() : tried to spend coinbase at depth %d&quot;, nBestHeight - pindex-&gt;nHeight); // Verify signature if (!VerifySignature(txPrev, *this, i)) return error(&quot;ConnectInputs() : %s VerifySignature failed&quot;, GetHash().ToString().substr(0,6).c_str()); // Check for conflicts if (!txindex.vSpent[prevout.n].IsNull()) return fMiner ? false : error(&quot;ConnectInputs() : %s prev tx already used at %s&quot;, GetHash().ToString().substr(0,6).c_str(), txindex.vSpent[prevout.n].ToString().c_str()); // 标记前一个交易对应的交易索引对应的花费标记 // Mark outpoints as spent txindex.vSpent[prevout.n] = posThisTx; // Write back if (fBlock) txdb.UpdateTxIndex(prevout.hash, txindex); else if (fMiner) mapTestPool[prevout.hash] = txindex; nValueIn += txPrev.vout[prevout.n].nValue; } // Tally transaction fees int64 nTxFee = nValueIn - GetValueOut(); if (nTxFee &lt; 0) return error(&quot;ConnectInputs() : %s nTxFee &lt; 0&quot;, GetHash().ToString().substr(0,6).c_str()); if (nTxFee &lt; nMinFee) return false; nFees += nTxFee; } if (fBlock) { // Add transaction to disk index if (!txdb.AddTxIndex(*this, posThisTx, nHeight)) return error(&quot;ConnectInputs() : AddTxPos failed&quot;); } else if (fMiner) { // 如果是矿工，将对应的交易放入对应的交易测试池中 // Add transaction to test pool mapTestPool[GetHash()] = CTxIndex(CDiskTxPos(1,1,1), vout.size()); } return true; } 1.1.2 交易断开连接输入DisconnectInputs Ctransaction:: DisconnectInputs对应的处理流程 释放交易对应的输入占用的标记，即是释放交易输入对应的交易索引中的标记，并将交易从库或者mapTestPool中进行移除。源码如下: // 断开连接输入，就是释放交易对应的输入的占用：即是释放交易输入对应的交易索引的标记占用 bool CTransaction::DisconnectInputs(CTxDB&amp; txdb) { // 放弃或者让出前一个交易对应的花费标记指针 // Relinquish previous transactions&#39; spent pointers if (!IsCoinBase()) // 币基 { foreach(const CTxIn&amp; txin, vin) { COutPoint prevout = txin.prevout; // Get prev txindex from disk CTxIndex txindex; // 从数据库中读取对应的交易的索引 if (!txdb.ReadTxIndex(prevout.hash, txindex)) return error(&quot;DisconnectInputs() : ReadTxIndex failed&quot;); if (prevout.n &gt;= txindex.vSpent.size()) return error(&quot;DisconnectInputs() : prevout.n out of range&quot;); // Mark outpoint as not spent txindex.vSpent[prevout.n].SetNull(); // Write back txdb.UpdateTxIndex(prevout.hash, txindex); } } // 将当前交易从交易索引表中移除 // Remove transaction from index if (!txdb.EraseTxIndex(*this)) return error(&quot;DisconnectInputs() : EraseTxPos failed&quot;); return true; } 1.1.3 交易接受处理 CTransaction::AcceptTransaction对应的处理流程 判断交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中源码如下: // 判断这边交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中 bool CTransaction::AcceptTransaction(CTxDB&amp; txdb, bool fCheckInputs, bool* pfMissingInputs) { if (pfMissingInputs) *pfMissingInputs = false; // 币基交易仅仅在块中有效，币基交易不能做为一个单独的交易 // Coinbase is only valid in a block, not as a loose transaction if (IsCoinBase()) return error(&quot;AcceptTransaction() : coinbase as individual tx&quot;); if (!CheckTransaction()) return error(&quot;AcceptTransaction() : CheckTransaction failed&quot;); // 判断当前交易是否我们已经接收到过了 // Do we already have it? uint256 hash = GetHash(); CRITICAL_BLOCK(cs_mapTransactions) if (mapTransactions.count(hash)) // 判断内存对象map中是否已经存在 return false; if (fCheckInputs) if (txdb.ContainsTx(hash)) // 判断交易db中是否已经存在 return false; // 判断当前交易对象是否和内存中的交易对象列表冲突 // Check for conflicts with in-memory transactions CTransaction* ptxOld = NULL; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 根据当前交易对应的输入交易，获得对应输入交易对应的输出交易 if (mapNextTx.count(outpoint)) { // Allow replacing with a newer version of the same transaction // i ==0 为coinbase，也就是coinbase可以替换 if (i != 0) return false; // 相对于当前交易更老的交易 ptxOld = mapNextTx[outpoint].ptx; if (!IsNewerThan(*ptxOld)) // 判断是否比原来交易更新，通过nSequences判断 return false; for (int i = 0; i &lt; vin.size(); i++) { COutPoint outpoint = vin[i].prevout; // 当前交易的输入在内存对象mapNextTx对应的输出如果都存在，且都指向原来老的交易，则接收此交易 if (!mapNextTx.count(outpoint) || mapNextTx[outpoint].ptx != ptxOld) return false; } break; } } // 对前交易进行校验和设置前交易对应的输出为花费标记 // Check against previous transactions map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; if (fCheckInputs &amp;&amp; !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false)) { if (pfMissingInputs) *pfMissingInputs = true; return error(&quot;AcceptTransaction() : ConnectInputs failed %s&quot;, hash.ToString().substr(0,6).c_str()); } // 将当前交易存储在内存，如果老的交易存在，则从内存中将对应的交易移除 // Store transaction in memory CRITICAL_BLOCK(cs_mapTransactions) { if (ptxOld) { printf(&quot;mapTransaction.erase(%s) replacing with new version\\n&quot;, ptxOld-&gt;GetHash().ToString().c_str()); mapTransactions.erase(ptxOld-&gt;GetHash()); } // 将当前交易存储到内存对象中 AddToMemoryPool(); } // 如果老的交易存在，则从钱包中将老的交易移除 ///// are we sure this is ok when loading transactions or restoring block txes // If updated, erase old tx from wallet if (ptxOld) // 将交易从钱包映射对象mapWallet中移除，同时将交易从CWalletDB中移除 EraseFromWallet(ptxOld-&gt;GetHash()); printf(&quot;AcceptTransaction(): accepted %s\\n&quot;, hash.ToString().substr(0,6).c_str()); return true; } 1.2 工作量难度获得 对应的方法是： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) 看源码更清晰，主要是保证对应的区块10分钟产生一个，14天更新一下对应的工作量难度（即是产生2016区块就要更新一下工作量难度），源码如下： // 根据前一个block对应的工作量获取下一个block获取需要的工作量 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast) { const unsigned int nTargetTimespan = 14 * 24 * 60 * 60; // two weeks const unsigned int nTargetSpacing = 10 * 60; // 10分钟产生一个block // 每隔2016个块对应的工作量难度就需要重新计算一次 const unsigned int nInterval = nTargetTimespan / nTargetSpacing; // 中间隔了多少个block 2016个块 // 说明当前块是一个创世区块，因为当前块对应的前一个区块为空 // Genesis block if (pindexLast == NULL) return bnProofOfWorkLimit.GetCompact(); // 如果不等于0不进行工作量难度改变 // Only change once per interval if ((pindexLast-&gt;nHeight+1) % nInterval != 0) return pindexLast-&gt;nBits; // 往前推2016个区块 // Go back by what we want to be 14 days worth of blocks const CBlockIndex* pindexFirst = pindexLast; for (int i = 0; pindexFirst &amp;&amp; i &lt; nInterval-1; I++) pindexFirst = pindexFirst-&gt;pprev; assert(pindexFirst); // 当前区块的前一个区块创建时间 减去 从当前区块向前推2016个区块得到区块创建时间 // Limit adjustment step unsigned int nActualTimespan = pindexLast-&gt;nTime - pindexFirst-&gt;nTime; printf(&quot; nActualTimespan = %d before bounds\\n&quot;, nActualTimespan); // 控制目标难度调整的跨度不能太大 if (nActualTimespan &lt; nTargetTimespan/4) nActualTimespan = nTargetTimespan/4; if (nActualTimespan &gt; nTargetTimespan*4) nActualTimespan = nTargetTimespan*4; // 重新目标计算难度：当前区块对应的前一个区块对应的目标难度 * 实际2016区块对应的创建时间间隔 / 目标时间跨度14天 // Retarget CBigNum bnNew; bnNew.SetCompact(pindexLast-&gt;nBits); bnNew *= nActualTimespan; bnNew /= nTargetTimespan; // 如果计算的工作量难度（值越大对应的工作难度越小）小于当前对应的工作量难度 if (bnNew &gt; bnProofOfWorkLimit) bnNew = bnProofOfWorkLimit; /// debug print printf(&quot;\\n\\n\\nGetNextWorkRequired RETARGET *****\\n&quot;); printf(&quot;nTargetTimespan = %d nActualTimespan = %d\\n&quot;, nTargetTimespan, nActualTimespan); printf(&quot;Before: %08x %s\\n&quot;, pindexLast-&gt;nBits, CBigNum().SetCompact(pindexLast-&gt;nBits).getuint256().ToString().c_str()); printf(&quot;After: %08x %s\\n&quot;, bnNew.GetCompact(), bnNew.getuint256().ToString().c_str()); return bnNew.GetCompact(); } 1.3 区块对应的创建时间 在新建区块的时候，要设置对应区块的时间，由于是P2P的，没有中心化节点能够获得对应的时间，所以需要从对应的区块链中区块的时间中取中位数，然后和当前时间去最大值，对应的代码就是： pblock-&gt;nTime = max((pindexPrev ? pindexPrev-&gt;GetMedianTimePast()+1 : 0), GetAdjustedTime()); 1.4 block接收处理 1.4.1 区块连接处理 对应的方法是: // 区块链接：每一个交易链接，增加到区块索引链中 bool CBlock::ConnectBlock(CTxDB&amp; txdb, CBlockIndex* pindex) { //// issue here: it doesn&#39;t know the version unsigned int nTxPos = pindex-&gt;nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - 1 + GetSizeOfCompactSize(vtx.size()); map&lt;uint256, CTxIndex&gt; mapUnused; int64 nFees = 0; foreach(CTransaction&amp; tx, vtx) { CDiskTxPos posThisTx(pindex-&gt;nFile, pindex-&gt;nBlockPos, nTxPos); nTxPos += ::GetSerializeSize(tx, SER_DISK); // 对每一个交易进行输入链接判断 if (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex-&gt;nHeight, nFees, true, false)) return false; } // 币基交易中对应的输出不能大于整个对应的奖励+交易手续费 if (vtx[0].GetValueOut() &gt; GetBlockValue(nFees)) return false; // Update block index on disk without changing it in memory. // The memory index structure will be changed after the db commits. if (pindex-&gt;pprev) { // 将当前区块索引 挂在 前一个区块索引之后 CDiskBlockIndex blockindexPrev(pindex-&gt;pprev); blockindexPrev.hashNext = pindex-&gt;GetBlockHash(); txdb.WriteBlockIndex(blockindexPrev); } // 监视在block中哪些 // Watch for transactions paying to me foreach(CTransaction&amp; tx, vtx) AddToWalletIfMine(tx, this); return true; } 1.4.2区块分叉处理 方法如下： // 重新组织区块的索引：因为此时已经出现区块链分叉 bool Reorganize(CTxDB&amp; txdb, CBlockIndex* pindexNew) { printf(&quot;*** REORGANIZE ***\\n&quot;); // 找到区块分叉点 // Find the fork CBlockIndex* pfork = pindexBest; CBlockIndex* plonger = pindexNew; // 找到主链和分叉链对应的交叉点 while (pfork != plonger) { if (!(pfork = pfork-&gt;pprev)) return error(&quot;Reorganize() : pfork-&gt;pprev is null&quot;); while (plonger-&gt;nHeight &gt; pfork-&gt;nHeight) if (!(plonger = plonger-&gt;pprev)) return error(&quot;Reorganize() : plonger-&gt;pprev is null&quot;); } // 列举出当前节点认为的最长链中（从当前最长链到交叉点）失去连接的块 // List of what to disconnect vector&lt;CBlockIndex*&gt; vDisconnect; for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex-&gt;pprev) vDisconnect.push_back(pindex); // 获取需要连接的块，因为自己认为的最长链实际上不是最长链 // List of what to connect vector&lt;CBlockIndex*&gt; vConnect; for (CBlockIndex* pindex = pindexNew; pindex != pfork; pindex = pindex-&gt;pprev) vConnect.push_back(pindex); // 因为上面放入的时候是倒着放的，所以这里在将这个逆序，得到正向的 reverse(vConnect.begin(), vConnect.end()); // 释放断链（仅仅释放对应的block链，对应的block索引链还没有释放） // Disconnect shorter branch vector&lt;CTransaction&gt; vResurrect; foreach(CBlockIndex* pindex, vDisconnect) { CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for disconnect failed&quot;); if (!block.DisconnectBlock(txdb, pindex)) return error(&quot;Reorganize() : DisconnectBlock failed&quot;); // 将释放块中的交易放入vResurrect，等待复活 // Queue memory transactions to resurrect foreach(const CTransaction&amp; tx, block.vtx) if (!tx.IsCoinBase()) vResurrect.push_back(tx); } // 连接最长的分支 // Connect longer branch vector&lt;CTransaction&gt; vDelete; for (int i = 0; i &lt; vConnect.size(); i++) { CBlockIndex* pindex = vConnect[i]; CBlock block; if (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, true)) return error(&quot;Reorganize() : ReadFromDisk for connect failed&quot;); if (!block.ConnectBlock(txdb, pindex)) { // 如果block连接失败之后，说明这个block无效，则删除这块之后的分支 // Invalid block, delete the rest of this branch txdb.TxnAbort(); for (int j = i; j &lt; vConnect.size(); j++) { CBlockIndex* pindex = vConnect[j]; pindex-&gt;EraseBlockFromDisk(); txdb.EraseBlockIndex(pindex-&gt;GetBlockHash()); mapBlockIndex.erase(pindex-&gt;GetBlockHash()); delete pindex; } return error(&quot;Reorganize() : ConnectBlock failed&quot;); } // 将加入区块链的块中的交易从对应的内存中删除 // Queue memory transactions to delete foreach(const CTransaction&amp; tx, block.vtx) vDelete.push_back(tx); } // 写入最长链 if (!txdb.WriteHashBestChain(pindexNew-&gt;GetBlockHash())) return error(&quot;Reorganize() : WriteHashBestChain failed&quot;); // Commit now because resurrecting 复活could take some time txdb.TxnCommit(); // 释放对应的块索引链 // Disconnect shorter branch foreach(CBlockIndex* pindex, vDisconnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = NULL; // 表示这些块没有在主链上 // 形成一条主链的块索引链 // Connect longer branch foreach(CBlockIndex* pindex, vConnect) if (pindex-&gt;pprev) pindex-&gt;pprev-&gt;pnext = pindex; // 从释放链接的分支中获取对应的交易，将这些交易放入对应的全局变量中得到复活 // Resurrect memory transactions that were in the disconnected branch foreach(CTransaction&amp; tx, vResurrect) tx.AcceptTransaction(txdb, false); // 从全局变量中删除那些已经在主链中的交易 // Delete redundant memory transactions that are in the connected branch foreach(CTransaction&amp; tx, vDelete) tx.RemoveFromMemoryPool(); return true; } 1.4.3将区块新增到区块索引链中 // 将当前区块增加到对应的区块索引链中mapBlockIndex bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos) { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AddToBlockIndex() : %s already exists&quot;, hash.ToString().substr(0,14).c_str()); // Construct new block index object CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this); if (!pindexNew) return error(&quot;AddToBlockIndex() : new CBlockIndex failed&quot;); map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first; pindexNew-&gt;phashBlock = &amp;((*mi).first); map&lt;uint256, CBlockIndex*&gt;::iterator miPrev = mapBlockIndex.find(hashPrevBlock); if (miPrev != mapBlockIndex.end()) { pindexNew-&gt;pprev = (*miPrev).second; // 增加前一个区块索引对应的高度 pindexNew-&gt;nHeight = pindexNew-&gt;pprev-&gt;nHeight + 1; } CTxDB txdb; txdb.TxnBegin(); txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew)); // 更新最长链对应的指针 // New best // 新链的高度已经超过主链了（即是新链到创世区块的长度 大于 本节点认为的最长链到创世区块的长度 if (pindexNew-&gt;nHeight &gt; nBestHeight) { // 判断是否是创世区块 if (pindexGenesisBlock == NULL &amp;&amp; hash == hashGenesisBlock) { pindexGenesisBlock = pindexNew; txdb.WriteHashBestChain(hash); } else if (hashPrevBlock == hashBestChain) { // 如果当前块对应的前一个块是最长的链 // Adding to current best branch if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash)) { txdb.TxnAbort(); pindexNew-&gt;EraseBlockFromDisk(); mapBlockIndex.erase(pindexNew-&gt;GetBlockHash()); delete pindexNew; return error(&quot;AddToBlockIndex() : ConnectBlock failed&quot;); } txdb.TxnCommit(); // 如果在最长链中，才设置对应区块索引的pnext字段，将当前区块索引设置在前一个区块索引的后面 pindexNew-&gt;pprev-&gt;pnext = pindexNew; // 如果对应的区块已经放入到主链中，则对应的区块交易应该要从本节点保存的交易内存池中删除 // Delete redundant memory transactions foreach(CTransaction&amp; tx, vtx) tx.RemoveFromMemoryPool(); } else { // 当前区块既不是创世区块，且当前区块对应的前一个区块也不在最长主链上的情况 // 再加上新区块所在链的长度大于本节点认为主链的长度，所有将进行分叉处理 // New best branch if (!Reorganize(txdb, pindexNew)) { txdb.TxnAbort(); return error(&quot;AddToBlockIndex() : Reorganize failed&quot;); } } // New best link hashBestChain = hash; pindexBest = pindexNew; nBestHeight = pindexBest-&gt;nHeight; nTransactionsUpdated++; printf(&quot;AddToBlockIndex: new best=%s height=%d\\n&quot;, hashBestChain.ToString().substr(0,14).c_str(), nBestHeight); } txdb.TxnCommit(); txdb.Close(); // 转播那些到目前为止还没有进入block中的钱包交易 // Relay wallet transactions that haven&#39;t gotten in yet if (pindexNew == pindexBest) RelayWalletTransactions();// 在节点之间进行转播 MainFrameRepaint(); return true; } 1.4.4区块接受处理 对应的方法如下： // 判断当前区块能够被接收 bool CBlock::AcceptBlock() { // Check for duplicate uint256 hash = GetHash(); if (mapBlockIndex.count(hash)) return error(&quot;AcceptBlock() : block already in mapBlockIndex&quot;); // Get prev block index map&lt;uint256, CBlockIndex*&gt;::iterator mi = mapBlockIndex.find(hashPrevBlock); if (mi == mapBlockIndex.end()) return error(&quot;AcceptBlock() : prev block not found&quot;); CBlockIndex* pindexPrev = (*mi).second; // 当前块创建的时间要大于前一个块对应的中位数时间 // Check timestamp against prev if (nTime &lt;= pindexPrev-&gt;GetMedianTimePast()) return error(&quot;AcceptBlock() : block&#39;s timestamp is too early&quot;); //工作量证明校验：每一个节点自己计算对应的工作量难度 // Check proof of work if (nBits != GetNextWorkRequired(pindexPrev)) return error(&quot;AcceptBlock() : incorrect proof of work&quot;); // Write block to history file unsigned int nFile; unsigned int nBlockPos; // 将块信息写入文件中 if (!WriteToDisk(!fClient, nFile, nBlockPos)) return error(&quot;AcceptBlock() : WriteToDisk failed&quot;); // 增加块对应的快索引信息 if (!AddToBlockIndex(nFile, nBlockPos)) return error(&quot;AcceptBlock() : AddToBlockIndex failed&quot;); if (hashBestChain == hash) RelayInventory(CInv(MSG_BLOCK, hash)); // // Add atoms to user reviews for coins created // vector&lt;unsigned char&gt; vchPubKey; // if (ExtractPubKey(vtx[0].vout[0].scriptPubKey, false, vchPubKey)) // { // unsigned short nAtom = GetRand(USHRT_MAX - 100) + 100; // vector&lt;unsigned short&gt; vAtoms(1, nAtom); // AddAtomsAndPropagate(Hash(vchPubKey.begin(), vchPubKey.end()), vAtoms, true); // } return true; } 2. 源码地址 我对比特币bitcoin-0.1.0源码加了详细的注释，对应的下载地址：https://github.com/lwjaiyjk/bitcoin-comment-0.1.0.git 转载请说明出处 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/04/26/572e285e54e1bbe6deb072aa241e0e1c.html","headline":"比特币bitcoin源码解析之重要流程详解","dateModified":"2018-04-26T00:00:00+08:00","datePublished":"2018-04-26T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/04/26/572e285e54e1bbe6deb072aa241e0e1c.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>比特币bitcoin源码解析之重要流程详解</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="1-重要处理流程详解">1. 重要处理流程详解</h1> 
+  <h2 id="11交易">1.1交易</h2> 
+  <h3 id="111-交易连接输入connectinputs">1.1.1 交易连接输入ConnectInputs</h3> 
+  <ul> 
+   <li>Ctransaction:: ConnectInputs对应的处理流程 <br> 对交易的输入进行判断，并对交易输入在对应交易输入索引中进行占用（标记为花费），并将对应的交易保存起来。<img src="https://upload-images.jianshu.io/upload_images/11372892-28d5f3322fa02984.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="Ctransaction:: ConnectInputs对应的处理流程" title="">源码如下：</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 交易输入链接，将对应的交易输入占用对应的交易输入的花费标记</span>
+<span class="hljs-keyword">bool</span> CTransaction::ConnectInputs(CTxDB&amp; txdb, <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CTxIndex&gt;</span>&amp; mapTestPool, CDiskTxPos posThisTx, <span class="hljs-keyword">int</span> nHeight, int64&amp; nFees, <span class="hljs-keyword">bool</span> fBlock, <span class="hljs-keyword">bool</span> fMiner, int64 nMinFee)
+{
+    <span class="hljs-comment">// 占用前一个交易对应的花费指针</span>
+    <span class="hljs-comment">// Take over previous transactions' spent pointers</span>
+    <span class="hljs-keyword">if</span> (!IsCoinBase())
+    {
+        int64 nValueIn = <span class="hljs-number">0</span>;
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; vin.size(); i++)
+        {
+            COutPoint prevout = vin[i].prevout;
+
+            <span class="hljs-comment">// Read txindex</span>
+            CTxIndex txindex;
+            <span class="hljs-keyword">bool</span> fFound = <span class="hljs-keyword">true</span>;
+            <span class="hljs-keyword">if</span> (fMiner &amp;&amp; mapTestPool.count(prevout.hash))
+            {
+                <span class="hljs-comment">// Get txindex from current proposed changes</span>
+                txindex = mapTestPool[prevout.hash];
+            }
+            <span class="hljs-keyword">else</span>
+            {
+                <span class="hljs-comment">// Read txindex from txdb</span>
+                fFound = txdb.ReadTxIndex(prevout.hash, txindex);
+            }
+            <span class="hljs-keyword">if</span> (!fFound &amp;&amp; (fBlock || fMiner))
+                <span class="hljs-keyword">return</span> fMiner ? <span class="hljs-keyword">false</span> : error(<span class="hljs-string">"ConnectInputs() : %s prev tx %s index entry not found"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str(),  prevout.hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+
+            <span class="hljs-comment">// Read txPrev</span>
+            CTransaction txPrev;
+            <span class="hljs-keyword">if</span> (!fFound || txindex.pos == CDiskTxPos(<span class="hljs-number">1</span>,<span class="hljs-number">1</span>,<span class="hljs-number">1</span>))
+            {
+                <span class="hljs-comment">// Get prev tx from single transactions in memory</span>
+                CRITICAL_BLOCK(cs_mapTransactions)
+                {
+                    <span class="hljs-keyword">if</span> (!mapTransactions.count(prevout.hash))
+                        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : %s mapTransactions prev not found %s"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str(),  prevout.hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+                    txPrev = mapTransactions[prevout.hash];
+                }
+                <span class="hljs-keyword">if</span> (!fFound)
+                    txindex.vSpent.resize(txPrev.vout.size());
+            }
+            <span class="hljs-keyword">else</span>
+            {
+                <span class="hljs-comment">// Get prev tx from disk</span>
+                <span class="hljs-keyword">if</span> (!txPrev.ReadFromDisk(txindex.pos))
+                    <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : %s ReadFromDisk prev tx %s failed"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str(),  prevout.hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+            }
+
+            <span class="hljs-keyword">if</span> (prevout.n &gt;= txPrev.vout.size() || prevout.n &gt;= txindex.vSpent.size())
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : %s prevout.n out of range %d %d %d"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size());
+
+            <span class="hljs-comment">// If prev is coinbase, check that it's matured</span>
+            <span class="hljs-keyword">if</span> (txPrev.IsCoinBase())
+                <span class="hljs-keyword">for</span> (CBlockIndex* pindex = pindexBest; pindex &amp;&amp; nBestHeight - pindex-&gt;nHeight &lt; COINBASE_MATURITY-<span class="hljs-number">1</span>; pindex = pindex-&gt;pprev)
+                    <span class="hljs-keyword">if</span> (pindex-&gt;nBlockPos == txindex.pos.nBlockPos &amp;&amp; pindex-&gt;nFile == txindex.pos.nFile)
+                        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : tried to spend coinbase at depth %d"</span>, nBestHeight - pindex-&gt;nHeight);
+
+            <span class="hljs-comment">// Verify signature</span>
+            <span class="hljs-keyword">if</span> (!VerifySignature(txPrev, *<span class="hljs-keyword">this</span>, i))
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : %s VerifySignature failed"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+
+            <span class="hljs-comment">// Check for conflicts</span>
+            <span class="hljs-keyword">if</span> (!txindex.vSpent[prevout.n].IsNull())
+                <span class="hljs-keyword">return</span> fMiner ? <span class="hljs-keyword">false</span> : error(<span class="hljs-string">"ConnectInputs() : %s prev tx already used at %s"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str(), txindex.vSpent[prevout.n].ToString().c_str());
+
+            <span class="hljs-comment">// 标记前一个交易对应的交易索引对应的花费标记</span>
+            <span class="hljs-comment">// Mark outpoints as spent</span>
+            txindex.vSpent[prevout.n] = posThisTx;
+
+            <span class="hljs-comment">// Write back</span>
+            <span class="hljs-keyword">if</span> (fBlock)
+                txdb.UpdateTxIndex(prevout.hash, txindex);
+            <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (fMiner)
+                mapTestPool[prevout.hash] = txindex;
+
+            nValueIn += txPrev.vout[prevout.n].nValue;
+        }
+
+        <span class="hljs-comment">// Tally transaction fees</span>
+        int64 nTxFee = nValueIn - GetValueOut();
+        <span class="hljs-keyword">if</span> (nTxFee &lt; <span class="hljs-number">0</span>)
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : %s nTxFee &lt; 0"</span>, GetHash().ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+        <span class="hljs-keyword">if</span> (nTxFee &lt; nMinFee)
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+        nFees += nTxFee;
+    }
+
+    <span class="hljs-keyword">if</span> (fBlock)
+    {
+        <span class="hljs-comment">// Add transaction to disk index</span>
+        <span class="hljs-keyword">if</span> (!txdb.AddTxIndex(*<span class="hljs-keyword">this</span>, posThisTx, nHeight))
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"ConnectInputs() : AddTxPos failed"</span>);
+    }
+    <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (fMiner)
+    {
+        <span class="hljs-comment">// 如果是矿工，将对应的交易放入对应的交易测试池中</span>
+        <span class="hljs-comment">// Add transaction to test pool</span>
+        mapTestPool[GetHash()] = CTxIndex(CDiskTxPos(<span class="hljs-number">1</span>,<span class="hljs-number">1</span>,<span class="hljs-number">1</span>), vout.size());
+    }
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <h3 id="112-交易断开连接输入disconnectinputs">1.1.2 交易断开连接输入DisconnectInputs</h3> 
+  <ul> 
+   <li>Ctransaction:: DisconnectInputs对应的处理流程 <br> 释放交易对应的输入占用的标记，即是释放交易输入对应的交易索引中的标记，并将交易从库或者mapTestPool中进行移除。<img src="https://upload-images.jianshu.io/upload_images/11372892-b609e1dfa9827c6c.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="Ctransaction:: DisconnectInputs对应的处理流程" title="">源码如下:</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-C++ hljs cs"><span class="hljs-comment">// 断开连接输入，就是释放交易对应的输入的占用：即是释放交易输入对应的交易索引的标记占用</span>
+<span class="hljs-keyword">bool</span> CTransaction::DisconnectInputs(CTxDB&amp; txdb)
+{
+    <span class="hljs-comment">// 放弃或者让出前一个交易对应的花费标记指针</span>
+    <span class="hljs-comment">// Relinquish previous transactions' spent pointers</span>
+    <span class="hljs-keyword">if</span> (!IsCoinBase()) <span class="hljs-comment">// 币基</span>
+    {
+        <span class="hljs-keyword">foreach</span>(<span class="hljs-keyword">const</span> CTxIn&amp; txin, vin)
+        {
+            COutPoint prevout = txin.prevout;
+
+            <span class="hljs-comment">// Get prev txindex from disk</span>
+            CTxIndex txindex;
+            <span class="hljs-comment">// 从数据库中读取对应的交易的索引</span>
+            <span class="hljs-keyword">if</span> (!txdb.ReadTxIndex(prevout.hash, txindex))
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"DisconnectInputs() : ReadTxIndex failed"</span>);
+
+            <span class="hljs-keyword">if</span> (prevout.n &gt;= txindex.vSpent.size())
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"DisconnectInputs() : prevout.n out of range"</span>);
+
+            <span class="hljs-comment">// Mark outpoint as not spent</span>
+            txindex.vSpent[prevout.n].SetNull();
+
+            <span class="hljs-comment">// Write back</span>
+            txdb.UpdateTxIndex(prevout.hash, txindex);
+        }
+    }
+
+    <span class="hljs-comment">// 将当前交易从交易索引表中移除</span>
+    <span class="hljs-comment">// Remove transaction from index</span>
+    <span class="hljs-keyword">if</span> (!txdb.EraseTxIndex(*<span class="hljs-keyword">this</span>))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"DisconnectInputs() : EraseTxPos failed"</span>);
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <h3 id="113-交易接受处理">1.1.3 交易接受处理</h3> 
+  <ul> 
+   <li>CTransaction::AcceptTransaction对应的处理流程 <br> 判断交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中<img src="https://upload-images.jianshu.io/upload_images/11372892-181ac7795b5141c2.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="CTransaction::AcceptTransaction对应的处理流程" title="">源码如下:</li> 
+  </ul> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 判断这边交易能不能被接受，如果能接受将对应的交易放入全局变量中mapTransactions，mapNextTx中</span>
+<span class="hljs-keyword">bool</span> CTransaction::AcceptTransaction(CTxDB&amp; txdb, <span class="hljs-keyword">bool</span> fCheckInputs, <span class="hljs-keyword">bool</span>* pfMissingInputs)
+{
+    <span class="hljs-keyword">if</span> (pfMissingInputs)
+        *pfMissingInputs = <span class="hljs-keyword">false</span>;
+
+    <span class="hljs-comment">// 币基交易仅仅在块中有效，币基交易不能做为一个单独的交易</span>
+    <span class="hljs-comment">// Coinbase is only valid in a block, not as a loose transaction</span>
+    <span class="hljs-keyword">if</span> (IsCoinBase())
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptTransaction() : coinbase as individual tx"</span>);
+
+    <span class="hljs-keyword">if</span> (!CheckTransaction())
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptTransaction() : CheckTransaction failed"</span>);
+
+    <span class="hljs-comment">// 判断当前交易是否我们已经接收到过了</span>
+    <span class="hljs-comment">// Do we already have it?</span>
+    uint256 hash = GetHash();
+    CRITICAL_BLOCK(cs_mapTransactions)
+        <span class="hljs-keyword">if</span> (mapTransactions.count(hash)) <span class="hljs-comment">// 判断内存对象map中是否已经存在</span>
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+    <span class="hljs-keyword">if</span> (fCheckInputs)
+        <span class="hljs-keyword">if</span> (txdb.ContainsTx(hash)) <span class="hljs-comment">// 判断交易db中是否已经存在</span>
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+
+    <span class="hljs-comment">// 判断当前交易对象是否和内存中的交易对象列表冲突</span>
+    <span class="hljs-comment">// Check for conflicts with in-memory transactions</span>
+    CTransaction* ptxOld = NULL;
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; vin.size(); i++)
+    {
+        COutPoint outpoint = vin[i].prevout;
+        <span class="hljs-comment">// 根据当前交易对应的输入交易，获得对应输入交易对应的输出交易</span>
+        <span class="hljs-keyword">if</span> (mapNextTx.count(outpoint))
+        {
+            <span class="hljs-comment">// Allow replacing with a newer version of the same transaction</span>
+            <span class="hljs-comment">// i ==0 为coinbase，也就是coinbase可以替换</span>
+            <span class="hljs-keyword">if</span> (i != <span class="hljs-number">0</span>)
+                <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+            <span class="hljs-comment">// 相对于当前交易更老的交易</span>
+            ptxOld = mapNextTx[outpoint].ptx;
+            <span class="hljs-keyword">if</span> (!IsNewerThan(*ptxOld)) <span class="hljs-comment">// 判断是否比原来交易更新，通过nSequences判断</span>
+                <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+            <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; vin.size(); i++)
+            {
+                COutPoint outpoint = vin[i].prevout;
+                <span class="hljs-comment">// 当前交易的输入在内存对象mapNextTx对应的输出如果都存在，且都指向原来老的交易，则接收此交易</span>
+                <span class="hljs-keyword">if</span> (!mapNextTx.count(outpoint) || mapNextTx[outpoint].ptx != ptxOld)
+                    <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+            }
+            <span class="hljs-keyword">break</span>;
+        }
+    }
+
+    <span class="hljs-comment">// 对前交易进行校验和设置前交易对应的输出为花费标记</span>
+    <span class="hljs-comment">// Check against previous transactions</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CTxIndex&gt;</span> mapUnused;
+    int64 nFees = <span class="hljs-number">0</span>;
+    <span class="hljs-keyword">if</span> (fCheckInputs &amp;&amp; !ConnectInputs(txdb, mapUnused, CDiskTxPos(<span class="hljs-number">1</span>,<span class="hljs-number">1</span>,<span class="hljs-number">1</span>), <span class="hljs-number">0</span>, nFees, <span class="hljs-keyword">false</span>, <span class="hljs-keyword">false</span>))
+    {
+        <span class="hljs-keyword">if</span> (pfMissingInputs)
+            *pfMissingInputs = <span class="hljs-keyword">true</span>;
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptTransaction() : ConnectInputs failed %s"</span>, hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+    }
+
+    <span class="hljs-comment">// 将当前交易存储在内存，如果老的交易存在，则从内存中将对应的交易移除</span>
+    <span class="hljs-comment">// Store transaction in memory</span>
+    CRITICAL_BLOCK(cs_mapTransactions)
+    {
+        <span class="hljs-keyword">if</span> (ptxOld)
+        {
+            <span class="hljs-built_in">printf</span>(<span class="hljs-string">"mapTransaction.erase(%s) replacing with new version\n"</span>, ptxOld-&gt;GetHash().ToString().c_str());
+            mapTransactions.erase(ptxOld-&gt;GetHash());
+        }
+        <span class="hljs-comment">// 将当前交易存储到内存对象中</span>
+        AddToMemoryPool();
+    }
+
+    <span class="hljs-comment">// 如果老的交易存在，则从钱包中将老的交易移除</span>
+    <span class="hljs-comment">///// are we sure this is ok when loading transactions or restoring block txes</span>
+    <span class="hljs-comment">// If updated, erase old tx from wallet</span>
+    <span class="hljs-keyword">if</span> (ptxOld)
+        <span class="hljs-comment">// 将交易从钱包映射对象mapWallet中移除，同时将交易从CWalletDB中移除</span>
+        EraseFromWallet(ptxOld-&gt;GetHash());
+
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"AcceptTransaction(): accepted %s\n"</span>, hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">6</span>).c_str());
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <h2 id="12-工作量难度获得">1.2 工作量难度获得</h2> 
+  <p>对应的方法是：</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs objectivec"><span class="hljs-comment">// 根据前一个block对应的工作量获取下一个block获取需要的工作量</span>
+<span class="hljs-keyword">unsigned</span>  <span class="hljs-keyword">int</span> GetNextWorkRequired(<span class="hljs-keyword">const</span>  CBlockIndex* pindexLast)</code></pre> 
+  <p>看源码更清晰，主要是保证对应的区块10分钟产生一个，14天更新一下对应的工作量难度（即是产生2016区块就要更新一下工作量难度），源码如下：</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 根据前一个block对应的工作量获取下一个block获取需要的工作量</span>
+<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> GetNextWorkRequired(<span class="hljs-keyword">const</span> CBlockIndex* pindexLast)
+{
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nTargetTimespan = <span class="hljs-number">14</span> * <span class="hljs-number">24</span> * <span class="hljs-number">60</span> * <span class="hljs-number">60</span>; <span class="hljs-comment">// two weeks</span>
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nTargetSpacing = <span class="hljs-number">10</span> * <span class="hljs-number">60</span>; <span class="hljs-comment">// 10分钟产生一个block</span>
+    <span class="hljs-comment">// 每隔2016个块对应的工作量难度就需要重新计算一次</span>
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nInterval = nTargetTimespan / nTargetSpacing; <span class="hljs-comment">// 中间隔了多少个block 2016个块</span>
+
+    <span class="hljs-comment">// 说明当前块是一个创世区块，因为当前块对应的前一个区块为空</span>
+    <span class="hljs-comment">// Genesis block</span>
+    <span class="hljs-keyword">if</span> (pindexLast == NULL)
+        <span class="hljs-keyword">return</span> bnProofOfWorkLimit.GetCompact();
+
+    <span class="hljs-comment">// 如果不等于0不进行工作量难度改变</span>
+    <span class="hljs-comment">// Only change once per interval</span>
+    <span class="hljs-keyword">if</span> ((pindexLast-&gt;nHeight+<span class="hljs-number">1</span>) % nInterval != <span class="hljs-number">0</span>)
+        <span class="hljs-keyword">return</span> pindexLast-&gt;nBits;
+
+    <span class="hljs-comment">// 往前推2016个区块</span>
+    <span class="hljs-comment">// Go back by what we want to be 14 days worth of blocks</span>
+    <span class="hljs-keyword">const</span> CBlockIndex* pindexFirst = pindexLast;
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; pindexFirst &amp;&amp; i &lt; nInterval-<span class="hljs-number">1</span>; I++)
+        pindexFirst = pindexFirst-&gt;pprev;
+    assert(pindexFirst);
+
+    <span class="hljs-comment">// 当前区块的前一个区块创建时间 减去 从当前区块向前推2016个区块得到区块创建时间</span>
+    <span class="hljs-comment">// Limit adjustment step</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nActualTimespan = pindexLast-&gt;nTime - pindexFirst-&gt;nTime;
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">" nActualTimespan = %d before bounds\n"</span>, nActualTimespan);
+    <span class="hljs-comment">// 控制目标难度调整的跨度不能太大</span>
+    <span class="hljs-keyword">if</span> (nActualTimespan &lt; nTargetTimespan/<span class="hljs-number">4</span>)
+        nActualTimespan = nTargetTimespan/<span class="hljs-number">4</span>;
+    <span class="hljs-keyword">if</span> (nActualTimespan &gt; nTargetTimespan*<span class="hljs-number">4</span>)
+        nActualTimespan = nTargetTimespan*<span class="hljs-number">4</span>;
+
+    <span class="hljs-comment">// 重新目标计算难度：当前区块对应的前一个区块对应的目标难度 * 实际2016区块对应的创建时间间隔 / 目标时间跨度14天</span>
+    <span class="hljs-comment">// Retarget</span>
+    CBigNum bnNew;
+    bnNew.SetCompact(pindexLast-&gt;nBits);
+    bnNew *= nActualTimespan;
+    bnNew /= nTargetTimespan;
+
+    <span class="hljs-comment">// 如果计算的工作量难度（值越大对应的工作难度越小）小于当前对应的工作量难度</span>
+    <span class="hljs-keyword">if</span> (bnNew &gt; bnProofOfWorkLimit)
+        bnNew = bnProofOfWorkLimit;
+
+    <span class="hljs-comment">/// debug print</span>
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"\n\n\nGetNextWorkRequired RETARGET *****\n"</span>);
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"nTargetTimespan = %d nActualTimespan = %d\n"</span>, nTargetTimespan, nActualTimespan);
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"Before: %08x %s\n"</span>, pindexLast-&gt;nBits, CBigNum().SetCompact(pindexLast-&gt;nBits).getuint256().ToString().c_str());
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"After: %08x %s\n"</span>, bnNew.GetCompact(), bnNew.getuint256().ToString().c_str());
+
+    <span class="hljs-keyword">return</span> bnNew.GetCompact();
+}</code></pre> 
+  <h2 id="13-区块对应的创建时间">1.3 区块对应的创建时间</h2> 
+  <p>在新建区块的时候，要设置对应区块的时间，由于是P2P的，没有中心化节点能够获得对应的时间，所以需要从对应的区块链中区块的时间中取中位数，然后和当前时间去最大值，对应的代码就是：</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs lasso">pblock<span class="hljs-subst">-&gt;</span>nTime <span class="hljs-subst">=</span> <span class="hljs-keyword">max</span>((pindexPrev <span class="hljs-subst">?</span> pindexPrev<span class="hljs-subst">-&gt;</span>GetMedianTimePast()<span class="hljs-subst">+</span><span class="hljs-number">1</span> : <span class="hljs-number">0</span>), GetAdjustedTime());</code></pre> 
+  <h2 id="14-block接收处理">1.4 block接收处理</h2> 
+  <h3 id="141-区块连接处理">1.4.1 区块连接处理</h3> 
+  <p>对应的方法是:</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 区块链接：每一个交易链接，增加到区块索引链中</span>
+<span class="hljs-keyword">bool</span> CBlock::ConnectBlock(CTxDB&amp; txdb, CBlockIndex* pindex)
+{
+    <span class="hljs-comment">//// issue here: it doesn't know the version</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nTxPos = pindex-&gt;nBlockPos + ::GetSerializeSize(CBlock(), SER_DISK) - <span class="hljs-number">1</span> + GetSizeOfCompactSize(vtx.size());
+
+    <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CTxIndex&gt;</span> mapUnused;
+    int64 nFees = <span class="hljs-number">0</span>;
+    foreach(CTransaction&amp; tx, vtx)
+    {
+        CDiskTxPos posThisTx(pindex-&gt;nFile, pindex-&gt;nBlockPos, nTxPos);
+        nTxPos += ::GetSerializeSize(tx, SER_DISK);
+        <span class="hljs-comment">// 对每一个交易进行输入链接判断</span>
+        <span class="hljs-keyword">if</span> (!tx.ConnectInputs(txdb, mapUnused, posThisTx, pindex-&gt;nHeight, nFees, <span class="hljs-keyword">true</span>, <span class="hljs-keyword">false</span>))
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+    }
+    <span class="hljs-comment">// 币基交易中对应的输出不能大于整个对应的奖励+交易手续费</span>
+    <span class="hljs-keyword">if</span> (vtx[<span class="hljs-number">0</span>].GetValueOut() &gt; GetBlockValue(nFees))
+        <span class="hljs-keyword">return</span> <span class="hljs-keyword">false</span>;
+
+    <span class="hljs-comment">// Update block index on disk without changing it in memory.</span>
+    <span class="hljs-comment">// The memory index structure will be changed after the db commits.</span>
+    <span class="hljs-keyword">if</span> (pindex-&gt;pprev)
+    {
+        <span class="hljs-comment">// 将当前区块索引 挂在 前一个区块索引之后</span>
+        CDiskBlockIndex blockindexPrev(pindex-&gt;pprev);
+        blockindexPrev.hashNext = pindex-&gt;GetBlockHash();
+        txdb.WriteBlockIndex(blockindexPrev);
+    }
+
+    <span class="hljs-comment">// 监视在block中哪些</span>
+    <span class="hljs-comment">// Watch for transactions paying to me</span>
+    foreach(CTransaction&amp; tx, vtx)
+        AddToWalletIfMine(tx, <span class="hljs-keyword">this</span>);
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <p><img src="https://upload-images.jianshu.io/upload_images/11372892-ea9a6bf4b9a644f6.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="image.png" title=""></p> 
+  <h3 id="142区块分叉处理">1.4.2区块分叉处理</h3> 
+  <p>方法如下：</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 重新组织区块的索引：因为此时已经出现区块链分叉</span>
+<span class="hljs-keyword">bool</span> Reorganize(CTxDB&amp; txdb, CBlockIndex* pindexNew)
+{
+    <span class="hljs-built_in">printf</span>(<span class="hljs-string">"*** REORGANIZE ***\n"</span>);
+
+    <span class="hljs-comment">// 找到区块分叉点</span>
+    <span class="hljs-comment">// Find the fork</span>
+    CBlockIndex* pfork = pindexBest;
+    CBlockIndex* plonger = pindexNew;
+    <span class="hljs-comment">// 找到主链和分叉链对应的交叉点</span>
+    <span class="hljs-keyword">while</span> (pfork != plonger)
+    {
+        <span class="hljs-keyword">if</span> (!(pfork = pfork-&gt;pprev))
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : pfork-&gt;pprev is null"</span>);
+        <span class="hljs-keyword">while</span> (plonger-&gt;nHeight &gt; pfork-&gt;nHeight)
+            <span class="hljs-keyword">if</span> (!(plonger = plonger-&gt;pprev))
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : plonger-&gt;pprev is null"</span>);
+    }
+
+    <span class="hljs-comment">// 列举出当前节点认为的最长链中（从当前最长链到交叉点）失去连接的块</span>
+    <span class="hljs-comment">// List of what to disconnect</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;CBlockIndex*&gt;</span> vDisconnect;
+    <span class="hljs-keyword">for</span> (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex-&gt;pprev)
+        vDisconnect.push_back(pindex);
+
+    <span class="hljs-comment">// 获取需要连接的块，因为自己认为的最长链实际上不是最长链</span>
+    <span class="hljs-comment">// List of what to connect</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;CBlockIndex*&gt;</span> vConnect;
+    <span class="hljs-keyword">for</span> (CBlockIndex* pindex = pindexNew; pindex != pfork; pindex = pindex-&gt;pprev)
+        vConnect.push_back(pindex);
+    <span class="hljs-comment">// 因为上面放入的时候是倒着放的，所以这里在将这个逆序，得到正向的</span>
+    reverse(vConnect.begin(), vConnect.end());
+
+    <span class="hljs-comment">// 释放断链（仅仅释放对应的block链，对应的block索引链还没有释放）</span>
+    <span class="hljs-comment">// Disconnect shorter branch</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;CTransaction&gt;</span> vResurrect;
+    foreach(CBlockIndex* pindex, vDisconnect)
+    {
+        CBlock block;
+        <span class="hljs-keyword">if</span> (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, <span class="hljs-keyword">true</span>))
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : ReadFromDisk for disconnect failed"</span>);
+        <span class="hljs-keyword">if</span> (!block.DisconnectBlock(txdb, pindex))
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : DisconnectBlock failed"</span>);
+
+        <span class="hljs-comment">// 将释放块中的交易放入vResurrect，等待复活</span>
+        <span class="hljs-comment">// Queue memory transactions to resurrect</span>
+        foreach(<span class="hljs-keyword">const</span> CTransaction&amp; tx, block.vtx)
+            <span class="hljs-keyword">if</span> (!tx.IsCoinBase())
+                vResurrect.push_back(tx);
+    }
+
+    <span class="hljs-comment">// 连接最长的分支</span>
+    <span class="hljs-comment">// Connect longer branch</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">vector</span>&lt;CTransaction&gt;</span> vDelete;
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; vConnect.size(); i++)
+    {
+        CBlockIndex* pindex = vConnect[i];
+        CBlock block;
+        <span class="hljs-keyword">if</span> (!block.ReadFromDisk(pindex-&gt;nFile, pindex-&gt;nBlockPos, <span class="hljs-keyword">true</span>))
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : ReadFromDisk for connect failed"</span>);
+        <span class="hljs-keyword">if</span> (!block.ConnectBlock(txdb, pindex))
+        {
+            <span class="hljs-comment">// 如果block连接失败之后，说明这个block无效，则删除这块之后的分支</span>
+            <span class="hljs-comment">// Invalid block, delete the rest of this branch</span>
+            txdb.TxnAbort();
+            <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> j = i; j &lt; vConnect.size(); j++)
+            {
+                CBlockIndex* pindex = vConnect[j];
+                pindex-&gt;EraseBlockFromDisk();
+                txdb.EraseBlockIndex(pindex-&gt;GetBlockHash());
+                mapBlockIndex.erase(pindex-&gt;GetBlockHash());
+                <span class="hljs-keyword">delete</span> pindex;
+            }
+            <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : ConnectBlock failed"</span>);
+        }
+        <span class="hljs-comment">// 将加入区块链的块中的交易从对应的内存中删除</span>
+        <span class="hljs-comment">// Queue memory transactions to delete</span>
+        foreach(<span class="hljs-keyword">const</span> CTransaction&amp; tx, block.vtx)
+            vDelete.push_back(tx);
+    }
+    <span class="hljs-comment">// 写入最长链</span>
+    <span class="hljs-keyword">if</span> (!txdb.WriteHashBestChain(pindexNew-&gt;GetBlockHash()))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"Reorganize() : WriteHashBestChain failed"</span>);
+
+    <span class="hljs-comment">// Commit now because resurrecting 复活could take some time</span>
+    txdb.TxnCommit();
+
+    <span class="hljs-comment">// 释放对应的块索引链</span>
+    <span class="hljs-comment">// Disconnect shorter branch</span>
+    foreach(CBlockIndex* pindex, vDisconnect)
+        <span class="hljs-keyword">if</span> (pindex-&gt;pprev)
+            pindex-&gt;pprev-&gt;pnext = NULL; <span class="hljs-comment">// 表示这些块没有在主链上</span>
+
+    <span class="hljs-comment">// 形成一条主链的块索引链</span>
+    <span class="hljs-comment">// Connect longer branch</span>
+    foreach(CBlockIndex* pindex, vConnect)
+        <span class="hljs-keyword">if</span> (pindex-&gt;pprev)
+            pindex-&gt;pprev-&gt;pnext = pindex;
+
+    <span class="hljs-comment">// 从释放链接的分支中获取对应的交易，将这些交易放入对应的全局变量中得到复活</span>
+    <span class="hljs-comment">// Resurrect memory transactions that were in the disconnected branch</span>
+    foreach(CTransaction&amp; tx, vResurrect)
+        tx.AcceptTransaction(txdb, <span class="hljs-keyword">false</span>);
+
+    <span class="hljs-comment">// 从全局变量中删除那些已经在主链中的交易</span>
+    <span class="hljs-comment">// Delete redundant memory transactions that are in the connected branch</span>
+    foreach(CTransaction&amp; tx, vDelete)
+        tx.RemoveFromMemoryPool();
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <p><img src="https://upload-images.jianshu.io/upload_images/11372892-aa008c743bce5616.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="Reorganize流程" title=""></p> 
+  <h3 id="143将区块新增到区块索引链中">1.4.3将区块新增到区块索引链中</h3> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 将当前区块增加到对应的区块索引链中mapBlockIndex</span>
+<span class="hljs-keyword">bool</span> CBlock::AddToBlockIndex(<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nFile, <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nBlockPos)
+{
+    <span class="hljs-comment">// Check for duplicate</span>
+    uint256 hash = GetHash();
+    <span class="hljs-keyword">if</span> (mapBlockIndex.count(hash))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AddToBlockIndex() : %s already exists"</span>, hash.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">14</span>).c_str());
+
+    <span class="hljs-comment">// Construct new block index object</span>
+    CBlockIndex* pindexNew = <span class="hljs-keyword">new</span> CBlockIndex(nFile, nBlockPos, *<span class="hljs-keyword">this</span>);
+    <span class="hljs-keyword">if</span> (!pindexNew)
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AddToBlockIndex() : new CBlockIndex failed"</span>);
+    <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CBlockIndex*&gt;</span>::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first;
+    pindexNew-&gt;phashBlock = &amp;((*mi).first);
+    <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CBlockIndex*&gt;</span>::iterator miPrev = mapBlockIndex.find(hashPrevBlock);
+    <span class="hljs-keyword">if</span> (miPrev != mapBlockIndex.end())
+    {
+        pindexNew-&gt;pprev = (*miPrev).second;
+        <span class="hljs-comment">// 增加前一个区块索引对应的高度</span>
+        pindexNew-&gt;nHeight = pindexNew-&gt;pprev-&gt;nHeight + <span class="hljs-number">1</span>;
+    }
+
+    CTxDB txdb;
+    txdb.TxnBegin();
+    txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
+
+    <span class="hljs-comment">// 更新最长链对应的指针</span>
+    <span class="hljs-comment">// New best</span>
+    <span class="hljs-comment">// 新链的高度已经超过主链了（即是新链到创世区块的长度 大于 本节点认为的最长链到创世区块的长度</span>
+    <span class="hljs-keyword">if</span> (pindexNew-&gt;nHeight &gt; nBestHeight)
+    {
+        <span class="hljs-comment">// 判断是否是创世区块</span>
+        <span class="hljs-keyword">if</span> (pindexGenesisBlock == NULL &amp;&amp; hash == hashGenesisBlock)
+        {
+            pindexGenesisBlock = pindexNew;
+            txdb.WriteHashBestChain(hash);
+        }
+        <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (hashPrevBlock == hashBestChain)
+        {
+            <span class="hljs-comment">// 如果当前块对应的前一个块是最长的链</span>
+            <span class="hljs-comment">// Adding to current best branch</span>
+            <span class="hljs-keyword">if</span> (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
+            {
+                txdb.TxnAbort();
+                pindexNew-&gt;EraseBlockFromDisk();
+                mapBlockIndex.erase(pindexNew-&gt;GetBlockHash());
+                <span class="hljs-keyword">delete</span> pindexNew;
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AddToBlockIndex() : ConnectBlock failed"</span>);
+            }
+            txdb.TxnCommit();
+            <span class="hljs-comment">// 如果在最长链中，才设置对应区块索引的pnext字段，将当前区块索引设置在前一个区块索引的后面</span>
+            pindexNew-&gt;pprev-&gt;pnext = pindexNew;
+
+            <span class="hljs-comment">// 如果对应的区块已经放入到主链中，则对应的区块交易应该要从本节点保存的交易内存池中删除</span>
+            <span class="hljs-comment">// Delete redundant memory transactions</span>
+            foreach(CTransaction&amp; tx, vtx)
+                tx.RemoveFromMemoryPool();
+        }
+        <span class="hljs-keyword">else</span>
+        {
+            <span class="hljs-comment">// 当前区块既不是创世区块，且当前区块对应的前一个区块也不在最长主链上的情况</span>
+            <span class="hljs-comment">// 再加上新区块所在链的长度大于本节点认为主链的长度，所有将进行分叉处理</span>
+            <span class="hljs-comment">// New best branch</span>
+            <span class="hljs-keyword">if</span> (!Reorganize(txdb, pindexNew))
+            {
+                txdb.TxnAbort();
+                <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AddToBlockIndex() : Reorganize failed"</span>);
+            }
+        }
+
+        <span class="hljs-comment">// New best link</span>
+        hashBestChain = hash;
+        pindexBest = pindexNew;
+        nBestHeight = pindexBest-&gt;nHeight;
+        nTransactionsUpdated++;
+        <span class="hljs-built_in">printf</span>(<span class="hljs-string">"AddToBlockIndex: new best=%s height=%d\n"</span>, hashBestChain.ToString().substr(<span class="hljs-number">0</span>,<span class="hljs-number">14</span>).c_str(), nBestHeight);
+    }
+
+    txdb.TxnCommit();
+    txdb.Close();
+
+    <span class="hljs-comment">// 转播那些到目前为止还没有进入block中的钱包交易</span>
+    <span class="hljs-comment">// Relay wallet transactions that haven't gotten in yet</span>
+    <span class="hljs-keyword">if</span> (pindexNew == pindexBest)
+        RelayWalletTransactions();<span class="hljs-comment">// 在节点之间进行转播</span>
+
+    MainFrameRepaint();
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <p><img src="https://upload-images.jianshu.io/upload_images/11372892-1fb4fd0dc10a310c.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="CBlock::AddToBlockIndex" title=""></p> 
+  <h3 id="144区块接受处理">1.4.4区块接受处理</h3> 
+  <p>对应的方法如下：</p> 
+  <pre class="prettyprint"><code class="language-C++ hljs cpp"><span class="hljs-comment">// 判断当前区块能够被接收</span>
+<span class="hljs-keyword">bool</span> CBlock::AcceptBlock()
+{
+    <span class="hljs-comment">// Check for duplicate</span>
+    uint256 hash = GetHash();
+    <span class="hljs-keyword">if</span> (mapBlockIndex.count(hash)) 
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : block already in mapBlockIndex"</span>);
+
+    <span class="hljs-comment">// Get prev block index</span>
+    <span class="hljs-stl_container"><span class="hljs-built_in">map</span>&lt;uint256, CBlockIndex*&gt;</span>::iterator mi = mapBlockIndex.find(hashPrevBlock);
+    <span class="hljs-keyword">if</span> (mi == mapBlockIndex.end())
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : prev block not found"</span>);
+    CBlockIndex* pindexPrev = (*mi).second;
+
+    <span class="hljs-comment">// 当前块创建的时间要大于前一个块对应的中位数时间</span>
+    <span class="hljs-comment">// Check timestamp against prev</span>
+    <span class="hljs-keyword">if</span> (nTime &lt;= pindexPrev-&gt;GetMedianTimePast())
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : block's timestamp is too early"</span>);
+
+    <span class="hljs-comment">//工作量证明校验：每一个节点自己计算对应的工作量难度</span>
+    <span class="hljs-comment">// Check proof of work</span>
+    <span class="hljs-keyword">if</span> (nBits != GetNextWorkRequired(pindexPrev))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : incorrect proof of work"</span>);
+
+    <span class="hljs-comment">// Write block to history file</span>
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nFile;
+    <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">int</span> nBlockPos;
+    <span class="hljs-comment">// 将块信息写入文件中</span>
+    <span class="hljs-keyword">if</span> (!WriteToDisk(!fClient, nFile, nBlockPos))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : WriteToDisk failed"</span>);
+    <span class="hljs-comment">// 增加块对应的快索引信息</span>
+    <span class="hljs-keyword">if</span> (!AddToBlockIndex(nFile, nBlockPos))
+        <span class="hljs-keyword">return</span> error(<span class="hljs-string">"AcceptBlock() : AddToBlockIndex failed"</span>);
+
+    <span class="hljs-keyword">if</span> (hashBestChain == hash)
+        RelayInventory(CInv(MSG_BLOCK, hash));
+
+    <span class="hljs-comment">// // Add atoms to user reviews for coins created</span>
+    <span class="hljs-comment">// vector&lt;unsigned char&gt; vchPubKey;</span>
+    <span class="hljs-comment">// if (ExtractPubKey(vtx[0].vout[0].scriptPubKey, false, vchPubKey))</span>
+    <span class="hljs-comment">// {</span>
+    <span class="hljs-comment">// unsigned short nAtom = GetRand(USHRT_MAX - 100) + 100;</span>
+    <span class="hljs-comment">// vector&lt;unsigned short&gt; vAtoms(1, nAtom);</span>
+    <span class="hljs-comment">// AddAtomsAndPropagate(Hash(vchPubKey.begin(), vchPubKey.end()), vAtoms, true);</span>
+    <span class="hljs-comment">// }</span>
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+}</code></pre> 
+  <p><img src="https://upload-images.jianshu.io/upload_images/11372892-7374fa05d85b3970.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="CBlock::AcceptBlock" title=""></p> 
+  <h1 id="2-源码地址">2. 源码地址</h1> 
+  <p>我对比特币bitcoin-0.1.0源码加了详细的注释，对应的下载地址：<a href="https://github.com/lwjaiyjk/bitcoin-comment-0.1.0.git" rel="nofollow" target="_blank">https://github.com/lwjaiyjk/bitcoin-comment-0.1.0.git</a></p> 
+  <h4 id="转载请说明出处">转载请说明出处</h4> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/yujiak/article/details/80101582,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/yujiak/article/details/80101582,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

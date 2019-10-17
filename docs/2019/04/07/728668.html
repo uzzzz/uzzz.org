@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>阿里HBase的数据管道设施实践与演进 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="阿里HBase的数据管道设施实践与演进" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="云栖君导读：第九届中国数据库技术大会，阿里巴巴技术专家孟庆义对阿里HBase的数据管道设施实践与演进进行了讲解。主要从数据导入场景、 HBase Bulkload功能、HImporter系统、数据导出场景、HExporter系统这些部分进行了讲述。 直播视频回顾： http://click.aliyun.com/m/1000008515/ PPT下载请点击左下角阅读原文！ 以下为演讲内容整理： 数据导入场景 生意参谋 生意参谋是一种为商家服务，帮助商家进行决策和运营的数据产品。如在淘宝或天猫上开一家店，生意参谋会提供店里每天进入的流量、转化率、客户的画像和同行业进行对比这些数据属于什么位置。商家可以根据流量分析、活动分析和行业分析去进行决策。可以根据平时日志、点击量和访问量，数据库把数据通过实时的流处理写入HBase。有一部分写到离线系统里，定期做一些清洗和计算再写入HBase，然后供业务去查询 HBase。 蚂蚁风控 在蚂蚁上任何一笔交易支付都会调用风控，风控主要是去看这次交易是否属于同一个设备，是否是经常交易的地点，以及交易的店铺信息。它必须在100ms—200ms把风险做完，风控是根据长期的历史信息、近期历史的信息和实时的信息三个方向做综合考量。用户的输入会实时的写入HBase，同时这个实时的信息增量也会导入到离线系统里面，离线系统会定期的对数据进行计算，计算的数据结果会作为历史或近期历史再写回HBase，一个支付可能会调百十次的风控，而且需要在百毫秒内进行返回。 数据导入需要解决的问题 2013年刚刚开始做数据导入的时候面临的更多的是功能需求性的问题，现在需要考虑的是导入的周期性调度、异构数据源多、导入效率高和多集群下的数据一致性的问题。前两个问题更适合由平台化去解决，HBase的数据导入更关注的是导入效率和多集群下的数据的一致性。 什么是Bulkload？Bulkload有什么功能？ Bulkload使用的是一种新的结构LSM Tree进行写入更新，其结构如上图所示。使用Application code 进行数据写入，数据会被写入到MemStore，MemStore在HBase里是一个跳表，可以把它看成一个有序的列表，并不断往里面插入数据。当数据达到一定量时就会启动flush对数据进行编码和压缩，并写成HFile。HFile是由索引块和数据块组成的文件结构，其特点是只读性，生成HFile之后就不可改了。当用户进行读取数据的时候，就会从三个HFile和一个MemStore进行查找进行读取。这个结构的优化就是就把随机的写变成了有序的写。Bulkload就可以把上千上万条数据在毫秒内加入到HBase里。所以Bulkload的优势如下： 高吞吐 不需要WAL 避免small compaction 支持离线构建 Bulkload的导入结构如上图所示，数据来源于数仓，首先根据HBase的分区规则对数据进行分区和排序。然后会生成Partition Data，需要写一个HBase插进去。同步中心就会调动一个作业，作业内部会有很多的tasks，每个task独立的执行把文件读出，写到HDFS上，形成一个HFile文件。当把所有文件写完，同步中心就会调Bulkload指令到HBase，把所有的HFile一次性的load进去。 以前采用的是多集群导入的方法，但是多集群导入有很多缺点如下： 很难保证多个任务同时完成，导致一定时间窗口内数据不一致 调度后的运行环境不一致 网络延迟不一致 失败重试集群部署对业务不透明的缺点： 需要配置多个任务 集群迁移需要重新配置任务为了保证数据的一致性，采用了逻辑集群导入法。 逻辑集群的流程如上图所示，首先进行分区合并，然后进行双数据流处理，把流分别写到Active和Backup里，当Active和Backup的HFile文件写完后执行Bulkload。因为Bulkload是毫秒级别的，所以能实现一致性。多任务和逻辑集群的差别比较如下： 多任务模式：需要重复配置，是不透明的，很难保证一致性，分区排序需要执行两次，编码压缩两次。 逻辑集群模式：配置一次，迁移无感知，在一致性上达到毫秒级，分区排序是执行一次，但分区数量变多，编码压缩一次。 随着业务做得越来越大，这种导入就会遇到新的线上问题，如扩展性、资源利用率、研发效率、监控等。 什么是HImporter系统？ HImporter是用于辅助数据同步的中间层，他会把所有HFile的构建，加载逻辑下沉到HImporter层。 HImporter所处的位置如上图所示。 HImporter的优势 分布式水平扩展，同一个作业的不同任务可以调度到HImporter的不同worker节点 提高资源利用率，将压缩等CPU密集操作下降到HImporter 快速迭代，HImporter的运维和迭代与同步中心独立 独立监控，HImporter可按照自己的需求实现监控 HImporter 功能迭代 功能迭代主要包括表属性感知、保证本地化率、支持轻量计算和安全隔离。其中表属性感知就是感知特性，并保证特征不会变，主要包括、混合存储、新压缩编码、表级别副本数；保证本地化率是将Hfile写入到分区所在服务器，保证本地化率和存储特性，对一些rt敏感的业务效果明显；支持轻量计算就是支持MD5，字符串拼接等函数；安全隔离是避免对外暴露HDFS地址、支持Task级别重试。 数据导出场景 菜鸟联盟 菜鸟联盟的场景如上图所示。一个物流详情会传到HBase，HBase会传到数据仓库，数据仓会产生报表，然后去训练路由算法。 淘宝客服 淘宝客服的一个退款应用场景如上图。这是一个逆向链接，把退款、纠纷、退款物流、退款费用等实时的写入到HBase里，HBase会实时的写入queue里，blink流系统会消费queue产生一些数据会返回到HBase，blink输出会支撑智能服务、客户监控等。 增量数据导出需要解决的问题 增量数据导出需要解决的问题主要是离线数据的T+1处理特点、吞吐量 、实时性、主备流量切换等。 早期的方案是会周期性的从HDFS里把所有的日志罗列出来，然后对日志进行排序会产生一个有序的时间流。取work里同步时间最短的作为最终的同步时间。这种方案具有对NN节点造成很大压力、无法应对主备切换、日志热点处理能力低等问题。 HExporter系统 HExporter1.0如上图所示，HExporter1.0优势主要有主备流量切换不影响数据导出，能够识别数据来源，过滤非原始数据；独立的同步时间流，能够保障数据按有序时间分区Dump到数据仓库；复用HBase replication框架，能够降低开发工作量，复用HBase的监控，运维体系。 HExporter1.0 优化主要包括以下五点： 减少拓扑网络中的数据发送，备库避免向Exporter发送重复数据； 远程辅助消化器，空闲的机器帮助消化热点； 避免发送小包，HExporter在接收到小包后，等待一段时间再处理； 同步通道配置隔离，实时消费链路和离线消费链路可以采用不同的配置； 数据发送前压缩。 HExporter1.0的问题是业务写入流量产生高峰，离线出现同步延迟；HBase升级速度慢。然后我们就有了以下解决思路，离线同步的资源可以和在线资源隔离，利用离线大池子可以削峰填谷；Exporter的worker是无状态的，如果把所有逻辑都放在Exporter，那么升级、扩容会简单快速。然后就产生了HExporter2.0。 HExporter2.0如上图所示。 总结 ALiHBase数据通道的导入和导出都是添加了中间层，中间层的核心价值易扩展、可靠性高、迭代快和稳定。因为采用分布式水平扩展更易扩展；采用自主识别主备切换，封装对HBase访问更可靠；采用架构解耦，快速迭代使迭代速度更快；因为无状态，节点对等所以更加稳定。 推荐阅读： 1，HBase高可用集群运维实践 2，HBase在滴滴出行的应用场景和最佳实践 3，HBase学习—高表与宽表的选择" />
+<meta property="og:description" content="云栖君导读：第九届中国数据库技术大会，阿里巴巴技术专家孟庆义对阿里HBase的数据管道设施实践与演进进行了讲解。主要从数据导入场景、 HBase Bulkload功能、HImporter系统、数据导出场景、HExporter系统这些部分进行了讲述。 直播视频回顾： http://click.aliyun.com/m/1000008515/ PPT下载请点击左下角阅读原文！ 以下为演讲内容整理： 数据导入场景 生意参谋 生意参谋是一种为商家服务，帮助商家进行决策和运营的数据产品。如在淘宝或天猫上开一家店，生意参谋会提供店里每天进入的流量、转化率、客户的画像和同行业进行对比这些数据属于什么位置。商家可以根据流量分析、活动分析和行业分析去进行决策。可以根据平时日志、点击量和访问量，数据库把数据通过实时的流处理写入HBase。有一部分写到离线系统里，定期做一些清洗和计算再写入HBase，然后供业务去查询 HBase。 蚂蚁风控 在蚂蚁上任何一笔交易支付都会调用风控，风控主要是去看这次交易是否属于同一个设备，是否是经常交易的地点，以及交易的店铺信息。它必须在100ms—200ms把风险做完，风控是根据长期的历史信息、近期历史的信息和实时的信息三个方向做综合考量。用户的输入会实时的写入HBase，同时这个实时的信息增量也会导入到离线系统里面，离线系统会定期的对数据进行计算，计算的数据结果会作为历史或近期历史再写回HBase，一个支付可能会调百十次的风控，而且需要在百毫秒内进行返回。 数据导入需要解决的问题 2013年刚刚开始做数据导入的时候面临的更多的是功能需求性的问题，现在需要考虑的是导入的周期性调度、异构数据源多、导入效率高和多集群下的数据一致性的问题。前两个问题更适合由平台化去解决，HBase的数据导入更关注的是导入效率和多集群下的数据的一致性。 什么是Bulkload？Bulkload有什么功能？ Bulkload使用的是一种新的结构LSM Tree进行写入更新，其结构如上图所示。使用Application code 进行数据写入，数据会被写入到MemStore，MemStore在HBase里是一个跳表，可以把它看成一个有序的列表，并不断往里面插入数据。当数据达到一定量时就会启动flush对数据进行编码和压缩，并写成HFile。HFile是由索引块和数据块组成的文件结构，其特点是只读性，生成HFile之后就不可改了。当用户进行读取数据的时候，就会从三个HFile和一个MemStore进行查找进行读取。这个结构的优化就是就把随机的写变成了有序的写。Bulkload就可以把上千上万条数据在毫秒内加入到HBase里。所以Bulkload的优势如下： 高吞吐 不需要WAL 避免small compaction 支持离线构建 Bulkload的导入结构如上图所示，数据来源于数仓，首先根据HBase的分区规则对数据进行分区和排序。然后会生成Partition Data，需要写一个HBase插进去。同步中心就会调动一个作业，作业内部会有很多的tasks，每个task独立的执行把文件读出，写到HDFS上，形成一个HFile文件。当把所有文件写完，同步中心就会调Bulkload指令到HBase，把所有的HFile一次性的load进去。 以前采用的是多集群导入的方法，但是多集群导入有很多缺点如下： 很难保证多个任务同时完成，导致一定时间窗口内数据不一致 调度后的运行环境不一致 网络延迟不一致 失败重试集群部署对业务不透明的缺点： 需要配置多个任务 集群迁移需要重新配置任务为了保证数据的一致性，采用了逻辑集群导入法。 逻辑集群的流程如上图所示，首先进行分区合并，然后进行双数据流处理，把流分别写到Active和Backup里，当Active和Backup的HFile文件写完后执行Bulkload。因为Bulkload是毫秒级别的，所以能实现一致性。多任务和逻辑集群的差别比较如下： 多任务模式：需要重复配置，是不透明的，很难保证一致性，分区排序需要执行两次，编码压缩两次。 逻辑集群模式：配置一次，迁移无感知，在一致性上达到毫秒级，分区排序是执行一次，但分区数量变多，编码压缩一次。 随着业务做得越来越大，这种导入就会遇到新的线上问题，如扩展性、资源利用率、研发效率、监控等。 什么是HImporter系统？ HImporter是用于辅助数据同步的中间层，他会把所有HFile的构建，加载逻辑下沉到HImporter层。 HImporter所处的位置如上图所示。 HImporter的优势 分布式水平扩展，同一个作业的不同任务可以调度到HImporter的不同worker节点 提高资源利用率，将压缩等CPU密集操作下降到HImporter 快速迭代，HImporter的运维和迭代与同步中心独立 独立监控，HImporter可按照自己的需求实现监控 HImporter 功能迭代 功能迭代主要包括表属性感知、保证本地化率、支持轻量计算和安全隔离。其中表属性感知就是感知特性，并保证特征不会变，主要包括、混合存储、新压缩编码、表级别副本数；保证本地化率是将Hfile写入到分区所在服务器，保证本地化率和存储特性，对一些rt敏感的业务效果明显；支持轻量计算就是支持MD5，字符串拼接等函数；安全隔离是避免对外暴露HDFS地址、支持Task级别重试。 数据导出场景 菜鸟联盟 菜鸟联盟的场景如上图所示。一个物流详情会传到HBase，HBase会传到数据仓库，数据仓会产生报表，然后去训练路由算法。 淘宝客服 淘宝客服的一个退款应用场景如上图。这是一个逆向链接，把退款、纠纷、退款物流、退款费用等实时的写入到HBase里，HBase会实时的写入queue里，blink流系统会消费queue产生一些数据会返回到HBase，blink输出会支撑智能服务、客户监控等。 增量数据导出需要解决的问题 增量数据导出需要解决的问题主要是离线数据的T+1处理特点、吞吐量 、实时性、主备流量切换等。 早期的方案是会周期性的从HDFS里把所有的日志罗列出来，然后对日志进行排序会产生一个有序的时间流。取work里同步时间最短的作为最终的同步时间。这种方案具有对NN节点造成很大压力、无法应对主备切换、日志热点处理能力低等问题。 HExporter系统 HExporter1.0如上图所示，HExporter1.0优势主要有主备流量切换不影响数据导出，能够识别数据来源，过滤非原始数据；独立的同步时间流，能够保障数据按有序时间分区Dump到数据仓库；复用HBase replication框架，能够降低开发工作量，复用HBase的监控，运维体系。 HExporter1.0 优化主要包括以下五点： 减少拓扑网络中的数据发送，备库避免向Exporter发送重复数据； 远程辅助消化器，空闲的机器帮助消化热点； 避免发送小包，HExporter在接收到小包后，等待一段时间再处理； 同步通道配置隔离，实时消费链路和离线消费链路可以采用不同的配置； 数据发送前压缩。 HExporter1.0的问题是业务写入流量产生高峰，离线出现同步延迟；HBase升级速度慢。然后我们就有了以下解决思路，离线同步的资源可以和在线资源隔离，利用离线大池子可以削峰填谷；Exporter的worker是无状态的，如果把所有逻辑都放在Exporter，那么升级、扩容会简单快速。然后就产生了HExporter2.0。 HExporter2.0如上图所示。 总结 ALiHBase数据通道的导入和导出都是添加了中间层，中间层的核心价值易扩展、可靠性高、迭代快和稳定。因为采用分布式水平扩展更易扩展；采用自主识别主备切换，封装对HBase访问更可靠；采用架构解耦，快速迭代使迭代速度更快；因为无状态，节点对等所以更加稳定。 推荐阅读： 1，HBase高可用集群运维实践 2，HBase在滴滴出行的应用场景和最佳实践 3，HBase学习—高表与宽表的选择" />
+<link rel="canonical" href="https://uzzz.org/2019/04/07/728668.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/07/728668.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-07T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"云栖君导读：第九届中国数据库技术大会，阿里巴巴技术专家孟庆义对阿里HBase的数据管道设施实践与演进进行了讲解。主要从数据导入场景、 HBase Bulkload功能、HImporter系统、数据导出场景、HExporter系统这些部分进行了讲述。 直播视频回顾： http://click.aliyun.com/m/1000008515/ PPT下载请点击左下角阅读原文！ 以下为演讲内容整理： 数据导入场景 生意参谋 生意参谋是一种为商家服务，帮助商家进行决策和运营的数据产品。如在淘宝或天猫上开一家店，生意参谋会提供店里每天进入的流量、转化率、客户的画像和同行业进行对比这些数据属于什么位置。商家可以根据流量分析、活动分析和行业分析去进行决策。可以根据平时日志、点击量和访问量，数据库把数据通过实时的流处理写入HBase。有一部分写到离线系统里，定期做一些清洗和计算再写入HBase，然后供业务去查询 HBase。 蚂蚁风控 在蚂蚁上任何一笔交易支付都会调用风控，风控主要是去看这次交易是否属于同一个设备，是否是经常交易的地点，以及交易的店铺信息。它必须在100ms—200ms把风险做完，风控是根据长期的历史信息、近期历史的信息和实时的信息三个方向做综合考量。用户的输入会实时的写入HBase，同时这个实时的信息增量也会导入到离线系统里面，离线系统会定期的对数据进行计算，计算的数据结果会作为历史或近期历史再写回HBase，一个支付可能会调百十次的风控，而且需要在百毫秒内进行返回。 数据导入需要解决的问题 2013年刚刚开始做数据导入的时候面临的更多的是功能需求性的问题，现在需要考虑的是导入的周期性调度、异构数据源多、导入效率高和多集群下的数据一致性的问题。前两个问题更适合由平台化去解决，HBase的数据导入更关注的是导入效率和多集群下的数据的一致性。 什么是Bulkload？Bulkload有什么功能？ Bulkload使用的是一种新的结构LSM Tree进行写入更新，其结构如上图所示。使用Application code 进行数据写入，数据会被写入到MemStore，MemStore在HBase里是一个跳表，可以把它看成一个有序的列表，并不断往里面插入数据。当数据达到一定量时就会启动flush对数据进行编码和压缩，并写成HFile。HFile是由索引块和数据块组成的文件结构，其特点是只读性，生成HFile之后就不可改了。当用户进行读取数据的时候，就会从三个HFile和一个MemStore进行查找进行读取。这个结构的优化就是就把随机的写变成了有序的写。Bulkload就可以把上千上万条数据在毫秒内加入到HBase里。所以Bulkload的优势如下： 高吞吐 不需要WAL 避免small compaction 支持离线构建 Bulkload的导入结构如上图所示，数据来源于数仓，首先根据HBase的分区规则对数据进行分区和排序。然后会生成Partition Data，需要写一个HBase插进去。同步中心就会调动一个作业，作业内部会有很多的tasks，每个task独立的执行把文件读出，写到HDFS上，形成一个HFile文件。当把所有文件写完，同步中心就会调Bulkload指令到HBase，把所有的HFile一次性的load进去。 以前采用的是多集群导入的方法，但是多集群导入有很多缺点如下： 很难保证多个任务同时完成，导致一定时间窗口内数据不一致 调度后的运行环境不一致 网络延迟不一致 失败重试集群部署对业务不透明的缺点： 需要配置多个任务 集群迁移需要重新配置任务为了保证数据的一致性，采用了逻辑集群导入法。 逻辑集群的流程如上图所示，首先进行分区合并，然后进行双数据流处理，把流分别写到Active和Backup里，当Active和Backup的HFile文件写完后执行Bulkload。因为Bulkload是毫秒级别的，所以能实现一致性。多任务和逻辑集群的差别比较如下： 多任务模式：需要重复配置，是不透明的，很难保证一致性，分区排序需要执行两次，编码压缩两次。 逻辑集群模式：配置一次，迁移无感知，在一致性上达到毫秒级，分区排序是执行一次，但分区数量变多，编码压缩一次。 随着业务做得越来越大，这种导入就会遇到新的线上问题，如扩展性、资源利用率、研发效率、监控等。 什么是HImporter系统？ HImporter是用于辅助数据同步的中间层，他会把所有HFile的构建，加载逻辑下沉到HImporter层。 HImporter所处的位置如上图所示。 HImporter的优势 分布式水平扩展，同一个作业的不同任务可以调度到HImporter的不同worker节点 提高资源利用率，将压缩等CPU密集操作下降到HImporter 快速迭代，HImporter的运维和迭代与同步中心独立 独立监控，HImporter可按照自己的需求实现监控 HImporter 功能迭代 功能迭代主要包括表属性感知、保证本地化率、支持轻量计算和安全隔离。其中表属性感知就是感知特性，并保证特征不会变，主要包括、混合存储、新压缩编码、表级别副本数；保证本地化率是将Hfile写入到分区所在服务器，保证本地化率和存储特性，对一些rt敏感的业务效果明显；支持轻量计算就是支持MD5，字符串拼接等函数；安全隔离是避免对外暴露HDFS地址、支持Task级别重试。 数据导出场景 菜鸟联盟 菜鸟联盟的场景如上图所示。一个物流详情会传到HBase，HBase会传到数据仓库，数据仓会产生报表，然后去训练路由算法。 淘宝客服 淘宝客服的一个退款应用场景如上图。这是一个逆向链接，把退款、纠纷、退款物流、退款费用等实时的写入到HBase里，HBase会实时的写入queue里，blink流系统会消费queue产生一些数据会返回到HBase，blink输出会支撑智能服务、客户监控等。 增量数据导出需要解决的问题 增量数据导出需要解决的问题主要是离线数据的T+1处理特点、吞吐量 、实时性、主备流量切换等。 早期的方案是会周期性的从HDFS里把所有的日志罗列出来，然后对日志进行排序会产生一个有序的时间流。取work里同步时间最短的作为最终的同步时间。这种方案具有对NN节点造成很大压力、无法应对主备切换、日志热点处理能力低等问题。 HExporter系统 HExporter1.0如上图所示，HExporter1.0优势主要有主备流量切换不影响数据导出，能够识别数据来源，过滤非原始数据；独立的同步时间流，能够保障数据按有序时间分区Dump到数据仓库；复用HBase replication框架，能够降低开发工作量，复用HBase的监控，运维体系。 HExporter1.0 优化主要包括以下五点： 减少拓扑网络中的数据发送，备库避免向Exporter发送重复数据； 远程辅助消化器，空闲的机器帮助消化热点； 避免发送小包，HExporter在接收到小包后，等待一段时间再处理； 同步通道配置隔离，实时消费链路和离线消费链路可以采用不同的配置； 数据发送前压缩。 HExporter1.0的问题是业务写入流量产生高峰，离线出现同步延迟；HBase升级速度慢。然后我们就有了以下解决思路，离线同步的资源可以和在线资源隔离，利用离线大池子可以削峰填谷；Exporter的worker是无状态的，如果把所有逻辑都放在Exporter，那么升级、扩容会简单快速。然后就产生了HExporter2.0。 HExporter2.0如上图所示。 总结 ALiHBase数据通道的导入和导出都是添加了中间层，中间层的核心价值易扩展、可靠性高、迭代快和稳定。因为采用分布式水平扩展更易扩展；采用自主识别主备切换，封装对HBase访问更可靠；采用架构解耦，快速迭代使迭代速度更快；因为无状态，节点对等所以更加稳定。 推荐阅读： 1，HBase高可用集群运维实践 2，HBase在滴滴出行的应用场景和最佳实践 3，HBase学习—高表与宽表的选择","@type":"BlogPosting","url":"https://uzzz.org/2019/04/07/728668.html","headline":"阿里HBase的数据管道设施实践与演进","dateModified":"2019-04-07T00:00:00+08:00","datePublished":"2019-04-07T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/07/728668.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>阿里HBase的数据管道设施实践与演进</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <div class="rich_media_content" id="js_content"> 
+   <p><br></p>
+   <p><strong>云栖君导读</strong>：第九届中国数据库技术大会，阿里巴巴技术专家孟庆义对阿里HBase的数据管道设施实践与演进进行了讲解。主要从数据导入场景、 HBase Bulkload功能、HImporter系统、数据导出场景、HExporter系统这些部分进行了讲述。</p>
+   <p><br><strong>直播视频回顾：</strong></p>
+   <p><strong>http://click.aliyun.com/m/1000008515/</strong></p>
+   <p><br></p>
+   <p><strong>PPT下载请点击左下角阅读原文！</strong></p>
+   <p><br></p>
+   <p>以下为演讲内容整理：</p>
+   <p><br></p>
+   <p style="text-align:center;"><strong><span style="font-size:16px;">数据导入场景</span></strong></p>
+   <p><strong><span style="font-size:16px;"><br></span></strong></p>
+   <p><strong>生意参谋</strong></p>
+   <p><strong><br></strong></p>
+   <p>生意参谋是一种为商家服务，帮助商家进行决策和运营的数据产品。如在淘宝或天猫上开一家店，生意参谋会提供店里每天进入的流量、转化率、客户的画像和同行业进行对比这些数据属于什么位置。商家可以根据流量分析、活动分析和行业分析去进行决策。可以根据平时日志、点击量和访问量，数据库把数据通过实时的流处理写入HBase。有一部分写到离线系统里，定期做一些清洗和计算再写入HBase，然后供业务去查询 HBase。</p>
+   <p><br></p>
+   <p><strong>蚂蚁风控</strong></p>
+   <p><br></p>
+   <p>在蚂蚁上任何一笔交易支付都会调用风控，风控主要是去看这次交易是否属于同一个设备，是否是经常交易的地点，以及交易的店铺信息。它必须在100ms—200ms把风险做完，风控是根据长期的历史信息、近期历史的信息和实时的信息三个方向做综合考量。用户的输入会实时的写入HBase，同时这个实时的信息增量也会导入到离线系统里面，离线系统会定期的对数据进行计算，计算的数据结果会作为历史或近期历史再写回HBase，一个支付可能会调百十次的风控，而且需要在百毫秒内进行返回。</p>
+   <p><br></p>
+   <p><strong>数据导入需要解决的问题</strong></p>
+   <p><strong><br></strong></p>
+   <p>2013年刚刚开始做数据导入的时候面临的更多的是功能需求性的问题，现在需要考虑的是导入的周期性调度、异构数据源多、导入效率高和多集群下的数据一致性的问题。前两个问题更适合由平台化去解决，HBase的数据导入更关注的是导入效率和多集群下的数据的一致性。</p>
+   <p><br></p>
+   <p style="text-align:center;"><span style="font-size:16px;"><strong>什么是Bulkload？Bulkload有什么功能？</strong></span><br></p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ibR05c76W5m4AHjxicBtogia7azqKRu6y5CCNicetiaBoC2hHUegrazSD9Bg/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>Bulkload使用的是一种新的结构LSM Tree进行写入更新，其结构如上图所示。使用Application code 进行数据写入，数据会被写入到MemStore，MemStore在HBase里是一个跳表，可以把它看成一个有序的列表，并不断往里面插入数据。当数据达到一定量时就会启动flush对数据进行编码和压缩，并写成HFile。HFile是由索引块和数据块组成的文件结构，其特点是只读性，生成HFile之后就不可改了。当用户进行读取数据的时候，就会从三个HFile和一个MemStore进行查找进行读取。这个结构的优化就是就把随机的写变成了有序的写。Bulkload就可以把上千上万条数据在毫秒内加入到HBase里。所以Bulkload的优势如下：</p>
+   <ul class="list-paddingleft-2" style="list-style-type:disc;">
+    <li><p>高吞吐</p></li>
+    <li><p>不需要WAL</p></li>
+    <li><p>避免small compaction</p></li>
+    <li><p>支持离线构建<br></p></li>
+   </ul>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ib0LSaZFYlgqH8rpvsPmE6AjgIFbf3Gd9yzG2paRicFGhurnZt21F7qPA/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br>Bulkload的导入结构如上图所示，数据来源于数仓，首先根据HBase的分区规则对数据进行分区和排序。然后会生成Partition Data，需要写一个HBase插进去。同步中心就会调动一个作业，作业内部会有很多的tasks，每个task独立的执行把文件读出，写到HDFS上，形成一个HFile文件。当把所有文件写完，同步中心就会调Bulkload指令到HBase，把所有的HFile一次性的load进去。</p>
+   <p><br>以前采用的是多集群导入的方法，但是多集群导入有很多缺点如下：</p>
+   <p><br></p>
+   <ul class="list-paddingleft-2" style="list-style-type:disc;">
+    <li><p>很难保证多个任务同时完成，导致一定时间窗口内数据不一致</p></li>
+    <li><p>调度后的运行环境不一致</p></li>
+    <li><p>网络延迟不一致</p></li>
+    <li><p>失败重试<br>集群部署对业务不透明的缺点：</p></li>
+    <li><p>需要配置多个任务</p></li>
+    <li><p>集群迁移需要重新配置任务<br>为了保证数据的一致性，采用了逻辑集群导入法。</p></li>
+   </ul>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ib2iczxibpSxyy4OibUMpL5bBmgEWcicXIt8crK1lblKykBObyGMGoxn9yOA/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>逻辑集群的流程如上图所示，首先进行分区合并，然后进行双数据流处理，把流分别写到Active和Backup里，当Active和Backup的HFile文件写完后执行Bulkload。因为Bulkload是毫秒级别的，所以能实现一致性。<br>多任务和逻辑集群的差别比较如下：</p>
+   <p><br></p>
+   <ul class="list-paddingleft-2" style="list-style-type:disc;">
+    <li><p>多任务模式：需要重复配置，是不透明的，很难保证一致性，分区排序<br>需要执行两次，编码压缩两次。</p></li>
+    <li><p>逻辑集群模式：配置一次，迁移无感知，在一致性上达到毫秒级，分区排序是执行一次，但分区数量变多，编码压缩一次。</p></li>
+   </ul>
+   <p><br>随着业务做得越来越大，这种导入就会遇到新的线上问题，如扩展性、资源利用率、研发效率、监控等。</p>
+   <p><br></p>
+   <p style="text-align:center;"><strong><span style="font-size:16px;">什么是HImporter系统？</span></strong></p>
+   <p><br></p>
+   <p>HImporter是用于辅助数据同步的中间层，他会把所有HFile的构建，加载逻辑下沉到HImporter层。<br></p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ibKKGTv4JGhib3X4SnjheXDIgMPojVhjkibjejdEicibWtplJevGndK5VyTw/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>HImporter所处的位置如上图所示。</p>
+   <p><br></p>
+   <p><strong>HImporter的优势</strong></p>
+   <p><br></p>
+   <p>分布式水平扩展，同一个作业的不同任务可以调度到HImporter的不同worker节点</p>
+   <p>提高资源利用率，将压缩等CPU密集操作下降到HImporter</p>
+   <p>快速迭代，HImporter的运维和迭代与同步中心独立</p>
+   <p>独立监控，HImporter可按照自己的需求实现监控</p>
+   <p><br></p>
+   <p><strong>HImporter 功能迭代</strong></p>
+   <p><br></p>
+   <p>功能迭代主要包括表属性感知、保证本地化率、支持轻量计算和安全隔离。其中表属性感知就是感知特性，并保证特征不会变，主要包括、混合存储、新压缩编码、表级别副本数；保证本地化率是将Hfile写入到分区所在服务器，保证本地化率和存储特性，对一些rt敏感的业务效果明显；支持轻量计算就是支持MD5，字符串拼接等函数；安全隔离是避免对外暴露HDFS地址、支持Task级别重试。</p>
+   <p><br></p>
+   <p style="text-align:center;"><strong><span style="font-size:16px;">数据导出场景</span></strong></p>
+   <p><br></p>
+   <p><strong>菜鸟联盟</strong></p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ibpJSNP1VMDI9PSkcW9Jtn1pgMneSHqdg2gI8rLhCrN0sQYRGhY5gEUA/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>菜鸟联盟的场景如上图所示。一个物流详情会传到HBase，HBase会传到数据仓库，数据仓会产生报表，然后去训练路由算法。</p>
+   <p><br></p>
+   <p><strong>淘宝客服</strong></p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ibWQeF9LAmTOUvvOQViaZIBuibNQgR3vtxpYFk8FyWQWc3ozM3bQdfy6yg/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>淘宝客服的一个退款应用场景如上图。这是一个逆向链接，把退款、纠纷、退款物流、退款费用等实时的写入到HBase里，HBase会实时的写入queue里，blink流系统会消费queue产生一些数据会返回到HBase，blink输出会支撑智能服务、客户监控等。</p>
+   <p><br></p>
+   <p><strong>增量数据导出需要解决的问题</strong></p>
+   <p><br></p>
+   <p>增量数据导出需要解决的问题主要是离线数据的T+1处理特点、吞吐量 、实时性、主备流量切换等。</p>
+   <p><br>早期的方案是会周期性的从HDFS里把所有的日志罗列出来，然后对日志进行排序会产生一个有序的时间流。取work里同步时间最短的作为最终的同步时间。这种方案具有对NN节点造成很大压力、无法应对主备切换、日志热点处理能力低等问题。</p>
+   <p><br></p>
+   <p style="text-align:center;"><strong><span style="font-size:16px;">HExporter系统</span></strong></p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ibUuvssf6PG10tl97U3nPMByC536zqCqickX9aQsZtuwx9RjqhcNDc5qQ/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p>HExporter1.0如上图所示，HExporter1.0优势主要有主备流量切换不影响数据导出，能够识别数据来源，过滤非原始数据；独立的同步时间流，能够保障数据按有序时间分区Dump到数据仓库；复用HBase replication框架，能够降低开发工作量，复用HBase的监控，运维体系。</p>
+   <p><br>HExporter1.0 优化主要包括以下五点：</p>
+   <p><br></p>
+   <ul class="list-paddingleft-2" style="list-style-type:disc;">
+    <li><p>减少拓扑网络中的数据发送，备库避免向Exporter发送重复数据；</p></li>
+    <li><p>远程辅助消化器，空闲的机器帮助消化热点；</p></li>
+    <li><p>避免发送小包，HExporter在接收到小包后，等待一段时间再处理；</p></li>
+    <li><p>同步通道配置隔离，实时消费链路和离线消费链路可以采用不同的配置；</p></li>
+    <li><p>数据发送前压缩。</p></li>
+   </ul>
+   <p><br>HExporter1.0的问题是业务写入流量产生高峰，离线出现同步延迟；HBase升级速度慢。然后我们就有了以下解决思路，离线同步的资源可以和在线资源隔离，利用离线大池子可以削峰填谷；Exporter的worker是无状态的，如果把所有逻辑都放在Exporter，那么升级、扩容会简单快速。然后就产生了HExporter2.0。</p>
+   <p><br></p>
+   <img style="vertical-align:middle;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/tMJtfgIIibWIG8Hc0pdu2LXRERnGxEn6ib3cAlgQxF6mh9ub9DwPJiaEdIJR1eH2U1tXmkTaw0GMIWVDj0YpaiakUg/640?wx_fmt=png" alt="640?wx_fmt=png">
+   <p><br></p>
+   <p style="text-align:left;">HExporter2.0如上图所示。</p>
+   <p><br></p>
+   <p style="text-align:center;"><strong><span style="font-size:16px;">总结</span></strong></p>
+   <p><br></p>
+   <p>ALiHBase数据通道的导入和导出都是添加了中间层，中间层的核心价值易扩展、可靠性高、迭代快和稳定。因为采用分布式水平扩展更易扩展；采用自主识别主备切换，封装对HBase访问更可靠；采用架构解耦，快速迭代使迭代速度更快；因为无状态，节点对等所以更加稳定。</p>
+   <p><span style="font-size:18px;">推荐阅读：</span></p>
+   <p>1，<a href="http://mp.weixin.qq.com/s?__biz=MzA3MDY0NTMxOQ==&amp;mid=2247484508&amp;idx=1&amp;sn=690e313ab18b81198985e98a42084c17&amp;chksm=9f38e774a84f6e62bcb93476f8a626bb651756f507e1ff8f3288424e04dab12888262bb33a89&amp;scene=21#wechat_redirect" rel="nofollow">HBase高可用集群运维实践</a></p>
+   <p>2，<a href="http://mp.weixin.qq.com/s?__biz=MzA3MDY0NTMxOQ==&amp;mid=2247484343&amp;idx=1&amp;sn=cd0c5bd1fbd8d55dd9779d336880bb3d&amp;chksm=9f38e09fa84f6989105d027e60beb463332313724813ea114ec3f4e29707c8da75fc09434269&amp;scene=21#wechat_redirect" rel="nofollow">HBase在滴滴出行的应用场景和最佳实践</a></p>
+   <p>3，<a href="http://mp.weixin.qq.com/s?__biz=MzA3MDY0NTMxOQ==&amp;mid=2247484419&amp;idx=1&amp;sn=78b39975f5f41b193d5a508b6150755e&amp;chksm=9f38e72ba84f6e3df903b6dbe2b2ed51797851a46e6084ebbb21ac0aeee0f59755c8fc5ffb9d&amp;scene=21#wechat_redirect" rel="nofollow">HBase学习—高表与宽表的选择</a></p>
+   <p style="text-align:center;"><img class="rich_pages" style="width:372px;" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_png/adI0ApTVBFWF1rkKibTzeA8PicbicYXBsH26a9PXg2HNnlEt1thHBFxUtEjicACeaSlRWictpPziaMdibXmYq34dWfQ9w/640?wx_fmt=png" alt="640?wx_fmt=png"></p>
+  </div> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

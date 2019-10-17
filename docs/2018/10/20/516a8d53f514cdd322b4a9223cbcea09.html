@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>初链主网上线技术解读之-混合共识 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="初链主网上线技术解读之-混合共识" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="背景 从2017年11月启动至今，经过历时近一年的研究、开发与测试，初链主网Beta版于新加坡时间2018年09月28日08:00正式上线，在此之前，07:56分PBFT委员会第一次共识出块和TrueChain fPOW创世区块被挖出，为了让更多人从技术上去理解初链，初链社区发布了初链技术解读的任务，我也借这次任务开始我第一篇博客。 说明 初链本次上线体现了五大亮点，包括混合共识，FPow公链，TrueHash抗ASIC的挖矿算法，PBFT委员会的随机选举机制，高TPS。本文主要针对初链的混合共识进行解读。后续一一解读其它亮点。 名称解释 共识： 共识顾名思义，共同的认识，在区块链世界中早期的共识算法代表要算比特币的pow。pow简单来讲，就是前一个区块有一个随机数，大家都去猜，谁先猜出来谁就有记账权，记账好了后，就将区块广播给其它节点，如果要想从源码层解读，请参考文档“PoW挖矿算法原理及其在比特币、以太坊中的实现”。 混合共识： pow共识安全但不高效，转账效率低，为了解决这个问题，后面出现了pos dpos，虽然效率提高了但是已不再那么去中心化。为了找到效率和安全的平衡点，混合共识出现，一种共识解决记账，一种共识解决区中心化。本文主要解读初链，让我们来看看true链是怎么找到这个平衡点的。 技术架构 初链采用双链结构，如图所示。一条快链，一条慢链。快链是交易块，里面记录的是很多交易。慢链是水果块，里面记录的是很多水果，水果一次递增，每个水果映射一个交易块。 混合共识又是怎么一回事呢？ 在初链中，采用改进拜赞庭（fbft）和工作量证明（pow）两种共识。fbft主要解决交易效率问题，如图所示，委员会由41个节点组成，相对于比特比节点而已，已经少之又少，当交易网络的交易提交到委员会网络以后，交易能够得到快速的确认，自然整个网络的交易效率也就提高了额。pow主要解决去中心化问题，每个水果和每个快区块一一对应，而每个水果又会被pow再次打包出块，如果想要篡改交易，首先要篡改pow里面的水果，就必须控制51%的算力。 这有点虚吧！没问题，下面就来点实际的。 从启动到运行bft有很深的调用链，如下可以找到node的NewNode方法 main--&gt;&gt;cmd:StartNode() cmd--&gt;&gt;node:Start() node--&gt;&gt;service:start() service--&gt;&gt;backend-Truechain:Start() truechain--&gt;&gt;pbft_agent:start()loop() pbft_agent--&gt;&gt;commitee:PutNodes() commitee--&gt;&gt;pbftserver:PutNodes() pbftserver--&gt;&gt;proxy_server:NewServer() proxy_server--&gt;&gt;node:NewNode() 有关pbft算法过程详情可以参考【链接5】，大概有5个过程1. Request 2. Pre-Prepare 3. Prepare 4. Commit 5.Reply。true链进行了改造。整个逻辑如图，重点是node的resolveMsg，该方法是true链委员会和fbft_impl起到核心关联作用。 相关代码如下 type PBFT interface { StartConsensus(request *RequestMsg) (*PrePrepareMsg, error) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) Prepare(prepareMsg *VoteMsg) (*VoteMsg, error) Commit(commitMsg *VoteMsg) (*ReplyMsg, *RequestMsg, error) } 实现类在pbft_impl.go中，这里只展示一段，其它方法感兴趣的同学可以自行查看 func (state *State) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) { // Get ReqMsgs and save it to its logs like the primary. state.MsgLogs.ReqMsg = prePrepareMsg.RequestMsg // Verify if v, n(a.k.a. sequenceID), d are correct. if !state.verifyMsg(prePrepareMsg.ViewID, prePrepareMsg.SequenceID, prePrepareMsg.Digest) { return nil, errors.New(&quot;pre-prepare message is corrupted&quot;) } // Change the stage to pre-prepared. state.CurrentStage = PrePrepared return &amp;VoteMsg{ ViewID: state.ViewID, SequenceID: prePrepareMsg.SequenceID, Digest: prePrepareMsg.Digest, MsgType: PrepareMsg, Height: prePrepareMsg.Height, }, nil } 而上文提到的node.NewNode中有这么一段，其中resolveMsg就是处理各种fbft过程传统msg，对msg校验，然后发起下一阶段的请求。 // Start message dispatcher go node.dispatchMsg() // Start alarm trigger go node.alarmToDispatcher() // Start message resolver go node.resolveMsg() //start backward message dispatcher go node.dispatchMsgBackward() //start Process message commit wait go node.processCommitWaitMessage() resolveMsg代码如下 func (node *Node) resolveMsg() { for { // Get buffered messages from the dispatcher. msgs := &lt;-node.MsgDelivery switch msgs.(type) { case []*consensus.RequestMsg: errs := node.resolveRequestMsg(msgs.([]*consensus.RequestMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.PrePrepareMsg: errs := node.resolvePrePrepareMsg(msgs.([]*consensus.PrePrepareMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.VoteMsg: voteMsgs := msgs.([]*consensus.VoteMsg) if len(voteMsgs) == 0 { break } if voteMsgs[0].MsgType == consensus.PrepareMsg { errs := node.resolvePrepareMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } else if voteMsgs[0].MsgType == consensus.CommitMsg { errs := node.resolveCommitMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } } } } 还有一个重要的问题必须要回答，因为现在fbft调用链找到了额，fbft过程消息处理机制也找到了额，但是共识的是什么？这个问题一直没回答。其实fbft共识的是leader和fastblock。代码如下，中间省去部分细节。 app启动是会开启维护员leader选举 pbft_agent.go case types.CommitteeStart: log.Info(&quot;CommitteeStart...&quot;) self.committeeMu.Lock() self.setCommitteeInfo(self.NextCommitteeInfo, CurrentCommittee) self.committeeMu.Unlock() if self.IsCommitteeMember(self.CommitteeInfo) { go self.server.Notify(self.CommitteeInfo.Id, int(ch.Option))//发送选举通知 Notify为调用pbftserver.work } pbftserver.go work代码如下 func (ss *PbftServerMgr) work(cid *big.Int, acChan &lt;-chan *consensus.ActionIn) { for { select { case ac := &lt;-acChan: if ac.AC == consensus.ActionFecth { req, err := ss.GetRequest(cid) if err == nil &amp;&amp; req != nil { if server, ok := ss.servers[cid.Uint64()]; ok { server.Height = big.NewInt(req.Height) server.server.PutRequest(req) //发起共识 } else { fmt.Println(err.Error()) } } else { lock.PSLog(err.Error()) } } else if ac.AC == consensus.ActionBroadcast { ss.Broadcast(ac.Height) } else if ac.AC == consensus.ActionFinish { return } } } 选举完成之后将自己设置为leader func (ss *PbftServerMgr) PutCommittee(committeeInfo *types.CommitteeInfo) error { lock.PSLog(&quot;PutCommittee&quot;, committeeInfo.Id, committeeInfo.Members) id := committeeInfo.Id members := committeeInfo.Members if id == nil || len(members) &lt;= 0 { return errors.New(&quot;wrong params...&quot;) } if _, ok := ss.servers[id.Uint64()]; ok { return errors.New(&quot;repeat ID:&quot; + id.String()) } leader := members[0].Publickey infos := make([]*types.CommitteeNode, 0) server := serverInfo{ //第一次共识完成，选出leader leader: leader, nodeid: common.ToHex(crypto.FromECDSAPub(ss.pk)), info: infos, Height: new(big.Int).Set(common.Big0), clear: false, } for _, v := range members { server.insertMember(v) } ss.servers[id.Uint64()] = &amp;server return nil } 在fb出块的时候有一个leader判断动作 func (ss *PbftServerMgr) GetRequest(id *big.Int) (*consensus.RequestMsg, error) { // get new fastblock 产出一个fastblock server, ok := ss.servers[id.Uint64()] if !ok { return nil, errors.New(&quot;wrong conmmitt ID:&quot; + id.String()) } // the node must be leader if !bytes.Equal(crypto.FromECDSAPub(server.leader), crypto.FromECDSAPub(ss.pk)) { //leader判断 return nil, errors.New(&quot;local node must be leader...&quot;) } lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, &quot;start&quot;) fb, err := ss.Agent.FetchFastBlock() lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, err == nil, &quot;end&quot;) if err != nil { return nil, err } if fb := ss.getBlock(fb.NumberU64()); fb != nil { return nil, errors.New(&quot;same height:&quot; + fb.Number().String()) } fmt.Println(len(ss.blocks)) sum := ss.getBlockLen() if sum &gt; 0 { last := ss.getLastBlock() if last != nil { cur := last.Number() cur.Add(cur, common.Big1) if cur.Cmp(fb.Number()) != 0 { return nil, errors.New(&quot;wrong fastblock,lastheight:&quot; + cur.String() + &quot; cur:&quot; + fb.Number().String()) } } } ss.putBlock(fb.NumberU64(), fb) data, err := rlp.EncodeToBytes(fb) if err != nil { return nil, err } msg := hex.EncodeToString(data) val := &amp;consensus.RequestMsg{ //返回一个fastblock共识消息 ClientID: server.nodeid, Timestamp: time.Now().Unix(), Operation: msg, Height: fb.Number().Int64(), } return val, nil } 本来想对pow在解析一下，发现有童鞋写的非常好了额，感兴趣的可以移步链接【6】 运行状况 再来看看true链运行情况。 总体运行情况如下图：图中可以看出目前委员会为6个，FB69758个，SB982个。委员会6据了解是前期为了主网稳定，但6个节点那么允许作恶容忍6*0.25=1.2个，作恶风险还是比较高，如果出现2台机器作恶，将会产生混乱，还是希望官网引起重视。 再来看混合共识的结果 快链：初略看了一下大部分block的共识委员会都是6个，说明目前没有分岔，但有一个疑问，为什么第一个的block高度不是1？ 慢链：初略看了一下大部分挖矿地址比较分散，说明pow效果还是很明显真正做到了去中心化。但是大部分区块没有交易数，很多空块会占用大量的存储空间，而且毫无意义，因为没有交易。我想一种采用一种压缩技术，对连续空块进行压缩；一种方式降低出块速率让速率和交易量挂钩。这两种思路都可以解决空块暂用磁盘问题，我的一点拙见。 Snail Blocks：进入SnailBlocks发现没有水果，不知是我理解的问题，还是浏览器的bug，没有发现水果。按照逻辑应该水果能被查询出来才算正常，水果作为Fast Block再次打包的凭证，如果没有水果很难说pow发挥作用，希望是浏览器的bug。 结论 节点启动以后会先发起一轮fbft的共识选举，选举leader有记账权，记账的表现形式为fastblock。如果想研究pow机制请参考链接【6】。这两种共识一种保障效率，一种保障安全，在去中心化和效率选进行了一个折中的选择。从上线的运行效果来看，两种共识能够完美配合，但是仍存在一些不足，比如空块暂用磁盘可以进行优化，水果在区块链浏览器中无法查看，委员会只有6个安全有待进一步提升。最后，初链做出的努力和结果可喜可贺，为投资者和社区交了一份满意的答卷。 参考资料 [1]:https://www.8btc.com/article/106800 论比特币系统的共识规则 [2]:http://blog.51cto.com/11821908/2059711 PoW挖矿算法原理及其在比特币、以太坊中的实现 [3]:http://www.sohu.com/a/239677141_100092199 POW+POS混合共识机制有多牛？区块链大佬揭秘！ [4]:https://blog.csdn.net/qq_22269733/article/details/83025225 Truechain主网Beta版交易流程解析 [5]:https://blog.csdn.net/jerry81333/article/details/74303194/ 区块链共识算法 PBFT（拜占庭容错）、PAXOS、RAFT简述 [6]:https://blog.csdn.net/sinat_27935057/article/details/83193018 初链主网Beta版慢链挖矿解析 阅读更多" />
+<meta property="og:description" content="背景 从2017年11月启动至今，经过历时近一年的研究、开发与测试，初链主网Beta版于新加坡时间2018年09月28日08:00正式上线，在此之前，07:56分PBFT委员会第一次共识出块和TrueChain fPOW创世区块被挖出，为了让更多人从技术上去理解初链，初链社区发布了初链技术解读的任务，我也借这次任务开始我第一篇博客。 说明 初链本次上线体现了五大亮点，包括混合共识，FPow公链，TrueHash抗ASIC的挖矿算法，PBFT委员会的随机选举机制，高TPS。本文主要针对初链的混合共识进行解读。后续一一解读其它亮点。 名称解释 共识： 共识顾名思义，共同的认识，在区块链世界中早期的共识算法代表要算比特币的pow。pow简单来讲，就是前一个区块有一个随机数，大家都去猜，谁先猜出来谁就有记账权，记账好了后，就将区块广播给其它节点，如果要想从源码层解读，请参考文档“PoW挖矿算法原理及其在比特币、以太坊中的实现”。 混合共识： pow共识安全但不高效，转账效率低，为了解决这个问题，后面出现了pos dpos，虽然效率提高了但是已不再那么去中心化。为了找到效率和安全的平衡点，混合共识出现，一种共识解决记账，一种共识解决区中心化。本文主要解读初链，让我们来看看true链是怎么找到这个平衡点的。 技术架构 初链采用双链结构，如图所示。一条快链，一条慢链。快链是交易块，里面记录的是很多交易。慢链是水果块，里面记录的是很多水果，水果一次递增，每个水果映射一个交易块。 混合共识又是怎么一回事呢？ 在初链中，采用改进拜赞庭（fbft）和工作量证明（pow）两种共识。fbft主要解决交易效率问题，如图所示，委员会由41个节点组成，相对于比特比节点而已，已经少之又少，当交易网络的交易提交到委员会网络以后，交易能够得到快速的确认，自然整个网络的交易效率也就提高了额。pow主要解决去中心化问题，每个水果和每个快区块一一对应，而每个水果又会被pow再次打包出块，如果想要篡改交易，首先要篡改pow里面的水果，就必须控制51%的算力。 这有点虚吧！没问题，下面就来点实际的。 从启动到运行bft有很深的调用链，如下可以找到node的NewNode方法 main--&gt;&gt;cmd:StartNode() cmd--&gt;&gt;node:Start() node--&gt;&gt;service:start() service--&gt;&gt;backend-Truechain:Start() truechain--&gt;&gt;pbft_agent:start()loop() pbft_agent--&gt;&gt;commitee:PutNodes() commitee--&gt;&gt;pbftserver:PutNodes() pbftserver--&gt;&gt;proxy_server:NewServer() proxy_server--&gt;&gt;node:NewNode() 有关pbft算法过程详情可以参考【链接5】，大概有5个过程1. Request 2. Pre-Prepare 3. Prepare 4. Commit 5.Reply。true链进行了改造。整个逻辑如图，重点是node的resolveMsg，该方法是true链委员会和fbft_impl起到核心关联作用。 相关代码如下 type PBFT interface { StartConsensus(request *RequestMsg) (*PrePrepareMsg, error) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) Prepare(prepareMsg *VoteMsg) (*VoteMsg, error) Commit(commitMsg *VoteMsg) (*ReplyMsg, *RequestMsg, error) } 实现类在pbft_impl.go中，这里只展示一段，其它方法感兴趣的同学可以自行查看 func (state *State) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) { // Get ReqMsgs and save it to its logs like the primary. state.MsgLogs.ReqMsg = prePrepareMsg.RequestMsg // Verify if v, n(a.k.a. sequenceID), d are correct. if !state.verifyMsg(prePrepareMsg.ViewID, prePrepareMsg.SequenceID, prePrepareMsg.Digest) { return nil, errors.New(&quot;pre-prepare message is corrupted&quot;) } // Change the stage to pre-prepared. state.CurrentStage = PrePrepared return &amp;VoteMsg{ ViewID: state.ViewID, SequenceID: prePrepareMsg.SequenceID, Digest: prePrepareMsg.Digest, MsgType: PrepareMsg, Height: prePrepareMsg.Height, }, nil } 而上文提到的node.NewNode中有这么一段，其中resolveMsg就是处理各种fbft过程传统msg，对msg校验，然后发起下一阶段的请求。 // Start message dispatcher go node.dispatchMsg() // Start alarm trigger go node.alarmToDispatcher() // Start message resolver go node.resolveMsg() //start backward message dispatcher go node.dispatchMsgBackward() //start Process message commit wait go node.processCommitWaitMessage() resolveMsg代码如下 func (node *Node) resolveMsg() { for { // Get buffered messages from the dispatcher. msgs := &lt;-node.MsgDelivery switch msgs.(type) { case []*consensus.RequestMsg: errs := node.resolveRequestMsg(msgs.([]*consensus.RequestMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.PrePrepareMsg: errs := node.resolvePrePrepareMsg(msgs.([]*consensus.PrePrepareMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.VoteMsg: voteMsgs := msgs.([]*consensus.VoteMsg) if len(voteMsgs) == 0 { break } if voteMsgs[0].MsgType == consensus.PrepareMsg { errs := node.resolvePrepareMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } else if voteMsgs[0].MsgType == consensus.CommitMsg { errs := node.resolveCommitMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } } } } 还有一个重要的问题必须要回答，因为现在fbft调用链找到了额，fbft过程消息处理机制也找到了额，但是共识的是什么？这个问题一直没回答。其实fbft共识的是leader和fastblock。代码如下，中间省去部分细节。 app启动是会开启维护员leader选举 pbft_agent.go case types.CommitteeStart: log.Info(&quot;CommitteeStart...&quot;) self.committeeMu.Lock() self.setCommitteeInfo(self.NextCommitteeInfo, CurrentCommittee) self.committeeMu.Unlock() if self.IsCommitteeMember(self.CommitteeInfo) { go self.server.Notify(self.CommitteeInfo.Id, int(ch.Option))//发送选举通知 Notify为调用pbftserver.work } pbftserver.go work代码如下 func (ss *PbftServerMgr) work(cid *big.Int, acChan &lt;-chan *consensus.ActionIn) { for { select { case ac := &lt;-acChan: if ac.AC == consensus.ActionFecth { req, err := ss.GetRequest(cid) if err == nil &amp;&amp; req != nil { if server, ok := ss.servers[cid.Uint64()]; ok { server.Height = big.NewInt(req.Height) server.server.PutRequest(req) //发起共识 } else { fmt.Println(err.Error()) } } else { lock.PSLog(err.Error()) } } else if ac.AC == consensus.ActionBroadcast { ss.Broadcast(ac.Height) } else if ac.AC == consensus.ActionFinish { return } } } 选举完成之后将自己设置为leader func (ss *PbftServerMgr) PutCommittee(committeeInfo *types.CommitteeInfo) error { lock.PSLog(&quot;PutCommittee&quot;, committeeInfo.Id, committeeInfo.Members) id := committeeInfo.Id members := committeeInfo.Members if id == nil || len(members) &lt;= 0 { return errors.New(&quot;wrong params...&quot;) } if _, ok := ss.servers[id.Uint64()]; ok { return errors.New(&quot;repeat ID:&quot; + id.String()) } leader := members[0].Publickey infos := make([]*types.CommitteeNode, 0) server := serverInfo{ //第一次共识完成，选出leader leader: leader, nodeid: common.ToHex(crypto.FromECDSAPub(ss.pk)), info: infos, Height: new(big.Int).Set(common.Big0), clear: false, } for _, v := range members { server.insertMember(v) } ss.servers[id.Uint64()] = &amp;server return nil } 在fb出块的时候有一个leader判断动作 func (ss *PbftServerMgr) GetRequest(id *big.Int) (*consensus.RequestMsg, error) { // get new fastblock 产出一个fastblock server, ok := ss.servers[id.Uint64()] if !ok { return nil, errors.New(&quot;wrong conmmitt ID:&quot; + id.String()) } // the node must be leader if !bytes.Equal(crypto.FromECDSAPub(server.leader), crypto.FromECDSAPub(ss.pk)) { //leader判断 return nil, errors.New(&quot;local node must be leader...&quot;) } lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, &quot;start&quot;) fb, err := ss.Agent.FetchFastBlock() lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, err == nil, &quot;end&quot;) if err != nil { return nil, err } if fb := ss.getBlock(fb.NumberU64()); fb != nil { return nil, errors.New(&quot;same height:&quot; + fb.Number().String()) } fmt.Println(len(ss.blocks)) sum := ss.getBlockLen() if sum &gt; 0 { last := ss.getLastBlock() if last != nil { cur := last.Number() cur.Add(cur, common.Big1) if cur.Cmp(fb.Number()) != 0 { return nil, errors.New(&quot;wrong fastblock,lastheight:&quot; + cur.String() + &quot; cur:&quot; + fb.Number().String()) } } } ss.putBlock(fb.NumberU64(), fb) data, err := rlp.EncodeToBytes(fb) if err != nil { return nil, err } msg := hex.EncodeToString(data) val := &amp;consensus.RequestMsg{ //返回一个fastblock共识消息 ClientID: server.nodeid, Timestamp: time.Now().Unix(), Operation: msg, Height: fb.Number().Int64(), } return val, nil } 本来想对pow在解析一下，发现有童鞋写的非常好了额，感兴趣的可以移步链接【6】 运行状况 再来看看true链运行情况。 总体运行情况如下图：图中可以看出目前委员会为6个，FB69758个，SB982个。委员会6据了解是前期为了主网稳定，但6个节点那么允许作恶容忍6*0.25=1.2个，作恶风险还是比较高，如果出现2台机器作恶，将会产生混乱，还是希望官网引起重视。 再来看混合共识的结果 快链：初略看了一下大部分block的共识委员会都是6个，说明目前没有分岔，但有一个疑问，为什么第一个的block高度不是1？ 慢链：初略看了一下大部分挖矿地址比较分散，说明pow效果还是很明显真正做到了去中心化。但是大部分区块没有交易数，很多空块会占用大量的存储空间，而且毫无意义，因为没有交易。我想一种采用一种压缩技术，对连续空块进行压缩；一种方式降低出块速率让速率和交易量挂钩。这两种思路都可以解决空块暂用磁盘问题，我的一点拙见。 Snail Blocks：进入SnailBlocks发现没有水果，不知是我理解的问题，还是浏览器的bug，没有发现水果。按照逻辑应该水果能被查询出来才算正常，水果作为Fast Block再次打包的凭证，如果没有水果很难说pow发挥作用，希望是浏览器的bug。 结论 节点启动以后会先发起一轮fbft的共识选举，选举leader有记账权，记账的表现形式为fastblock。如果想研究pow机制请参考链接【6】。这两种共识一种保障效率，一种保障安全，在去中心化和效率选进行了一个折中的选择。从上线的运行效果来看，两种共识能够完美配合，但是仍存在一些不足，比如空块暂用磁盘可以进行优化，水果在区块链浏览器中无法查看，委员会只有6个安全有待进一步提升。最后，初链做出的努力和结果可喜可贺，为投资者和社区交了一份满意的答卷。 参考资料 [1]:https://www.8btc.com/article/106800 论比特币系统的共识规则 [2]:http://blog.51cto.com/11821908/2059711 PoW挖矿算法原理及其在比特币、以太坊中的实现 [3]:http://www.sohu.com/a/239677141_100092199 POW+POS混合共识机制有多牛？区块链大佬揭秘！ [4]:https://blog.csdn.net/qq_22269733/article/details/83025225 Truechain主网Beta版交易流程解析 [5]:https://blog.csdn.net/jerry81333/article/details/74303194/ 区块链共识算法 PBFT（拜占庭容错）、PAXOS、RAFT简述 [6]:https://blog.csdn.net/sinat_27935057/article/details/83193018 初链主网Beta版慢链挖矿解析 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/10/20/516a8d53f514cdd322b4a9223cbcea09.html" />
+<meta property="og:url" content="https://uzzz.org/2018/10/20/516a8d53f514cdd322b4a9223cbcea09.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-10-20T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"背景 从2017年11月启动至今，经过历时近一年的研究、开发与测试，初链主网Beta版于新加坡时间2018年09月28日08:00正式上线，在此之前，07:56分PBFT委员会第一次共识出块和TrueChain fPOW创世区块被挖出，为了让更多人从技术上去理解初链，初链社区发布了初链技术解读的任务，我也借这次任务开始我第一篇博客。 说明 初链本次上线体现了五大亮点，包括混合共识，FPow公链，TrueHash抗ASIC的挖矿算法，PBFT委员会的随机选举机制，高TPS。本文主要针对初链的混合共识进行解读。后续一一解读其它亮点。 名称解释 共识： 共识顾名思义，共同的认识，在区块链世界中早期的共识算法代表要算比特币的pow。pow简单来讲，就是前一个区块有一个随机数，大家都去猜，谁先猜出来谁就有记账权，记账好了后，就将区块广播给其它节点，如果要想从源码层解读，请参考文档“PoW挖矿算法原理及其在比特币、以太坊中的实现”。 混合共识： pow共识安全但不高效，转账效率低，为了解决这个问题，后面出现了pos dpos，虽然效率提高了但是已不再那么去中心化。为了找到效率和安全的平衡点，混合共识出现，一种共识解决记账，一种共识解决区中心化。本文主要解读初链，让我们来看看true链是怎么找到这个平衡点的。 技术架构 初链采用双链结构，如图所示。一条快链，一条慢链。快链是交易块，里面记录的是很多交易。慢链是水果块，里面记录的是很多水果，水果一次递增，每个水果映射一个交易块。 混合共识又是怎么一回事呢？ 在初链中，采用改进拜赞庭（fbft）和工作量证明（pow）两种共识。fbft主要解决交易效率问题，如图所示，委员会由41个节点组成，相对于比特比节点而已，已经少之又少，当交易网络的交易提交到委员会网络以后，交易能够得到快速的确认，自然整个网络的交易效率也就提高了额。pow主要解决去中心化问题，每个水果和每个快区块一一对应，而每个水果又会被pow再次打包出块，如果想要篡改交易，首先要篡改pow里面的水果，就必须控制51%的算力。 这有点虚吧！没问题，下面就来点实际的。 从启动到运行bft有很深的调用链，如下可以找到node的NewNode方法 main--&gt;&gt;cmd:StartNode() cmd--&gt;&gt;node:Start() node--&gt;&gt;service:start() service--&gt;&gt;backend-Truechain:Start() truechain--&gt;&gt;pbft_agent:start()loop() pbft_agent--&gt;&gt;commitee:PutNodes() commitee--&gt;&gt;pbftserver:PutNodes() pbftserver--&gt;&gt;proxy_server:NewServer() proxy_server--&gt;&gt;node:NewNode() 有关pbft算法过程详情可以参考【链接5】，大概有5个过程1. Request 2. Pre-Prepare 3. Prepare 4. Commit 5.Reply。true链进行了改造。整个逻辑如图，重点是node的resolveMsg，该方法是true链委员会和fbft_impl起到核心关联作用。 相关代码如下 type PBFT interface { StartConsensus(request *RequestMsg) (*PrePrepareMsg, error) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) Prepare(prepareMsg *VoteMsg) (*VoteMsg, error) Commit(commitMsg *VoteMsg) (*ReplyMsg, *RequestMsg, error) } 实现类在pbft_impl.go中，这里只展示一段，其它方法感兴趣的同学可以自行查看 func (state *State) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) { // Get ReqMsgs and save it to its logs like the primary. state.MsgLogs.ReqMsg = prePrepareMsg.RequestMsg // Verify if v, n(a.k.a. sequenceID), d are correct. if !state.verifyMsg(prePrepareMsg.ViewID, prePrepareMsg.SequenceID, prePrepareMsg.Digest) { return nil, errors.New(&quot;pre-prepare message is corrupted&quot;) } // Change the stage to pre-prepared. state.CurrentStage = PrePrepared return &amp;VoteMsg{ ViewID: state.ViewID, SequenceID: prePrepareMsg.SequenceID, Digest: prePrepareMsg.Digest, MsgType: PrepareMsg, Height: prePrepareMsg.Height, }, nil } 而上文提到的node.NewNode中有这么一段，其中resolveMsg就是处理各种fbft过程传统msg，对msg校验，然后发起下一阶段的请求。 // Start message dispatcher go node.dispatchMsg() // Start alarm trigger go node.alarmToDispatcher() // Start message resolver go node.resolveMsg() //start backward message dispatcher go node.dispatchMsgBackward() //start Process message commit wait go node.processCommitWaitMessage() resolveMsg代码如下 func (node *Node) resolveMsg() { for { // Get buffered messages from the dispatcher. msgs := &lt;-node.MsgDelivery switch msgs.(type) { case []*consensus.RequestMsg: errs := node.resolveRequestMsg(msgs.([]*consensus.RequestMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.PrePrepareMsg: errs := node.resolvePrePrepareMsg(msgs.([]*consensus.PrePrepareMsg)) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } case []*consensus.VoteMsg: voteMsgs := msgs.([]*consensus.VoteMsg) if len(voteMsgs) == 0 { break } if voteMsgs[0].MsgType == consensus.PrepareMsg { errs := node.resolvePrepareMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } else if voteMsgs[0].MsgType == consensus.CommitMsg { errs := node.resolveCommitMsg(voteMsgs) if len(errs) != 0 { for _, err := range errs { fmt.Println(err) } // TODO: send err to ErrorChannel } } } } } 还有一个重要的问题必须要回答，因为现在fbft调用链找到了额，fbft过程消息处理机制也找到了额，但是共识的是什么？这个问题一直没回答。其实fbft共识的是leader和fastblock。代码如下，中间省去部分细节。 app启动是会开启维护员leader选举 pbft_agent.go case types.CommitteeStart: log.Info(&quot;CommitteeStart...&quot;) self.committeeMu.Lock() self.setCommitteeInfo(self.NextCommitteeInfo, CurrentCommittee) self.committeeMu.Unlock() if self.IsCommitteeMember(self.CommitteeInfo) { go self.server.Notify(self.CommitteeInfo.Id, int(ch.Option))//发送选举通知 Notify为调用pbftserver.work } pbftserver.go work代码如下 func (ss *PbftServerMgr) work(cid *big.Int, acChan &lt;-chan *consensus.ActionIn) { for { select { case ac := &lt;-acChan: if ac.AC == consensus.ActionFecth { req, err := ss.GetRequest(cid) if err == nil &amp;&amp; req != nil { if server, ok := ss.servers[cid.Uint64()]; ok { server.Height = big.NewInt(req.Height) server.server.PutRequest(req) //发起共识 } else { fmt.Println(err.Error()) } } else { lock.PSLog(err.Error()) } } else if ac.AC == consensus.ActionBroadcast { ss.Broadcast(ac.Height) } else if ac.AC == consensus.ActionFinish { return } } } 选举完成之后将自己设置为leader func (ss *PbftServerMgr) PutCommittee(committeeInfo *types.CommitteeInfo) error { lock.PSLog(&quot;PutCommittee&quot;, committeeInfo.Id, committeeInfo.Members) id := committeeInfo.Id members := committeeInfo.Members if id == nil || len(members) &lt;= 0 { return errors.New(&quot;wrong params...&quot;) } if _, ok := ss.servers[id.Uint64()]; ok { return errors.New(&quot;repeat ID:&quot; + id.String()) } leader := members[0].Publickey infos := make([]*types.CommitteeNode, 0) server := serverInfo{ //第一次共识完成，选出leader leader: leader, nodeid: common.ToHex(crypto.FromECDSAPub(ss.pk)), info: infos, Height: new(big.Int).Set(common.Big0), clear: false, } for _, v := range members { server.insertMember(v) } ss.servers[id.Uint64()] = &amp;server return nil } 在fb出块的时候有一个leader判断动作 func (ss *PbftServerMgr) GetRequest(id *big.Int) (*consensus.RequestMsg, error) { // get new fastblock 产出一个fastblock server, ok := ss.servers[id.Uint64()] if !ok { return nil, errors.New(&quot;wrong conmmitt ID:&quot; + id.String()) } // the node must be leader if !bytes.Equal(crypto.FromECDSAPub(server.leader), crypto.FromECDSAPub(ss.pk)) { //leader判断 return nil, errors.New(&quot;local node must be leader...&quot;) } lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, &quot;start&quot;) fb, err := ss.Agent.FetchFastBlock() lock.PSLog(&quot;AGENT&quot;, &quot;FetchFastBlock&quot;, err == nil, &quot;end&quot;) if err != nil { return nil, err } if fb := ss.getBlock(fb.NumberU64()); fb != nil { return nil, errors.New(&quot;same height:&quot; + fb.Number().String()) } fmt.Println(len(ss.blocks)) sum := ss.getBlockLen() if sum &gt; 0 { last := ss.getLastBlock() if last != nil { cur := last.Number() cur.Add(cur, common.Big1) if cur.Cmp(fb.Number()) != 0 { return nil, errors.New(&quot;wrong fastblock,lastheight:&quot; + cur.String() + &quot; cur:&quot; + fb.Number().String()) } } } ss.putBlock(fb.NumberU64(), fb) data, err := rlp.EncodeToBytes(fb) if err != nil { return nil, err } msg := hex.EncodeToString(data) val := &amp;consensus.RequestMsg{ //返回一个fastblock共识消息 ClientID: server.nodeid, Timestamp: time.Now().Unix(), Operation: msg, Height: fb.Number().Int64(), } return val, nil } 本来想对pow在解析一下，发现有童鞋写的非常好了额，感兴趣的可以移步链接【6】 运行状况 再来看看true链运行情况。 总体运行情况如下图：图中可以看出目前委员会为6个，FB69758个，SB982个。委员会6据了解是前期为了主网稳定，但6个节点那么允许作恶容忍6*0.25=1.2个，作恶风险还是比较高，如果出现2台机器作恶，将会产生混乱，还是希望官网引起重视。 再来看混合共识的结果 快链：初略看了一下大部分block的共识委员会都是6个，说明目前没有分岔，但有一个疑问，为什么第一个的block高度不是1？ 慢链：初略看了一下大部分挖矿地址比较分散，说明pow效果还是很明显真正做到了去中心化。但是大部分区块没有交易数，很多空块会占用大量的存储空间，而且毫无意义，因为没有交易。我想一种采用一种压缩技术，对连续空块进行压缩；一种方式降低出块速率让速率和交易量挂钩。这两种思路都可以解决空块暂用磁盘问题，我的一点拙见。 Snail Blocks：进入SnailBlocks发现没有水果，不知是我理解的问题，还是浏览器的bug，没有发现水果。按照逻辑应该水果能被查询出来才算正常，水果作为Fast Block再次打包的凭证，如果没有水果很难说pow发挥作用，希望是浏览器的bug。 结论 节点启动以后会先发起一轮fbft的共识选举，选举leader有记账权，记账的表现形式为fastblock。如果想研究pow机制请参考链接【6】。这两种共识一种保障效率，一种保障安全，在去中心化和效率选进行了一个折中的选择。从上线的运行效果来看，两种共识能够完美配合，但是仍存在一些不足，比如空块暂用磁盘可以进行优化，水果在区块链浏览器中无法查看，委员会只有6个安全有待进一步提升。最后，初链做出的努力和结果可喜可贺，为投资者和社区交了一份满意的答卷。 参考资料 [1]:https://www.8btc.com/article/106800 论比特币系统的共识规则 [2]:http://blog.51cto.com/11821908/2059711 PoW挖矿算法原理及其在比特币、以太坊中的实现 [3]:http://www.sohu.com/a/239677141_100092199 POW+POS混合共识机制有多牛？区块链大佬揭秘！ [4]:https://blog.csdn.net/qq_22269733/article/details/83025225 Truechain主网Beta版交易流程解析 [5]:https://blog.csdn.net/jerry81333/article/details/74303194/ 区块链共识算法 PBFT（拜占庭容错）、PAXOS、RAFT简述 [6]:https://blog.csdn.net/sinat_27935057/article/details/83193018 初链主网Beta版慢链挖矿解析 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/10/20/516a8d53f514cdd322b4a9223cbcea09.html","headline":"初链主网上线技术解读之-混合共识","dateModified":"2018-10-20T00:00:00+08:00","datePublished":"2018-10-20T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/10/20/516a8d53f514cdd322b4a9223cbcea09.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>初链主网上线技术解读之-混合共识</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h2><a id="_0"></a>背景</h2> 
+  <p>从2017年11月启动至今，经过历时近一年的研究、开发与测试，初链主网Beta版于新加坡时间2018年09月28日08:00正式上线，在此之前，07:56分PBFT委员会第一次共识出块和TrueChain fPOW创世区块被挖出，为了让更多人从技术上去理解初链，初链社区发布了初链技术解读的任务，我也借这次任务开始我第一篇博客。</p> 
+  <h2><a id="_2"></a>说明</h2> 
+  <p>初链本次上线体现了五大亮点，包括混合共识，FPow公链，TrueHash抗ASIC的挖矿算法，PBFT委员会的随机选举机制，高TPS。本文主要针对初链的混合共识进行解读。后续一一解读其它亮点。</p> 
+  <h2><a id="_5"></a>名称解释</h2> 
+  <p><strong>共识：</strong> 共识顾名思义，共同的认识，在区块链世界中早期的共识算法代表要算比特币的pow。pow简单来讲，就是前一个区块有一个随机数，大家都去猜，谁先猜出来谁就有记账权，记账好了后，就将区块广播给其它节点，如果要想从源码层解读，请参考文档“PoW挖矿算法原理及其在比特币、以太坊中的实现”。<br> <strong>混合共识：</strong> pow共识安全但不高效，转账效率低，为了解决这个问题，后面出现了pos dpos，虽然效率提高了但是已不再那么去中心化。为了找到效率和安全的平衡点，混合共识出现，一种共识解决记账，一种共识解决区中心化。本文主要解读初链，让我们来看看true链是怎么找到这个平衡点的。</p> 
+  <h2><a id="_8"></a>技术架构</h2> 
+  <p>初链采用双链结构，如图所示。一条快链，一条慢链。快链是交易块，里面记录的是很多交易。慢链是水果块，里面记录的是很多水果，水果一次递增，每个水果映射一个交易块。<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181019220947496?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3RpYW5qdWVzaGFv/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"><br> 混合共识又是怎么一回事呢？<br> 在初链中，采用改进拜赞庭（fbft）和工作量证明（pow）两种共识。fbft主要解决交易效率问题，如图所示，委员会由41个节点组成，相对于比特比节点而已，已经少之又少，当交易网络的交易提交到委员会网络以后，交易能够得到快速的确认，自然整个网络的交易效率也就提高了额。pow主要解决去中心化问题，每个水果和每个快区块一一对应，而每个水果又会被pow再次打包出块，如果想要篡改交易，首先要篡改pow里面的水果，就必须控制51%的算力。<br> 这有点虚吧！没问题，下面就来点实际的。</p> 
+  <pre><code>从启动到运行bft有很深的调用链，如下可以找到node的NewNode方法
+main--&gt;&gt;cmd:StartNode()
+cmd--&gt;&gt;node:Start()
+node--&gt;&gt;service:start()
+service--&gt;&gt;backend-Truechain:Start()
+truechain--&gt;&gt;pbft_agent:start()loop()
+pbft_agent--&gt;&gt;commitee:PutNodes()
+commitee--&gt;&gt;pbftserver:PutNodes()
+pbftserver--&gt;&gt;proxy_server:NewServer()
+proxy_server--&gt;&gt;node:NewNode()
+</code></pre> 
+  <p>有关pbft算法过程详情可以参考【链接5】，大概有5个过程1. Request 2. Pre-Prepare 3. Prepare 4. Commit 5.Reply。true链进行了改造。整个逻辑如图，重点是node的resolveMsg，该方法是true链委员会和fbft_impl起到核心关联作用。<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181020143100594?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3RpYW5qdWVzaGFv/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"><br> 相关代码如下</p> 
+  <pre><code>type PBFT interface {
+	StartConsensus(request *RequestMsg) (*PrePrepareMsg, error)
+	PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error)
+	Prepare(prepareMsg *VoteMsg) (*VoteMsg, error)
+	Commit(commitMsg *VoteMsg) (*ReplyMsg, *RequestMsg, error)
+}
+
+实现类在pbft_impl.go中，这里只展示一段，其它方法感兴趣的同学可以自行查看
+func (state *State) PrePrepare(prePrepareMsg *PrePrepareMsg) (*VoteMsg, error) {
+	// Get ReqMsgs and save it to its logs like the primary.
+	state.MsgLogs.ReqMsg = prePrepareMsg.RequestMsg
+
+	// Verify if v, n(a.k.a. sequenceID), d are correct.
+	if !state.verifyMsg(prePrepareMsg.ViewID, prePrepareMsg.SequenceID, prePrepareMsg.Digest) {
+		return nil, errors.New("pre-prepare message is corrupted")
+	}
+	// Change the stage to pre-prepared.
+	state.CurrentStage = PrePrepared
+
+	return &amp;VoteMsg{
+		ViewID:     state.ViewID,
+		SequenceID: prePrepareMsg.SequenceID,
+		Digest:     prePrepareMsg.Digest,
+		MsgType:    PrepareMsg,
+		Height:     prePrepareMsg.Height,
+	}, nil
+}
+而上文提到的node.NewNode中有这么一段，其中resolveMsg就是处理各种fbft过程传统msg，对msg校验，然后发起下一阶段的请求。
+// Start message dispatcher
+	go node.dispatchMsg()
+
+	// Start alarm trigger
+	go node.alarmToDispatcher()
+
+	// Start message resolver
+	go node.resolveMsg()
+
+	//start backward message dispatcher
+	go node.dispatchMsgBackward()
+
+	//start Process message commit wait
+	go node.processCommitWaitMessage()
+
+resolveMsg代码如下
+func (node *Node) resolveMsg() {
+	for {
+		// Get buffered messages from the dispatcher.
+		msgs := &lt;-node.MsgDelivery
+		switch msgs.(type) {
+		case []*consensus.RequestMsg:
+			errs := node.resolveRequestMsg(msgs.([]*consensus.RequestMsg))
+			if len(errs) != 0 {
+				for _, err := range errs {
+					fmt.Println(err)
+				}
+				// TODO: send err to ErrorChannel
+			}
+		case []*consensus.PrePrepareMsg:
+			errs := node.resolvePrePrepareMsg(msgs.([]*consensus.PrePrepareMsg))
+			if len(errs) != 0 {
+				for _, err := range errs {
+					fmt.Println(err)
+				}
+				// TODO: send err to ErrorChannel
+			}
+		case []*consensus.VoteMsg:
+			voteMsgs := msgs.([]*consensus.VoteMsg)
+			if len(voteMsgs) == 0 {
+				break
+			}
+
+			if voteMsgs[0].MsgType == consensus.PrepareMsg {
+				errs := node.resolvePrepareMsg(voteMsgs)
+				if len(errs) != 0 {
+					for _, err := range errs {
+						fmt.Println(err)
+					}
+					// TODO: send err to ErrorChannel
+				}
+			} else if voteMsgs[0].MsgType == consensus.CommitMsg {
+				errs := node.resolveCommitMsg(voteMsgs)
+				if len(errs) != 0 {
+					for _, err := range errs {
+						fmt.Println(err)
+					}
+					// TODO: send err to ErrorChannel
+				}
+			}
+		}
+	}
+}
+</code></pre> 
+  <p>还有一个重要的问题必须要回答，因为现在fbft调用链找到了额，fbft过程消息处理机制也找到了额，但是共识的是什么？这个问题一直没回答。其实fbft共识的是leader和fastblock。代码如下，中间省去部分细节。</p> 
+  <pre><code>app启动是会开启维护员leader选举
+pbft_agent.go
+	case types.CommitteeStart:
+				log.Info("CommitteeStart...")
+				self.committeeMu.Lock()
+				self.setCommitteeInfo(self.NextCommitteeInfo, CurrentCommittee)
+				self.committeeMu.Unlock()
+				if self.IsCommitteeMember(self.CommitteeInfo) {
+					go self.server.Notify(self.CommitteeInfo.Id, int(ch.Option))//发送选举通知  Notify为调用pbftserver.work
+				}
+pbftserver.go work代码如下
+func (ss *PbftServerMgr) work(cid *big.Int, acChan &lt;-chan *consensus.ActionIn) {
+	for {
+		select {
+		case ac := &lt;-acChan:
+			if ac.AC == consensus.ActionFecth {
+				req, err := ss.GetRequest(cid)
+				if err == nil &amp;&amp; req != nil {
+					if server, ok := ss.servers[cid.Uint64()]; ok {
+						server.Height = big.NewInt(req.Height)
+						server.server.PutRequest(req) //发起共识
+					} else {
+						fmt.Println(err.Error())
+					}
+				} else {
+					lock.PSLog(err.Error())
+				}
+			} else if ac.AC == consensus.ActionBroadcast {
+				ss.Broadcast(ac.Height)
+			} else if ac.AC == consensus.ActionFinish {
+				return
+			}
+		}
+	}
+				
+选举完成之后将自己设置为leader
+func (ss *PbftServerMgr) PutCommittee(committeeInfo *types.CommitteeInfo) error {
+	lock.PSLog("PutCommittee", committeeInfo.Id, committeeInfo.Members)
+	id := committeeInfo.Id
+	members := committeeInfo.Members
+	if id == nil || len(members) &lt;= 0 {
+		return errors.New("wrong params...")
+	}
+	if _, ok := ss.servers[id.Uint64()]; ok {
+		return errors.New("repeat ID:" + id.String())
+	}
+	leader := members[0].Publickey
+	infos := make([]*types.CommitteeNode, 0)
+	server := serverInfo{   //第一次共识完成，选出leader
+		leader: leader,
+		nodeid: common.ToHex(crypto.FromECDSAPub(ss.pk)),
+		info:   infos,
+		Height: new(big.Int).Set(common.Big0),
+		clear:  false,
+	}
+	for _, v := range members {
+		server.insertMember(v)
+	}
+	ss.servers[id.Uint64()] = &amp;server
+	return nil
+}
+在fb出块的时候有一个leader判断动作
+func (ss *PbftServerMgr) GetRequest(id *big.Int) (*consensus.RequestMsg, error) {
+	// get new fastblock 产出一个fastblock
+	server, ok := ss.servers[id.Uint64()]
+	if !ok {
+		return nil, errors.New("wrong conmmitt ID:" + id.String())
+	}
+	// the node must be leader
+	if !bytes.Equal(crypto.FromECDSAPub(server.leader), crypto.FromECDSAPub(ss.pk)) { //leader判断
+		return nil, errors.New("local node must be leader...")
+	}
+	lock.PSLog("AGENT", "FetchFastBlock", "start")
+	fb, err := ss.Agent.FetchFastBlock()
+	lock.PSLog("AGENT", "FetchFastBlock", err == nil, "end")
+	if err != nil {
+		return nil, err
+	}
+
+	if fb := ss.getBlock(fb.NumberU64()); fb != nil {
+		return nil, errors.New("same height:" + fb.Number().String())
+	}
+
+	fmt.Println(len(ss.blocks))
+	sum := ss.getBlockLen()
+
+	if sum &gt; 0 {
+		last := ss.getLastBlock()
+		if last != nil {
+			cur := last.Number()
+			cur.Add(cur, common.Big1)
+			if cur.Cmp(fb.Number()) != 0 {
+				return nil, errors.New("wrong fastblock,lastheight:" + cur.String() + " cur:" + fb.Number().String())
+			}
+		}
+	}
+
+	ss.putBlock(fb.NumberU64(), fb)
+	data, err := rlp.EncodeToBytes(fb)
+	if err != nil {
+		return nil, err
+	}
+	msg := hex.EncodeToString(data)
+	val := &amp;consensus.RequestMsg{ //返回一个fastblock共识消息
+		ClientID:  server.nodeid,
+		Timestamp: time.Now().Unix(),
+		Operation: msg,
+		Height:    fb.Number().Int64(),
+	}
+	return val, nil
+}
+
+</code></pre> 
+  <p>本来想对pow在解析一下，发现有童鞋写的非常好了额，感兴趣的可以移步链接【6】</p> 
+  <h2><a id="_238"></a>运行状况</h2> 
+  <p>再来看看true链运行情况。<br> 总体运行情况如下图：图中可以看出目前委员会为6个，FB69758个，SB982个。委员会6据了解是前期为了主网稳定，但6个节点那么允许作恶容忍6*0.25=1.2个，作恶风险还是比较高，如果出现2台机器作恶，将会产生混乱，还是希望官网引起重视。<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181019223452157?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3RpYW5qdWVzaGFv/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"><br> 再来看混合共识的结果<br> 快链：初略看了一下大部分block的共识委员会都是6个，说明目前没有分岔，但有一个疑问，为什么第一个的block高度不是1？<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181019224730143?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3RpYW5qdWVzaGFv/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"><br> 慢链：初略看了一下大部分挖矿地址比较分散，说明pow效果还是很明显真正做到了去中心化。但是大部分区块没有交易数，很多空块会占用大量的存储空间，而且毫无意义，因为没有交易。我想一种采用一种压缩技术，对连续空块进行压缩；一种方式降低出块速率让速率和交易量挂钩。这两种思路都可以解决空块暂用磁盘问题，我的一点拙见。<br> <img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181019225038330?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3RpYW5qdWVzaGFv/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"><br> Snail Blocks：进入SnailBlocks发现没有水果，不知是我理解的问题，还是浏览器的bug，没有发现水果。按照逻辑应该水果能被查询出来才算正常，水果作为Fast Block再次打包的凭证，如果没有水果很难说pow发挥作用，希望是浏览器的bug。</p> 
+  <h2><a id="_248"></a>结论</h2> 
+  <p>节点启动以后会先发起一轮fbft的共识选举，选举leader有记账权，记账的表现形式为fastblock。如果想研究pow机制请参考链接【6】。这两种共识一种保障效率，一种保障安全，在去中心化和效率选进行了一个折中的选择。从上线的运行效果来看，两种共识能够完美配合，但是仍存在一些不足，比如空块暂用磁盘可以进行优化，水果在区块链浏览器中无法查看，委员会只有6个安全有待进一步提升。最后，初链做出的努力和结果可喜可贺，为投资者和社区交了一份满意的答卷。</p> 
+  <h2><a id="_251"></a>参考资料</h2> 
+  <p>[1]:<a href="https://www.8btc.com/article/106800" rel="nofollow">https://www.8btc.com/article/106800</a> 论比特币系统的共识规则<br> [2]:<a href="http://blog.51cto.com/11821908/2059711" rel="nofollow">http://blog.51cto.com/11821908/2059711</a> PoW挖矿算法原理及其在比特币、以太坊中的实现<br> [3]:<a href="http://www.sohu.com/a/239677141_100092199" rel="nofollow">http://www.sohu.com/a/239677141_100092199</a> POW+POS混合共识机制有多牛？区块链大佬揭秘！<br> [4]:<a href="https://blog.csdn.net/qq_22269733/article/details/83025225" rel="nofollow">https://blog.csdn.net/qq_22269733/article/details/83025225</a> Truechain主网Beta版交易流程解析<br> [5]:<a href="https://blog.csdn.net/jerry81333/article/details/74303194/" rel="nofollow">https://blog.csdn.net/jerry81333/article/details/74303194/</a> 区块链共识算法 PBFT（拜占庭容错）、PAXOS、RAFT简述<br> [6]:<a href="https://blog.csdn.net/sinat_27935057/article/details/83193018" rel="nofollow">https://blog.csdn.net/sinat_27935057/article/details/83193018</a> 初链主网Beta版慢链挖矿解析</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-7f770a53f2.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/tianjueshao/article/details/83154451,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/tianjueshao/article/details/83154451,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Tendermint同步区块 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Tendermint同步区块" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="最近在学习Tendermint的代码，记录下同步区块的流程，直接跳过P2P阶段，后续再写一篇文章记录P2P流程吧 blockchain/pool.go的OnStart()新建了gorountine来发起获取区块请求 func (pool *BlockPool) OnStart() error { go pool.makeRequestersRoutine() pool.startTime = time.Now() return nil } 看下makeRequestersRoutine的代码 // Run spawns requesters as needed. func (pool *BlockPool) makeRequestersRoutine() { for { if !pool.IsRunning() { break } _, numPending, lenRequesters := pool.GetStatus() if numPending &gt;= maxPendingRequests { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else if lenRequesters &gt;= maxTotalRequesters { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else { // request for more blocks. pool.makeNextRequester() } } } 这里是一个for循环，获取当前pool的状态 1 如果当前pending的个数大于等于10000个，sleep 100ms，并且remove掉timeout的peer（remove timeout peer的逻辑是当前接收peer的bitrate小于10KB/S 2 如果当前request的个数大于等于10000个，sleep 100ms并且remove timeout的peer 3 新建一个请求 func (pool *BlockPool) makeNextRequester() { pool.mtx.Lock() defer pool.mtx.Unlock() nextHeight := pool.height + pool.requestersLen() request := newBPRequester(pool, nextHeight) // request.SetLogger(pool.Logger.With(&quot;height&quot;, nextHeight)) pool.requesters[nextHeight] = request pool.numPending++ err := request.Start() if err != nil { request.Logger.Error(&quot;Error starting request&quot;, &quot;err&quot;, err) } }新建请求的时候rquester和pending都会+1，然后调用request.Start()，这个调用的是blockchain/pool.go的另外一个OnStart() func (bpr *bpRequester) OnStart() error { go bpr.requestRoutine() return nil } 看下requestRoutine的代码 func (bpr *bpRequester) requestRoutine() { OUTER_LOOP: for { // Pick a peer to send request to. var peer *bpPeer = nil PICK_PEER_LOOP: for { if !bpr.IsRunning() || !bpr.pool.IsRunning() { return } peer = bpr.pool.pickIncrAvailablePeer(bpr.height) if peer == nil { //log.Info(&quot;No peers available&quot;, &quot;height&quot;, height) time.Sleep(requestIntervalMS * time.Millisecond) continue PICK_PEER_LOOP } break PICK_PEER_LOOP } bpr.mtx.Lock() bpr.peerID = peer.id bpr.mtx.Unlock() // Send request and wait. bpr.pool.sendRequest(bpr.height, peer.id) ... } } pickIncrAvailablePeer的作用是找到有高度（bpr.height）的节点 sendRequest其实是写了一个channel func (pool *BlockPool) sendRequest(height int64, peerID string) { if !pool.IsRunning() { return } pool.requestsCh &lt;- BlockRequest{height, peerID} } 接着找requestsCh读取的地方，就在blockchain/reactor.go中： func (bcR *BlockchainReactor) poolRoutine() { trySyncTicker := time.NewTicker(trySyncIntervalMS * time.Millisecond) statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second) switchToConsensusTicker := time.NewTicker(switchToConsensusIntervalSeconds * time.Second) blocksSynced := 0 chainID := bcR.initialState.ChainID state := bcR.initialState lastHundred := time.Now() lastRate := 0.0 FOR_LOOP: for { select { case request := &lt;-bcR.requestsCh: // chan BlockRequest peer := bcR.Switch.Peers().Get(request.PeerID) if peer == nil { continue FOR_LOOP // Peer has since been disconnected. } msg := &amp;bcBlockRequestMessage{request.Height} queued := peer.TrySend(BlockchainChannel, struct{ BlockchainMessage }{msg}) if !queued { // We couldn&#39;t make the request, send-queue full. // The pool handles timeouts, just let it go. continue FOR_LOOP } case peerID := &lt;-bcR.timeoutsCh: // chan string // Peer timed out. peer := bcR.Switch.Peers().Get(peerID) if peer != nil { bcR.Switch.StopPeerForError(peer, errors.New(&quot;BlockchainReactor Timeout&quot;)) } case &lt;-statusUpdateTicker.C: // ask for status updates go bcR.BroadcastStatusRequest() // nolint: errcheck case &lt;-switchToConsensusTicker.C: height, numPending, lenRequesters := bcR.pool.GetStatus() outbound, inbound, _ := bcR.Switch.NumPeers() bcR.Logger.Debug(&quot;Consensus ticker&quot;, &quot;numPending&quot;, numPending, &quot;total&quot;, lenRequesters, &quot;outbound&quot;, outbound, &quot;inbound&quot;, inbound) if bcR.pool.IsCaughtUp() { bcR.Logger.Info(&quot;Time to switch to consensus reactor!&quot;, &quot;height&quot;, height) bcR.pool.Stop() conR := bcR.Switch.Reactor(&quot;CONSENSUS&quot;).(consensusReactor) conR.SwitchToConsensus(state, blocksSynced) break FOR_LOOP } case &lt;-trySyncTicker.C: // chan time // This loop can be slow as long as it&#39;s doing syncing work. SYNC_LOOP: for i := 0; i &lt; 10; i++ { // See if there are any blocks to sync. first, second := bcR.pool.PeekTwoBlocks() //bcR.Logger.Info(&quot;TrySync peeked&quot;, &quot;first&quot;, first, &quot;second&quot;, second) if first == nil || second == nil { // We need both to sync the first block. break SYNC_LOOP } firstParts := first.MakePartSet(state.ConsensusParams.BlockPartSizeBytes) firstPartsHeader := firstParts.Header() firstID := types.BlockID{first.Hash(), firstPartsHeader} // Finally, verify the first block using the second&#39;s commit // NOTE: we can probably make this more efficient, but note that calling // first.Hash() doesn&#39;t verify the tx contents, so MakePartSet() is // currently necessary. err := state.Validators.VerifyCommit( chainID, firstID, first.Height, second.LastCommit) if err != nil { bcR.Logger.Error(&quot;Error in validation&quot;, &quot;err&quot;, err) bcR.pool.RedoRequest(first.Height) break SYNC_LOOP } else { bcR.pool.PopRequest() bcR.store.SaveBlock(first, firstParts, second.LastCommit) // NOTE: we could improve performance if we // didn&#39;t make the app commit to disk every block // ... but we would need a way to get the hash without it persisting var err error state, err = bcR.blockExec.ApplyBlock(state, firstID, first) if err != nil { // TODO This is bad, are we zombie? cmn.PanicQ(cmn.Fmt(&quot;Failed to process committed block (%d:%X): %v&quot;, first.Height, first.Hash(), err)) } blocksSynced += 1 // update the consensus params bcR.updateConsensusParams(state.ConsensusParams) if blocksSynced%100 == 0 { lastRate = 0.9*lastRate + 0.1*(100/time.Since(lastHundred).Seconds()) bcR.Logger.Info(&quot;Fast Sync Rate&quot;, &quot;height&quot;, bcR.pool.height, &quot;max_peer_height&quot;, bcR.pool.MaxPeerHeight(), &quot;blocks/s&quot;, lastRate) lastHundred = time.Now() } } } continue FOR_LOOP case &lt;-bcR.Quit: break FOR_LOOP } } } 1 收到reqeustCh的数据，发送bcBlockRequestMessage到对端节点（对端节点收到消息后返回高度的block）。是在本文件中的Receive()函数处理的 2 本函数有个trySyncTicker 50ms的timer一直在运行，作用是拿到两个已经从对端peer获取的block，经过VerifyCommit之后，SaveBlock存在tendermint内部，再调用ApplyBlock存到application 3 也有个statusUpdateTicker 10s的timer，作用是broadcast bcStatusRequestMessage去获取对端节点的block高度 4 还有个switchToConsensusTicker 1s的timer也在运行，作用是看本节点的block高度有没有大于等于其他节点的最大高度，如果到达了（也就是同步区块完成了）就SwitchToConsensus切换fast mode到consensus mode 阅读更多" />
+<meta property="og:description" content="最近在学习Tendermint的代码，记录下同步区块的流程，直接跳过P2P阶段，后续再写一篇文章记录P2P流程吧 blockchain/pool.go的OnStart()新建了gorountine来发起获取区块请求 func (pool *BlockPool) OnStart() error { go pool.makeRequestersRoutine() pool.startTime = time.Now() return nil } 看下makeRequestersRoutine的代码 // Run spawns requesters as needed. func (pool *BlockPool) makeRequestersRoutine() { for { if !pool.IsRunning() { break } _, numPending, lenRequesters := pool.GetStatus() if numPending &gt;= maxPendingRequests { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else if lenRequesters &gt;= maxTotalRequesters { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else { // request for more blocks. pool.makeNextRequester() } } } 这里是一个for循环，获取当前pool的状态 1 如果当前pending的个数大于等于10000个，sleep 100ms，并且remove掉timeout的peer（remove timeout peer的逻辑是当前接收peer的bitrate小于10KB/S 2 如果当前request的个数大于等于10000个，sleep 100ms并且remove timeout的peer 3 新建一个请求 func (pool *BlockPool) makeNextRequester() { pool.mtx.Lock() defer pool.mtx.Unlock() nextHeight := pool.height + pool.requestersLen() request := newBPRequester(pool, nextHeight) // request.SetLogger(pool.Logger.With(&quot;height&quot;, nextHeight)) pool.requesters[nextHeight] = request pool.numPending++ err := request.Start() if err != nil { request.Logger.Error(&quot;Error starting request&quot;, &quot;err&quot;, err) } }新建请求的时候rquester和pending都会+1，然后调用request.Start()，这个调用的是blockchain/pool.go的另外一个OnStart() func (bpr *bpRequester) OnStart() error { go bpr.requestRoutine() return nil } 看下requestRoutine的代码 func (bpr *bpRequester) requestRoutine() { OUTER_LOOP: for { // Pick a peer to send request to. var peer *bpPeer = nil PICK_PEER_LOOP: for { if !bpr.IsRunning() || !bpr.pool.IsRunning() { return } peer = bpr.pool.pickIncrAvailablePeer(bpr.height) if peer == nil { //log.Info(&quot;No peers available&quot;, &quot;height&quot;, height) time.Sleep(requestIntervalMS * time.Millisecond) continue PICK_PEER_LOOP } break PICK_PEER_LOOP } bpr.mtx.Lock() bpr.peerID = peer.id bpr.mtx.Unlock() // Send request and wait. bpr.pool.sendRequest(bpr.height, peer.id) ... } } pickIncrAvailablePeer的作用是找到有高度（bpr.height）的节点 sendRequest其实是写了一个channel func (pool *BlockPool) sendRequest(height int64, peerID string) { if !pool.IsRunning() { return } pool.requestsCh &lt;- BlockRequest{height, peerID} } 接着找requestsCh读取的地方，就在blockchain/reactor.go中： func (bcR *BlockchainReactor) poolRoutine() { trySyncTicker := time.NewTicker(trySyncIntervalMS * time.Millisecond) statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second) switchToConsensusTicker := time.NewTicker(switchToConsensusIntervalSeconds * time.Second) blocksSynced := 0 chainID := bcR.initialState.ChainID state := bcR.initialState lastHundred := time.Now() lastRate := 0.0 FOR_LOOP: for { select { case request := &lt;-bcR.requestsCh: // chan BlockRequest peer := bcR.Switch.Peers().Get(request.PeerID) if peer == nil { continue FOR_LOOP // Peer has since been disconnected. } msg := &amp;bcBlockRequestMessage{request.Height} queued := peer.TrySend(BlockchainChannel, struct{ BlockchainMessage }{msg}) if !queued { // We couldn&#39;t make the request, send-queue full. // The pool handles timeouts, just let it go. continue FOR_LOOP } case peerID := &lt;-bcR.timeoutsCh: // chan string // Peer timed out. peer := bcR.Switch.Peers().Get(peerID) if peer != nil { bcR.Switch.StopPeerForError(peer, errors.New(&quot;BlockchainReactor Timeout&quot;)) } case &lt;-statusUpdateTicker.C: // ask for status updates go bcR.BroadcastStatusRequest() // nolint: errcheck case &lt;-switchToConsensusTicker.C: height, numPending, lenRequesters := bcR.pool.GetStatus() outbound, inbound, _ := bcR.Switch.NumPeers() bcR.Logger.Debug(&quot;Consensus ticker&quot;, &quot;numPending&quot;, numPending, &quot;total&quot;, lenRequesters, &quot;outbound&quot;, outbound, &quot;inbound&quot;, inbound) if bcR.pool.IsCaughtUp() { bcR.Logger.Info(&quot;Time to switch to consensus reactor!&quot;, &quot;height&quot;, height) bcR.pool.Stop() conR := bcR.Switch.Reactor(&quot;CONSENSUS&quot;).(consensusReactor) conR.SwitchToConsensus(state, blocksSynced) break FOR_LOOP } case &lt;-trySyncTicker.C: // chan time // This loop can be slow as long as it&#39;s doing syncing work. SYNC_LOOP: for i := 0; i &lt; 10; i++ { // See if there are any blocks to sync. first, second := bcR.pool.PeekTwoBlocks() //bcR.Logger.Info(&quot;TrySync peeked&quot;, &quot;first&quot;, first, &quot;second&quot;, second) if first == nil || second == nil { // We need both to sync the first block. break SYNC_LOOP } firstParts := first.MakePartSet(state.ConsensusParams.BlockPartSizeBytes) firstPartsHeader := firstParts.Header() firstID := types.BlockID{first.Hash(), firstPartsHeader} // Finally, verify the first block using the second&#39;s commit // NOTE: we can probably make this more efficient, but note that calling // first.Hash() doesn&#39;t verify the tx contents, so MakePartSet() is // currently necessary. err := state.Validators.VerifyCommit( chainID, firstID, first.Height, second.LastCommit) if err != nil { bcR.Logger.Error(&quot;Error in validation&quot;, &quot;err&quot;, err) bcR.pool.RedoRequest(first.Height) break SYNC_LOOP } else { bcR.pool.PopRequest() bcR.store.SaveBlock(first, firstParts, second.LastCommit) // NOTE: we could improve performance if we // didn&#39;t make the app commit to disk every block // ... but we would need a way to get the hash without it persisting var err error state, err = bcR.blockExec.ApplyBlock(state, firstID, first) if err != nil { // TODO This is bad, are we zombie? cmn.PanicQ(cmn.Fmt(&quot;Failed to process committed block (%d:%X): %v&quot;, first.Height, first.Hash(), err)) } blocksSynced += 1 // update the consensus params bcR.updateConsensusParams(state.ConsensusParams) if blocksSynced%100 == 0 { lastRate = 0.9*lastRate + 0.1*(100/time.Since(lastHundred).Seconds()) bcR.Logger.Info(&quot;Fast Sync Rate&quot;, &quot;height&quot;, bcR.pool.height, &quot;max_peer_height&quot;, bcR.pool.MaxPeerHeight(), &quot;blocks/s&quot;, lastRate) lastHundred = time.Now() } } } continue FOR_LOOP case &lt;-bcR.Quit: break FOR_LOOP } } } 1 收到reqeustCh的数据，发送bcBlockRequestMessage到对端节点（对端节点收到消息后返回高度的block）。是在本文件中的Receive()函数处理的 2 本函数有个trySyncTicker 50ms的timer一直在运行，作用是拿到两个已经从对端peer获取的block，经过VerifyCommit之后，SaveBlock存在tendermint内部，再调用ApplyBlock存到application 3 也有个statusUpdateTicker 10s的timer，作用是broadcast bcStatusRequestMessage去获取对端节点的block高度 4 还有个switchToConsensusTicker 1s的timer也在运行，作用是看本节点的block高度有没有大于等于其他节点的最大高度，如果到达了（也就是同步区块完成了）就SwitchToConsensus切换fast mode到consensus mode 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/20/16a95a287e513e5ce7d8d98cf14a556b.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/20/16a95a287e513e5ce7d8d98cf14a556b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-20T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"最近在学习Tendermint的代码，记录下同步区块的流程，直接跳过P2P阶段，后续再写一篇文章记录P2P流程吧 blockchain/pool.go的OnStart()新建了gorountine来发起获取区块请求 func (pool *BlockPool) OnStart() error { go pool.makeRequestersRoutine() pool.startTime = time.Now() return nil } 看下makeRequestersRoutine的代码 // Run spawns requesters as needed. func (pool *BlockPool) makeRequestersRoutine() { for { if !pool.IsRunning() { break } _, numPending, lenRequesters := pool.GetStatus() if numPending &gt;= maxPendingRequests { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else if lenRequesters &gt;= maxTotalRequesters { // sleep for a bit. time.Sleep(requestIntervalMS * time.Millisecond) // check for timed out peers pool.removeTimedoutPeers() } else { // request for more blocks. pool.makeNextRequester() } } } 这里是一个for循环，获取当前pool的状态 1 如果当前pending的个数大于等于10000个，sleep 100ms，并且remove掉timeout的peer（remove timeout peer的逻辑是当前接收peer的bitrate小于10KB/S 2 如果当前request的个数大于等于10000个，sleep 100ms并且remove timeout的peer 3 新建一个请求 func (pool *BlockPool) makeNextRequester() { pool.mtx.Lock() defer pool.mtx.Unlock() nextHeight := pool.height + pool.requestersLen() request := newBPRequester(pool, nextHeight) // request.SetLogger(pool.Logger.With(&quot;height&quot;, nextHeight)) pool.requesters[nextHeight] = request pool.numPending++ err := request.Start() if err != nil { request.Logger.Error(&quot;Error starting request&quot;, &quot;err&quot;, err) } }新建请求的时候rquester和pending都会+1，然后调用request.Start()，这个调用的是blockchain/pool.go的另外一个OnStart() func (bpr *bpRequester) OnStart() error { go bpr.requestRoutine() return nil } 看下requestRoutine的代码 func (bpr *bpRequester) requestRoutine() { OUTER_LOOP: for { // Pick a peer to send request to. var peer *bpPeer = nil PICK_PEER_LOOP: for { if !bpr.IsRunning() || !bpr.pool.IsRunning() { return } peer = bpr.pool.pickIncrAvailablePeer(bpr.height) if peer == nil { //log.Info(&quot;No peers available&quot;, &quot;height&quot;, height) time.Sleep(requestIntervalMS * time.Millisecond) continue PICK_PEER_LOOP } break PICK_PEER_LOOP } bpr.mtx.Lock() bpr.peerID = peer.id bpr.mtx.Unlock() // Send request and wait. bpr.pool.sendRequest(bpr.height, peer.id) ... } } pickIncrAvailablePeer的作用是找到有高度（bpr.height）的节点 sendRequest其实是写了一个channel func (pool *BlockPool) sendRequest(height int64, peerID string) { if !pool.IsRunning() { return } pool.requestsCh &lt;- BlockRequest{height, peerID} } 接着找requestsCh读取的地方，就在blockchain/reactor.go中： func (bcR *BlockchainReactor) poolRoutine() { trySyncTicker := time.NewTicker(trySyncIntervalMS * time.Millisecond) statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second) switchToConsensusTicker := time.NewTicker(switchToConsensusIntervalSeconds * time.Second) blocksSynced := 0 chainID := bcR.initialState.ChainID state := bcR.initialState lastHundred := time.Now() lastRate := 0.0 FOR_LOOP: for { select { case request := &lt;-bcR.requestsCh: // chan BlockRequest peer := bcR.Switch.Peers().Get(request.PeerID) if peer == nil { continue FOR_LOOP // Peer has since been disconnected. } msg := &amp;bcBlockRequestMessage{request.Height} queued := peer.TrySend(BlockchainChannel, struct{ BlockchainMessage }{msg}) if !queued { // We couldn&#39;t make the request, send-queue full. // The pool handles timeouts, just let it go. continue FOR_LOOP } case peerID := &lt;-bcR.timeoutsCh: // chan string // Peer timed out. peer := bcR.Switch.Peers().Get(peerID) if peer != nil { bcR.Switch.StopPeerForError(peer, errors.New(&quot;BlockchainReactor Timeout&quot;)) } case &lt;-statusUpdateTicker.C: // ask for status updates go bcR.BroadcastStatusRequest() // nolint: errcheck case &lt;-switchToConsensusTicker.C: height, numPending, lenRequesters := bcR.pool.GetStatus() outbound, inbound, _ := bcR.Switch.NumPeers() bcR.Logger.Debug(&quot;Consensus ticker&quot;, &quot;numPending&quot;, numPending, &quot;total&quot;, lenRequesters, &quot;outbound&quot;, outbound, &quot;inbound&quot;, inbound) if bcR.pool.IsCaughtUp() { bcR.Logger.Info(&quot;Time to switch to consensus reactor!&quot;, &quot;height&quot;, height) bcR.pool.Stop() conR := bcR.Switch.Reactor(&quot;CONSENSUS&quot;).(consensusReactor) conR.SwitchToConsensus(state, blocksSynced) break FOR_LOOP } case &lt;-trySyncTicker.C: // chan time // This loop can be slow as long as it&#39;s doing syncing work. SYNC_LOOP: for i := 0; i &lt; 10; i++ { // See if there are any blocks to sync. first, second := bcR.pool.PeekTwoBlocks() //bcR.Logger.Info(&quot;TrySync peeked&quot;, &quot;first&quot;, first, &quot;second&quot;, second) if first == nil || second == nil { // We need both to sync the first block. break SYNC_LOOP } firstParts := first.MakePartSet(state.ConsensusParams.BlockPartSizeBytes) firstPartsHeader := firstParts.Header() firstID := types.BlockID{first.Hash(), firstPartsHeader} // Finally, verify the first block using the second&#39;s commit // NOTE: we can probably make this more efficient, but note that calling // first.Hash() doesn&#39;t verify the tx contents, so MakePartSet() is // currently necessary. err := state.Validators.VerifyCommit( chainID, firstID, first.Height, second.LastCommit) if err != nil { bcR.Logger.Error(&quot;Error in validation&quot;, &quot;err&quot;, err) bcR.pool.RedoRequest(first.Height) break SYNC_LOOP } else { bcR.pool.PopRequest() bcR.store.SaveBlock(first, firstParts, second.LastCommit) // NOTE: we could improve performance if we // didn&#39;t make the app commit to disk every block // ... but we would need a way to get the hash without it persisting var err error state, err = bcR.blockExec.ApplyBlock(state, firstID, first) if err != nil { // TODO This is bad, are we zombie? cmn.PanicQ(cmn.Fmt(&quot;Failed to process committed block (%d:%X): %v&quot;, first.Height, first.Hash(), err)) } blocksSynced += 1 // update the consensus params bcR.updateConsensusParams(state.ConsensusParams) if blocksSynced%100 == 0 { lastRate = 0.9*lastRate + 0.1*(100/time.Since(lastHundred).Seconds()) bcR.Logger.Info(&quot;Fast Sync Rate&quot;, &quot;height&quot;, bcR.pool.height, &quot;max_peer_height&quot;, bcR.pool.MaxPeerHeight(), &quot;blocks/s&quot;, lastRate) lastHundred = time.Now() } } } continue FOR_LOOP case &lt;-bcR.Quit: break FOR_LOOP } } } 1 收到reqeustCh的数据，发送bcBlockRequestMessage到对端节点（对端节点收到消息后返回高度的block）。是在本文件中的Receive()函数处理的 2 本函数有个trySyncTicker 50ms的timer一直在运行，作用是拿到两个已经从对端peer获取的block，经过VerifyCommit之后，SaveBlock存在tendermint内部，再调用ApplyBlock存到application 3 也有个statusUpdateTicker 10s的timer，作用是broadcast bcStatusRequestMessage去获取对端节点的block高度 4 还有个switchToConsensusTicker 1s的timer也在运行，作用是看本节点的block高度有没有大于等于其他节点的最大高度，如果到达了（也就是同步区块完成了）就SwitchToConsensus切换fast mode到consensus mode 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/20/16a95a287e513e5ce7d8d98cf14a556b.html","headline":"Tendermint同步区块","dateModified":"2018-06-20T00:00:00+08:00","datePublished":"2018-06-20T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/20/16a95a287e513e5ce7d8d98cf14a556b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Tendermint同步区块</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>最近在学习Tendermint的代码，记录下同步区块的流程，直接跳过P2P阶段，后续再写一篇文章记录P2P流程吧</p>
+  <p>blockchain/pool.go的OnStart()新建了gorountine来发起获取区块请求</p>
+  <pre><code class="language-plain">func (pool *BlockPool) OnStart() error {
+	go pool.makeRequestersRoutine()
+	pool.startTime = time.Now()
+	return nil
+}</code></pre>
+  <p>看下makeRequestersRoutine的代码</p>
+  <pre><code class="language-plain">// Run spawns requesters as needed.
+func (pool *BlockPool) makeRequestersRoutine() {
+
+	for {
+		if !pool.IsRunning() {
+			break
+		}
+
+		_, numPending, lenRequesters := pool.GetStatus()
+		if numPending &gt;= maxPendingRequests {
+			// sleep for a bit.
+			time.Sleep(requestIntervalMS * time.Millisecond)
+			// check for timed out peers
+			pool.removeTimedoutPeers()
+		} else if lenRequesters &gt;= maxTotalRequesters {
+			// sleep for a bit.
+			time.Sleep(requestIntervalMS * time.Millisecond)
+			// check for timed out peers
+			pool.removeTimedoutPeers()
+		} else {
+			// request for more blocks.
+			pool.makeNextRequester()
+		}
+	}
+}</code></pre>
+  <p>这里是一个for循环，获取当前pool的状态</p>
+  <p>1 如果当前pending的个数大于等于10000个，sleep 100ms，并且remove掉timeout的peer（remove timeout peer的逻辑是当前接收peer的bitrate小于10KB/S</p>
+  <p>2 如果当前request的个数大于等于10000个，sleep 100ms并且remove timeout的peer</p>
+  <p>3 新建一个请求</p>
+  <pre><code class="language-plain">func (pool *BlockPool) makeNextRequester() {
+	pool.mtx.Lock()
+	defer pool.mtx.Unlock()
+
+	nextHeight := pool.height + pool.requestersLen()
+	request := newBPRequester(pool, nextHeight)
+	// request.SetLogger(pool.Logger.With("height", nextHeight))
+
+	pool.requesters[nextHeight] = request
+	pool.numPending++
+
+	err := request.Start()
+	if err != nil {
+		request.Logger.Error("Error starting request", "err", err)
+	}
+}</code></pre>新建请求的时候rquester和pending都会+1，然后调用request.Start()，这个调用的是blockchain/pool.go的另外一个OnStart()
+  <pre><code class="language-plain">func (bpr *bpRequester) OnStart() error {
+	go bpr.requestRoutine()
+	return nil
+}</code></pre>
+  <p>看下requestRoutine的代码</p>
+  <pre><code class="language-plain">func (bpr *bpRequester) requestRoutine() {
+OUTER_LOOP:
+	for {
+		// Pick a peer to send request to.
+		var peer *bpPeer = nil
+	PICK_PEER_LOOP:
+		for {
+			if !bpr.IsRunning() || !bpr.pool.IsRunning() {
+				return
+			}
+			peer = bpr.pool.pickIncrAvailablePeer(bpr.height)
+			if peer == nil {
+				//log.Info("No peers available", "height", height)
+				time.Sleep(requestIntervalMS * time.Millisecond)
+				continue PICK_PEER_LOOP
+			}
+			break PICK_PEER_LOOP
+		}
+		bpr.mtx.Lock()
+		bpr.peerID = peer.id
+		bpr.mtx.Unlock()
+
+		// Send request and wait.
+		bpr.pool.sendRequest(bpr.height, peer.id)
+		...
+	}
+}</code></pre>
+  <p>pickIncrAvailablePeer的作用是找到有高度（bpr.height）的节点</p>
+  <p>sendRequest其实是写了一个channel</p>
+  <pre><code class="language-plain">func (pool *BlockPool) sendRequest(height int64, peerID string) {
+	if !pool.IsRunning() {
+		return
+	}
+	pool.requestsCh &lt;- BlockRequest{height, peerID}
+}</code></pre>
+  <p>接着找requestsCh读取的地方，就在blockchain/reactor.go中：</p>
+  <pre><code class="language-plain">func (bcR *BlockchainReactor) poolRoutine() {
+
+	trySyncTicker := time.NewTicker(trySyncIntervalMS * time.Millisecond)
+	statusUpdateTicker := time.NewTicker(statusUpdateIntervalSeconds * time.Second)
+	switchToConsensusTicker := time.NewTicker(switchToConsensusIntervalSeconds * time.Second)
+
+	blocksSynced := 0
+
+	chainID := bcR.initialState.ChainID
+	state := bcR.initialState
+
+	lastHundred := time.Now()
+	lastRate := 0.0
+
+FOR_LOOP:
+	for {
+		select {
+		case request := &lt;-bcR.requestsCh: // chan BlockRequest
+			peer := bcR.Switch.Peers().Get(request.PeerID)
+			if peer == nil {
+				continue FOR_LOOP // Peer has since been disconnected.
+			}
+			msg := &amp;bcBlockRequestMessage{request.Height}
+			queued := peer.TrySend(BlockchainChannel, struct{ BlockchainMessage }{msg})
+			if !queued {
+				// We couldn't make the request, send-queue full.
+				// The pool handles timeouts, just let it go.
+				continue FOR_LOOP
+			}
+		case peerID := &lt;-bcR.timeoutsCh: // chan string
+			// Peer timed out.
+			peer := bcR.Switch.Peers().Get(peerID)
+			if peer != nil {
+				bcR.Switch.StopPeerForError(peer, errors.New("BlockchainReactor Timeout"))
+			}
+		case &lt;-statusUpdateTicker.C:
+			// ask for status updates
+			go bcR.BroadcastStatusRequest() // nolint: errcheck
+		case &lt;-switchToConsensusTicker.C:
+			height, numPending, lenRequesters := bcR.pool.GetStatus()
+			outbound, inbound, _ := bcR.Switch.NumPeers()
+			bcR.Logger.Debug("Consensus ticker", "numPending", numPending, "total", lenRequesters,
+				"outbound", outbound, "inbound", inbound)
+			if bcR.pool.IsCaughtUp() {
+				bcR.Logger.Info("Time to switch to consensus reactor!", "height", height)
+				bcR.pool.Stop()
+
+				conR := bcR.Switch.Reactor("CONSENSUS").(consensusReactor)
+				conR.SwitchToConsensus(state, blocksSynced)
+
+				break FOR_LOOP
+			}
+		case &lt;-trySyncTicker.C: // chan time
+			// This loop can be slow as long as it's doing syncing work.
+		SYNC_LOOP:
+			for i := 0; i &lt; 10; i++ {
+				// See if there are any blocks to sync.
+				first, second := bcR.pool.PeekTwoBlocks()
+				//bcR.Logger.Info("TrySync peeked", "first", first, "second", second)
+				if first == nil || second == nil {
+					// We need both to sync the first block.
+					break SYNC_LOOP
+				}
+				firstParts := first.MakePartSet(state.ConsensusParams.BlockPartSizeBytes)
+				firstPartsHeader := firstParts.Header()
+				firstID := types.BlockID{first.Hash(), firstPartsHeader}
+				// Finally, verify the first block using the second's commit
+				// NOTE: we can probably make this more efficient, but note that calling
+				// first.Hash() doesn't verify the tx contents, so MakePartSet() is
+				// currently necessary.
+				err := state.Validators.VerifyCommit(
+					chainID, firstID, first.Height, second.LastCommit)
+				if err != nil {
+					bcR.Logger.Error("Error in validation", "err", err)
+					bcR.pool.RedoRequest(first.Height)
+					break SYNC_LOOP
+				} else {
+					bcR.pool.PopRequest()
+
+					bcR.store.SaveBlock(first, firstParts, second.LastCommit)
+
+					// NOTE: we could improve performance if we
+					// didn't make the app commit to disk every block
+					// ... but we would need a way to get the hash without it persisting
+					var err error
+					state, err = bcR.blockExec.ApplyBlock(state, firstID, first)
+					if err != nil {
+						// TODO This is bad, are we zombie?
+						cmn.PanicQ(cmn.Fmt("Failed to process committed block (%d:%X): %v", first.Height, first.Hash(), err))
+					}
+					blocksSynced += 1
+
+					// update the consensus params
+					bcR.updateConsensusParams(state.ConsensusParams)
+
+					if blocksSynced%100 == 0 {
+						lastRate = 0.9*lastRate + 0.1*(100/time.Since(lastHundred).Seconds())
+						bcR.Logger.Info("Fast Sync Rate", "height", bcR.pool.height,
+							"max_peer_height", bcR.pool.MaxPeerHeight(), "blocks/s", lastRate)
+						lastHundred = time.Now()
+					}
+				}
+			}
+			continue FOR_LOOP
+		case &lt;-bcR.Quit:
+			break FOR_LOOP
+		}
+	}
+}</code></pre>
+  <p>1 收到reqeustCh的数据，发送bcBlockRequestMessage到对端节点（对端节点收到消息后返回高度的block）。是在本文件中的Receive()函数处理的</p>
+  <p>2 本函数有个trySyncTicker 50ms的timer一直在运行，作用是拿到两个已经从对端peer获取的block，经过VerifyCommit之后，SaveBlock存在tendermint内部，再调用ApplyBlock存到application</p>
+  <p>3 也有个statusUpdateTicker 10s的timer，作用是broadcast bcStatusRequestMessage去获取对端节点的block高度</p>
+  <p>4 还有个switchToConsensusTicker 1s的timer也在运行，作用是看本节点的block高度有没有大于等于其他节点的最大高度，如果到达了（也就是同步区块完成了）就SwitchToConsensus切换fast mode到consensus mode</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80742813,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/csds319/article/details/80742813,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

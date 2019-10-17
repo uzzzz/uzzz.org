@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析—交易的执行 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析—交易的执行" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="前言 以太坊是一个运行智能合约的平台，被称作可编程的区块链，允许用户将编写的智能合约部署在区块链上运行。而运行合约的主体便是以太坊虚拟机(EVM) 区块 交易 合约 区块链由区块(Block)组成，而区块中打包一定数量的交易(Transaction)，交易可能是一个单纯的转账操作，也可能是调用一个智能合约，无论是哪一种，EVM在运行(excute)交易时都会创建合约(Contract) 外部账户 合约账户 以太坊中的账户有两类 * 外部账户 由账户持有人的私钥控制的真实存在的账户 * 合约账户 由合约代码控制，保存着合约代码 一笔交易包含发送方(sender) 接收方(recipient) 和数额(value) 三要素。发送方将一定数额的ETH转移到接收方的账户，这里的转账交易中，接收方是外部账户。而在调用智能合约的交易时，接收方是合约账户。 gas 如同现实中的税费一样，交易也需要将支付少量的费用，称为gas，费用支付给矿工，这可以激励矿工打包交易到区块，也使得区块链避免恶意运算攻击。gas由交易的发送者使用ETH购买，在执行交易的每一步都会消耗gas，如果gas用完了，交易状态会被回退，但消耗的gas不会返还。 交易执行 以太坊是一个基于交易的状态机，一笔交易可以使以太坊从一个状态(state)切换到另一个状态，即交易的执行伴随着状态的改变。 交易执行的入口在 core/state_processor.go 的 Process()方法，下面是该方法的轮廓 func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts，[]*types.Log，uint64，error) { ...... var ( usedGas = new(uint) header = block.Header() gp = new(GasPool).AddGas(block.GasLimit()) ) for i, tx := range block.Transactions() { receipt, _, _ := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg) receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } p.engine.Finalize(p.bc. header, statedb, block.Transactions(), block.Uncles(), receipts) ...... } Process()方法对block中的每个交易tx调用ApplyTransaction()来执行交易，入参state存储了各个账户的信息，如账户余额、合约代码(仅对合约账户而言)，我们姑且将其理解为一个内存中的数据库。其中每个账户以state object表示 ApplyTransaction()方法完成以下功能 * 调用AsMessage()用tx生成core.Message 其实现就是将tx中的一些字段存入Message以及从tx的数字签名中反解出tx的sender，重点关注其中的data 字段：对普通转账交易，该字段为空，对创建一个新的合约，该字段为新的合约的代码，对执行一个已经在区块链上存在的合约，该参数为合约代码的输入参数 * 调用NewEVMContext()创建一个EVM运行上下文vm.Context。注意其中的Coinbase字段填入的矿工的地址，Transfer是具体的转账方法，其实就是操作sender和recipient的账户余额 * 调用NewEVM()创建一个虚拟机运行环境EVM，它主要作用是汇集之前的信息以及创建一个代码解释器(Interpreter)，这个解释器之后会用来解释并执行合约代码 * 接下来就是调用ApplyMessage()将以上的信息作用在当前以太坊状态上，使得状态机发生状态变换 ApplyMessage()的顶层比较简单，它创建一个StateTransition结构并调用其TransitionDb()方法，StateTransition表示一次以太访的状态转移 其定义如下： type StateTransition struct { gp *GasPool msg Message gas uint64 gasPrice *big,Int initialGas uint64 value *big.Int data []byte state vm.StateDB evm *vm.EVM } 其中的字段都是之前ApplyTransaction()方法中创建的结构得到。一次状态转移包括以下流程 * nonce检查：交易的nonce值用于标识这是sender发起的交易的序号，该值总是等于上一笔交易的nonce值递增1，当我们检查发现当前Apply的这笔交易与该sender期待的nonce不一致时，就会拒绝此次状态转换 * gas预购： sender 预购此次转换需要的gas，简单说来就是扣除sender账户的ETH(反映在stateDB)，扣除的数量却决于交易设定的gasPrice和gasLimit的乘积，单位是gwei。 * 合约账户创建： 如果交易的recipient为空的话，标识这笔交易需要创建一个合约，那么就创建一个合约账户(state object) * 价值转移：每笔交易都伴随着价值转移，即ETH从sender账户发送到receipt账户，如果创建了合约，还要执行合约代码 TransitionDB()完成这样的状态转换，其实现流程如下： 最终由交易的receipt是否为空决定是使用evm.Create()还是evm.Call()，无论是哪种，最终都是创建一个Contract结构，然后调用run()方法运行之。注意，即使是外部账户之间普通的转账也会调用Call() 和 run()，只是由于receipt上没有代码，运行会很快结束而已。run()最终调用Interpreter的Run()方法。 前面提到过，在调用NewEVM()时创建了一个解释器(Interpreter) func NewInterpreter(evm *EVM，cfg Config) *Interpreter { switch { case evm.ChainConfig().IsConstantinople(evm.BlockNumber): cfg.JumpTable = constantinopleInstructionSet case evm.ChainConfig().IsByzantium(evm.BlockNumber): cfg.JumpTable = byzantiumInstructionSet case evm.ChainConfig().IsHomestead(evm.BlockNumber): cfg.JumpTable = homesteadInstructionSet default: cfg.JumpTable = fromtierInstructionSet } return &amp;Interpreter{ evm: evm, cfg: cfg, ...... } } 根据当前Block的高度，计算出它处于以太坊演进的阶段，得到该阶段支持的指令集(InstructionSet)，新的阶段在兼容老的阶段的所有指令前提下，再增加了独特的新指令。最终存储在Interpreter的cfg字段 合约代码本质上上是由Solidity语言编译后形成的EVM字节码,字节码中的操作也正是指令集中定义的指令 再回到Run()方法，其大概流程如下 EVM逐字节的解析合约代码并调用excute()方法运行，直到运行完成或者gas提前耗尽。 关于具体的EVM指令解释方式和虚拟机内部栈和内存等内部实现，参考本系列文章 小结 在以太坊中，交易的执行是由EVM完成的，网络中的所有全节点都会去执行每一笔交易(这样所有人的状态才可以保持一致) 交易分为普通转账和执行(创建)智能合约，两者都由sender付费，后者相比前者，EVM要额外执行合约的字节码 阅读更多" />
+<meta property="og:description" content="前言 以太坊是一个运行智能合约的平台，被称作可编程的区块链，允许用户将编写的智能合约部署在区块链上运行。而运行合约的主体便是以太坊虚拟机(EVM) 区块 交易 合约 区块链由区块(Block)组成，而区块中打包一定数量的交易(Transaction)，交易可能是一个单纯的转账操作，也可能是调用一个智能合约，无论是哪一种，EVM在运行(excute)交易时都会创建合约(Contract) 外部账户 合约账户 以太坊中的账户有两类 * 外部账户 由账户持有人的私钥控制的真实存在的账户 * 合约账户 由合约代码控制，保存着合约代码 一笔交易包含发送方(sender) 接收方(recipient) 和数额(value) 三要素。发送方将一定数额的ETH转移到接收方的账户，这里的转账交易中，接收方是外部账户。而在调用智能合约的交易时，接收方是合约账户。 gas 如同现实中的税费一样，交易也需要将支付少量的费用，称为gas，费用支付给矿工，这可以激励矿工打包交易到区块，也使得区块链避免恶意运算攻击。gas由交易的发送者使用ETH购买，在执行交易的每一步都会消耗gas，如果gas用完了，交易状态会被回退，但消耗的gas不会返还。 交易执行 以太坊是一个基于交易的状态机，一笔交易可以使以太坊从一个状态(state)切换到另一个状态，即交易的执行伴随着状态的改变。 交易执行的入口在 core/state_processor.go 的 Process()方法，下面是该方法的轮廓 func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts，[]*types.Log，uint64，error) { ...... var ( usedGas = new(uint) header = block.Header() gp = new(GasPool).AddGas(block.GasLimit()) ) for i, tx := range block.Transactions() { receipt, _, _ := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg) receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } p.engine.Finalize(p.bc. header, statedb, block.Transactions(), block.Uncles(), receipts) ...... } Process()方法对block中的每个交易tx调用ApplyTransaction()来执行交易，入参state存储了各个账户的信息，如账户余额、合约代码(仅对合约账户而言)，我们姑且将其理解为一个内存中的数据库。其中每个账户以state object表示 ApplyTransaction()方法完成以下功能 * 调用AsMessage()用tx生成core.Message 其实现就是将tx中的一些字段存入Message以及从tx的数字签名中反解出tx的sender，重点关注其中的data 字段：对普通转账交易，该字段为空，对创建一个新的合约，该字段为新的合约的代码，对执行一个已经在区块链上存在的合约，该参数为合约代码的输入参数 * 调用NewEVMContext()创建一个EVM运行上下文vm.Context。注意其中的Coinbase字段填入的矿工的地址，Transfer是具体的转账方法，其实就是操作sender和recipient的账户余额 * 调用NewEVM()创建一个虚拟机运行环境EVM，它主要作用是汇集之前的信息以及创建一个代码解释器(Interpreter)，这个解释器之后会用来解释并执行合约代码 * 接下来就是调用ApplyMessage()将以上的信息作用在当前以太坊状态上，使得状态机发生状态变换 ApplyMessage()的顶层比较简单，它创建一个StateTransition结构并调用其TransitionDb()方法，StateTransition表示一次以太访的状态转移 其定义如下： type StateTransition struct { gp *GasPool msg Message gas uint64 gasPrice *big,Int initialGas uint64 value *big.Int data []byte state vm.StateDB evm *vm.EVM } 其中的字段都是之前ApplyTransaction()方法中创建的结构得到。一次状态转移包括以下流程 * nonce检查：交易的nonce值用于标识这是sender发起的交易的序号，该值总是等于上一笔交易的nonce值递增1，当我们检查发现当前Apply的这笔交易与该sender期待的nonce不一致时，就会拒绝此次状态转换 * gas预购： sender 预购此次转换需要的gas，简单说来就是扣除sender账户的ETH(反映在stateDB)，扣除的数量却决于交易设定的gasPrice和gasLimit的乘积，单位是gwei。 * 合约账户创建： 如果交易的recipient为空的话，标识这笔交易需要创建一个合约，那么就创建一个合约账户(state object) * 价值转移：每笔交易都伴随着价值转移，即ETH从sender账户发送到receipt账户，如果创建了合约，还要执行合约代码 TransitionDB()完成这样的状态转换，其实现流程如下： 最终由交易的receipt是否为空决定是使用evm.Create()还是evm.Call()，无论是哪种，最终都是创建一个Contract结构，然后调用run()方法运行之。注意，即使是外部账户之间普通的转账也会调用Call() 和 run()，只是由于receipt上没有代码，运行会很快结束而已。run()最终调用Interpreter的Run()方法。 前面提到过，在调用NewEVM()时创建了一个解释器(Interpreter) func NewInterpreter(evm *EVM，cfg Config) *Interpreter { switch { case evm.ChainConfig().IsConstantinople(evm.BlockNumber): cfg.JumpTable = constantinopleInstructionSet case evm.ChainConfig().IsByzantium(evm.BlockNumber): cfg.JumpTable = byzantiumInstructionSet case evm.ChainConfig().IsHomestead(evm.BlockNumber): cfg.JumpTable = homesteadInstructionSet default: cfg.JumpTable = fromtierInstructionSet } return &amp;Interpreter{ evm: evm, cfg: cfg, ...... } } 根据当前Block的高度，计算出它处于以太坊演进的阶段，得到该阶段支持的指令集(InstructionSet)，新的阶段在兼容老的阶段的所有指令前提下，再增加了独特的新指令。最终存储在Interpreter的cfg字段 合约代码本质上上是由Solidity语言编译后形成的EVM字节码,字节码中的操作也正是指令集中定义的指令 再回到Run()方法，其大概流程如下 EVM逐字节的解析合约代码并调用excute()方法运行，直到运行完成或者gas提前耗尽。 关于具体的EVM指令解释方式和虚拟机内部栈和内存等内部实现，参考本系列文章 小结 在以太坊中，交易的执行是由EVM完成的，网络中的所有全节点都会去执行每一笔交易(这样所有人的状态才可以保持一致) 交易分为普通转账和执行(创建)智能合约，两者都由sender付费，后者相比前者，EVM要额外执行合约的字节码 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/06/23/de8e3d1439d2cba28367939fd37abf66.html" />
+<meta property="og:url" content="https://uzzz.org/2018/06/23/de8e3d1439d2cba28367939fd37abf66.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-06-23T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"前言 以太坊是一个运行智能合约的平台，被称作可编程的区块链，允许用户将编写的智能合约部署在区块链上运行。而运行合约的主体便是以太坊虚拟机(EVM) 区块 交易 合约 区块链由区块(Block)组成，而区块中打包一定数量的交易(Transaction)，交易可能是一个单纯的转账操作，也可能是调用一个智能合约，无论是哪一种，EVM在运行(excute)交易时都会创建合约(Contract) 外部账户 合约账户 以太坊中的账户有两类 * 外部账户 由账户持有人的私钥控制的真实存在的账户 * 合约账户 由合约代码控制，保存着合约代码 一笔交易包含发送方(sender) 接收方(recipient) 和数额(value) 三要素。发送方将一定数额的ETH转移到接收方的账户，这里的转账交易中，接收方是外部账户。而在调用智能合约的交易时，接收方是合约账户。 gas 如同现实中的税费一样，交易也需要将支付少量的费用，称为gas，费用支付给矿工，这可以激励矿工打包交易到区块，也使得区块链避免恶意运算攻击。gas由交易的发送者使用ETH购买，在执行交易的每一步都会消耗gas，如果gas用完了，交易状态会被回退，但消耗的gas不会返还。 交易执行 以太坊是一个基于交易的状态机，一笔交易可以使以太坊从一个状态(state)切换到另一个状态，即交易的执行伴随着状态的改变。 交易执行的入口在 core/state_processor.go 的 Process()方法，下面是该方法的轮廓 func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts，[]*types.Log，uint64，error) { ...... var ( usedGas = new(uint) header = block.Header() gp = new(GasPool).AddGas(block.GasLimit()) ) for i, tx := range block.Transactions() { receipt, _, _ := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg) receipts = append(receipts, receipt) allLogs = append(allLogs, receipt.Logs...) } p.engine.Finalize(p.bc. header, statedb, block.Transactions(), block.Uncles(), receipts) ...... } Process()方法对block中的每个交易tx调用ApplyTransaction()来执行交易，入参state存储了各个账户的信息，如账户余额、合约代码(仅对合约账户而言)，我们姑且将其理解为一个内存中的数据库。其中每个账户以state object表示 ApplyTransaction()方法完成以下功能 * 调用AsMessage()用tx生成core.Message 其实现就是将tx中的一些字段存入Message以及从tx的数字签名中反解出tx的sender，重点关注其中的data 字段：对普通转账交易，该字段为空，对创建一个新的合约，该字段为新的合约的代码，对执行一个已经在区块链上存在的合约，该参数为合约代码的输入参数 * 调用NewEVMContext()创建一个EVM运行上下文vm.Context。注意其中的Coinbase字段填入的矿工的地址，Transfer是具体的转账方法，其实就是操作sender和recipient的账户余额 * 调用NewEVM()创建一个虚拟机运行环境EVM，它主要作用是汇集之前的信息以及创建一个代码解释器(Interpreter)，这个解释器之后会用来解释并执行合约代码 * 接下来就是调用ApplyMessage()将以上的信息作用在当前以太坊状态上，使得状态机发生状态变换 ApplyMessage()的顶层比较简单，它创建一个StateTransition结构并调用其TransitionDb()方法，StateTransition表示一次以太访的状态转移 其定义如下： type StateTransition struct { gp *GasPool msg Message gas uint64 gasPrice *big,Int initialGas uint64 value *big.Int data []byte state vm.StateDB evm *vm.EVM } 其中的字段都是之前ApplyTransaction()方法中创建的结构得到。一次状态转移包括以下流程 * nonce检查：交易的nonce值用于标识这是sender发起的交易的序号，该值总是等于上一笔交易的nonce值递增1，当我们检查发现当前Apply的这笔交易与该sender期待的nonce不一致时，就会拒绝此次状态转换 * gas预购： sender 预购此次转换需要的gas，简单说来就是扣除sender账户的ETH(反映在stateDB)，扣除的数量却决于交易设定的gasPrice和gasLimit的乘积，单位是gwei。 * 合约账户创建： 如果交易的recipient为空的话，标识这笔交易需要创建一个合约，那么就创建一个合约账户(state object) * 价值转移：每笔交易都伴随着价值转移，即ETH从sender账户发送到receipt账户，如果创建了合约，还要执行合约代码 TransitionDB()完成这样的状态转换，其实现流程如下： 最终由交易的receipt是否为空决定是使用evm.Create()还是evm.Call()，无论是哪种，最终都是创建一个Contract结构，然后调用run()方法运行之。注意，即使是外部账户之间普通的转账也会调用Call() 和 run()，只是由于receipt上没有代码，运行会很快结束而已。run()最终调用Interpreter的Run()方法。 前面提到过，在调用NewEVM()时创建了一个解释器(Interpreter) func NewInterpreter(evm *EVM，cfg Config) *Interpreter { switch { case evm.ChainConfig().IsConstantinople(evm.BlockNumber): cfg.JumpTable = constantinopleInstructionSet case evm.ChainConfig().IsByzantium(evm.BlockNumber): cfg.JumpTable = byzantiumInstructionSet case evm.ChainConfig().IsHomestead(evm.BlockNumber): cfg.JumpTable = homesteadInstructionSet default: cfg.JumpTable = fromtierInstructionSet } return &amp;Interpreter{ evm: evm, cfg: cfg, ...... } } 根据当前Block的高度，计算出它处于以太坊演进的阶段，得到该阶段支持的指令集(InstructionSet)，新的阶段在兼容老的阶段的所有指令前提下，再增加了独特的新指令。最终存储在Interpreter的cfg字段 合约代码本质上上是由Solidity语言编译后形成的EVM字节码,字节码中的操作也正是指令集中定义的指令 再回到Run()方法，其大概流程如下 EVM逐字节的解析合约代码并调用excute()方法运行，直到运行完成或者gas提前耗尽。 关于具体的EVM指令解释方式和虚拟机内部栈和内存等内部实现，参考本系列文章 小结 在以太坊中，交易的执行是由EVM完成的，网络中的所有全节点都会去执行每一笔交易(这样所有人的状态才可以保持一致) 交易分为普通转账和执行(创建)智能合约，两者都由sender付费，后者相比前者，EVM要额外执行合约的字节码 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/06/23/de8e3d1439d2cba28367939fd37abf66.html","headline":"以太坊源码分析—交易的执行","dateModified":"2018-06-23T00:00:00+08:00","datePublished":"2018-06-23T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/06/23/de8e3d1439d2cba28367939fd37abf66.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析—交易的执行</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="前言">前言</h1> 
+  <p>以太坊是一个运行智能合约的平台，被称作可编程的区块链，允许用户将编写的智能合约部署在区块链上运行。而运行合约的主体便是以太坊虚拟机(<strong>EVM</strong>)</p> 
+  <h5 id="区块-交易-合约">区块 交易 合约</h5> 
+  <p>区块链由<strong>区块</strong>(Block)组成，而<strong>区块</strong>中打包一定数量的<strong>交易</strong>(Transaction)，<strong>交易</strong>可能是一个单纯的转账操作，也可能是调用一个智能合约，无论是哪一种，<strong>EVM</strong>在运行(excute)交易时都会创建<strong>合约</strong>(Contract)</p> 
+  <h5 id="外部账户-合约账户">外部账户 合约账户</h5> 
+  <p>以太坊中的账户有两类 <br> * 外部账户 由账户持有人的私钥控制的真实存在的账户 <br> * 合约账户 由合约代码控制，保存着合约代码 <br> 一笔<strong>交易</strong>包含发送方(sender) 接收方(recipient) 和数额(value) 三要素。发送方将一定数额的ETH转移到接收方的账户，这里的转账交易中，接收方是外部账户。而在调用智能合约的交易时，接收方是合约账户。</p> 
+  <h5 id="gas">gas</h5> 
+  <p>如同现实中的税费一样，<strong>交易</strong>也需要将支付少量的费用，称为<em>gas</em>，费用支付给矿工，这可以激励矿工打包交易到区块，也使得区块链避免恶意运算攻击。gas由交易的发送者使用ETH购买，在执行交易的每一步都会消耗gas，如果gas用完了，交易状态会被回退，但消耗的gas不会返还。</p> 
+  <h1 id="交易执行">交易执行</h1> 
+  <p>以太坊是一个基于交易的状态机，一笔交易可以使以太坊从一个状态(state)切换到另一个状态，即交易的执行伴随着状态的改变。 <br> 交易执行的入口在 <strong>core/state_processor.go</strong> 的 <strong>Process()</strong>方法，下面是该方法的轮廓 </p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">func</span> (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts，[]*types.Log，<span class="hljs-typename">uint64</span>，error) {
+    ......
+    <span class="hljs-keyword">var</span> (
+        usedGas = <span class="hljs-built_in">new</span>(<span class="hljs-typename">uint</span>) 
+        header = block.Header()
+        gp = <span class="hljs-built_in">new</span>(GasPool).AddGas(block.GasLimit())
+    )
+    <span class="hljs-keyword">for</span> i, tx := <span class="hljs-keyword">range</span> block.Transactions() {
+        receipt, _, _ := ApplyTransaction(p.config, p.bc, <span class="hljs-constant">nil</span>, gp, statedb, header, tx, usedGas, cfg)
+        receipts = <span class="hljs-built_in">append</span>(receipts, receipt)
+        allLogs = <span class="hljs-built_in">append</span>(allLogs, receipt.Logs...)        
+    }
+    p.engine.Finalize(p.bc. header, statedb, block.Transactions(), block.Uncles(), receipts)
+    ......
+}</code></pre> 
+  <p><strong>Process()</strong>方法对block中的每个交易<code>tx</code>调用<strong>ApplyTransaction()</strong>来执行交易，入参<strong>state</strong>存储了各个账户的信息，如账户余额、合约代码(仅对合约账户而言)，我们姑且将其理解为一个内存中的数据库。其中每个账户以<strong>state object</strong>表示</p> 
+  <p><strong>ApplyTransaction()</strong>方法完成以下功能 <br> * 调用<strong>AsMessage()</strong>用tx生成<code>core.Message</code> 其实现就是将<code>tx</code>中的一些字段存入<code>Message</code>以及从<code>tx</code>的数字签名中反解出<code>tx</code>的<strong>sender</strong>，重点关注其中的<strong>data</strong> 字段：对普通转账交易，该字段为空，对创建一个新的合约，该字段为新的合约的<strong>代码</strong>，对执行一个已经在区块链上存在的合约，该参数为合约代码的<strong>输入参数</strong> <br> * 调用<strong>NewEVMContext()</strong>创建一个EVM运行上下文<code>vm.Context</code>。注意其中的<strong>Coinbase</strong>字段填入的矿工的地址，<code>Transfer</code>是具体的转账方法，其实就是操作<strong>sender</strong>和<strong>recipient</strong>的账户余额 <br> * 调用<strong>NewEVM()</strong>创建一个虚拟机运行环境<code>EVM</code>，它主要作用是汇集之前的信息以及创建一个代码解释器(Interpreter)，这个解释器之后会用来解释并执行合约代码 <br> * 接下来就是调用<strong>ApplyMessage()</strong>将以上的信息<strong>作用</strong>在当前以太坊状态上，使得状态机发生状态变换</p> 
+  <p><strong>ApplyMessage()</strong>的顶层比较简单，它创建一个<code>StateTransition</code>结构并调用其<strong>TransitionDb()</strong>方法，<code>StateTransition</code>表示一次以太访的状态转移 其定义如下：</p> 
+  <pre class="prettyprint"><code class="language-golang hljs "><span class="hljs-keyword">type</span> StateTransition <span class="hljs-keyword">struct</span> {
+    gp  *GasPool
+    msg Message
+    gas  <span class="hljs-typename">uint64</span>
+    gasPrice  *big,Int
+    initialGas   <span class="hljs-typename">uint64</span>
+    value   *big.Int
+    data    []<span class="hljs-typename">byte</span>
+    state   vm.StateDB
+    evm    *vm.EVM
+}</code></pre> 
+  <p>其中的字段都是之前<strong>ApplyTransaction()</strong>方法中创建的结构得到。一次状态转移包括以下流程 <br> * <strong>nonce</strong>检查：交易的<strong>nonce</strong>值用于标识这是<strong>sender</strong>发起的交易的序号，该值总是等于上一笔交易的<strong>nonce</strong>值递增<strong>1</strong>，当我们检查发现当前Apply的这笔交易与该<strong>sender</strong>期待的<strong>nonce</strong>不一致时，就会拒绝此次状态转换 <br> * <strong>gas</strong>预购： <strong>sender</strong> 预购此次转换需要的gas，简单说来就是扣除<strong>sender</strong>账户的<code>ETH</code>(反映在stateDB)，扣除的数量却决于交易设定的<strong>gasPrice</strong>和<strong>gasLimit</strong>的乘积，单位是<code>gwei</code>。 <br> * 合约账户创建： 如果交易的<strong>recipient</strong>为空的话，标识这笔交易需要创建一个合约，那么就创建一个合约账户(<strong>state object</strong>) <br> * 价值转移：每笔交易都伴随着价值转移，即<code>ETH</code>从<strong>sender</strong>账户发送到<strong>receipt</strong>账户，如果创建了合约，还要执行合约代码</p> 
+  <p><strong>TransitionDB()</strong>完成这样的状态转换，其实现流程如下： <br> <img src="https://upload-images.jianshu.io/upload_images/12621947-896d4729d4d44cd9.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="TransitionDb.png" title=""></p> 
+  <p>最终由交易的<strong>receipt</strong>是否为空决定是使用<strong>evm.Create()</strong>还是<strong>evm.Call()</strong>，无论是哪种，最终都是创建一个<code>Contract</code>结构，然后调用<strong>run()</strong>方法运行之。注意，即使是外部账户之间普通的转账也会调用<strong>Call()</strong> 和 <strong>run()</strong>，只是由于<strong>receipt</strong>上没有代码，运行会很快结束而已。<strong>run()</strong>最终调用<code>Interpreter</code>的<strong>Run()</strong>方法。</p> 
+  <p>前面提到过，在调用<strong>NewEVM()</strong>时创建了一个解释器(Interpreter)</p> 
+  <pre class="prettyprint"><code class=" hljs avrasm">func NewInterpreter(evm *EVM，cfg Config)  *Interpreter {
+     switch {
+         case evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsConstantinople</span>(evm<span class="hljs-preprocessor">.BlockNumber</span>):
+             cfg<span class="hljs-preprocessor">.JumpTable</span> = constantinopleInstructionSet
+         case evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsByzantium</span>(evm<span class="hljs-preprocessor">.BlockNumber</span>):
+             cfg<span class="hljs-preprocessor">.JumpTable</span> = byzantiumInstructionSet
+         case evm<span class="hljs-preprocessor">.ChainConfig</span>()<span class="hljs-preprocessor">.IsHomestead</span>(evm<span class="hljs-preprocessor">.BlockNumber</span>):
+             cfg<span class="hljs-preprocessor">.JumpTable</span> = homesteadInstructionSet
+         default:
+             cfg<span class="hljs-preprocessor">.JumpTable</span> = fromtierInstructionSet  
+     }
+     return &amp;Interpreter{
+         evm:      evm,
+         cfg:      cfg,
+         ......
+     }
+}</code></pre> 
+  <p>根据当前Block的高度，计算出它处于以太坊演进的阶段，得到该阶段支持的<strong>指令集</strong>(InstructionSet)，新的阶段在兼容老的阶段的所有指令前提下，再增加了独特的新指令。最终存储在<code>Interpreter</code>的<strong>cfg</strong>字段</p> 
+  <p><strong>合约代码</strong>本质上上是由<code>Solidity</code>语言编译后形成的<strong>EVM字节码</strong>,字节码中的操作也正是指令集中定义的指令</p> 
+  <p>再回到<strong>Run()</strong>方法，其大概流程如下</p> 
+  <p><img src="https://upload-images.jianshu.io/upload_images/12621947-359d32a79feaffaa.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240" alt="Run.png" title=""></p> 
+  <p><code>EVM</code>逐字节的解析合约代码并调用<strong>excute()</strong>方法运行，直到运行完成或者<strong>gas</strong>提前耗尽。</p> 
+  <p>关于具体的<code>EVM</code>指令解释方式和虚拟机内部<strong>栈</strong>和<strong>内存</strong>等内部实现，参考<a href="https://blog.csdn.net/chenmo187j3x1/article/details/80799970" rel="nofollow">本系列文章</a></p> 
+  <h1 id="小结">小结</h1> 
+  <ol> 
+   <li>在以太坊中，交易的执行是由EVM完成的，网络中的所有全节点都会去执行每一笔交易(这样所有人的状态才可以保持一致)</li> 
+   <li>交易分为普通转账和执行(创建)智能合约，两者都由sender付费，后者相比前者，EVM要额外执行合约的字节码</li> 
+  </ol> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/chenmo187J3X1/article/details/80782276,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/chenmo187J3X1/article/details/80782276,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

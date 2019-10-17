@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>基于Java语言构建区块链（六）—— 交易（Merkle Tree） | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="基于Java语言构建区块链（六）—— 交易（Merkle Tree）" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="最终内容请以原文为准：https://wangwei.one/posts/630e7ae5.html 引言 在这一系列文章的最开始部分，我们提到过区块链是一个分布式的数据库。那时候，我们决定跳过”分布式”这一环节，并且聚焦于”数据存储”这一环节。到目前为止，我们几乎实现了区块链的所有组成部分。在本篇文章中，我们将会涉及一些在前面的文章中所忽略的一些机制，并且在下一篇文章中我们将开始研究区块链的分布式特性。 前面各个部分内容： 基本原型 工作量证明 持久化 &amp; 命令行 交易（UTXO） 地址（钱包） UTXO池 在 持久化 &amp; 命令行 这篇文章中，我们研究了比特币核心存储区块的方式。当中我们提到过与区块相关的数据存储在 blocks 这个数据桶中，而交易数据则存储在 chainstate 这个数据桶中，让我们来回忆一下，chainstate 数据桶的数据结构： ‘c’ + 32-byte transaction hash -&gt; unspent transaction output record for that transaction 某笔交易的UTXO记录 ‘B’ -&gt; 32-byte block hash: the block hash up to which the database represents the unspent transaction outputs 数据库所表示的UTXO的区块Hash 从那篇文章开始，我们已经实现了比特币的交易机制，但是我们还没有用到 chainstate 数据桶去存储我们的交易输出。所以，这将是我们现在要去做的事情。 chainstate 不会去存储交易数据。相反，它存储的是 UTXO 集，也就是未被花费的交易输出集合。除此之外，它还存储了”数据库所表示的UTXO的区块Hash”，我们这里先暂且忽略这一点，因为我们还没有用到区块高度（这一点我们会在后面的文章进行实现）。 那么，我们为什么需要 UTXO 池呢？ 一起来看一下我们前面实现的 findUnspentTransactions 方法： /** * 查找钱包地址对应的所有未花费的交易 * * @param pubKeyHash 钱包公钥Hash * @return */ private Transaction[] findUnspentTransactions(byte[] pubKeyHash) throws Exception { Map&lt;String, int[]&gt; allSpentTXOs = this.getAllSpentTXOs(pubKeyHash); Transaction[] unspentTxs = {}; // 再次遍历所有区块中的交易输出 for (BlockchainIterator blockchainIterator = this.getBlockchainIterator(); blockchainIterator.hashNext(); ) { Block block = blockchainIterator.next(); for (Transaction transaction : block.getTransactions()) { String txId = Hex.encodeHexString(transaction.getTxId()); int[] spentOutIndexArray = allSpentTXOs.get(txId); for (int outIndex = 0; outIndex &lt; transaction.getOutputs().length; outIndex++) { if (spentOutIndexArray != null &amp;&amp; ArrayUtils.contains(spentOutIndexArray, outIndex)) { continue; } // 保存不存在 allSpentTXOs 中的交易 if (transaction.getOutputs()[outIndex].isLockedWithKey(pubKeyHash)) { unspentTxs = ArrayUtils.add(unspentTxs, transaction); } } } } return unspentTxs; } 该方法是用来查找钱包地址对应的包含未花费交易输出的交易信息。由于交易信息是存储在区块当中，所以我们现有的做法是遍历区块链中的每个区块，然后遍历每个区块中的交易信息，再然后遍历每个交易中的交易输出，并检查交易输出是否被相应的钱包地址所锁定，效率非常低下。截止2018年3月29号，比特币中有 515698 个区块，并且这些数据占据了140+Gb 的磁盘空间。这也就意味着一个人必须运行全节点（下载所有的区块数据）才能验证交易信息。此外，验证交易信息需要遍历所有的区块。 针对这个问题的解决办法是需要有一个存储了所有UTXOs（未花费交易输出）的索引，这就是 UTXOs 池所要做的事情：UTXOs池其实是一个缓存空间，它所缓存的数据需要从构建区块链中所有的交易数据中获得（通过遍历所有的区块链，不过这个构建操作只需要执行一次即可），并且它后续还会用于钱包余额的计算以及新的交易数据的验证。截止到2017年9月，UTXOs池大约为 2.7Gb。 好了，让我们来想一下，为了实现 UTXOs 池我们需要做哪些事情。当前，有下列方法被用于查找交易信息： Blockchain.getAllSpentTXOs —— 查询所有已被花费的交易输出。它需要遍历区块链中所有区块中交易信息。 Blockchain.findUnspentTransactions —— 查询包含未被花费的交易输出的交易信息。它也需要遍历区块链中所有区块中交易信息。 Blockchain.findSpendableOutputs —— 该方法用于新的交易创建之时。它需要找到足够多的交易输出，以满足所需支付的金额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findUTXO —— 查询钱包地址所对应的所有未花费交易输出，然后用于计算钱包余额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findTransaction —— 通过交易ID查询交易信息。它需要遍历所有的区块直到找到交易信息为止。 如你所见，上面这些方法都需要去遍历数据库中的所有区块。由于UTXOs池只存储未被花费的交易输出，而不会存储所有的交易信息，因此我们不会对有 Blockchain.findTransaction 进行优化。 那么，我们需要下列这些方法： Blockchain.findUTXO —— 通过遍历所有的区块来找到所有未被花费的交易输出. UTXOSet.reindex —— 调用上面 findUTXO 方法，然后将查询结果存储在数据库中。也即需要进行缓存的地方。 UTXOSet.findSpendableOutputs —— 与 Blockchain.findSpendableOutputs 类似，区别在于会使用 UTXO 池。 UTXOSet.findUTXO —— 与Blockchain.findUTXO 类似，区别在于会使用 UTXO 池。 Blockchain.findTransaction —— 逻辑保持不变。 这样，两个使用最频繁的方法将从现在开始使用缓存！让我们开始编码吧！ 定义 UTXOSet： @NoArgsConstructor @AllArgsConstructor @Slf4j public class UTXOSet { private Blockchain blockchain; } 重建 UTXO 池索引: public class UTXOSet { ... /** * 重建 UTXO 池索引 */ @Synchronized public void reIndex() { log.info(&quot;Start to reIndex UTXO set !&quot;); RocksDBUtils.getInstance().cleanChainStateBucket(); Map&lt;String, TXOutput[]&gt; allUTXOs = blockchain.findAllUTXOs(); for (Map.Entry&lt;String, TXOutput[]&gt; entry : allUTXOs.entrySet()) { RocksDBUtils.getInstance().putUTXOs(entry.getKey(), entry.getValue()); } log.info(&quot;ReIndex UTXO set finished ! &quot;); } ... } 此方法用于初始化 UTXOSet。首先，需要清空 chainstate 数据桶，然后查询所有未被花费的交易输出，并将它们保存到 chainstate 数据桶中。 实现 findSpendableOutputs 方法，供 Transation.newUTXOTransaction 调用 public class UTXOSet { ... /** * 寻找能够花费的交易 * * @param pubKeyHash 钱包公钥Hash * @param amount 花费金额 */ public SpendableOutputResult findSpendableOutputs(byte[] pubKeyHash, int amount) { Map&lt;String, int[]&gt; unspentOuts = Maps.newHashMap(); int accumulated = 0; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); for (Map.Entry&lt;String, byte[]&gt; entry : chainstateBucket.entrySet()) { String txId = entry.getKey(); TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(entry.getValue()); for (int outId = 0; outId &lt; txOutputs.length; outId++) { TXOutput txOutput = txOutputs[outId]; if (txOutput.isLockedWithKey(pubKeyHash) &amp;&amp; accumulated &lt; amount) { accumulated += txOutput.getValue(); int[] outIds = unspentOuts.get(txId); if (outIds == null) { outIds = new int[]{outId}; } else { outIds = ArrayUtils.add(outIds, outId); } unspentOuts.put(txId, outIds); if (accumulated &gt;= amount) { break; } } } } return new SpendableOutputResult(accumulated, unspentOuts); } ... } 实现 findUTXOs 接口，供 CLI.getBalance 调用： public class UTXOSet { ... /** * 查找钱包地址对应的所有UTXO * * @param pubKeyHash 钱包公钥Hash * @return */ public TXOutput[] findUTXOs(byte[] pubKeyHash) { TXOutput[] utxos = {}; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); if (chainstateBucket.isEmpty()) { return utxos; } for (byte[] value : chainstateBucket.values()) { TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(value); for (TXOutput txOutput : txOutputs) { if (txOutput.isLockedWithKey(pubKeyHash)) { utxos = ArrayUtils.add(utxos, txOutput); } } } return utxos; } ... } 以上这些方法都是先前 Blockchain 中相应方法的微调版，先前的方法将不再使用。 有了UTXO池之后，意味着我们的交易数据分开存储到了两个不同的数据桶中：交易数据存储到了 block 数据桶中，而UTXO存储到了 chainstate 数据桶中。这就需要一种同步机制来保证每当一个新的区块产生时，UTXO池能够及时同步最新区块中的交易数据，毕竟我们不想频地进行 reIndex 。因此，我们需要如下方法： 更新UTXO池： public class UTXOSet { ... /** * 更新UTXO池 * &lt;p&gt; * 当一个新的区块产生时，需要去做两件事情： * 1）从UTXO池中移除花费掉了的交易输出； * 2）保存新的未花费交易输出； * * @param tipBlock 最新的区块 */ @Synchronized public void update(Block tipBlock) { if (tipBlock == null) { log.error(&quot;Fail to update UTXO set ! tipBlock is null !&quot;); throw new RuntimeException(&quot;Fail to update UTXO set ! &quot;); } for (Transaction transaction : tipBlock.getTransactions()) { // 根据交易输入排查出剩余未被使用的交易输出 if (!transaction.isCoinbase()) { for (TXInput txInput : transaction.getInputs()) { // 余下未被使用的交易输出 TXOutput[] remainderUTXOs = {}; String txId = Hex.encodeHexString(txInput.getTxId()); TXOutput[] txOutputs = RocksDBUtils.getInstance().getUTXOs(txId); if (txOutputs == null) { continue; } for (int outIndex = 0; outIndex &lt; txOutputs.length; outIndex++) { if (outIndex != txInput.getTxOutputIndex()) { remainderUTXOs = ArrayUtils.add(remainderUTXOs, txOutputs[outIndex]); } } // 没有剩余则删除，否则更新 if (remainderUTXOs.length == 0) { RocksDBUtils.getInstance().deleteUTXOs(txId); } else { RocksDBUtils.getInstance().putUTXOs(txId, remainderUTXOs); } } } // 新的交易输出保存到DB中 TXOutput[] txOutputs = transaction.getOutputs(); String txId = Hex.encodeHexString(transaction.getTxId()); RocksDBUtils.getInstance().putUTXOs(txId, txOutputs); } } ... } 让我们将 UTXOSet 用到它们所需之处去： public class CLI { ... /** * 创建区块链 * * @param address */ private void createBlockchain(String address) { Blockchain blockchain = Blockchain.createBlockchain(address); UTXOSet utxoSet = new UTXOSet(blockchain); utxoSet.reIndex(); log.info(&quot;Done ! &quot;); } ... } 当创建一个新的区块链是，我们需要重建 UTXO 池索引。截止目前，这是唯一一处用到 reIndex 的地方，尽管看起有些多余，因为在区块链创建之初仅仅只有一个区块和一笔交易。 修改 CLI.send 接口： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction}); new UTXOSet(blockchain).update(newBlock); ... } ... } 当一个新的区块产生后，需要去更新 UTXO 池数据。 让我们来检查一下它们的运行情况： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Elapsed Time: 164.961 seconds correct hash Hex: 00225493862611bc517cb6b3610e99d26d98a6b52484c9fa745df6ceff93f445 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 10 $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -to 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -amount 5 java.lang.Exception: ERROR: Not enough funds $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0001ab21f71ff2d6d532bf3b3388db790c2b03e28d7bd27bd669c5f6380a4e5b Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0009b925cc94e3db8bab2958b1fc2d1764aa15531e20756d92c3a93065c920f0 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG Balance of &#39;1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG&#39;: 2 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV Balance of &#39;1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV&#39;: 2 奖励机制 前面的章节中我们省略了矿工挖矿的奖励机制。时机已经成熟，该实现它了。 矿工奖励其实是一个 coinbase 交易（创币交易）。当一个矿工节点开始去生产一个新的区块时，他会从队列中取出一些交易数据，并且为它们预制一个 coinbase 交易。这笔 coinbase 交易中仅有的交易输出包含了矿工的公钥hash。 只需要更新 send 命令接口，我们就可以轻松实现矿工的奖励机制： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); // 新交易 Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); // 奖励 Transaction rewardTx = Transaction.newCoinbaseTX(from, &quot;&quot;); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction, rewardTx}); new UTXOSet(blockchain).update(newBlock); ... } ... } 还需要修改交易验证方法，coinbase 交易直接验证通过： public class Blockchain { /** * 交易签名验证 * * @param tx */ private boolean verifyTransactions(Transaction tx) { if (tx.isCoinbase()) { return true; } ... } ... } 在我们的实现逻辑中，代币的发送也是区块的生产者，因此，奖励也归他所有。 让我们来验证一下奖励机制： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Elapsed Time: 17.973 seconds correct hash Hex: 0000defe83a851a5db3803d5013bbc20c6234f176b2c52ae36fdb53d28b33d93 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX -amount 6 Elapsed Time: 30.887 seconds correct hash Hex: 00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT -amount 3 Elapsed Time: 45.267 seconds correct hash Hex: 00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Balance of &#39;1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD&#39;: 21 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX Balance of &#39;17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT Balance of &#39;12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT&#39;: 3 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD 这个地址一共收到了三份奖励： 第一次是开采创世区块； 第二次是开采区块：00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 第三次是开采区块：00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Merkle Tree Merkle Tree（默克尔树） 是这篇文章中我们需要重点讨论的一个机制。 正如我前面提到的那样，整个比特币的数据库占到了大约140G的磁盘空间。由于比特币的分布式特性，网络中的每一个节点必须是独立且自给自足的。每个比特币节点都是路由、区块链数据库、挖矿、钱包服务的功能集合。每个节点都参与全网络的路由功能，同时也可能包含其他功能。每个节点都参与验证并传播交易及区块信息，发现并维持与对等节点的连接。一个全节点（full node）包括以下四个功能： 随着越来越多的人开始使用比特币，这条规则开始变得越来越难以遵循：让每一个人都去运行一个完整的节点不太现实。在中本聪发布的 比特币白皮书 中，针对这个问题提出了一个解决方案：Simplified Payment Verification (SPV)（简易支付验证）。SPV是比特币的轻量级节点，它不需要下载所有的区块链数据，也不需要验证区块和交易数据。相反，当SPV想要验证一笔交易的有效性时，它会从它所连接的全节点上检索所需要的一些数据。这种机制保证了在只有一个全节点的情况，可以运行多个SPV轻钱包节点。 更多有关SPV的介绍，请查看：《精通比特币（第二版）》第八章 为了使SPV成为可能，就需要有一种方法在没有全量下载区块数据的情况下，来检查一个区块是否包含了某笔交易。这就是 Merkle Tree 发挥作用的地方了。 比特币中所使用的Merkle Tree是为了获得交易的Hash值，随后这个已经被Pow（工作量证明）系统认可了的Hash值会被保存到区块头中。到目前为止，我们只是简单地计算了一个区块中每笔交易的Hash值，然后在准备Pow数据时，再对这些交易进行 SHA-256 计算。虽然这是一个用于获取区块交易唯一表示的一个不错的途径，但是它不具有到 Merkle Tree的优点。 来看一下Merkle Tree的结构： 每一个区块都会构建一个Merkle Tree，它从最底部的叶子节点开始往上构建，每一个交易的Hash就是一个叶子节点（比特币中用的双SHA256算法）。叶子节点的数量必须是偶数个，但是并不是每一个区块都能包含偶数笔交易数据。如果存在奇数笔交易数据，那么最后一笔交易数据将会被复制一份（这仅仅发生在Merkle Tree中，而不是区块中）。 从下往上移动，叶子节点成对分组，它们的Hash值被连接到一起，并且在此基础上再次计算出新的Hash值。新的Hash 形成新的树节点。这个过程不断地被重复，直到最后仅剩一个被称为根节点的树节点。这个根节点的Hash就是区块中交易数据们的唯一代表，它会被保存到区块头中，并被用于参与POW系统的计算。 Merkle树的好处是节点可以在不下载整个块的情况下验证某笔交易的合法性。 为此，只需要交易Hash，Merkle树根Hash和Merkle路径。 Merkle Tree代码实现如下： package one.wangwei.blockchain.transaction; import com.google.common.collect.Lists; import lombok.Data; import one.wangwei.blockchain.util.ByteUtils; import org.apache.commons.codec.digest.DigestUtils; import java.util.List; /** * 默克尔树 * * @author wangwei * @date 2018/04/15 */ @Data public class MerkleTree { /** * 根节点 */ private Node root; /** * 叶子节点Hash */ private byte[][] leafHashes; public MerkleTree(byte[][] leafHashes) { constructTree(leafHashes); } /** * 从底部叶子节点开始往上构建整个Merkle Tree * * @param leafHashes */ private void constructTree(byte[][] leafHashes) { if (leafHashes == null || leafHashes.length &lt; 1) { throw new RuntimeException(&quot;ERROR:Fail to construct merkle tree ! leafHashes data invalid ! &quot;); } this.leafHashes = leafHashes; List&lt;Node&gt; parents = bottomLevel(leafHashes); while (parents.size() &gt; 1) { parents = internalLevel(parents); } root = parents.get(0); } /** * 构建一个层级节点 * * @param children * @return */ private List&lt;Node&gt; internalLevel(List&lt;Node&gt; children) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(children.size() / 2); for (int i = 0; i &lt; children.size() - 1; i += 2) { Node child1 = children.get(i); Node child2 = children.get(i + 1); Node parent = constructInternalNode(child1, child2); parents.add(parent); } // 内部节点奇数个，只对left节点进行计算 if (children.size() % 2 != 0) { Node child = children.get(children.size() - 1); Node parent = constructInternalNode(child, null); parents.add(parent); } return parents; } /** * 底部节点构建 * * @param hashes * @return */ private List&lt;Node&gt; bottomLevel(byte[][] hashes) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(hashes.length / 2); for (int i = 0; i &lt; hashes.length - 1; i += 2) { Node leaf1 = constructLeafNode(hashes[i]); Node leaf2 = constructLeafNode(hashes[i + 1]); Node parent = constructInternalNode(leaf1, leaf2); parents.add(parent); } if (hashes.length % 2 != 0) { Node leaf = constructLeafNode(hashes[hashes.length - 1]); // 奇数个节点的情况，复制最后一个节点 Node parent = constructInternalNode(leaf, leaf); parents.add(parent); } return parents; } /** * 构建叶子节点 * * @param hash * @return */ private static Node constructLeafNode(byte[] hash) { Node leaf = new Node(); leaf.hash = hash; return leaf; } /** * 构建内部节点 * * @param leftChild * @param rightChild * @return */ private Node constructInternalNode(Node leftChild, Node rightChild) { Node parent = new Node(); if (rightChild == null) { parent.hash = leftChild.hash; } else { parent.hash = internalHash(leftChild.hash, rightChild.hash); } parent.left = leftChild; parent.right = rightChild; return parent; } /** * 计算内部节点Hash * * @param leftChildHash * @param rightChildHash * @return */ private byte[] internalHash(byte[] leftChildHash, byte[] rightChildHash) { byte[] mergedBytes = ByteUtils.merge(leftChildHash, rightChildHash); return DigestUtils.sha256(mergedBytes); } /** * Merkle Tree节点 */ @Data public static class Node { private byte[] hash; private Node left; private Node right; } } 然后修改 Block.hashTransaction 接口： public class Block { ... /** * 对区块中的交易信息进行Hash计算 * * @return */ public byte[] hashTransaction() { byte[][] txIdArrays = new byte[this.getTransactions().length][]; for (int i = 0; i &lt; this.getTransactions().length; i++) { txIdArrays[i] = this.getTransactions()[i].hash(); } return new MerkleTree(txIdArrays).getRoot().getHash(); } ... } MerkleTree的根节点的Hash值，就是区块中交易信息的唯一代表。 小结 这一节我们主要是对前面的交易机制做了进一步的优化，加入UTXO池和Merkle Tree机制。 资料 源码：https://github.com/wangweiX/blockchain-java/tree/part6-transaction2 The UTXO Set UTXO set statistics Merkle Tree Why every Bitcoin user should understand “SPV security” Script “Ultraprune” Bitcoin Core commit Smart contracts and Bitcoin 阅读更多" />
+<meta property="og:description" content="最终内容请以原文为准：https://wangwei.one/posts/630e7ae5.html 引言 在这一系列文章的最开始部分，我们提到过区块链是一个分布式的数据库。那时候，我们决定跳过”分布式”这一环节，并且聚焦于”数据存储”这一环节。到目前为止，我们几乎实现了区块链的所有组成部分。在本篇文章中，我们将会涉及一些在前面的文章中所忽略的一些机制，并且在下一篇文章中我们将开始研究区块链的分布式特性。 前面各个部分内容： 基本原型 工作量证明 持久化 &amp; 命令行 交易（UTXO） 地址（钱包） UTXO池 在 持久化 &amp; 命令行 这篇文章中，我们研究了比特币核心存储区块的方式。当中我们提到过与区块相关的数据存储在 blocks 这个数据桶中，而交易数据则存储在 chainstate 这个数据桶中，让我们来回忆一下，chainstate 数据桶的数据结构： ‘c’ + 32-byte transaction hash -&gt; unspent transaction output record for that transaction 某笔交易的UTXO记录 ‘B’ -&gt; 32-byte block hash: the block hash up to which the database represents the unspent transaction outputs 数据库所表示的UTXO的区块Hash 从那篇文章开始，我们已经实现了比特币的交易机制，但是我们还没有用到 chainstate 数据桶去存储我们的交易输出。所以，这将是我们现在要去做的事情。 chainstate 不会去存储交易数据。相反，它存储的是 UTXO 集，也就是未被花费的交易输出集合。除此之外，它还存储了”数据库所表示的UTXO的区块Hash”，我们这里先暂且忽略这一点，因为我们还没有用到区块高度（这一点我们会在后面的文章进行实现）。 那么，我们为什么需要 UTXO 池呢？ 一起来看一下我们前面实现的 findUnspentTransactions 方法： /** * 查找钱包地址对应的所有未花费的交易 * * @param pubKeyHash 钱包公钥Hash * @return */ private Transaction[] findUnspentTransactions(byte[] pubKeyHash) throws Exception { Map&lt;String, int[]&gt; allSpentTXOs = this.getAllSpentTXOs(pubKeyHash); Transaction[] unspentTxs = {}; // 再次遍历所有区块中的交易输出 for (BlockchainIterator blockchainIterator = this.getBlockchainIterator(); blockchainIterator.hashNext(); ) { Block block = blockchainIterator.next(); for (Transaction transaction : block.getTransactions()) { String txId = Hex.encodeHexString(transaction.getTxId()); int[] spentOutIndexArray = allSpentTXOs.get(txId); for (int outIndex = 0; outIndex &lt; transaction.getOutputs().length; outIndex++) { if (spentOutIndexArray != null &amp;&amp; ArrayUtils.contains(spentOutIndexArray, outIndex)) { continue; } // 保存不存在 allSpentTXOs 中的交易 if (transaction.getOutputs()[outIndex].isLockedWithKey(pubKeyHash)) { unspentTxs = ArrayUtils.add(unspentTxs, transaction); } } } } return unspentTxs; } 该方法是用来查找钱包地址对应的包含未花费交易输出的交易信息。由于交易信息是存储在区块当中，所以我们现有的做法是遍历区块链中的每个区块，然后遍历每个区块中的交易信息，再然后遍历每个交易中的交易输出，并检查交易输出是否被相应的钱包地址所锁定，效率非常低下。截止2018年3月29号，比特币中有 515698 个区块，并且这些数据占据了140+Gb 的磁盘空间。这也就意味着一个人必须运行全节点（下载所有的区块数据）才能验证交易信息。此外，验证交易信息需要遍历所有的区块。 针对这个问题的解决办法是需要有一个存储了所有UTXOs（未花费交易输出）的索引，这就是 UTXOs 池所要做的事情：UTXOs池其实是一个缓存空间，它所缓存的数据需要从构建区块链中所有的交易数据中获得（通过遍历所有的区块链，不过这个构建操作只需要执行一次即可），并且它后续还会用于钱包余额的计算以及新的交易数据的验证。截止到2017年9月，UTXOs池大约为 2.7Gb。 好了，让我们来想一下，为了实现 UTXOs 池我们需要做哪些事情。当前，有下列方法被用于查找交易信息： Blockchain.getAllSpentTXOs —— 查询所有已被花费的交易输出。它需要遍历区块链中所有区块中交易信息。 Blockchain.findUnspentTransactions —— 查询包含未被花费的交易输出的交易信息。它也需要遍历区块链中所有区块中交易信息。 Blockchain.findSpendableOutputs —— 该方法用于新的交易创建之时。它需要找到足够多的交易输出，以满足所需支付的金额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findUTXO —— 查询钱包地址所对应的所有未花费交易输出，然后用于计算钱包余额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findTransaction —— 通过交易ID查询交易信息。它需要遍历所有的区块直到找到交易信息为止。 如你所见，上面这些方法都需要去遍历数据库中的所有区块。由于UTXOs池只存储未被花费的交易输出，而不会存储所有的交易信息，因此我们不会对有 Blockchain.findTransaction 进行优化。 那么，我们需要下列这些方法： Blockchain.findUTXO —— 通过遍历所有的区块来找到所有未被花费的交易输出. UTXOSet.reindex —— 调用上面 findUTXO 方法，然后将查询结果存储在数据库中。也即需要进行缓存的地方。 UTXOSet.findSpendableOutputs —— 与 Blockchain.findSpendableOutputs 类似，区别在于会使用 UTXO 池。 UTXOSet.findUTXO —— 与Blockchain.findUTXO 类似，区别在于会使用 UTXO 池。 Blockchain.findTransaction —— 逻辑保持不变。 这样，两个使用最频繁的方法将从现在开始使用缓存！让我们开始编码吧！ 定义 UTXOSet： @NoArgsConstructor @AllArgsConstructor @Slf4j public class UTXOSet { private Blockchain blockchain; } 重建 UTXO 池索引: public class UTXOSet { ... /** * 重建 UTXO 池索引 */ @Synchronized public void reIndex() { log.info(&quot;Start to reIndex UTXO set !&quot;); RocksDBUtils.getInstance().cleanChainStateBucket(); Map&lt;String, TXOutput[]&gt; allUTXOs = blockchain.findAllUTXOs(); for (Map.Entry&lt;String, TXOutput[]&gt; entry : allUTXOs.entrySet()) { RocksDBUtils.getInstance().putUTXOs(entry.getKey(), entry.getValue()); } log.info(&quot;ReIndex UTXO set finished ! &quot;); } ... } 此方法用于初始化 UTXOSet。首先，需要清空 chainstate 数据桶，然后查询所有未被花费的交易输出，并将它们保存到 chainstate 数据桶中。 实现 findSpendableOutputs 方法，供 Transation.newUTXOTransaction 调用 public class UTXOSet { ... /** * 寻找能够花费的交易 * * @param pubKeyHash 钱包公钥Hash * @param amount 花费金额 */ public SpendableOutputResult findSpendableOutputs(byte[] pubKeyHash, int amount) { Map&lt;String, int[]&gt; unspentOuts = Maps.newHashMap(); int accumulated = 0; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); for (Map.Entry&lt;String, byte[]&gt; entry : chainstateBucket.entrySet()) { String txId = entry.getKey(); TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(entry.getValue()); for (int outId = 0; outId &lt; txOutputs.length; outId++) { TXOutput txOutput = txOutputs[outId]; if (txOutput.isLockedWithKey(pubKeyHash) &amp;&amp; accumulated &lt; amount) { accumulated += txOutput.getValue(); int[] outIds = unspentOuts.get(txId); if (outIds == null) { outIds = new int[]{outId}; } else { outIds = ArrayUtils.add(outIds, outId); } unspentOuts.put(txId, outIds); if (accumulated &gt;= amount) { break; } } } } return new SpendableOutputResult(accumulated, unspentOuts); } ... } 实现 findUTXOs 接口，供 CLI.getBalance 调用： public class UTXOSet { ... /** * 查找钱包地址对应的所有UTXO * * @param pubKeyHash 钱包公钥Hash * @return */ public TXOutput[] findUTXOs(byte[] pubKeyHash) { TXOutput[] utxos = {}; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); if (chainstateBucket.isEmpty()) { return utxos; } for (byte[] value : chainstateBucket.values()) { TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(value); for (TXOutput txOutput : txOutputs) { if (txOutput.isLockedWithKey(pubKeyHash)) { utxos = ArrayUtils.add(utxos, txOutput); } } } return utxos; } ... } 以上这些方法都是先前 Blockchain 中相应方法的微调版，先前的方法将不再使用。 有了UTXO池之后，意味着我们的交易数据分开存储到了两个不同的数据桶中：交易数据存储到了 block 数据桶中，而UTXO存储到了 chainstate 数据桶中。这就需要一种同步机制来保证每当一个新的区块产生时，UTXO池能够及时同步最新区块中的交易数据，毕竟我们不想频地进行 reIndex 。因此，我们需要如下方法： 更新UTXO池： public class UTXOSet { ... /** * 更新UTXO池 * &lt;p&gt; * 当一个新的区块产生时，需要去做两件事情： * 1）从UTXO池中移除花费掉了的交易输出； * 2）保存新的未花费交易输出； * * @param tipBlock 最新的区块 */ @Synchronized public void update(Block tipBlock) { if (tipBlock == null) { log.error(&quot;Fail to update UTXO set ! tipBlock is null !&quot;); throw new RuntimeException(&quot;Fail to update UTXO set ! &quot;); } for (Transaction transaction : tipBlock.getTransactions()) { // 根据交易输入排查出剩余未被使用的交易输出 if (!transaction.isCoinbase()) { for (TXInput txInput : transaction.getInputs()) { // 余下未被使用的交易输出 TXOutput[] remainderUTXOs = {}; String txId = Hex.encodeHexString(txInput.getTxId()); TXOutput[] txOutputs = RocksDBUtils.getInstance().getUTXOs(txId); if (txOutputs == null) { continue; } for (int outIndex = 0; outIndex &lt; txOutputs.length; outIndex++) { if (outIndex != txInput.getTxOutputIndex()) { remainderUTXOs = ArrayUtils.add(remainderUTXOs, txOutputs[outIndex]); } } // 没有剩余则删除，否则更新 if (remainderUTXOs.length == 0) { RocksDBUtils.getInstance().deleteUTXOs(txId); } else { RocksDBUtils.getInstance().putUTXOs(txId, remainderUTXOs); } } } // 新的交易输出保存到DB中 TXOutput[] txOutputs = transaction.getOutputs(); String txId = Hex.encodeHexString(transaction.getTxId()); RocksDBUtils.getInstance().putUTXOs(txId, txOutputs); } } ... } 让我们将 UTXOSet 用到它们所需之处去： public class CLI { ... /** * 创建区块链 * * @param address */ private void createBlockchain(String address) { Blockchain blockchain = Blockchain.createBlockchain(address); UTXOSet utxoSet = new UTXOSet(blockchain); utxoSet.reIndex(); log.info(&quot;Done ! &quot;); } ... } 当创建一个新的区块链是，我们需要重建 UTXO 池索引。截止目前，这是唯一一处用到 reIndex 的地方，尽管看起有些多余，因为在区块链创建之初仅仅只有一个区块和一笔交易。 修改 CLI.send 接口： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction}); new UTXOSet(blockchain).update(newBlock); ... } ... } 当一个新的区块产生后，需要去更新 UTXO 池数据。 让我们来检查一下它们的运行情况： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Elapsed Time: 164.961 seconds correct hash Hex: 00225493862611bc517cb6b3610e99d26d98a6b52484c9fa745df6ceff93f445 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 10 $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -to 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -amount 5 java.lang.Exception: ERROR: Not enough funds $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0001ab21f71ff2d6d532bf3b3388db790c2b03e28d7bd27bd669c5f6380a4e5b Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0009b925cc94e3db8bab2958b1fc2d1764aa15531e20756d92c3a93065c920f0 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG Balance of &#39;1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG&#39;: 2 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV Balance of &#39;1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV&#39;: 2 奖励机制 前面的章节中我们省略了矿工挖矿的奖励机制。时机已经成熟，该实现它了。 矿工奖励其实是一个 coinbase 交易（创币交易）。当一个矿工节点开始去生产一个新的区块时，他会从队列中取出一些交易数据，并且为它们预制一个 coinbase 交易。这笔 coinbase 交易中仅有的交易输出包含了矿工的公钥hash。 只需要更新 send 命令接口，我们就可以轻松实现矿工的奖励机制： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); // 新交易 Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); // 奖励 Transaction rewardTx = Transaction.newCoinbaseTX(from, &quot;&quot;); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction, rewardTx}); new UTXOSet(blockchain).update(newBlock); ... } ... } 还需要修改交易验证方法，coinbase 交易直接验证通过： public class Blockchain { /** * 交易签名验证 * * @param tx */ private boolean verifyTransactions(Transaction tx) { if (tx.isCoinbase()) { return true; } ... } ... } 在我们的实现逻辑中，代币的发送也是区块的生产者，因此，奖励也归他所有。 让我们来验证一下奖励机制： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Elapsed Time: 17.973 seconds correct hash Hex: 0000defe83a851a5db3803d5013bbc20c6234f176b2c52ae36fdb53d28b33d93 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX -amount 6 Elapsed Time: 30.887 seconds correct hash Hex: 00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT -amount 3 Elapsed Time: 45.267 seconds correct hash Hex: 00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Balance of &#39;1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD&#39;: 21 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX Balance of &#39;17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT Balance of &#39;12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT&#39;: 3 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD 这个地址一共收到了三份奖励： 第一次是开采创世区块； 第二次是开采区块：00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 第三次是开采区块：00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Merkle Tree Merkle Tree（默克尔树） 是这篇文章中我们需要重点讨论的一个机制。 正如我前面提到的那样，整个比特币的数据库占到了大约140G的磁盘空间。由于比特币的分布式特性，网络中的每一个节点必须是独立且自给自足的。每个比特币节点都是路由、区块链数据库、挖矿、钱包服务的功能集合。每个节点都参与全网络的路由功能，同时也可能包含其他功能。每个节点都参与验证并传播交易及区块信息，发现并维持与对等节点的连接。一个全节点（full node）包括以下四个功能： 随着越来越多的人开始使用比特币，这条规则开始变得越来越难以遵循：让每一个人都去运行一个完整的节点不太现实。在中本聪发布的 比特币白皮书 中，针对这个问题提出了一个解决方案：Simplified Payment Verification (SPV)（简易支付验证）。SPV是比特币的轻量级节点，它不需要下载所有的区块链数据，也不需要验证区块和交易数据。相反，当SPV想要验证一笔交易的有效性时，它会从它所连接的全节点上检索所需要的一些数据。这种机制保证了在只有一个全节点的情况，可以运行多个SPV轻钱包节点。 更多有关SPV的介绍，请查看：《精通比特币（第二版）》第八章 为了使SPV成为可能，就需要有一种方法在没有全量下载区块数据的情况下，来检查一个区块是否包含了某笔交易。这就是 Merkle Tree 发挥作用的地方了。 比特币中所使用的Merkle Tree是为了获得交易的Hash值，随后这个已经被Pow（工作量证明）系统认可了的Hash值会被保存到区块头中。到目前为止，我们只是简单地计算了一个区块中每笔交易的Hash值，然后在准备Pow数据时，再对这些交易进行 SHA-256 计算。虽然这是一个用于获取区块交易唯一表示的一个不错的途径，但是它不具有到 Merkle Tree的优点。 来看一下Merkle Tree的结构： 每一个区块都会构建一个Merkle Tree，它从最底部的叶子节点开始往上构建，每一个交易的Hash就是一个叶子节点（比特币中用的双SHA256算法）。叶子节点的数量必须是偶数个，但是并不是每一个区块都能包含偶数笔交易数据。如果存在奇数笔交易数据，那么最后一笔交易数据将会被复制一份（这仅仅发生在Merkle Tree中，而不是区块中）。 从下往上移动，叶子节点成对分组，它们的Hash值被连接到一起，并且在此基础上再次计算出新的Hash值。新的Hash 形成新的树节点。这个过程不断地被重复，直到最后仅剩一个被称为根节点的树节点。这个根节点的Hash就是区块中交易数据们的唯一代表，它会被保存到区块头中，并被用于参与POW系统的计算。 Merkle树的好处是节点可以在不下载整个块的情况下验证某笔交易的合法性。 为此，只需要交易Hash，Merkle树根Hash和Merkle路径。 Merkle Tree代码实现如下： package one.wangwei.blockchain.transaction; import com.google.common.collect.Lists; import lombok.Data; import one.wangwei.blockchain.util.ByteUtils; import org.apache.commons.codec.digest.DigestUtils; import java.util.List; /** * 默克尔树 * * @author wangwei * @date 2018/04/15 */ @Data public class MerkleTree { /** * 根节点 */ private Node root; /** * 叶子节点Hash */ private byte[][] leafHashes; public MerkleTree(byte[][] leafHashes) { constructTree(leafHashes); } /** * 从底部叶子节点开始往上构建整个Merkle Tree * * @param leafHashes */ private void constructTree(byte[][] leafHashes) { if (leafHashes == null || leafHashes.length &lt; 1) { throw new RuntimeException(&quot;ERROR:Fail to construct merkle tree ! leafHashes data invalid ! &quot;); } this.leafHashes = leafHashes; List&lt;Node&gt; parents = bottomLevel(leafHashes); while (parents.size() &gt; 1) { parents = internalLevel(parents); } root = parents.get(0); } /** * 构建一个层级节点 * * @param children * @return */ private List&lt;Node&gt; internalLevel(List&lt;Node&gt; children) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(children.size() / 2); for (int i = 0; i &lt; children.size() - 1; i += 2) { Node child1 = children.get(i); Node child2 = children.get(i + 1); Node parent = constructInternalNode(child1, child2); parents.add(parent); } // 内部节点奇数个，只对left节点进行计算 if (children.size() % 2 != 0) { Node child = children.get(children.size() - 1); Node parent = constructInternalNode(child, null); parents.add(parent); } return parents; } /** * 底部节点构建 * * @param hashes * @return */ private List&lt;Node&gt; bottomLevel(byte[][] hashes) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(hashes.length / 2); for (int i = 0; i &lt; hashes.length - 1; i += 2) { Node leaf1 = constructLeafNode(hashes[i]); Node leaf2 = constructLeafNode(hashes[i + 1]); Node parent = constructInternalNode(leaf1, leaf2); parents.add(parent); } if (hashes.length % 2 != 0) { Node leaf = constructLeafNode(hashes[hashes.length - 1]); // 奇数个节点的情况，复制最后一个节点 Node parent = constructInternalNode(leaf, leaf); parents.add(parent); } return parents; } /** * 构建叶子节点 * * @param hash * @return */ private static Node constructLeafNode(byte[] hash) { Node leaf = new Node(); leaf.hash = hash; return leaf; } /** * 构建内部节点 * * @param leftChild * @param rightChild * @return */ private Node constructInternalNode(Node leftChild, Node rightChild) { Node parent = new Node(); if (rightChild == null) { parent.hash = leftChild.hash; } else { parent.hash = internalHash(leftChild.hash, rightChild.hash); } parent.left = leftChild; parent.right = rightChild; return parent; } /** * 计算内部节点Hash * * @param leftChildHash * @param rightChildHash * @return */ private byte[] internalHash(byte[] leftChildHash, byte[] rightChildHash) { byte[] mergedBytes = ByteUtils.merge(leftChildHash, rightChildHash); return DigestUtils.sha256(mergedBytes); } /** * Merkle Tree节点 */ @Data public static class Node { private byte[] hash; private Node left; private Node right; } } 然后修改 Block.hashTransaction 接口： public class Block { ... /** * 对区块中的交易信息进行Hash计算 * * @return */ public byte[] hashTransaction() { byte[][] txIdArrays = new byte[this.getTransactions().length][]; for (int i = 0; i &lt; this.getTransactions().length; i++) { txIdArrays[i] = this.getTransactions()[i].hash(); } return new MerkleTree(txIdArrays).getRoot().getHash(); } ... } MerkleTree的根节点的Hash值，就是区块中交易信息的唯一代表。 小结 这一节我们主要是对前面的交易机制做了进一步的优化，加入UTXO池和Merkle Tree机制。 资料 源码：https://github.com/wangweiX/blockchain-java/tree/part6-transaction2 The UTXO Set UTXO set statistics Merkle Tree Why every Bitcoin user should understand “SPV security” Script “Ultraprune” Bitcoin Core commit Smart contracts and Bitcoin 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/04/16/b1c5c1381e11635f927135a4e856d059.html" />
+<meta property="og:url" content="https://uzzz.org/2018/04/16/b1c5c1381e11635f927135a4e856d059.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-04-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"最终内容请以原文为准：https://wangwei.one/posts/630e7ae5.html 引言 在这一系列文章的最开始部分，我们提到过区块链是一个分布式的数据库。那时候，我们决定跳过”分布式”这一环节，并且聚焦于”数据存储”这一环节。到目前为止，我们几乎实现了区块链的所有组成部分。在本篇文章中，我们将会涉及一些在前面的文章中所忽略的一些机制，并且在下一篇文章中我们将开始研究区块链的分布式特性。 前面各个部分内容： 基本原型 工作量证明 持久化 &amp; 命令行 交易（UTXO） 地址（钱包） UTXO池 在 持久化 &amp; 命令行 这篇文章中，我们研究了比特币核心存储区块的方式。当中我们提到过与区块相关的数据存储在 blocks 这个数据桶中，而交易数据则存储在 chainstate 这个数据桶中，让我们来回忆一下，chainstate 数据桶的数据结构： ‘c’ + 32-byte transaction hash -&gt; unspent transaction output record for that transaction 某笔交易的UTXO记录 ‘B’ -&gt; 32-byte block hash: the block hash up to which the database represents the unspent transaction outputs 数据库所表示的UTXO的区块Hash 从那篇文章开始，我们已经实现了比特币的交易机制，但是我们还没有用到 chainstate 数据桶去存储我们的交易输出。所以，这将是我们现在要去做的事情。 chainstate 不会去存储交易数据。相反，它存储的是 UTXO 集，也就是未被花费的交易输出集合。除此之外，它还存储了”数据库所表示的UTXO的区块Hash”，我们这里先暂且忽略这一点，因为我们还没有用到区块高度（这一点我们会在后面的文章进行实现）。 那么，我们为什么需要 UTXO 池呢？ 一起来看一下我们前面实现的 findUnspentTransactions 方法： /** * 查找钱包地址对应的所有未花费的交易 * * @param pubKeyHash 钱包公钥Hash * @return */ private Transaction[] findUnspentTransactions(byte[] pubKeyHash) throws Exception { Map&lt;String, int[]&gt; allSpentTXOs = this.getAllSpentTXOs(pubKeyHash); Transaction[] unspentTxs = {}; // 再次遍历所有区块中的交易输出 for (BlockchainIterator blockchainIterator = this.getBlockchainIterator(); blockchainIterator.hashNext(); ) { Block block = blockchainIterator.next(); for (Transaction transaction : block.getTransactions()) { String txId = Hex.encodeHexString(transaction.getTxId()); int[] spentOutIndexArray = allSpentTXOs.get(txId); for (int outIndex = 0; outIndex &lt; transaction.getOutputs().length; outIndex++) { if (spentOutIndexArray != null &amp;&amp; ArrayUtils.contains(spentOutIndexArray, outIndex)) { continue; } // 保存不存在 allSpentTXOs 中的交易 if (transaction.getOutputs()[outIndex].isLockedWithKey(pubKeyHash)) { unspentTxs = ArrayUtils.add(unspentTxs, transaction); } } } } return unspentTxs; } 该方法是用来查找钱包地址对应的包含未花费交易输出的交易信息。由于交易信息是存储在区块当中，所以我们现有的做法是遍历区块链中的每个区块，然后遍历每个区块中的交易信息，再然后遍历每个交易中的交易输出，并检查交易输出是否被相应的钱包地址所锁定，效率非常低下。截止2018年3月29号，比特币中有 515698 个区块，并且这些数据占据了140+Gb 的磁盘空间。这也就意味着一个人必须运行全节点（下载所有的区块数据）才能验证交易信息。此外，验证交易信息需要遍历所有的区块。 针对这个问题的解决办法是需要有一个存储了所有UTXOs（未花费交易输出）的索引，这就是 UTXOs 池所要做的事情：UTXOs池其实是一个缓存空间，它所缓存的数据需要从构建区块链中所有的交易数据中获得（通过遍历所有的区块链，不过这个构建操作只需要执行一次即可），并且它后续还会用于钱包余额的计算以及新的交易数据的验证。截止到2017年9月，UTXOs池大约为 2.7Gb。 好了，让我们来想一下，为了实现 UTXOs 池我们需要做哪些事情。当前，有下列方法被用于查找交易信息： Blockchain.getAllSpentTXOs —— 查询所有已被花费的交易输出。它需要遍历区块链中所有区块中交易信息。 Blockchain.findUnspentTransactions —— 查询包含未被花费的交易输出的交易信息。它也需要遍历区块链中所有区块中交易信息。 Blockchain.findSpendableOutputs —— 该方法用于新的交易创建之时。它需要找到足够多的交易输出，以满足所需支付的金额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findUTXO —— 查询钱包地址所对应的所有未花费交易输出，然后用于计算钱包余额。需要调用 Blockchain.findUnspentTransactions 方法。 Blockchain.findTransaction —— 通过交易ID查询交易信息。它需要遍历所有的区块直到找到交易信息为止。 如你所见，上面这些方法都需要去遍历数据库中的所有区块。由于UTXOs池只存储未被花费的交易输出，而不会存储所有的交易信息，因此我们不会对有 Blockchain.findTransaction 进行优化。 那么，我们需要下列这些方法： Blockchain.findUTXO —— 通过遍历所有的区块来找到所有未被花费的交易输出. UTXOSet.reindex —— 调用上面 findUTXO 方法，然后将查询结果存储在数据库中。也即需要进行缓存的地方。 UTXOSet.findSpendableOutputs —— 与 Blockchain.findSpendableOutputs 类似，区别在于会使用 UTXO 池。 UTXOSet.findUTXO —— 与Blockchain.findUTXO 类似，区别在于会使用 UTXO 池。 Blockchain.findTransaction —— 逻辑保持不变。 这样，两个使用最频繁的方法将从现在开始使用缓存！让我们开始编码吧！ 定义 UTXOSet： @NoArgsConstructor @AllArgsConstructor @Slf4j public class UTXOSet { private Blockchain blockchain; } 重建 UTXO 池索引: public class UTXOSet { ... /** * 重建 UTXO 池索引 */ @Synchronized public void reIndex() { log.info(&quot;Start to reIndex UTXO set !&quot;); RocksDBUtils.getInstance().cleanChainStateBucket(); Map&lt;String, TXOutput[]&gt; allUTXOs = blockchain.findAllUTXOs(); for (Map.Entry&lt;String, TXOutput[]&gt; entry : allUTXOs.entrySet()) { RocksDBUtils.getInstance().putUTXOs(entry.getKey(), entry.getValue()); } log.info(&quot;ReIndex UTXO set finished ! &quot;); } ... } 此方法用于初始化 UTXOSet。首先，需要清空 chainstate 数据桶，然后查询所有未被花费的交易输出，并将它们保存到 chainstate 数据桶中。 实现 findSpendableOutputs 方法，供 Transation.newUTXOTransaction 调用 public class UTXOSet { ... /** * 寻找能够花费的交易 * * @param pubKeyHash 钱包公钥Hash * @param amount 花费金额 */ public SpendableOutputResult findSpendableOutputs(byte[] pubKeyHash, int amount) { Map&lt;String, int[]&gt; unspentOuts = Maps.newHashMap(); int accumulated = 0; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); for (Map.Entry&lt;String, byte[]&gt; entry : chainstateBucket.entrySet()) { String txId = entry.getKey(); TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(entry.getValue()); for (int outId = 0; outId &lt; txOutputs.length; outId++) { TXOutput txOutput = txOutputs[outId]; if (txOutput.isLockedWithKey(pubKeyHash) &amp;&amp; accumulated &lt; amount) { accumulated += txOutput.getValue(); int[] outIds = unspentOuts.get(txId); if (outIds == null) { outIds = new int[]{outId}; } else { outIds = ArrayUtils.add(outIds, outId); } unspentOuts.put(txId, outIds); if (accumulated &gt;= amount) { break; } } } } return new SpendableOutputResult(accumulated, unspentOuts); } ... } 实现 findUTXOs 接口，供 CLI.getBalance 调用： public class UTXOSet { ... /** * 查找钱包地址对应的所有UTXO * * @param pubKeyHash 钱包公钥Hash * @return */ public TXOutput[] findUTXOs(byte[] pubKeyHash) { TXOutput[] utxos = {}; Map&lt;String, byte[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket(); if (chainstateBucket.isEmpty()) { return utxos; } for (byte[] value : chainstateBucket.values()) { TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(value); for (TXOutput txOutput : txOutputs) { if (txOutput.isLockedWithKey(pubKeyHash)) { utxos = ArrayUtils.add(utxos, txOutput); } } } return utxos; } ... } 以上这些方法都是先前 Blockchain 中相应方法的微调版，先前的方法将不再使用。 有了UTXO池之后，意味着我们的交易数据分开存储到了两个不同的数据桶中：交易数据存储到了 block 数据桶中，而UTXO存储到了 chainstate 数据桶中。这就需要一种同步机制来保证每当一个新的区块产生时，UTXO池能够及时同步最新区块中的交易数据，毕竟我们不想频地进行 reIndex 。因此，我们需要如下方法： 更新UTXO池： public class UTXOSet { ... /** * 更新UTXO池 * &lt;p&gt; * 当一个新的区块产生时，需要去做两件事情： * 1）从UTXO池中移除花费掉了的交易输出； * 2）保存新的未花费交易输出； * * @param tipBlock 最新的区块 */ @Synchronized public void update(Block tipBlock) { if (tipBlock == null) { log.error(&quot;Fail to update UTXO set ! tipBlock is null !&quot;); throw new RuntimeException(&quot;Fail to update UTXO set ! &quot;); } for (Transaction transaction : tipBlock.getTransactions()) { // 根据交易输入排查出剩余未被使用的交易输出 if (!transaction.isCoinbase()) { for (TXInput txInput : transaction.getInputs()) { // 余下未被使用的交易输出 TXOutput[] remainderUTXOs = {}; String txId = Hex.encodeHexString(txInput.getTxId()); TXOutput[] txOutputs = RocksDBUtils.getInstance().getUTXOs(txId); if (txOutputs == null) { continue; } for (int outIndex = 0; outIndex &lt; txOutputs.length; outIndex++) { if (outIndex != txInput.getTxOutputIndex()) { remainderUTXOs = ArrayUtils.add(remainderUTXOs, txOutputs[outIndex]); } } // 没有剩余则删除，否则更新 if (remainderUTXOs.length == 0) { RocksDBUtils.getInstance().deleteUTXOs(txId); } else { RocksDBUtils.getInstance().putUTXOs(txId, remainderUTXOs); } } } // 新的交易输出保存到DB中 TXOutput[] txOutputs = transaction.getOutputs(); String txId = Hex.encodeHexString(transaction.getTxId()); RocksDBUtils.getInstance().putUTXOs(txId, txOutputs); } } ... } 让我们将 UTXOSet 用到它们所需之处去： public class CLI { ... /** * 创建区块链 * * @param address */ private void createBlockchain(String address) { Blockchain blockchain = Blockchain.createBlockchain(address); UTXOSet utxoSet = new UTXOSet(blockchain); utxoSet.reIndex(); log.info(&quot;Done ! &quot;); } ... } 当创建一个新的区块链是，我们需要重建 UTXO 池索引。截止目前，这是唯一一处用到 reIndex 的地方，尽管看起有些多余，因为在区块链创建之初仅仅只有一个区块和一笔交易。 修改 CLI.send 接口： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction}); new UTXOSet(blockchain).update(newBlock); ... } ... } 当一个新的区块产生后，需要去更新 UTXO 池数据。 让我们来检查一下它们的运行情况： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Elapsed Time: 164.961 seconds correct hash Hex: 00225493862611bc517cb6b3610e99d26d98a6b52484c9fa745df6ceff93f445 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 10 $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -to 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -amount 5 java.lang.Exception: ERROR: Not enough funds $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0001ab21f71ff2d6d532bf3b3388db790c2b03e28d7bd27bd669c5f6380a4e5b Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf -to 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV -amount 2 Elapsed Time: 54.92 seconds correct hash Hex: 0009b925cc94e3db8bab2958b1fc2d1764aa15531e20756d92c3a93065c920f0 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf Balance of &#39;1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG Balance of &#39;1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG&#39;: 2 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV Balance of &#39;1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV&#39;: 2 奖励机制 前面的章节中我们省略了矿工挖矿的奖励机制。时机已经成熟，该实现它了。 矿工奖励其实是一个 coinbase 交易（创币交易）。当一个矿工节点开始去生产一个新的区块时，他会从队列中取出一些交易数据，并且为它们预制一个 coinbase 交易。这笔 coinbase 交易中仅有的交易输出包含了矿工的公钥hash。 只需要更新 send 命令接口，我们就可以轻松实现矿工的奖励机制： public class CLI { ... /** * 转账 * * @param from * @param to * @param amount */ private void send(String from, String to, int amount) throws Exception { ... Blockchain blockchain = Blockchain.createBlockchain(from); // 新交易 Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain); // 奖励 Transaction rewardTx = Transaction.newCoinbaseTX(from, &quot;&quot;); Block newBlock = blockchain.mineBlock(new Transaction[]{transaction, rewardTx}); new UTXOSet(blockchain).update(newBlock); ... } ... } 还需要修改交易验证方法，coinbase 交易直接验证通过： public class Blockchain { /** * 交易签名验证 * * @param tx */ private boolean verifyTransactions(Transaction tx) { if (tx.isCoinbase()) { return true; } ... } ... } 在我们的实现逻辑中，代币的发送也是区块的生产者，因此，奖励也归他所有。 让我们来验证一下奖励机制： $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX $ java -jar blockchain-java-jar-with-dependencies.jar createwallet wallet address : 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT $ java -jar blockchain-java-jar-with-dependencies.jar createblockchain -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Elapsed Time: 17.973 seconds correct hash Hex: 0000defe83a851a5db3803d5013bbc20c6234f176b2c52ae36fdb53d28b33d93 Done ! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX -amount 6 Elapsed Time: 30.887 seconds correct hash Hex: 00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 Success! $ java -jar blockchain-java-jar-with-dependencies.jar send -from 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD -to 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT -amount 3 Elapsed Time: 45.267 seconds correct hash Hex: 00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Success! $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD Balance of &#39;1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD&#39;: 21 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX Balance of &#39;17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX&#39;: 6 $ java -jar blockchain-java-jar-with-dependencies.jar getbalance -address 12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT Balance of &#39;12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT&#39;: 3 1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD 这个地址一共收到了三份奖励： 第一次是开采创世区块； 第二次是开采区块：00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 第三次是开采区块：00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 Merkle Tree Merkle Tree（默克尔树） 是这篇文章中我们需要重点讨论的一个机制。 正如我前面提到的那样，整个比特币的数据库占到了大约140G的磁盘空间。由于比特币的分布式特性，网络中的每一个节点必须是独立且自给自足的。每个比特币节点都是路由、区块链数据库、挖矿、钱包服务的功能集合。每个节点都参与全网络的路由功能，同时也可能包含其他功能。每个节点都参与验证并传播交易及区块信息，发现并维持与对等节点的连接。一个全节点（full node）包括以下四个功能： 随着越来越多的人开始使用比特币，这条规则开始变得越来越难以遵循：让每一个人都去运行一个完整的节点不太现实。在中本聪发布的 比特币白皮书 中，针对这个问题提出了一个解决方案：Simplified Payment Verification (SPV)（简易支付验证）。SPV是比特币的轻量级节点，它不需要下载所有的区块链数据，也不需要验证区块和交易数据。相反，当SPV想要验证一笔交易的有效性时，它会从它所连接的全节点上检索所需要的一些数据。这种机制保证了在只有一个全节点的情况，可以运行多个SPV轻钱包节点。 更多有关SPV的介绍，请查看：《精通比特币（第二版）》第八章 为了使SPV成为可能，就需要有一种方法在没有全量下载区块数据的情况下，来检查一个区块是否包含了某笔交易。这就是 Merkle Tree 发挥作用的地方了。 比特币中所使用的Merkle Tree是为了获得交易的Hash值，随后这个已经被Pow（工作量证明）系统认可了的Hash值会被保存到区块头中。到目前为止，我们只是简单地计算了一个区块中每笔交易的Hash值，然后在准备Pow数据时，再对这些交易进行 SHA-256 计算。虽然这是一个用于获取区块交易唯一表示的一个不错的途径，但是它不具有到 Merkle Tree的优点。 来看一下Merkle Tree的结构： 每一个区块都会构建一个Merkle Tree，它从最底部的叶子节点开始往上构建，每一个交易的Hash就是一个叶子节点（比特币中用的双SHA256算法）。叶子节点的数量必须是偶数个，但是并不是每一个区块都能包含偶数笔交易数据。如果存在奇数笔交易数据，那么最后一笔交易数据将会被复制一份（这仅仅发生在Merkle Tree中，而不是区块中）。 从下往上移动，叶子节点成对分组，它们的Hash值被连接到一起，并且在此基础上再次计算出新的Hash值。新的Hash 形成新的树节点。这个过程不断地被重复，直到最后仅剩一个被称为根节点的树节点。这个根节点的Hash就是区块中交易数据们的唯一代表，它会被保存到区块头中，并被用于参与POW系统的计算。 Merkle树的好处是节点可以在不下载整个块的情况下验证某笔交易的合法性。 为此，只需要交易Hash，Merkle树根Hash和Merkle路径。 Merkle Tree代码实现如下： package one.wangwei.blockchain.transaction; import com.google.common.collect.Lists; import lombok.Data; import one.wangwei.blockchain.util.ByteUtils; import org.apache.commons.codec.digest.DigestUtils; import java.util.List; /** * 默克尔树 * * @author wangwei * @date 2018/04/15 */ @Data public class MerkleTree { /** * 根节点 */ private Node root; /** * 叶子节点Hash */ private byte[][] leafHashes; public MerkleTree(byte[][] leafHashes) { constructTree(leafHashes); } /** * 从底部叶子节点开始往上构建整个Merkle Tree * * @param leafHashes */ private void constructTree(byte[][] leafHashes) { if (leafHashes == null || leafHashes.length &lt; 1) { throw new RuntimeException(&quot;ERROR:Fail to construct merkle tree ! leafHashes data invalid ! &quot;); } this.leafHashes = leafHashes; List&lt;Node&gt; parents = bottomLevel(leafHashes); while (parents.size() &gt; 1) { parents = internalLevel(parents); } root = parents.get(0); } /** * 构建一个层级节点 * * @param children * @return */ private List&lt;Node&gt; internalLevel(List&lt;Node&gt; children) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(children.size() / 2); for (int i = 0; i &lt; children.size() - 1; i += 2) { Node child1 = children.get(i); Node child2 = children.get(i + 1); Node parent = constructInternalNode(child1, child2); parents.add(parent); } // 内部节点奇数个，只对left节点进行计算 if (children.size() % 2 != 0) { Node child = children.get(children.size() - 1); Node parent = constructInternalNode(child, null); parents.add(parent); } return parents; } /** * 底部节点构建 * * @param hashes * @return */ private List&lt;Node&gt; bottomLevel(byte[][] hashes) { List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(hashes.length / 2); for (int i = 0; i &lt; hashes.length - 1; i += 2) { Node leaf1 = constructLeafNode(hashes[i]); Node leaf2 = constructLeafNode(hashes[i + 1]); Node parent = constructInternalNode(leaf1, leaf2); parents.add(parent); } if (hashes.length % 2 != 0) { Node leaf = constructLeafNode(hashes[hashes.length - 1]); // 奇数个节点的情况，复制最后一个节点 Node parent = constructInternalNode(leaf, leaf); parents.add(parent); } return parents; } /** * 构建叶子节点 * * @param hash * @return */ private static Node constructLeafNode(byte[] hash) { Node leaf = new Node(); leaf.hash = hash; return leaf; } /** * 构建内部节点 * * @param leftChild * @param rightChild * @return */ private Node constructInternalNode(Node leftChild, Node rightChild) { Node parent = new Node(); if (rightChild == null) { parent.hash = leftChild.hash; } else { parent.hash = internalHash(leftChild.hash, rightChild.hash); } parent.left = leftChild; parent.right = rightChild; return parent; } /** * 计算内部节点Hash * * @param leftChildHash * @param rightChildHash * @return */ private byte[] internalHash(byte[] leftChildHash, byte[] rightChildHash) { byte[] mergedBytes = ByteUtils.merge(leftChildHash, rightChildHash); return DigestUtils.sha256(mergedBytes); } /** * Merkle Tree节点 */ @Data public static class Node { private byte[] hash; private Node left; private Node right; } } 然后修改 Block.hashTransaction 接口： public class Block { ... /** * 对区块中的交易信息进行Hash计算 * * @return */ public byte[] hashTransaction() { byte[][] txIdArrays = new byte[this.getTransactions().length][]; for (int i = 0; i &lt; this.getTransactions().length; i++) { txIdArrays[i] = this.getTransactions()[i].hash(); } return new MerkleTree(txIdArrays).getRoot().getHash(); } ... } MerkleTree的根节点的Hash值，就是区块中交易信息的唯一代表。 小结 这一节我们主要是对前面的交易机制做了进一步的优化，加入UTXO池和Merkle Tree机制。 资料 源码：https://github.com/wangweiX/blockchain-java/tree/part6-transaction2 The UTXO Set UTXO set statistics Merkle Tree Why every Bitcoin user should understand “SPV security” Script “Ultraprune” Bitcoin Core commit Smart contracts and Bitcoin 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/04/16/b1c5c1381e11635f927135a4e856d059.html","headline":"基于Java语言构建区块链（六）—— 交易（Merkle Tree）","dateModified":"2018-04-16T00:00:00+08:00","datePublished":"2018-04-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/04/16/b1c5c1381e11635f927135a4e856d059.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>基于Java语言构建区块链（六）—— 交易（Merkle Tree）</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p><img src="https://img.i7years.com/blog/pexels-photo-38136.webp" alt="" title=""></p> 
+  <blockquote> 
+   <p>最终内容请以原文为准：<a href="https://wangwei.one/posts/630e7ae5.html" rel="nofollow">https://wangwei.one/posts/630e7ae5.html</a></p> 
+  </blockquote> 
+  <h2 id="引言">引言</h2> 
+  <p>在这一系列文章的最开始部分，我们提到过区块链是一个分布式的数据库。那时候，我们决定跳过”分布式”这一环节，并且聚焦于”数据存储”这一环节。到目前为止，我们几乎实现了区块链的所有组成部分。在本篇文章中，我们将会涉及一些在前面的文章中所忽略的一些机制，并且在下一篇文章中我们将开始研究区块链的分布式特性。</p> 
+  <!--more--> 
+  <p>前面各个部分内容：</p> 
+  <ol> 
+   <li><a href="https://wangwei.one/posts/df195d9.html" rel="nofollow">基本原型</a></li> 
+   <li><a href="https://wangwei.one/posts/7890ab7e.html" rel="nofollow">工作量证明</a></li> 
+   <li><a href="https://wangwei.one/posts/35c768a3.html" rel="nofollow">持久化 &amp; 命令行</a></li> 
+   <li><a href="https://wangwei.one/posts/9cf9e42a.html" rel="nofollow">交易（UTXO）</a></li> 
+   <li><a href="https://wangwei.one/posts/f9088e0f.html" rel="nofollow">地址（钱包）</a></li> 
+  </ol> 
+  <h2 id="utxo池">UTXO池</h2> 
+  <p>在 <a href="https://wangwei.one/posts/35c768a3.html" rel="nofollow">持久化 &amp; 命令行</a> 这篇文章中，我们研究了比特币核心存储区块的方式。当中我们提到过与区块相关的数据存储在 <strong>blocks</strong> 这个数据桶中，而交易数据则存储在 <strong>chainstate</strong> 这个数据桶中，让我们来回忆一下，<strong>chainstate</strong> 数据桶的数据结构：</p> 
+  <ul> 
+   <li><p>‘c’ + 32-byte transaction hash -&gt; unspent transaction output record for that transaction</p> 
+    <blockquote> 
+     <p>某笔交易的UTXO记录</p> 
+    </blockquote></li> 
+   <li><p>‘B’ -&gt; 32-byte block hash: the block hash up to which the database represents the unspent transaction outputs</p> 
+    <blockquote> 
+     <p>数据库所表示的UTXO的区块Hash</p> 
+    </blockquote></li> 
+  </ul> 
+  <p>从那篇文章开始，我们已经实现了比特币的交易机制，但是我们还没有用到 <strong>chainstate</strong> 数据桶去存储我们的交易输出。所以，这将是我们现在要去做的事情。</p> 
+  <p><strong>chainstate</strong> 不会去存储交易数据。相反，它存储的是 UTXO 集，也就是未被花费的交易输出集合。除此之外，它还存储了”数据库所表示的UTXO的区块Hash”，我们这里先暂且忽略这一点，因为我们还没有用到区块高度（这一点我们会在后面的文章进行实现）。</p> 
+  <p>那么，我们为什么需要 UTXO 池呢？</p> 
+  <p>一起来看一下我们前面实现的 <strong>findUnspentTransactions</strong> 方法：</p> 
+  <pre class="prettyprint"><code class="language-java hljs ">   <span class="hljs-javadoc">/** * 查找钱包地址对应的所有未花费的交易 * *<span class="hljs-javadoctag"> @param</span> pubKeyHash 钱包公钥Hash *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> Transaction[] <span class="hljs-title">findUnspentTransactions</span>(<span class="hljs-keyword">byte</span>[] pubKeyHash) <span class="hljs-keyword">throws</span> Exception {
+        Map&lt;String, <span class="hljs-keyword">int</span>[]&gt; allSpentTXOs = <span class="hljs-keyword">this</span>.getAllSpentTXOs(pubKeyHash);
+        Transaction[] unspentTxs = {};
+
+        <span class="hljs-comment">// 再次遍历所有区块中的交易输出</span>
+        <span class="hljs-keyword">for</span> (BlockchainIterator blockchainIterator = <span class="hljs-keyword">this</span>.getBlockchainIterator(); blockchainIterator.hashNext(); ) {
+            Block block = blockchainIterator.next();
+            <span class="hljs-keyword">for</span> (Transaction transaction : block.getTransactions()) {
+
+                String txId = Hex.encodeHexString(transaction.getTxId());
+
+                <span class="hljs-keyword">int</span>[] spentOutIndexArray = allSpentTXOs.get(txId);
+
+                <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> outIndex = <span class="hljs-number">0</span>; outIndex &lt; transaction.getOutputs().length; outIndex++) {
+                    <span class="hljs-keyword">if</span> (spentOutIndexArray != <span class="hljs-keyword">null</span> &amp;&amp; ArrayUtils.contains(spentOutIndexArray, outIndex)) {
+                        <span class="hljs-keyword">continue</span>;
+                    }
+
+                    <span class="hljs-comment">// 保存不存在 allSpentTXOs 中的交易</span>
+                    <span class="hljs-keyword">if</span> (transaction.getOutputs()[outIndex].isLockedWithKey(pubKeyHash)) {
+                        unspentTxs = ArrayUtils.add(unspentTxs, transaction);
+                    }
+                }
+            }
+        }
+        <span class="hljs-keyword">return</span> unspentTxs;
+    }</code></pre> 
+  <p>该方法是用来查找钱包地址对应的包含未花费交易输出的交易信息。由于交易信息是存储在区块当中，所以我们现有的做法是遍历区块链中的每个区块，然后遍历每个区块中的交易信息，再然后遍历每个交易中的交易输出，并检查交易输出是否被相应的钱包地址所锁定，效率非常低下。截止2018年3月29号，比特币中有 <a href="https://blockchain.info/zh-cn/block-height/515698" rel="nofollow">515698</a> 个区块，并且这些数据占据了140+Gb 的磁盘空间。这也就意味着一个人必须运行全节点（下载所有的区块数据）才能验证交易信息。此外，验证交易信息需要遍历所有的区块。</p> 
+  <p>针对这个问题的解决办法是需要有一个存储了所有UTXOs（未花费交易输出）的索引，这就是 UTXOs 池所要做的事情：UTXOs池其实是一个缓存空间，它所缓存的数据需要从构建区块链中所有的交易数据中获得（通过遍历所有的区块链，不过这个构建操作只需要执行一次即可），并且它后续还会用于钱包余额的计算以及新的交易数据的验证。截止到2017年9月，UTXOs池大约为 2.7Gb。</p> 
+  <p>好了，让我们来想一下，为了实现 UTXOs 池我们需要做哪些事情。当前，有下列方法被用于查找交易信息：</p> 
+  <ol> 
+   <li><p><strong>Blockchain.getAllSpentTXOs</strong> —— 查询所有已被花费的交易输出。它需要遍历区块链中所有区块中交易信息。</p></li> 
+   <li><p><strong>Blockchain.findUnspentTransactions</strong> —— 查询包含未被花费的交易输出的交易信息。它也需要遍历区块链中所有区块中交易信息。</p></li> 
+   <li><p><strong>Blockchain.findSpendableOutputs</strong> —— 该方法用于新的交易创建之时。它需要找到足够多的交易输出，以满足所需支付的金额。需要调用 <strong>Blockchain.findUnspentTransactions</strong> 方法。</p></li> 
+   <li><p><strong>Blockchain.findUTXO</strong> —— 查询钱包地址所对应的所有未花费交易输出，然后用于计算钱包余额。需要调用</p> <p><strong>Blockchain.findUnspentTransactions</strong> 方法。</p></li> 
+   <li><p><strong>Blockchain.findTransaction</strong> —— 通过交易ID查询交易信息。它需要遍历所有的区块直到找到交易信息为止。</p></li> 
+  </ol> 
+  <p>如你所见，上面这些方法都需要去遍历数据库中的所有区块。由于UTXOs池只存储未被花费的交易输出，而不会存储所有的交易信息，因此我们不会对有 <strong>Blockchain.findTransaction</strong> 进行优化。</p> 
+  <p>那么，我们需要下列这些方法：</p> 
+  <ol> 
+   <li><strong>Blockchain.findUTXO</strong> —— 通过遍历所有的区块来找到所有未被花费的交易输出.</li> 
+   <li><strong>UTXOSet.reindex</strong> —— 调用上面 <strong>findUTXO</strong> 方法，然后将查询结果存储在数据库中。也即需要进行缓存的地方。</li> 
+   <li><strong>UTXOSet.findSpendableOutputs</strong> —— 与 <strong>Blockchain.findSpendableOutputs</strong> 类似，区别在于会使用 UTXO 池。</li> 
+   <li><strong>UTXOSet.findUTXO</strong> —— 与<strong>Blockchain.findUTXO</strong> 类似，区别在于会使用 UTXO 池。</li> 
+   <li><strong>Blockchain.findTransaction</strong> —— 逻辑保持不变。</li> 
+  </ol> 
+  <p>这样，两个使用最频繁的方法将从现在开始使用缓存！让我们开始编码吧！</p> 
+  <p>定义 <strong>UTXOSet</strong>：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-annotation">@NoArgsConstructor</span>
+<span class="hljs-annotation">@AllArgsConstructor</span>
+<span class="hljs-annotation">@Slf</span>4j
+<span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">UTXOSet</span> {</span>
+    <span class="hljs-keyword">private</span> Blockchain blockchain;
+}</code></pre> 
+  <p>重建 UTXO 池索引:</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">UTXOSet</span> {</span>
+
+   ...
+
+  <span class="hljs-javadoc">/** * 重建 UTXO 池索引 */</span>
+    <span class="hljs-annotation">@Synchronized</span>   
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">reIndex</span>() {
+        log.info(<span class="hljs-string">"Start to reIndex UTXO set !"</span>);
+        RocksDBUtils.getInstance().cleanChainStateBucket();
+        Map&lt;String, TXOutput[]&gt; allUTXOs = blockchain.findAllUTXOs();
+        <span class="hljs-keyword">for</span> (Map.Entry&lt;String, TXOutput[]&gt; entry : allUTXOs.entrySet()) {
+            RocksDBUtils.getInstance().putUTXOs(entry.getKey(), entry.getValue());
+        }
+        log.info(<span class="hljs-string">"ReIndex UTXO set finished ! "</span>);
+    }
+
+    ...
+}    </code></pre> 
+  <p>此方法用于初始化 UTXOSet。首先，需要清空 <code>chainstate</code> 数据桶，然后查询所有未被花费的交易输出，并将它们保存到 <code>chainstate</code> 数据桶中。</p> 
+  <p>实现 <strong>findSpendableOutputs</strong> 方法，供 <strong>Transation.newUTXOTransaction</strong> 调用</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">UTXOSet</span> {</span>
+
+   ... 
+
+   <span class="hljs-javadoc">/** * 寻找能够花费的交易 * *<span class="hljs-javadoctag"> @param</span> pubKeyHash 钱包公钥Hash *<span class="hljs-javadoctag"> @param</span> amount 花费金额 */</span>
+    <span class="hljs-keyword">public</span> SpendableOutputResult <span class="hljs-title">findSpendableOutputs</span>(<span class="hljs-keyword">byte</span>[] pubKeyHash, <span class="hljs-keyword">int</span> amount) {
+        Map&lt;String, <span class="hljs-keyword">int</span>[]&gt; unspentOuts = Maps.newHashMap();
+        <span class="hljs-keyword">int</span> accumulated = <span class="hljs-number">0</span>;
+        Map&lt;String, <span class="hljs-keyword">byte</span>[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket();
+        <span class="hljs-keyword">for</span> (Map.Entry&lt;String, <span class="hljs-keyword">byte</span>[]&gt; entry : chainstateBucket.entrySet()) {
+            String txId = entry.getKey();
+            TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(entry.getValue());
+
+            <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> outId = <span class="hljs-number">0</span>; outId &lt; txOutputs.length; outId++) {
+                TXOutput txOutput = txOutputs[outId];
+                <span class="hljs-keyword">if</span> (txOutput.isLockedWithKey(pubKeyHash) &amp;&amp; accumulated &lt; amount) {
+                    accumulated += txOutput.getValue();
+
+                    <span class="hljs-keyword">int</span>[] outIds = unspentOuts.get(txId);
+                    <span class="hljs-keyword">if</span> (outIds == <span class="hljs-keyword">null</span>) {
+                        outIds = <span class="hljs-keyword">new</span> <span class="hljs-keyword">int</span>[]{outId};
+                    } <span class="hljs-keyword">else</span> {
+                        outIds = ArrayUtils.add(outIds, outId);
+                    }
+                    unspentOuts.put(txId, outIds);
+                    <span class="hljs-keyword">if</span> (accumulated &gt;= amount) {
+                        <span class="hljs-keyword">break</span>;
+                    }
+                }
+            }
+        }
+        <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> SpendableOutputResult(accumulated, unspentOuts);
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>实现 <strong>findUTXOs</strong> 接口，供 <strong>CLI.getBalance</strong> 调用：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">UTXOSet</span> {</span>
+
+   ... 
+
+   <span class="hljs-javadoc">/** * 查找钱包地址对应的所有UTXO * *<span class="hljs-javadoctag"> @param</span> pubKeyHash 钱包公钥Hash *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">public</span> TXOutput[] <span class="hljs-title">findUTXOs</span>(<span class="hljs-keyword">byte</span>[] pubKeyHash) {
+        TXOutput[] utxos = {};
+        Map&lt;String, <span class="hljs-keyword">byte</span>[]&gt; chainstateBucket = RocksDBUtils.getInstance().getChainstateBucket();
+        <span class="hljs-keyword">if</span> (chainstateBucket.isEmpty()) {
+            <span class="hljs-keyword">return</span> utxos;
+        }
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">byte</span>[] value : chainstateBucket.values()) {
+            TXOutput[] txOutputs = (TXOutput[]) SerializeUtils.deserialize(value);
+            <span class="hljs-keyword">for</span> (TXOutput txOutput : txOutputs) {
+                <span class="hljs-keyword">if</span> (txOutput.isLockedWithKey(pubKeyHash)) {
+                    utxos = ArrayUtils.add(utxos, txOutput);
+                }
+            }
+        }
+        <span class="hljs-keyword">return</span> utxos;
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>以上这些方法都是先前 <strong>Blockchain</strong> 中相应方法的微调版，先前的方法将不再使用。</p> 
+  <p>有了UTXO池之后，意味着我们的交易数据分开存储到了两个不同的数据桶中：交易数据存储到了 <strong>block</strong> 数据桶中，而UTXO存储到了 <strong>chainstate</strong> 数据桶中。这就需要一种同步机制来保证每当一个新的区块产生时，UTXO池能够及时同步最新区块中的交易数据，毕竟我们不想频地进行 <strong>reIndex</strong> 。因此，我们需要如下方法：</p> 
+  <p>更新UTXO池：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">UTXOSet</span> {</span>
+
+   ... 
+
+   <span class="hljs-javadoc">/** * 更新UTXO池 * &lt;p&gt; * 当一个新的区块产生时，需要去做两件事情： * 1）从UTXO池中移除花费掉了的交易输出； * 2）保存新的未花费交易输出； * *<span class="hljs-javadoctag"> @param</span> tipBlock 最新的区块 */</span>
+    <span class="hljs-annotation">@Synchronized</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">void</span> <span class="hljs-title">update</span>(Block tipBlock) {
+        <span class="hljs-keyword">if</span> (tipBlock == <span class="hljs-keyword">null</span>) {
+            log.error(<span class="hljs-string">"Fail to update UTXO set ! tipBlock is null !"</span>);
+            <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> RuntimeException(<span class="hljs-string">"Fail to update UTXO set ! "</span>);
+        }
+        <span class="hljs-keyword">for</span> (Transaction transaction : tipBlock.getTransactions()) {
+
+            <span class="hljs-comment">// 根据交易输入排查出剩余未被使用的交易输出</span>
+            <span class="hljs-keyword">if</span> (!transaction.isCoinbase()) {
+                <span class="hljs-keyword">for</span> (TXInput txInput : transaction.getInputs()) {
+                    <span class="hljs-comment">// 余下未被使用的交易输出</span>
+                    TXOutput[] remainderUTXOs = {};
+                    String txId = Hex.encodeHexString(txInput.getTxId());
+                    TXOutput[] txOutputs = RocksDBUtils.getInstance().getUTXOs(txId);
+
+                    <span class="hljs-keyword">if</span> (txOutputs == <span class="hljs-keyword">null</span>) {
+                        <span class="hljs-keyword">continue</span>;
+                    }
+
+                    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> outIndex = <span class="hljs-number">0</span>; outIndex &lt; txOutputs.length; outIndex++) {
+                        <span class="hljs-keyword">if</span> (outIndex != txInput.getTxOutputIndex()) {
+                            remainderUTXOs = ArrayUtils.add(remainderUTXOs, txOutputs[outIndex]);
+                        }
+                    }
+
+                    <span class="hljs-comment">// 没有剩余则删除，否则更新</span>
+                    <span class="hljs-keyword">if</span> (remainderUTXOs.length == <span class="hljs-number">0</span>) {
+                        RocksDBUtils.getInstance().deleteUTXOs(txId);
+                    } <span class="hljs-keyword">else</span> {
+                        RocksDBUtils.getInstance().putUTXOs(txId, remainderUTXOs);
+                    }
+                }
+            }
+
+            <span class="hljs-comment">// 新的交易输出保存到DB中</span>
+            TXOutput[] txOutputs = transaction.getOutputs();
+            String txId = Hex.encodeHexString(transaction.getTxId());
+            RocksDBUtils.getInstance().putUTXOs(txId, txOutputs);
+        }
+
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>让我们将 UTXOSet 用到它们所需之处去：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">CLI</span> {</span>
+
+   ...
+
+   <span class="hljs-javadoc">/** * 创建区块链 * *<span class="hljs-javadoctag"> @param</span> address */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">void</span> <span class="hljs-title">createBlockchain</span>(String address) {
+        Blockchain blockchain = Blockchain.createBlockchain(address);
+        UTXOSet utxoSet = <span class="hljs-keyword">new</span> UTXOSet(blockchain);
+        utxoSet.reIndex();
+        log.info(<span class="hljs-string">"Done ! "</span>);
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>当创建一个新的区块链是，我们需要重建 UTXO 池索引。截止目前，这是唯一一处用到 <strong>reIndex</strong> 的地方，尽管看起有些多余，因为在区块链创建之初仅仅只有一个区块和一笔交易。</p> 
+  <p>修改 <strong>CLI.send</strong> 接口：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">CLI</span> {</span>
+
+    ...
+
+   <span class="hljs-javadoc">/** * 转账 * *<span class="hljs-javadoctag"> @param</span> from *<span class="hljs-javadoctag"> @param</span> to *<span class="hljs-javadoctag"> @param</span> amount */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">void</span> <span class="hljs-title">send</span>(String from, String to, <span class="hljs-keyword">int</span> amount) <span class="hljs-keyword">throws</span> Exception {
+
+        ...
+
+        Blockchain blockchain = Blockchain.createBlockchain(from);
+        Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain);
+        Block newBlock = blockchain.mineBlock(<span class="hljs-keyword">new</span> Transaction[]{transaction});
+        <span class="hljs-keyword">new</span> UTXOSet(blockchain).update(newBlock);
+
+        ...
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>当一个新的区块产生后，需要去更新 UTXO 池数据。</p> 
+  <p>让我们来检查一下它们的运行情况：</p> 
+  <pre class="prettyprint"><code class="language-powershell hljs lasso">$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet
+wallet address : <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet
+wallet address : <span class="hljs-number">1</span>HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet
+wallet address : <span class="hljs-number">1</span>L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createblockchain <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf
+
+Elapsed Time: <span class="hljs-number">164.961</span> seconds 
+correct hash Hex: <span class="hljs-number">00225493862611</span>bc517cb6b3610e99d26d98a6b52484c9fa745df6ceff93f445 
+
+Done <span class="hljs-subst">!</span> 
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf
+Balance of <span class="hljs-string">'1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf'</span>: <span class="hljs-number">10</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  send <span class="hljs-attribute">-from</span> <span class="hljs-number">1</span>HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG <span class="hljs-attribute">-to</span>  <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf <span class="hljs-attribute">-amount</span> <span class="hljs-number">5</span>
+java<span class="hljs-built_in">.</span>lang<span class="hljs-built_in">.</span>Exception: ERROR: <span class="hljs-literal">Not</span> enough funds
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  send <span class="hljs-attribute">-from</span> <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf <span class="hljs-attribute">-to</span> <span class="hljs-number">1</span>HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG <span class="hljs-attribute">-amount</span> <span class="hljs-number">2</span>
+Elapsed Time: <span class="hljs-number">54.92</span> seconds 
+correct hash Hex: <span class="hljs-number">0001</span>ab21f71ff2d6d532bf3b3388db790c2b03e28d7bd27bd669c5f6380a4e5b 
+
+Success<span class="hljs-subst">!</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  send <span class="hljs-attribute">-from</span> <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf <span class="hljs-attribute">-to</span> <span class="hljs-number">1</span>L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV <span class="hljs-attribute">-amount</span> <span class="hljs-number">2</span>
+Elapsed Time: <span class="hljs-number">54.92</span> seconds 
+correct hash Hex: <span class="hljs-number">0009</span>b925cc94e3db8bab2958b1fc2d1764aa15531e20756d92c3a93065c920f0 
+
+Success<span class="hljs-subst">!</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf
+Balance of <span class="hljs-string">'1JgppX2xMshr35wHzvNWQBejUAZ3Te5Mdf'</span>: <span class="hljs-number">6</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG
+Balance of <span class="hljs-string">'1HX7bWwCjvxkjq65GUgAVRFfTZy6yKWkoG'</span>: <span class="hljs-number">2</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV
+Balance of <span class="hljs-string">'1L1RoFgyjCrNPCPHmSEBtNiV3h2wiF9mZV'</span>: <span class="hljs-number">2</span></code></pre> 
+  <h2 id="奖励机制">奖励机制</h2> 
+  <p>前面的章节中我们省略了矿工挖矿的奖励机制。时机已经成熟，该实现它了。</p> 
+  <p>矿工奖励其实是一个 coinbase 交易（创币交易）。当一个矿工节点开始去生产一个新的区块时，他会从队列中取出一些交易数据，并且为它们预制一个 coinbase 交易。这笔 coinbase 交易中仅有的交易输出包含了矿工的公钥hash。</p> 
+  <p>只需要更新 <strong>send</strong> 命令接口，我们就可以轻松实现矿工的奖励机制：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">CLI</span> {</span>
+
+    ...
+
+   <span class="hljs-javadoc">/** * 转账 * *<span class="hljs-javadoctag"> @param</span> from *<span class="hljs-javadoctag"> @param</span> to *<span class="hljs-javadoctag"> @param</span> amount */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">void</span> <span class="hljs-title">send</span>(String from, String to, <span class="hljs-keyword">int</span> amount) <span class="hljs-keyword">throws</span> Exception {
+
+        ...
+
+        Blockchain blockchain = Blockchain.createBlockchain(from);
+        <span class="hljs-comment">// 新交易</span>
+        Transaction transaction = Transaction.newUTXOTransaction(from, to, amount, blockchain);
+        <span class="hljs-comment">// 奖励</span>
+        Transaction rewardTx = Transaction.newCoinbaseTX(from, <span class="hljs-string">""</span>);
+        Block newBlock = blockchain.mineBlock(<span class="hljs-keyword">new</span> Transaction[]{transaction, rewardTx});
+        <span class="hljs-keyword">new</span> UTXOSet(blockchain).update(newBlock);
+
+        ...
+    }
+
+    ...
+
+} </code></pre> 
+  <p>还需要修改交易验证方法，coinbase 交易直接验证通过：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Blockchain</span> {</span>
+
+  <span class="hljs-javadoc">/** * 交易签名验证 * *<span class="hljs-javadoctag"> @param</span> tx */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">boolean</span> <span class="hljs-title">verifyTransactions</span>(Transaction tx) {
+        <span class="hljs-keyword">if</span> (tx.isCoinbase()) {
+            <span class="hljs-keyword">return</span> <span class="hljs-keyword">true</span>;
+        }
+
+        ...
+    }
+
+    ...
+
+}    </code></pre> 
+  <p>在我们的实现逻辑中，代币的发送也是区块的生产者，因此，奖励也归他所有。</p> 
+  <p>让我们来验证一下奖励机制：</p> 
+  <pre class="prettyprint"><code class="language-powershell hljs lasso">$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet 
+wallet address : <span class="hljs-number">1</span>MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet 
+wallet address : <span class="hljs-number">17</span>crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createwallet 
+wallet address : <span class="hljs-number">12</span>L868QZW1ySYzf2oT5ha9py9M5JrSRhvT
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  createblockchain <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD
+
+Elapsed Time: <span class="hljs-number">17.973</span> seconds
+correct hash Hex: <span class="hljs-number">0000</span>defe83a851a5db3803d5013bbc20c6234f176b2c52ae36fdb53d28b33d93 
+
+Done <span class="hljs-subst">!</span> 
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  send <span class="hljs-attribute">-from</span> <span class="hljs-number">1</span>MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD <span class="hljs-attribute">-to</span> <span class="hljs-number">17</span>crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX <span class="hljs-attribute">-amount</span> <span class="hljs-number">6</span>
+Elapsed Time: <span class="hljs-number">30.887</span> seconds
+correct hash Hex: <span class="hljs-number">00005</span>fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7 
+
+Success<span class="hljs-subst">!</span>
+
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  send <span class="hljs-attribute">-from</span> <span class="hljs-number">1</span>MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD <span class="hljs-attribute">-to</span> <span class="hljs-number">12</span>L868QZW1ySYzf2oT5ha9py9M5JrSRhvT <span class="hljs-attribute">-amount</span> <span class="hljs-number">3</span>
+Elapsed Time: <span class="hljs-number">45.267</span> seconds
+correct hash Hex: <span class="hljs-number">00009</span>fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13 
+
+Success<span class="hljs-subst">!</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">1</span>MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD
+Balance of <span class="hljs-string">'1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD'</span>: <span class="hljs-number">21</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">17</span>crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX
+Balance of <span class="hljs-string">'17crpQoWy7TEkY9UPjZ3Qt9Fc2rWPUt8KX'</span>: <span class="hljs-number">6</span>
+
+$ java <span class="hljs-attribute">-jar</span> blockchain<span class="hljs-attribute">-java</span><span class="hljs-attribute">-jar</span><span class="hljs-attribute">-with</span><span class="hljs-attribute">-dependencies</span><span class="hljs-built_in">.</span>jar  getbalance <span class="hljs-attribute">-address</span> <span class="hljs-number">12</span>L868QZW1ySYzf2oT5ha9py9M5JrSRhvT
+Balance of <span class="hljs-string">'12L868QZW1ySYzf2oT5ha9py9M5JrSRhvT'</span>: <span class="hljs-number">3</span></code></pre> 
+  <p><strong>1MpdtjTEsDvrkrLWmMswq4K3VPtevXXnUD</strong> 这个地址一共收到了三份奖励：</p> 
+  <ul> 
+   <li><p>第一次是开采创世区块；</p></li> 
+   <li><p>第二次是开采区块：00005fd36a2609b43fd940577f93b8622e88e854f5ccfd70e113f763b6df69f7</p></li> 
+   <li><p>第三次是开采区块：00009fd7c59b830b60ec21ade7672921d2fb0962a1b06a42c245450e47582a13</p></li> 
+  </ul> 
+  <h2 id="merkle-tree">Merkle Tree</h2> 
+  <p>Merkle Tree（默克尔树） 是这篇文章中我们需要重点讨论的一个机制。</p> 
+  <p>正如我前面提到的那样，整个比特币的数据库占到了大约140G的磁盘空间。由于比特币的分布式特性，网络中的每一个节点必须是独立且自给自足的。每个比特币节点都是路由、区块链数据库、挖矿、钱包服务的功能集合。每个节点都参与全网络的路由功能，同时也可能包含其他功能。每个节点都参与验证并传播交易及区块信息，发现并维持与对等节点的连接。一个全节点（full node）包括以下四个功能：</p> 
+  <p><img src="https://img.i7years.com/blog/full_node.png-zoom50" alt="full node" title=""></p> 
+  <p>随着越来越多的人开始使用比特币，这条规则开始变得越来越难以遵循：让每一个人都去运行一个完整的节点不太现实。在中本聪发布的 <a href="https://bitcoin.org/bitcoin.pdf" rel="nofollow">比特币白皮书</a> 中，针对这个问题提出了一个解决方案：Simplified Payment Verification (SPV)（简易支付验证）。SPV是比特币的轻量级节点，它不需要下载所有的区块链数据，也<strong>不需要验证区块和交易数据</strong>。相反，当SPV想要验证一笔交易的有效性时，它会从它所连接的全节点上检索所需要的一些数据。这种机制保证了在只有一个全节点的情况，可以运行多个SPV轻钱包节点。</p> 
+  <blockquote> 
+   <p>更多有关SPV的介绍，请查看：<a href="https://github.com/bitcoinbook/bitcoinbook" rel="nofollow">《精通比特币（第二版）》第八章</a></p> 
+  </blockquote> 
+  <p>为了使SPV成为可能，就需要有一种方法在没有全量下载区块数据的情况下，来检查一个区块是否包含了某笔交易。这就是 Merkle Tree 发挥作用的地方了。</p> 
+  <p>比特币中所使用的Merkle Tree是为了获得交易的Hash值，随后这个已经被Pow（工作量证明）系统认可了的Hash值会被保存到区块头中。到目前为止，我们只是简单地计算了一个区块中每笔交易的Hash值，然后在准备Pow数据时，再对这些交易进行 <strong>SHA-256</strong> 计算。虽然这是一个用于获取区块交易唯一表示的一个不错的途径，但是它不具有到 Merkle Tree的优点。</p> 
+  <p>来看一下Merkle Tree的结构：</p> 
+  <p><img src="https://img.i7years.com/blog/merkle-tree-diagram.png" alt="" title=""></p> 
+  <p>每一个区块都会构建一个Merkle Tree，它从最底部的叶子节点开始往上构建，每一个交易的Hash就是一个叶子节点（比特币中用的双SHA256算法）。叶子节点的数量必须是偶数个，但是并不是每一个区块都能包含偶数笔交易数据。如果存在奇数笔交易数据，那么最后一笔交易数据将会被复制一份（这仅仅发生在Merkle Tree中，而不是区块中）。</p> 
+  <p>从下往上移动，叶子节点成对分组，它们的Hash值被连接到一起，并且在此基础上再次计算出新的Hash值。新的Hash 形成新的树节点。这个过程不断地被重复，直到最后仅剩一个被称为根节点的树节点。这个根节点的Hash就是区块中交易数据们的唯一代表，它会被保存到区块头中，并被用于参与POW系统的计算。</p> 
+  <p>Merkle树的好处是节点可以在不下载整个块的情况下验证某笔交易的合法性。 为此，只需要交易Hash，Merkle树根Hash和Merkle路径。</p> 
+  <p>Merkle Tree代码实现如下：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">package</span> one.wangwei.blockchain.transaction;
+
+<span class="hljs-keyword">import</span> com.google.common.collect.Lists;
+<span class="hljs-keyword">import</span> lombok.Data;
+<span class="hljs-keyword">import</span> one.wangwei.blockchain.util.ByteUtils;
+<span class="hljs-keyword">import</span> org.apache.commons.codec.digest.DigestUtils;
+
+<span class="hljs-keyword">import</span> java.util.List;
+
+<span class="hljs-javadoc">/** * 默克尔树 * *<span class="hljs-javadoctag"> @author</span> wangwei *<span class="hljs-javadoctag"> @date</span> 2018/04/15 */</span>
+<span class="hljs-annotation">@Data</span>
+<span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">MerkleTree</span> {</span>
+
+    <span class="hljs-javadoc">/** * 根节点 */</span>
+    <span class="hljs-keyword">private</span> Node root;
+    <span class="hljs-javadoc">/** * 叶子节点Hash */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">byte</span>[][] leafHashes;
+
+    <span class="hljs-keyword">public</span> <span class="hljs-title">MerkleTree</span>(<span class="hljs-keyword">byte</span>[][] leafHashes) {
+        constructTree(leafHashes);
+    }
+
+    <span class="hljs-javadoc">/** * 从底部叶子节点开始往上构建整个Merkle Tree * *<span class="hljs-javadoctag"> @param</span> leafHashes */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">void</span> <span class="hljs-title">constructTree</span>(<span class="hljs-keyword">byte</span>[][] leafHashes) {
+        <span class="hljs-keyword">if</span> (leafHashes == <span class="hljs-keyword">null</span> || leafHashes.length &lt; <span class="hljs-number">1</span>) {
+            <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> RuntimeException(<span class="hljs-string">"ERROR:Fail to construct merkle tree ! leafHashes data invalid ! "</span>);
+        }
+        <span class="hljs-keyword">this</span>.leafHashes = leafHashes;
+        List&lt;Node&gt; parents = bottomLevel(leafHashes);
+        <span class="hljs-keyword">while</span> (parents.size() &gt; <span class="hljs-number">1</span>) {
+            parents = internalLevel(parents);
+        }
+        root = parents.get(<span class="hljs-number">0</span>);
+    }
+
+    <span class="hljs-javadoc">/** * 构建一个层级节点 * *<span class="hljs-javadoctag"> @param</span> children *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> List&lt;Node&gt; <span class="hljs-title">internalLevel</span>(List&lt;Node&gt; children) {
+        List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(children.size() / <span class="hljs-number">2</span>);
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; children.size() - <span class="hljs-number">1</span>; i += <span class="hljs-number">2</span>) {
+            Node child1 = children.get(i);
+            Node child2 = children.get(i + <span class="hljs-number">1</span>);
+
+            Node parent = constructInternalNode(child1, child2);
+            parents.add(parent);
+        }
+
+        <span class="hljs-comment">// 内部节点奇数个，只对left节点进行计算</span>
+        <span class="hljs-keyword">if</span> (children.size() % <span class="hljs-number">2</span> != <span class="hljs-number">0</span>) {
+            Node child = children.get(children.size() - <span class="hljs-number">1</span>);
+            Node parent = constructInternalNode(child, <span class="hljs-keyword">null</span>);
+            parents.add(parent);
+        }
+
+        <span class="hljs-keyword">return</span> parents;
+    }
+
+    <span class="hljs-javadoc">/** * 底部节点构建 * *<span class="hljs-javadoctag"> @param</span> hashes *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> List&lt;Node&gt; <span class="hljs-title">bottomLevel</span>(<span class="hljs-keyword">byte</span>[][] hashes) {
+        List&lt;Node&gt; parents = Lists.newArrayListWithCapacity(hashes.length / <span class="hljs-number">2</span>);
+
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; hashes.length - <span class="hljs-number">1</span>; i += <span class="hljs-number">2</span>) {
+            Node leaf1 = constructLeafNode(hashes[i]);
+            Node leaf2 = constructLeafNode(hashes[i + <span class="hljs-number">1</span>]);
+
+            Node parent = constructInternalNode(leaf1, leaf2);
+            parents.add(parent);
+        }
+
+        <span class="hljs-keyword">if</span> (hashes.length % <span class="hljs-number">2</span> != <span class="hljs-number">0</span>) {
+            Node leaf = constructLeafNode(hashes[hashes.length - <span class="hljs-number">1</span>]);
+            <span class="hljs-comment">// 奇数个节点的情况，复制最后一个节点</span>
+            Node parent = constructInternalNode(leaf, leaf);
+            parents.add(parent);
+        }
+
+        <span class="hljs-keyword">return</span> parents;
+    }
+
+    <span class="hljs-javadoc">/** * 构建叶子节点 * *<span class="hljs-javadoctag"> @param</span> hash *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">static</span> Node <span class="hljs-title">constructLeafNode</span>(<span class="hljs-keyword">byte</span>[] hash) {
+        Node leaf = <span class="hljs-keyword">new</span> Node();
+        leaf.hash = hash;
+        <span class="hljs-keyword">return</span> leaf;
+    }
+
+    <span class="hljs-javadoc">/** * 构建内部节点 * *<span class="hljs-javadoctag"> @param</span> leftChild *<span class="hljs-javadoctag"> @param</span> rightChild *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> Node <span class="hljs-title">constructInternalNode</span>(Node leftChild, Node rightChild) {
+        Node parent = <span class="hljs-keyword">new</span> Node();
+        <span class="hljs-keyword">if</span> (rightChild == <span class="hljs-keyword">null</span>) {
+            parent.hash = leftChild.hash;
+        } <span class="hljs-keyword">else</span> {
+            parent.hash = internalHash(leftChild.hash, rightChild.hash);
+        }
+        parent.left = leftChild;
+        parent.right = rightChild;
+        <span class="hljs-keyword">return</span> parent;
+    }
+
+    <span class="hljs-javadoc">/** * 计算内部节点Hash * *<span class="hljs-javadoctag"> @param</span> leftChildHash *<span class="hljs-javadoctag"> @param</span> rightChildHash *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">private</span> <span class="hljs-keyword">byte</span>[] <span class="hljs-title">internalHash</span>(<span class="hljs-keyword">byte</span>[] leftChildHash, <span class="hljs-keyword">byte</span>[] rightChildHash) {
+        <span class="hljs-keyword">byte</span>[] mergedBytes = ByteUtils.merge(leftChildHash, rightChildHash);
+        <span class="hljs-keyword">return</span> DigestUtils.sha256(mergedBytes);
+    }
+
+    <span class="hljs-javadoc">/** * Merkle Tree节点 */</span>
+    <span class="hljs-annotation">@Data</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">static</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Node</span> {</span>
+        <span class="hljs-keyword">private</span> <span class="hljs-keyword">byte</span>[] hash;
+        <span class="hljs-keyword">private</span> Node left;
+        <span class="hljs-keyword">private</span> Node right;
+    }
+
+}
+</code></pre> 
+  <p>然后修改 <strong>Block.hashTransaction</strong> 接口：</p> 
+  <pre class="prettyprint"><code class="language-java hljs "><span class="hljs-keyword">public</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Block</span> {</span>
+
+   ... 
+
+   <span class="hljs-javadoc">/** * 对区块中的交易信息进行Hash计算 * *<span class="hljs-javadoctag"> @return</span> */</span>
+    <span class="hljs-keyword">public</span> <span class="hljs-keyword">byte</span>[] <span class="hljs-title">hashTransaction</span>() {
+        <span class="hljs-keyword">byte</span>[][] txIdArrays = <span class="hljs-keyword">new</span> <span class="hljs-keyword">byte</span>[<span class="hljs-keyword">this</span>.getTransactions().length][];
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-keyword">this</span>.getTransactions().length; i++) {
+            txIdArrays[i] = <span class="hljs-keyword">this</span>.getTransactions()[i].hash();
+        }
+        <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> MerkleTree(txIdArrays).getRoot().getHash();
+    }
+
+    ...
+
+}</code></pre> 
+  <p>MerkleTree的根节点的Hash值，就是区块中交易信息的唯一代表。</p> 
+  <h2 id="小结">小结</h2> 
+  <p>这一节我们主要是对前面的交易机制做了进一步的优化，加入UTXO池和Merkle Tree机制。</p> 
+  <h2 id="资料">资料</h2> 
+  <ol> 
+   <li>源码：<a href="https://github.com/wangweiX/blockchain-java/tree/part6-transaction2" rel="nofollow">https://github.com/wangweiX/blockchain-java/tree/part6-transaction2</a></li> 
+   <li><a href="https://en.bitcoin.it/wiki/Bitcoin_Core_0.11_%28ch_2%29:_Data_Storage#The_UTXO_set_.28chainstate_leveldb.29" rel="nofollow">The UTXO Set</a></li> 
+   <li><a href="https://statoshi.info/dashboard/db/unspent-transaction-output-set" rel="nofollow">UTXO set statistics</a></li> 
+   <li><a href="https://en.bitcoin.it/wiki/Protocol_documentation#Merkle_Trees" rel="nofollow">Merkle Tree</a></li> 
+   <li><a href="https://medium.com/@jonaldfyookball/why-every-bitcoin-user-should-understand-spv-security-520d1d45e0b9" rel="nofollow">Why every Bitcoin user should understand “SPV security”</a></li> 
+   <li><a href="https://en.bitcoin.it/wiki/Script" rel="nofollow">Script</a></li> 
+   <li><a href="https://github.com/sipa/bitcoin/commit/450cbb0944cd20a06ce806e6679a1f4c83c50db2" rel="nofollow">“Ultraprune” Bitcoin Core commit</a></li> 
+   <li><a href="https://medium.com/@maraoz/smart-contracts-and-bitcoin-a5d61011d9b1" rel="nofollow">Smart contracts and Bitcoin</a></li> 
+  </ol> 
+  <p><img src="https://img.i7years.com/blog/blockchain_exploer.png" alt="" title=""></p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/tarenaWW/article/details/79957181,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/tarenaWW/article/details/79957181,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

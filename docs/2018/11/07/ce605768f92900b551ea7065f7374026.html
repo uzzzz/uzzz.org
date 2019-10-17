@@ -1,0 +1,1027 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>超级账本hyperledger fabric第五集：共识排序及源码阅读 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="超级账本hyperledger fabric第五集：共识排序及源码阅读" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="一.共识机制 达成共识需要3个阶段，交易背书，交易排序，交易验证 交易背书：模拟的 交易排序：确定交易顺序，最终将排序好的交易打包区块分发 交易验证：区块存储前要进行一下交易验证 二.orderer节点的作用 交易排序 目的：保证系统的最终一致性（有限状态机） solo：单节点排序 kafka：外置的分布式消息队列 区块分发 orderer中的区块并不是最终持久化的区块 是一个中间状态的区块 包含了所有交易，不管是有效还是无效，都会打包传给组织的锚节点 多通道的数据隔离 客户端可以使用某个通道，发送交易 三.源码目录 从goland中阅读 源码目录 bccsp：与密码学相关的，加密，数字签名，证书，将密码学中的函数抽象成了接口，方便调用和扩展 bddtests：行为驱动开发，从需求直接到开发 common：公共库、错误处理、日志出项，账本存储，相关工具 core：是fabric的核心库，子目录是各个模块的目录 /&nbsp; comm：网络通信相关 devenv：官方提供的开发环境，使用的是Vagrant docs：文档 events：事件监听机制 examples：例子程序 gossip：通信协议，组织内部的通信，区块同步 gotools：用于编译 images：docker镜像相关 msp：成员服务管理，member serivce provider，读取证书做签名 orderer：排序节点 peer：peer节点 proposals：用于扩展，新功能的提案 protos：数据结构的定义 四.共识机制源码 orderer节点的源码 首先看orderer目录下的main.go ，main.go里有一个NewServer可以进入server.go main.go中func main()&nbsp;主要起到判断作用，如果接收到的是start命令，就加载和初始化各种配置，如果接收到的是version指令，就打印版本号；之后在下面定义了上面的各种方法。 func main() { kingpin.Version(&quot;0.0.1&quot;) //判断接受到的参数Args switch kingpin.MustParse(app.Parse(os.Args[1:])) { // 如果接受到&quot;start&quot; command case start.FullCommand(): logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) //加载配置 conf := config.Load() //初始化日志级别 //生产环境下日志级别调高 initializeLoggingLevel(conf) //初始化profile，go内置的观察程序运行的工具 //可以通过http调用 initializeProfilingService(conf) //初始化grpc服务端 grpcServer := initializeGrpcServer(conf) //加载msp签名证书 initializeLocalMsp(conf) //msp证书给签名者实例化 signer := localmsp.NewSigner() //初始化链的管理者（也就是主节点） manager := initializeMultiChainManager(conf, signer) //实例化服务 server := NewServer(manager, signer) //绑定服务 ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) //启动服务 grpcServer.Start() // 如果接受到&quot;version&quot; command case version.FullCommand(): //打印版本号 fmt.Println(metadata.GetVersionInfo()) } } 我们来看下初始化管理者的代码 func initializeMultiChainManager(conf *config.TopLevel, signer crypto.LocalSigner) multichain.Manager { //创建账本工厂，产生临时区块 lf, _ := createLedgerFactory(conf) //判断链是否存在 if len(lf.ChainIDs()) == 0 { //链不存在 //启动引导链 initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //实例化共识机制 //有solo和kafka两种模式 consenters := make(map[string]multichain.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version) return multichain.NewManagerImpl(lf, consenters, signer) } orderer的配置文件在orderer.yaml中，监听的地址是127.0.0.1；监听的端口是7050；BCCSP是密码学，账本存储最终还是存储到硬盘中。 接下来咱们看下实例化服务server.go，这里面定义了交易收集和广播区块。 type server struct { //交易收集 bh broadcast.Handler //广播区块 dh deliver.Handler } 我们具体看下交易收集：broadcast.go func (bh *handlerImpl) Handle(srv ab.AtomicBroadcast_BroadcastServer) error { logger.Debugf(&quot;Starting new broadcast loop&quot;) for { //接收交易 msg, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } payload, err := utils.UnmarshalPayload(msg.Payload) if err != nil { logger.Warningf(&quot;Received malformed message, dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //验证消息体的内容，有错误则返回Status_BAD_REQUEST if payload.Header == nil { logger.Warningf(&quot;Received malformed message, with missing header, dropping connection&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Received malformed message (bad channel header), dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } if chdr.Type == int32(cb.HeaderType_CONFIG_UPDATE) { logger.Debugf(&quot;Preprocessing CONFIG_UPDATE&quot;) msg, err = bh.sm.Process(msg) if err != nil { logger.Warningf(&quot;Rejecting CONFIG_UPDATE because: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } err = proto.Unmarshal(msg.Payload, payload) if err != nil || payload.Header == nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } chdr, err = utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (bad channel header): %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } if chdr.ChannelId == &quot;&quot; { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (empty channel ID)&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } } //获取support对象 support, ok := bh.sm.GetChain(chdr.ChannelId) if !ok { logger.Warningf(&quot;Rejecting broadcast because channel %s was not found&quot;, chdr.ChannelId) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_NOT_FOUND}) } logger.Debugf(&quot;[channel: %s] Broadcast is filtering message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) //将消息传到support的过滤器中过滤 //是区块的第一次过滤，第二次是在区块切割时过滤的 _, filterErr := support.Filters().Apply(msg) if filterErr != nil { logger.Warningf(&quot;[channel: %s] Rejecting broadcast message because of filter error: %s&quot;, chdr.ChannelId, filterErr) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //消息入列，然后被solo或kafka处理 if !support.Enqueue(msg) { return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE}) } if logger.IsEnabledFor(logging.DEBUG) { logger.Debugf(&quot;[channel: %s] Broadcast has successfully enqueued message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) } //返回正确的200码 err = srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SUCCESS}) if err != nil { logger.Warningf(&quot;[channel: %s] Error sending to stream: %s&quot;, chdr.ChannelId, err) return err } } } 我们具体看下广播区块：deliver.go func (ds *deliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error { logger.Debugf(&quot;Starting new deliver loop&quot;) for { logger.Debugf(&quot;Attempting to read seek info message&quot;) //接收请求 envelope, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } //做校验 payload, err := utils.UnmarshalPayload(envelope.Payload) if err != nil { logger.Warningf(&quot;Received an envelope with no payload: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } if payload.Header == nil { logger.Warningf(&quot;Malformed envelope received with bad header&quot;) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Failed to unmarshal channel header: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } //获取chain对象 chain, ok := ds.sm.GetChain(chdr.ChannelId) if !ok { // Note, we log this at DEBUG because SDKs will poll waiting for channels to be created // So we would expect our log to be somewhat flooded with these logger.Debugf(&quot;Rejecting deliver because channel %s not found&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_NOT_FOUND) } //监听是否有错误发生 //有错误，返回503 erroredChan := chain.Errored() select { case &lt;-erroredChan: logger.Warningf(&quot;[channel: %s] Rejecting deliver request because of consenter error&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_SERVICE_UNAVAILABLE) default: } lastConfigSequence := chain.Sequence() //对链配置信息校验 sf := sigfilter.New(policies.ChannelReaders, chain.PolicyManager()) result, _ := sf.Apply(envelope) if result != filter.Forward { logger.Warningf(&quot;[channel: %s] Received unauthorized deliver request&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_FORBIDDEN) } //解析请求消息内容 seekInfo := &amp;ab.SeekInfo{} if err = proto.Unmarshal(payload.Data, seekInfo); err != nil { logger.Warningf(&quot;[channel: %s] Received a signed deliver request with malformed seekInfo payload: %s&quot;, chdr.ChannelId, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } 在server.go中会遇到chain调用Manager&nbsp; &nbsp; Manage.go type Manager interface { //获取链对象 GetChain(chainID string) (ChainSupport, bool) //获取系统链，用于引导其他链的生成 SystemChannelID() string //生成或更新链的配置 NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) } //配置资源 type configResources struct { configtxapi.Manager } //获取orderer相关的配置 //点进Orderer可以看相关配置 func (cr *configResources) SharedConfig() config.Orderer { oc, ok := cr.OrdererConfig() if !ok { logger.Panicf(&quot;[channel %s] has no orderer configuration&quot;, cr.ChainID()) } return oc } //定义账本资源 type ledgerResources struct { //配置资源 *configResources //账本的读写对象 //对账本操作的入口 ledger ledger.ReadWriter } //manager的实现类 type multiLedger struct { //链 chains map[string]*chainSupport //共识机制 consenters map[string]Consenter //账本读写工厂 ledgerFactory ledger.Factory //签名对象 signer crypto.LocalSigner //系统链的标识 systemChannelID string //定义系统链 systemChannel *chainSupport } //获取某条链更新的配置交易 func getConfigTx(reader ledger.Reader) *cb.Envelope { //获取链上最新的一个区块 lastBlock := ledger.GetBlock(reader, reader.Height()-1) //根据最新的区块信息，可以找到最新的配置交易的区块 index, err := utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Panicf(&quot;Chain did not have appropriately encoded last config in its latest block: %s&quot;, err) } //读取配置区块 configBlock := ledger.GetBlock(reader, index) if configBlock == nil { logger.Panicf(&quot;Config block does not exist&quot;) } //读取最新的配置交易 return utils.ExtractEnvelopeOrPanic(configBlock, 0) } //manager的实例化 func NewManagerImpl(ledgerFactory ledger.Factory, consenters map[string]Consenter, signer crypto.LocalSigner) Manager { //接收传来的参数 //直接赋值，上面定义的 ml := &amp;multiLedger{ chains: make(map[string]*chainSupport), ledgerFactory: ledgerFactory, consenters: consenters, signer: signer, } //读取本地存储的链的ID existingChains := ledgerFactory.ChainIDs() //循环 for _, chainID := range existingChains { //根据账本工厂实例化账本读的对象 //rl：read ledger rl, err := ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Ledger factory reported chainID %s but could not retrieve it: %s&quot;, chainID, err) } //获取最新的配置交易 configTx := getConfigTx(rl) if configTx == nil { logger.Panic(&quot;Programming error, configTx should never be nil here&quot;) } //将配置交易和ledger对象绑定 ledgerResources := ml.newLedgerResources(configTx) chainID := ledgerResources.ChainID() //读取链是否有联盟配置 //联盟配置：是否有创建其他链的权限 //一般只有系统链有联盟配置 if _, ok := ledgerResources.ConsortiumsConfig(); ok { //有联盟配置 if ml.systemChannelID != &quot;&quot; { //已经存在系统链，报错 logger.Panicf(&quot;There appear to be two system chains %s and %s&quot;, ml.systemChannelID, chainID) } //实例化ChainSupport，依次赋值 chain := newChainSupport(createSystemChainFilters(ml, ledgerResources), ledgerResources, consenters, signer) logger.Infof(&quot;Starting with system channel %s and orderer type %s&quot;, chainID, chain.SharedConfig().ConsensusType()) ml.chains[chainID] = chain ml.systemChannelID = chainID ml.systemChannel = chain // We delay starting this chain, as it might try to copy and replace the chains map via newChain before the map is fully built //延迟启动 //其他链完成后，启动系统链 defer chain.start() } else { logger.Debugf(&quot;Starting chain: %s&quot;, chainID) chain := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, consenters, signer) //创建标准链 ml.chains[chainID] = chain //启动 chain.start() } } //系统链不存在，则报错 if ml.systemChannelID == &quot;&quot; { logger.Panicf(&quot;No system chain found. If bootstrapping, does your system channel contain a consortiums group definition?&quot;) } //返回ml return ml } //返回系统链id func (ml *multiLedger) SystemChannelID() string { return ml.systemChannelID } // GetChain retrieves the chain support for a chain (and whether it exists) //得到链 func (ml *multiLedger) GetChain(chainID string) (ChainSupport, bool) { cs, ok := ml.chains[chainID] return cs, ok } //实例化一个账本资源对象 func (ml *multiLedger) newLedgerResources(configTx *cb.Envelope) *ledgerResources { //初始化配置交易 initializer := configtx.NewInitializer() //生成配置manager configManager, err := configtx.NewManagerImpl(configTx, initializer, nil) if err != nil { logger.Panicf(&quot;Error creating configtx manager and handlers: %s&quot;, err) } //得到chainID chainID := configManager.ChainID() //根据chainID，实例化账本对象 ledger, err := ml.ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Error getting ledger for %s&quot;, chainID) } //最终返回赋值后的账本资源对象 return &amp;ledgerResources{ configResources: &amp;configResources{Manager: configManager}, ledger: ledger, } } //生成一条新链 func (ml *multiLedger) newChain(configtx *cb.Envelope) { //创建账本资源对象 ledgerResources := ml.newLedgerResources(configtx) //组装区块，通过Append加到链上 ledgerResources.ledger.Append(ledger.CreateNextBlock(ledgerResources.ledger, []*cb.Envelope{configtx})) // Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is //得到新的链，可以加锁 newChains := make(map[string]*chainSupport) for key, value := range ml.chains { newChains[key] = value } cs := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, ml.consenters, ml.signer) chainID := ledgerResources.ChainID() logger.Infof(&quot;Created and starting new chain %s&quot;, chainID) newChains[string(chainID)] = cs cs.start() ml.chains = newChains } func (ml *multiLedger) channelsCount() int { return len(ml.chains) } //生成新的链的配置 func (ml *multiLedger) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) { //下面是生成新链前，做各种校验 configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload) if err != nil { return nil, fmt.Errorf(&quot;Failing initial channel config creation because of payload unmarshaling error: %s&quot;, err) } 接下来看chainsupport.go //定义共识机制的接口 type ConsenterSupport interface { //本地签名 crypto.LocalSigner //区块切割对象 BlockCutter() blockcutter.Receiver //配置 SharedConfig() config.Orderer //切割好的交易打包成区块 CreateNextBlock(messages []*cb.Envelope) *cb.Block //将区块写入 WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block //获取链的ID ChainID() string //获取链当前的区块高度 Height() uint64 // Returns the number of blocks on the chain this specific consenter instance is associated with } type ChainSupport interface { //背书策略 PolicyManager() policies.Manager //读取账本的接口 Reader() ledger.Reader //处理账本的错误 Errored() &lt;-chan struct{} //处理交易输入的接口 broadcast.Support //定义共识机制的接口 ConsenterSupport //序列 //每次对链进行修改，Sequence是加1的 Sequence() uint64 //将一个交易转为配置交易 //Envelope：可以理解为交易 ProposeConfigUpdate(env *cb.Envelope) (*cb.ConfigEnvelope, error) } type chainSupport struct { //链的资源信息，链的配置和账本读写对象 *ledgerResources //链 chain Chain //区块切割 cutter blockcutter.Receiver //过滤器 //orderer过滤一些交易为空的数据 filters *filter.RuleSet //签名 signer crypto.LocalSigner //最新配置信息所在的区块高度 lastConfig uint64 //最新配置信息所在的序列化 lastConfigSeq uint64 } func newChainSupport( filters *filter.RuleSet, ledgerResources *ledgerResources, consenters map[string]Consenter, signer crypto.LocalSigner, ) *chainSupport { //创建区块切割对象 cutter := blockcutter.NewReceiverImpl(ledgerResources.SharedConfig(), filters) //根据配置查询orderer使用的共识机制 consenterType := ledgerResources.SharedConfig().ConsensusType() //得到共识机制 consenter, ok := consenters[consenterType] if !ok { logger.Fatalf(&quot;Error retrieving consenter of type: %s&quot;, consenterType) } //赋值 cs := &amp;chainSupport{ ledgerResources: ledgerResources, cutter: cutter, filters: filters, signer: signer, } //序列号 cs.lastConfigSeq = cs.Sequence() var err error //最新区块 lastBlock := ledger.GetBlock(cs.Reader(), cs.Reader().Height()-1) if lastBlock.Header.Number != 0 { //获取最新配置信息所在的区块高度 cs.lastConfig, err = utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting last config block from block metadata: %s&quot;, cs.ChainID(), err) } } //获取区块元数据信息 metadata, err := utils.GetMetadataFromBlock(lastBlock, cb.BlockMetadataIndex_ORDERER) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting orderer metadata: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Retrieved metadata for tip of chain (blockNumber=%d, lastConfig=%d, lastConfigSeq=%d): %+v&quot;, cs.ChainID(), lastBlock.Header.Number, cs.lastConfig, cs.lastConfigSeq, metadata) //用共识机制操作Chain cs.chain, err = consenter.HandleChain(cs, metadata) if err != nil { logger.Fatalf(&quot;[channel: %s] Error creating consenter: %s&quot;, cs.ChainID(), err) } return cs } //实例化过滤器 func createStandardFilters(ledgerResources *ledgerResources) *filter.RuleSet { return filter.NewRuleSet([]filter.Rule{ filter.EmptyRejectRule, sizefilter.MaxBytesRule(ledgerResources.SharedConfig()), sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()), configtxfilter.NewFilter(ledgerResources), filter.AcceptRule, }) } func (cs *chainSupport) WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block { //遍历所有提交的交易 for _, committer := range committers { committer.Commit() } // Set the orderer-related metadata field //判断元数据 if encodedMetadataValue != nil { block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&amp;cb.Metadata{Value: encodedMetadataValue}) } //进行区块签名 cs.addBlockSignature(block) //配置签名 cs.addLastConfigSignature(block) //将区块写入账本中 err := cs.ledger.Append(block) if err != nil { logger.Panicf(&quot;[channel: %s] Could not append block: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Wrote block %d&quot;, cs.ChainID(), block.GetHeader().Number) return block } 点Receiver进去，看区块切割，在blockcutter.go中： func (r *receiver) Ordered(msg *cb.Envelope) (messageBatches [][]*cb.Envelope, committerBatches [][]filter.Committer, validTx bool, pending bool) { //将交易信息再次过滤 //第一次过滤是orderer接收到交易请求时 committer, err := r.filters.Apply(msg) if err != nil { logger.Debugf(&quot;Rejecting message: %s&quot;, err) return // We don&#39;t bother to determine `pending` here as it&#39;s not processed in error case } // message is valid //将交易标记为有效 validTx = true //计算交易体的大小 messageSizeBytes := messageSizeBytes(msg) //判断是否交易隔离，配置交易进行隔离 //交易体的大小，如果比最大交易体大小大，认为交易内容过大，进行单独切块 if committer.Isolated() || messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes { if committer.Isolated() { logger.Debugf(&quot;Found message which requested to be isolated, cutting into its own batch&quot;) } else { logger.Debugf(&quot;The current message, with %v bytes, is larger than the preferred batch size of %v bytes and will be isolated.&quot;, messageSizeBytes, r.sharedConfigManager.BatchSize().PreferredMaxBytes) } //若存在每被七个的交易 //将未被切割的交易存放到区块 if len(r.pendingBatch) &gt; 0 { messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } //单独切割当前交易 messageBatches = append(messageBatches, []*cb.Envelope{msg}) committerBatches = append(committerBatches, []filter.Committer{committer}) return } //不隔离的交易，这里处理 //判断加上当前交易后，区块大小是否超出预先设定的大小 messageWillOverflowBatchSizeBytes := r.pendingBatchSizeBytes+messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes //如果超出了预定大小，进入if if messageWillOverflowBatchSizeBytes { logger.Debugf(&quot;The current message, with %v bytes, will overflow the pending batch of %v bytes.&quot;, messageSizeBytes, r.pendingBatchSizeBytes) logger.Debugf(&quot;Pending batch would overflow if current message is added, cutting batch now.&quot;) //进行切割 messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } logger.Debugf(&quot;Enqueuing message into batch&quot;) r.pendingBatch = append(r.pendingBatch, msg) r.pendingBatchSizeBytes += messageSizeBytes r.pendingCommitters = append(r.pendingCommitters, committer) pending = true //若区块队列超出阈值范围，进行切割 if uint32(len(r.pendingBatch)) &gt;= r.sharedConfigManager.BatchSize().MaxMessageCount { logger.Debugf(&quot;Batch size met, cutting batch&quot;) messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) pending = false } return } //完成切割这个动作 func (r *receiver) Cut() ([]*cb.Envelope, []filter.Committer) { batch := r.pendingBatch r.pendingBatch = nil committers := r.pendingCommitters r.pendingCommitters = nil r.pendingBatchSizeBytes = 0 return batch, committers } func messageSizeBytes(message *cb.Envelope) uint32 { //将消息体和签名加起来求长度 return uint32(len(message.Payload) + len(message.Signature)) } 在consensus.go中是共识： func (ch *chain) main() { //定义定时器 var timer &lt;-chan time.Time //循环 for { select { //不停的从交易的channel中获取交易 //将获取到的交易，发送给区块切割对象 //返回需要切割的区块 case msg := &lt;-ch.sendChan: //区块切割 batches, committers, ok, _ := ch.support.BlockCutter().Ordered(msg) //判断交易是否有效 //判断定时器是否未空 if ok &amp;&amp; len(batches) == 0 &amp;&amp; timer == nil { //实例化定时器 timer = time.After(ch.support.SharedConfig().BatchTimeout()) continue } //创建区块 //最终保存到orderer节点的临时账本中 for i, batch := range batches { block := ch.support.CreateNextBlock(batch) ch.support.WriteBlock(block, committers[i], nil) } //判断交易的有效性 if len(batches) &gt; 0 { //定时器重新计时 timer = nil } //定时器触发 //马上进行区块切割 case &lt;-timer: //clear the timer timer = nil //区块切割 batch, committers := ch.support.BlockCutter().Cut() if len(batch) == 0 { logger.Warningf(&quot;Batch timer expired with no pending requests, this might indicate a bug&quot;) continue } logger.Debugf(&quot;Batch timer expired, creating block&quot;) //创建区块 block := ch.support.CreateNextBlock(batch) //写区块 ch.support.WriteBlock(block, committers, nil) case &lt;-ch.exitChan: logger.Debugf(&quot;Exiting&quot;) //直接退出 return } } } &nbsp; 阅读更多" />
+<meta property="og:description" content="一.共识机制 达成共识需要3个阶段，交易背书，交易排序，交易验证 交易背书：模拟的 交易排序：确定交易顺序，最终将排序好的交易打包区块分发 交易验证：区块存储前要进行一下交易验证 二.orderer节点的作用 交易排序 目的：保证系统的最终一致性（有限状态机） solo：单节点排序 kafka：外置的分布式消息队列 区块分发 orderer中的区块并不是最终持久化的区块 是一个中间状态的区块 包含了所有交易，不管是有效还是无效，都会打包传给组织的锚节点 多通道的数据隔离 客户端可以使用某个通道，发送交易 三.源码目录 从goland中阅读 源码目录 bccsp：与密码学相关的，加密，数字签名，证书，将密码学中的函数抽象成了接口，方便调用和扩展 bddtests：行为驱动开发，从需求直接到开发 common：公共库、错误处理、日志出项，账本存储，相关工具 core：是fabric的核心库，子目录是各个模块的目录 /&nbsp; comm：网络通信相关 devenv：官方提供的开发环境，使用的是Vagrant docs：文档 events：事件监听机制 examples：例子程序 gossip：通信协议，组织内部的通信，区块同步 gotools：用于编译 images：docker镜像相关 msp：成员服务管理，member serivce provider，读取证书做签名 orderer：排序节点 peer：peer节点 proposals：用于扩展，新功能的提案 protos：数据结构的定义 四.共识机制源码 orderer节点的源码 首先看orderer目录下的main.go ，main.go里有一个NewServer可以进入server.go main.go中func main()&nbsp;主要起到判断作用，如果接收到的是start命令，就加载和初始化各种配置，如果接收到的是version指令，就打印版本号；之后在下面定义了上面的各种方法。 func main() { kingpin.Version(&quot;0.0.1&quot;) //判断接受到的参数Args switch kingpin.MustParse(app.Parse(os.Args[1:])) { // 如果接受到&quot;start&quot; command case start.FullCommand(): logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) //加载配置 conf := config.Load() //初始化日志级别 //生产环境下日志级别调高 initializeLoggingLevel(conf) //初始化profile，go内置的观察程序运行的工具 //可以通过http调用 initializeProfilingService(conf) //初始化grpc服务端 grpcServer := initializeGrpcServer(conf) //加载msp签名证书 initializeLocalMsp(conf) //msp证书给签名者实例化 signer := localmsp.NewSigner() //初始化链的管理者（也就是主节点） manager := initializeMultiChainManager(conf, signer) //实例化服务 server := NewServer(manager, signer) //绑定服务 ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) //启动服务 grpcServer.Start() // 如果接受到&quot;version&quot; command case version.FullCommand(): //打印版本号 fmt.Println(metadata.GetVersionInfo()) } } 我们来看下初始化管理者的代码 func initializeMultiChainManager(conf *config.TopLevel, signer crypto.LocalSigner) multichain.Manager { //创建账本工厂，产生临时区块 lf, _ := createLedgerFactory(conf) //判断链是否存在 if len(lf.ChainIDs()) == 0 { //链不存在 //启动引导链 initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //实例化共识机制 //有solo和kafka两种模式 consenters := make(map[string]multichain.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version) return multichain.NewManagerImpl(lf, consenters, signer) } orderer的配置文件在orderer.yaml中，监听的地址是127.0.0.1；监听的端口是7050；BCCSP是密码学，账本存储最终还是存储到硬盘中。 接下来咱们看下实例化服务server.go，这里面定义了交易收集和广播区块。 type server struct { //交易收集 bh broadcast.Handler //广播区块 dh deliver.Handler } 我们具体看下交易收集：broadcast.go func (bh *handlerImpl) Handle(srv ab.AtomicBroadcast_BroadcastServer) error { logger.Debugf(&quot;Starting new broadcast loop&quot;) for { //接收交易 msg, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } payload, err := utils.UnmarshalPayload(msg.Payload) if err != nil { logger.Warningf(&quot;Received malformed message, dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //验证消息体的内容，有错误则返回Status_BAD_REQUEST if payload.Header == nil { logger.Warningf(&quot;Received malformed message, with missing header, dropping connection&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Received malformed message (bad channel header), dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } if chdr.Type == int32(cb.HeaderType_CONFIG_UPDATE) { logger.Debugf(&quot;Preprocessing CONFIG_UPDATE&quot;) msg, err = bh.sm.Process(msg) if err != nil { logger.Warningf(&quot;Rejecting CONFIG_UPDATE because: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } err = proto.Unmarshal(msg.Payload, payload) if err != nil || payload.Header == nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } chdr, err = utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (bad channel header): %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } if chdr.ChannelId == &quot;&quot; { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (empty channel ID)&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } } //获取support对象 support, ok := bh.sm.GetChain(chdr.ChannelId) if !ok { logger.Warningf(&quot;Rejecting broadcast because channel %s was not found&quot;, chdr.ChannelId) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_NOT_FOUND}) } logger.Debugf(&quot;[channel: %s] Broadcast is filtering message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) //将消息传到support的过滤器中过滤 //是区块的第一次过滤，第二次是在区块切割时过滤的 _, filterErr := support.Filters().Apply(msg) if filterErr != nil { logger.Warningf(&quot;[channel: %s] Rejecting broadcast message because of filter error: %s&quot;, chdr.ChannelId, filterErr) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //消息入列，然后被solo或kafka处理 if !support.Enqueue(msg) { return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE}) } if logger.IsEnabledFor(logging.DEBUG) { logger.Debugf(&quot;[channel: %s] Broadcast has successfully enqueued message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) } //返回正确的200码 err = srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SUCCESS}) if err != nil { logger.Warningf(&quot;[channel: %s] Error sending to stream: %s&quot;, chdr.ChannelId, err) return err } } } 我们具体看下广播区块：deliver.go func (ds *deliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error { logger.Debugf(&quot;Starting new deliver loop&quot;) for { logger.Debugf(&quot;Attempting to read seek info message&quot;) //接收请求 envelope, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } //做校验 payload, err := utils.UnmarshalPayload(envelope.Payload) if err != nil { logger.Warningf(&quot;Received an envelope with no payload: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } if payload.Header == nil { logger.Warningf(&quot;Malformed envelope received with bad header&quot;) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Failed to unmarshal channel header: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } //获取chain对象 chain, ok := ds.sm.GetChain(chdr.ChannelId) if !ok { // Note, we log this at DEBUG because SDKs will poll waiting for channels to be created // So we would expect our log to be somewhat flooded with these logger.Debugf(&quot;Rejecting deliver because channel %s not found&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_NOT_FOUND) } //监听是否有错误发生 //有错误，返回503 erroredChan := chain.Errored() select { case &lt;-erroredChan: logger.Warningf(&quot;[channel: %s] Rejecting deliver request because of consenter error&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_SERVICE_UNAVAILABLE) default: } lastConfigSequence := chain.Sequence() //对链配置信息校验 sf := sigfilter.New(policies.ChannelReaders, chain.PolicyManager()) result, _ := sf.Apply(envelope) if result != filter.Forward { logger.Warningf(&quot;[channel: %s] Received unauthorized deliver request&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_FORBIDDEN) } //解析请求消息内容 seekInfo := &amp;ab.SeekInfo{} if err = proto.Unmarshal(payload.Data, seekInfo); err != nil { logger.Warningf(&quot;[channel: %s] Received a signed deliver request with malformed seekInfo payload: %s&quot;, chdr.ChannelId, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } 在server.go中会遇到chain调用Manager&nbsp; &nbsp; Manage.go type Manager interface { //获取链对象 GetChain(chainID string) (ChainSupport, bool) //获取系统链，用于引导其他链的生成 SystemChannelID() string //生成或更新链的配置 NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) } //配置资源 type configResources struct { configtxapi.Manager } //获取orderer相关的配置 //点进Orderer可以看相关配置 func (cr *configResources) SharedConfig() config.Orderer { oc, ok := cr.OrdererConfig() if !ok { logger.Panicf(&quot;[channel %s] has no orderer configuration&quot;, cr.ChainID()) } return oc } //定义账本资源 type ledgerResources struct { //配置资源 *configResources //账本的读写对象 //对账本操作的入口 ledger ledger.ReadWriter } //manager的实现类 type multiLedger struct { //链 chains map[string]*chainSupport //共识机制 consenters map[string]Consenter //账本读写工厂 ledgerFactory ledger.Factory //签名对象 signer crypto.LocalSigner //系统链的标识 systemChannelID string //定义系统链 systemChannel *chainSupport } //获取某条链更新的配置交易 func getConfigTx(reader ledger.Reader) *cb.Envelope { //获取链上最新的一个区块 lastBlock := ledger.GetBlock(reader, reader.Height()-1) //根据最新的区块信息，可以找到最新的配置交易的区块 index, err := utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Panicf(&quot;Chain did not have appropriately encoded last config in its latest block: %s&quot;, err) } //读取配置区块 configBlock := ledger.GetBlock(reader, index) if configBlock == nil { logger.Panicf(&quot;Config block does not exist&quot;) } //读取最新的配置交易 return utils.ExtractEnvelopeOrPanic(configBlock, 0) } //manager的实例化 func NewManagerImpl(ledgerFactory ledger.Factory, consenters map[string]Consenter, signer crypto.LocalSigner) Manager { //接收传来的参数 //直接赋值，上面定义的 ml := &amp;multiLedger{ chains: make(map[string]*chainSupport), ledgerFactory: ledgerFactory, consenters: consenters, signer: signer, } //读取本地存储的链的ID existingChains := ledgerFactory.ChainIDs() //循环 for _, chainID := range existingChains { //根据账本工厂实例化账本读的对象 //rl：read ledger rl, err := ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Ledger factory reported chainID %s but could not retrieve it: %s&quot;, chainID, err) } //获取最新的配置交易 configTx := getConfigTx(rl) if configTx == nil { logger.Panic(&quot;Programming error, configTx should never be nil here&quot;) } //将配置交易和ledger对象绑定 ledgerResources := ml.newLedgerResources(configTx) chainID := ledgerResources.ChainID() //读取链是否有联盟配置 //联盟配置：是否有创建其他链的权限 //一般只有系统链有联盟配置 if _, ok := ledgerResources.ConsortiumsConfig(); ok { //有联盟配置 if ml.systemChannelID != &quot;&quot; { //已经存在系统链，报错 logger.Panicf(&quot;There appear to be two system chains %s and %s&quot;, ml.systemChannelID, chainID) } //实例化ChainSupport，依次赋值 chain := newChainSupport(createSystemChainFilters(ml, ledgerResources), ledgerResources, consenters, signer) logger.Infof(&quot;Starting with system channel %s and orderer type %s&quot;, chainID, chain.SharedConfig().ConsensusType()) ml.chains[chainID] = chain ml.systemChannelID = chainID ml.systemChannel = chain // We delay starting this chain, as it might try to copy and replace the chains map via newChain before the map is fully built //延迟启动 //其他链完成后，启动系统链 defer chain.start() } else { logger.Debugf(&quot;Starting chain: %s&quot;, chainID) chain := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, consenters, signer) //创建标准链 ml.chains[chainID] = chain //启动 chain.start() } } //系统链不存在，则报错 if ml.systemChannelID == &quot;&quot; { logger.Panicf(&quot;No system chain found. If bootstrapping, does your system channel contain a consortiums group definition?&quot;) } //返回ml return ml } //返回系统链id func (ml *multiLedger) SystemChannelID() string { return ml.systemChannelID } // GetChain retrieves the chain support for a chain (and whether it exists) //得到链 func (ml *multiLedger) GetChain(chainID string) (ChainSupport, bool) { cs, ok := ml.chains[chainID] return cs, ok } //实例化一个账本资源对象 func (ml *multiLedger) newLedgerResources(configTx *cb.Envelope) *ledgerResources { //初始化配置交易 initializer := configtx.NewInitializer() //生成配置manager configManager, err := configtx.NewManagerImpl(configTx, initializer, nil) if err != nil { logger.Panicf(&quot;Error creating configtx manager and handlers: %s&quot;, err) } //得到chainID chainID := configManager.ChainID() //根据chainID，实例化账本对象 ledger, err := ml.ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Error getting ledger for %s&quot;, chainID) } //最终返回赋值后的账本资源对象 return &amp;ledgerResources{ configResources: &amp;configResources{Manager: configManager}, ledger: ledger, } } //生成一条新链 func (ml *multiLedger) newChain(configtx *cb.Envelope) { //创建账本资源对象 ledgerResources := ml.newLedgerResources(configtx) //组装区块，通过Append加到链上 ledgerResources.ledger.Append(ledger.CreateNextBlock(ledgerResources.ledger, []*cb.Envelope{configtx})) // Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is //得到新的链，可以加锁 newChains := make(map[string]*chainSupport) for key, value := range ml.chains { newChains[key] = value } cs := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, ml.consenters, ml.signer) chainID := ledgerResources.ChainID() logger.Infof(&quot;Created and starting new chain %s&quot;, chainID) newChains[string(chainID)] = cs cs.start() ml.chains = newChains } func (ml *multiLedger) channelsCount() int { return len(ml.chains) } //生成新的链的配置 func (ml *multiLedger) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) { //下面是生成新链前，做各种校验 configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload) if err != nil { return nil, fmt.Errorf(&quot;Failing initial channel config creation because of payload unmarshaling error: %s&quot;, err) } 接下来看chainsupport.go //定义共识机制的接口 type ConsenterSupport interface { //本地签名 crypto.LocalSigner //区块切割对象 BlockCutter() blockcutter.Receiver //配置 SharedConfig() config.Orderer //切割好的交易打包成区块 CreateNextBlock(messages []*cb.Envelope) *cb.Block //将区块写入 WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block //获取链的ID ChainID() string //获取链当前的区块高度 Height() uint64 // Returns the number of blocks on the chain this specific consenter instance is associated with } type ChainSupport interface { //背书策略 PolicyManager() policies.Manager //读取账本的接口 Reader() ledger.Reader //处理账本的错误 Errored() &lt;-chan struct{} //处理交易输入的接口 broadcast.Support //定义共识机制的接口 ConsenterSupport //序列 //每次对链进行修改，Sequence是加1的 Sequence() uint64 //将一个交易转为配置交易 //Envelope：可以理解为交易 ProposeConfigUpdate(env *cb.Envelope) (*cb.ConfigEnvelope, error) } type chainSupport struct { //链的资源信息，链的配置和账本读写对象 *ledgerResources //链 chain Chain //区块切割 cutter blockcutter.Receiver //过滤器 //orderer过滤一些交易为空的数据 filters *filter.RuleSet //签名 signer crypto.LocalSigner //最新配置信息所在的区块高度 lastConfig uint64 //最新配置信息所在的序列化 lastConfigSeq uint64 } func newChainSupport( filters *filter.RuleSet, ledgerResources *ledgerResources, consenters map[string]Consenter, signer crypto.LocalSigner, ) *chainSupport { //创建区块切割对象 cutter := blockcutter.NewReceiverImpl(ledgerResources.SharedConfig(), filters) //根据配置查询orderer使用的共识机制 consenterType := ledgerResources.SharedConfig().ConsensusType() //得到共识机制 consenter, ok := consenters[consenterType] if !ok { logger.Fatalf(&quot;Error retrieving consenter of type: %s&quot;, consenterType) } //赋值 cs := &amp;chainSupport{ ledgerResources: ledgerResources, cutter: cutter, filters: filters, signer: signer, } //序列号 cs.lastConfigSeq = cs.Sequence() var err error //最新区块 lastBlock := ledger.GetBlock(cs.Reader(), cs.Reader().Height()-1) if lastBlock.Header.Number != 0 { //获取最新配置信息所在的区块高度 cs.lastConfig, err = utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting last config block from block metadata: %s&quot;, cs.ChainID(), err) } } //获取区块元数据信息 metadata, err := utils.GetMetadataFromBlock(lastBlock, cb.BlockMetadataIndex_ORDERER) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting orderer metadata: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Retrieved metadata for tip of chain (blockNumber=%d, lastConfig=%d, lastConfigSeq=%d): %+v&quot;, cs.ChainID(), lastBlock.Header.Number, cs.lastConfig, cs.lastConfigSeq, metadata) //用共识机制操作Chain cs.chain, err = consenter.HandleChain(cs, metadata) if err != nil { logger.Fatalf(&quot;[channel: %s] Error creating consenter: %s&quot;, cs.ChainID(), err) } return cs } //实例化过滤器 func createStandardFilters(ledgerResources *ledgerResources) *filter.RuleSet { return filter.NewRuleSet([]filter.Rule{ filter.EmptyRejectRule, sizefilter.MaxBytesRule(ledgerResources.SharedConfig()), sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()), configtxfilter.NewFilter(ledgerResources), filter.AcceptRule, }) } func (cs *chainSupport) WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block { //遍历所有提交的交易 for _, committer := range committers { committer.Commit() } // Set the orderer-related metadata field //判断元数据 if encodedMetadataValue != nil { block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&amp;cb.Metadata{Value: encodedMetadataValue}) } //进行区块签名 cs.addBlockSignature(block) //配置签名 cs.addLastConfigSignature(block) //将区块写入账本中 err := cs.ledger.Append(block) if err != nil { logger.Panicf(&quot;[channel: %s] Could not append block: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Wrote block %d&quot;, cs.ChainID(), block.GetHeader().Number) return block } 点Receiver进去，看区块切割，在blockcutter.go中： func (r *receiver) Ordered(msg *cb.Envelope) (messageBatches [][]*cb.Envelope, committerBatches [][]filter.Committer, validTx bool, pending bool) { //将交易信息再次过滤 //第一次过滤是orderer接收到交易请求时 committer, err := r.filters.Apply(msg) if err != nil { logger.Debugf(&quot;Rejecting message: %s&quot;, err) return // We don&#39;t bother to determine `pending` here as it&#39;s not processed in error case } // message is valid //将交易标记为有效 validTx = true //计算交易体的大小 messageSizeBytes := messageSizeBytes(msg) //判断是否交易隔离，配置交易进行隔离 //交易体的大小，如果比最大交易体大小大，认为交易内容过大，进行单独切块 if committer.Isolated() || messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes { if committer.Isolated() { logger.Debugf(&quot;Found message which requested to be isolated, cutting into its own batch&quot;) } else { logger.Debugf(&quot;The current message, with %v bytes, is larger than the preferred batch size of %v bytes and will be isolated.&quot;, messageSizeBytes, r.sharedConfigManager.BatchSize().PreferredMaxBytes) } //若存在每被七个的交易 //将未被切割的交易存放到区块 if len(r.pendingBatch) &gt; 0 { messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } //单独切割当前交易 messageBatches = append(messageBatches, []*cb.Envelope{msg}) committerBatches = append(committerBatches, []filter.Committer{committer}) return } //不隔离的交易，这里处理 //判断加上当前交易后，区块大小是否超出预先设定的大小 messageWillOverflowBatchSizeBytes := r.pendingBatchSizeBytes+messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes //如果超出了预定大小，进入if if messageWillOverflowBatchSizeBytes { logger.Debugf(&quot;The current message, with %v bytes, will overflow the pending batch of %v bytes.&quot;, messageSizeBytes, r.pendingBatchSizeBytes) logger.Debugf(&quot;Pending batch would overflow if current message is added, cutting batch now.&quot;) //进行切割 messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } logger.Debugf(&quot;Enqueuing message into batch&quot;) r.pendingBatch = append(r.pendingBatch, msg) r.pendingBatchSizeBytes += messageSizeBytes r.pendingCommitters = append(r.pendingCommitters, committer) pending = true //若区块队列超出阈值范围，进行切割 if uint32(len(r.pendingBatch)) &gt;= r.sharedConfigManager.BatchSize().MaxMessageCount { logger.Debugf(&quot;Batch size met, cutting batch&quot;) messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) pending = false } return } //完成切割这个动作 func (r *receiver) Cut() ([]*cb.Envelope, []filter.Committer) { batch := r.pendingBatch r.pendingBatch = nil committers := r.pendingCommitters r.pendingCommitters = nil r.pendingBatchSizeBytes = 0 return batch, committers } func messageSizeBytes(message *cb.Envelope) uint32 { //将消息体和签名加起来求长度 return uint32(len(message.Payload) + len(message.Signature)) } 在consensus.go中是共识： func (ch *chain) main() { //定义定时器 var timer &lt;-chan time.Time //循环 for { select { //不停的从交易的channel中获取交易 //将获取到的交易，发送给区块切割对象 //返回需要切割的区块 case msg := &lt;-ch.sendChan: //区块切割 batches, committers, ok, _ := ch.support.BlockCutter().Ordered(msg) //判断交易是否有效 //判断定时器是否未空 if ok &amp;&amp; len(batches) == 0 &amp;&amp; timer == nil { //实例化定时器 timer = time.After(ch.support.SharedConfig().BatchTimeout()) continue } //创建区块 //最终保存到orderer节点的临时账本中 for i, batch := range batches { block := ch.support.CreateNextBlock(batch) ch.support.WriteBlock(block, committers[i], nil) } //判断交易的有效性 if len(batches) &gt; 0 { //定时器重新计时 timer = nil } //定时器触发 //马上进行区块切割 case &lt;-timer: //clear the timer timer = nil //区块切割 batch, committers := ch.support.BlockCutter().Cut() if len(batch) == 0 { logger.Warningf(&quot;Batch timer expired with no pending requests, this might indicate a bug&quot;) continue } logger.Debugf(&quot;Batch timer expired, creating block&quot;) //创建区块 block := ch.support.CreateNextBlock(batch) //写区块 ch.support.WriteBlock(block, committers, nil) case &lt;-ch.exitChan: logger.Debugf(&quot;Exiting&quot;) //直接退出 return } } } &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/11/07/ce605768f92900b551ea7065f7374026.html" />
+<meta property="og:url" content="https://uzzz.org/2018/11/07/ce605768f92900b551ea7065f7374026.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-11-07T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"一.共识机制 达成共识需要3个阶段，交易背书，交易排序，交易验证 交易背书：模拟的 交易排序：确定交易顺序，最终将排序好的交易打包区块分发 交易验证：区块存储前要进行一下交易验证 二.orderer节点的作用 交易排序 目的：保证系统的最终一致性（有限状态机） solo：单节点排序 kafka：外置的分布式消息队列 区块分发 orderer中的区块并不是最终持久化的区块 是一个中间状态的区块 包含了所有交易，不管是有效还是无效，都会打包传给组织的锚节点 多通道的数据隔离 客户端可以使用某个通道，发送交易 三.源码目录 从goland中阅读 源码目录 bccsp：与密码学相关的，加密，数字签名，证书，将密码学中的函数抽象成了接口，方便调用和扩展 bddtests：行为驱动开发，从需求直接到开发 common：公共库、错误处理、日志出项，账本存储，相关工具 core：是fabric的核心库，子目录是各个模块的目录 /&nbsp; comm：网络通信相关 devenv：官方提供的开发环境，使用的是Vagrant docs：文档 events：事件监听机制 examples：例子程序 gossip：通信协议，组织内部的通信，区块同步 gotools：用于编译 images：docker镜像相关 msp：成员服务管理，member serivce provider，读取证书做签名 orderer：排序节点 peer：peer节点 proposals：用于扩展，新功能的提案 protos：数据结构的定义 四.共识机制源码 orderer节点的源码 首先看orderer目录下的main.go ，main.go里有一个NewServer可以进入server.go main.go中func main()&nbsp;主要起到判断作用，如果接收到的是start命令，就加载和初始化各种配置，如果接收到的是version指令，就打印版本号；之后在下面定义了上面的各种方法。 func main() { kingpin.Version(&quot;0.0.1&quot;) //判断接受到的参数Args switch kingpin.MustParse(app.Parse(os.Args[1:])) { // 如果接受到&quot;start&quot; command case start.FullCommand(): logger.Infof(&quot;Starting %s&quot;, metadata.GetVersionInfo()) //加载配置 conf := config.Load() //初始化日志级别 //生产环境下日志级别调高 initializeLoggingLevel(conf) //初始化profile，go内置的观察程序运行的工具 //可以通过http调用 initializeProfilingService(conf) //初始化grpc服务端 grpcServer := initializeGrpcServer(conf) //加载msp签名证书 initializeLocalMsp(conf) //msp证书给签名者实例化 signer := localmsp.NewSigner() //初始化链的管理者（也就是主节点） manager := initializeMultiChainManager(conf, signer) //实例化服务 server := NewServer(manager, signer) //绑定服务 ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server) logger.Info(&quot;Beginning to serve requests&quot;) //启动服务 grpcServer.Start() // 如果接受到&quot;version&quot; command case version.FullCommand(): //打印版本号 fmt.Println(metadata.GetVersionInfo()) } } 我们来看下初始化管理者的代码 func initializeMultiChainManager(conf *config.TopLevel, signer crypto.LocalSigner) multichain.Manager { //创建账本工厂，产生临时区块 lf, _ := createLedgerFactory(conf) //判断链是否存在 if len(lf.ChainIDs()) == 0 { //链不存在 //启动引导链 initializeBootstrapChannel(conf, lf) } else { logger.Info(&quot;Not bootstrapping because of existing chains&quot;) } //实例化共识机制 //有solo和kafka两种模式 consenters := make(map[string]multichain.Consenter) consenters[&quot;solo&quot;] = solo.New() consenters[&quot;kafka&quot;] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version) return multichain.NewManagerImpl(lf, consenters, signer) } orderer的配置文件在orderer.yaml中，监听的地址是127.0.0.1；监听的端口是7050；BCCSP是密码学，账本存储最终还是存储到硬盘中。 接下来咱们看下实例化服务server.go，这里面定义了交易收集和广播区块。 type server struct { //交易收集 bh broadcast.Handler //广播区块 dh deliver.Handler } 我们具体看下交易收集：broadcast.go func (bh *handlerImpl) Handle(srv ab.AtomicBroadcast_BroadcastServer) error { logger.Debugf(&quot;Starting new broadcast loop&quot;) for { //接收交易 msg, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } payload, err := utils.UnmarshalPayload(msg.Payload) if err != nil { logger.Warningf(&quot;Received malformed message, dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //验证消息体的内容，有错误则返回Status_BAD_REQUEST if payload.Header == nil { logger.Warningf(&quot;Received malformed message, with missing header, dropping connection&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Received malformed message (bad channel header), dropping connection: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } if chdr.Type == int32(cb.HeaderType_CONFIG_UPDATE) { logger.Debugf(&quot;Preprocessing CONFIG_UPDATE&quot;) msg, err = bh.sm.Process(msg) if err != nil { logger.Warningf(&quot;Rejecting CONFIG_UPDATE because: %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } err = proto.Unmarshal(msg.Payload, payload) if err != nil || payload.Header == nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } chdr, err = utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (bad channel header): %s&quot;, err) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } if chdr.ChannelId == &quot;&quot; { logger.Criticalf(&quot;Generated bad transaction after CONFIG_UPDATE processing (empty channel ID)&quot;) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR}) } } //获取support对象 support, ok := bh.sm.GetChain(chdr.ChannelId) if !ok { logger.Warningf(&quot;Rejecting broadcast because channel %s was not found&quot;, chdr.ChannelId) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_NOT_FOUND}) } logger.Debugf(&quot;[channel: %s] Broadcast is filtering message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) //将消息传到support的过滤器中过滤 //是区块的第一次过滤，第二次是在区块切割时过滤的 _, filterErr := support.Filters().Apply(msg) if filterErr != nil { logger.Warningf(&quot;[channel: %s] Rejecting broadcast message because of filter error: %s&quot;, chdr.ChannelId, filterErr) return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST}) } //消息入列，然后被solo或kafka处理 if !support.Enqueue(msg) { return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE}) } if logger.IsEnabledFor(logging.DEBUG) { logger.Debugf(&quot;[channel: %s] Broadcast has successfully enqueued message of type %s&quot;, chdr.ChannelId, cb.HeaderType_name[chdr.Type]) } //返回正确的200码 err = srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SUCCESS}) if err != nil { logger.Warningf(&quot;[channel: %s] Error sending to stream: %s&quot;, chdr.ChannelId, err) return err } } } 我们具体看下广播区块：deliver.go func (ds *deliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error { logger.Debugf(&quot;Starting new deliver loop&quot;) for { logger.Debugf(&quot;Attempting to read seek info message&quot;) //接收请求 envelope, err := srv.Recv() if err == io.EOF { logger.Debugf(&quot;Received EOF, hangup&quot;) return nil } if err != nil { logger.Warningf(&quot;Error reading from stream: %s&quot;, err) return err } //做校验 payload, err := utils.UnmarshalPayload(envelope.Payload) if err != nil { logger.Warningf(&quot;Received an envelope with no payload: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } if payload.Header == nil { logger.Warningf(&quot;Malformed envelope received with bad header&quot;) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader) if err != nil { logger.Warningf(&quot;Failed to unmarshal channel header: %s&quot;, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } //获取chain对象 chain, ok := ds.sm.GetChain(chdr.ChannelId) if !ok { // Note, we log this at DEBUG because SDKs will poll waiting for channels to be created // So we would expect our log to be somewhat flooded with these logger.Debugf(&quot;Rejecting deliver because channel %s not found&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_NOT_FOUND) } //监听是否有错误发生 //有错误，返回503 erroredChan := chain.Errored() select { case &lt;-erroredChan: logger.Warningf(&quot;[channel: %s] Rejecting deliver request because of consenter error&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_SERVICE_UNAVAILABLE) default: } lastConfigSequence := chain.Sequence() //对链配置信息校验 sf := sigfilter.New(policies.ChannelReaders, chain.PolicyManager()) result, _ := sf.Apply(envelope) if result != filter.Forward { logger.Warningf(&quot;[channel: %s] Received unauthorized deliver request&quot;, chdr.ChannelId) return sendStatusReply(srv, cb.Status_FORBIDDEN) } //解析请求消息内容 seekInfo := &amp;ab.SeekInfo{} if err = proto.Unmarshal(payload.Data, seekInfo); err != nil { logger.Warningf(&quot;[channel: %s] Received a signed deliver request with malformed seekInfo payload: %s&quot;, chdr.ChannelId, err) return sendStatusReply(srv, cb.Status_BAD_REQUEST) } 在server.go中会遇到chain调用Manager&nbsp; &nbsp; Manage.go type Manager interface { //获取链对象 GetChain(chainID string) (ChainSupport, bool) //获取系统链，用于引导其他链的生成 SystemChannelID() string //生成或更新链的配置 NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) } //配置资源 type configResources struct { configtxapi.Manager } //获取orderer相关的配置 //点进Orderer可以看相关配置 func (cr *configResources) SharedConfig() config.Orderer { oc, ok := cr.OrdererConfig() if !ok { logger.Panicf(&quot;[channel %s] has no orderer configuration&quot;, cr.ChainID()) } return oc } //定义账本资源 type ledgerResources struct { //配置资源 *configResources //账本的读写对象 //对账本操作的入口 ledger ledger.ReadWriter } //manager的实现类 type multiLedger struct { //链 chains map[string]*chainSupport //共识机制 consenters map[string]Consenter //账本读写工厂 ledgerFactory ledger.Factory //签名对象 signer crypto.LocalSigner //系统链的标识 systemChannelID string //定义系统链 systemChannel *chainSupport } //获取某条链更新的配置交易 func getConfigTx(reader ledger.Reader) *cb.Envelope { //获取链上最新的一个区块 lastBlock := ledger.GetBlock(reader, reader.Height()-1) //根据最新的区块信息，可以找到最新的配置交易的区块 index, err := utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Panicf(&quot;Chain did not have appropriately encoded last config in its latest block: %s&quot;, err) } //读取配置区块 configBlock := ledger.GetBlock(reader, index) if configBlock == nil { logger.Panicf(&quot;Config block does not exist&quot;) } //读取最新的配置交易 return utils.ExtractEnvelopeOrPanic(configBlock, 0) } //manager的实例化 func NewManagerImpl(ledgerFactory ledger.Factory, consenters map[string]Consenter, signer crypto.LocalSigner) Manager { //接收传来的参数 //直接赋值，上面定义的 ml := &amp;multiLedger{ chains: make(map[string]*chainSupport), ledgerFactory: ledgerFactory, consenters: consenters, signer: signer, } //读取本地存储的链的ID existingChains := ledgerFactory.ChainIDs() //循环 for _, chainID := range existingChains { //根据账本工厂实例化账本读的对象 //rl：read ledger rl, err := ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Ledger factory reported chainID %s but could not retrieve it: %s&quot;, chainID, err) } //获取最新的配置交易 configTx := getConfigTx(rl) if configTx == nil { logger.Panic(&quot;Programming error, configTx should never be nil here&quot;) } //将配置交易和ledger对象绑定 ledgerResources := ml.newLedgerResources(configTx) chainID := ledgerResources.ChainID() //读取链是否有联盟配置 //联盟配置：是否有创建其他链的权限 //一般只有系统链有联盟配置 if _, ok := ledgerResources.ConsortiumsConfig(); ok { //有联盟配置 if ml.systemChannelID != &quot;&quot; { //已经存在系统链，报错 logger.Panicf(&quot;There appear to be two system chains %s and %s&quot;, ml.systemChannelID, chainID) } //实例化ChainSupport，依次赋值 chain := newChainSupport(createSystemChainFilters(ml, ledgerResources), ledgerResources, consenters, signer) logger.Infof(&quot;Starting with system channel %s and orderer type %s&quot;, chainID, chain.SharedConfig().ConsensusType()) ml.chains[chainID] = chain ml.systemChannelID = chainID ml.systemChannel = chain // We delay starting this chain, as it might try to copy and replace the chains map via newChain before the map is fully built //延迟启动 //其他链完成后，启动系统链 defer chain.start() } else { logger.Debugf(&quot;Starting chain: %s&quot;, chainID) chain := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, consenters, signer) //创建标准链 ml.chains[chainID] = chain //启动 chain.start() } } //系统链不存在，则报错 if ml.systemChannelID == &quot;&quot; { logger.Panicf(&quot;No system chain found. If bootstrapping, does your system channel contain a consortiums group definition?&quot;) } //返回ml return ml } //返回系统链id func (ml *multiLedger) SystemChannelID() string { return ml.systemChannelID } // GetChain retrieves the chain support for a chain (and whether it exists) //得到链 func (ml *multiLedger) GetChain(chainID string) (ChainSupport, bool) { cs, ok := ml.chains[chainID] return cs, ok } //实例化一个账本资源对象 func (ml *multiLedger) newLedgerResources(configTx *cb.Envelope) *ledgerResources { //初始化配置交易 initializer := configtx.NewInitializer() //生成配置manager configManager, err := configtx.NewManagerImpl(configTx, initializer, nil) if err != nil { logger.Panicf(&quot;Error creating configtx manager and handlers: %s&quot;, err) } //得到chainID chainID := configManager.ChainID() //根据chainID，实例化账本对象 ledger, err := ml.ledgerFactory.GetOrCreate(chainID) if err != nil { logger.Panicf(&quot;Error getting ledger for %s&quot;, chainID) } //最终返回赋值后的账本资源对象 return &amp;ledgerResources{ configResources: &amp;configResources{Manager: configManager}, ledger: ledger, } } //生成一条新链 func (ml *multiLedger) newChain(configtx *cb.Envelope) { //创建账本资源对象 ledgerResources := ml.newLedgerResources(configtx) //组装区块，通过Append加到链上 ledgerResources.ledger.Append(ledger.CreateNextBlock(ledgerResources.ledger, []*cb.Envelope{configtx})) // Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is //得到新的链，可以加锁 newChains := make(map[string]*chainSupport) for key, value := range ml.chains { newChains[key] = value } cs := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, ml.consenters, ml.signer) chainID := ledgerResources.ChainID() logger.Infof(&quot;Created and starting new chain %s&quot;, chainID) newChains[string(chainID)] = cs cs.start() ml.chains = newChains } func (ml *multiLedger) channelsCount() int { return len(ml.chains) } //生成新的链的配置 func (ml *multiLedger) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) { //下面是生成新链前，做各种校验 configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload) if err != nil { return nil, fmt.Errorf(&quot;Failing initial channel config creation because of payload unmarshaling error: %s&quot;, err) } 接下来看chainsupport.go //定义共识机制的接口 type ConsenterSupport interface { //本地签名 crypto.LocalSigner //区块切割对象 BlockCutter() blockcutter.Receiver //配置 SharedConfig() config.Orderer //切割好的交易打包成区块 CreateNextBlock(messages []*cb.Envelope) *cb.Block //将区块写入 WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block //获取链的ID ChainID() string //获取链当前的区块高度 Height() uint64 // Returns the number of blocks on the chain this specific consenter instance is associated with } type ChainSupport interface { //背书策略 PolicyManager() policies.Manager //读取账本的接口 Reader() ledger.Reader //处理账本的错误 Errored() &lt;-chan struct{} //处理交易输入的接口 broadcast.Support //定义共识机制的接口 ConsenterSupport //序列 //每次对链进行修改，Sequence是加1的 Sequence() uint64 //将一个交易转为配置交易 //Envelope：可以理解为交易 ProposeConfigUpdate(env *cb.Envelope) (*cb.ConfigEnvelope, error) } type chainSupport struct { //链的资源信息，链的配置和账本读写对象 *ledgerResources //链 chain Chain //区块切割 cutter blockcutter.Receiver //过滤器 //orderer过滤一些交易为空的数据 filters *filter.RuleSet //签名 signer crypto.LocalSigner //最新配置信息所在的区块高度 lastConfig uint64 //最新配置信息所在的序列化 lastConfigSeq uint64 } func newChainSupport( filters *filter.RuleSet, ledgerResources *ledgerResources, consenters map[string]Consenter, signer crypto.LocalSigner, ) *chainSupport { //创建区块切割对象 cutter := blockcutter.NewReceiverImpl(ledgerResources.SharedConfig(), filters) //根据配置查询orderer使用的共识机制 consenterType := ledgerResources.SharedConfig().ConsensusType() //得到共识机制 consenter, ok := consenters[consenterType] if !ok { logger.Fatalf(&quot;Error retrieving consenter of type: %s&quot;, consenterType) } //赋值 cs := &amp;chainSupport{ ledgerResources: ledgerResources, cutter: cutter, filters: filters, signer: signer, } //序列号 cs.lastConfigSeq = cs.Sequence() var err error //最新区块 lastBlock := ledger.GetBlock(cs.Reader(), cs.Reader().Height()-1) if lastBlock.Header.Number != 0 { //获取最新配置信息所在的区块高度 cs.lastConfig, err = utils.GetLastConfigIndexFromBlock(lastBlock) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting last config block from block metadata: %s&quot;, cs.ChainID(), err) } } //获取区块元数据信息 metadata, err := utils.GetMetadataFromBlock(lastBlock, cb.BlockMetadataIndex_ORDERER) if err != nil { logger.Fatalf(&quot;[channel: %s] Error extracting orderer metadata: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Retrieved metadata for tip of chain (blockNumber=%d, lastConfig=%d, lastConfigSeq=%d): %+v&quot;, cs.ChainID(), lastBlock.Header.Number, cs.lastConfig, cs.lastConfigSeq, metadata) //用共识机制操作Chain cs.chain, err = consenter.HandleChain(cs, metadata) if err != nil { logger.Fatalf(&quot;[channel: %s] Error creating consenter: %s&quot;, cs.ChainID(), err) } return cs } //实例化过滤器 func createStandardFilters(ledgerResources *ledgerResources) *filter.RuleSet { return filter.NewRuleSet([]filter.Rule{ filter.EmptyRejectRule, sizefilter.MaxBytesRule(ledgerResources.SharedConfig()), sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()), configtxfilter.NewFilter(ledgerResources), filter.AcceptRule, }) } func (cs *chainSupport) WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block { //遍历所有提交的交易 for _, committer := range committers { committer.Commit() } // Set the orderer-related metadata field //判断元数据 if encodedMetadataValue != nil { block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&amp;cb.Metadata{Value: encodedMetadataValue}) } //进行区块签名 cs.addBlockSignature(block) //配置签名 cs.addLastConfigSignature(block) //将区块写入账本中 err := cs.ledger.Append(block) if err != nil { logger.Panicf(&quot;[channel: %s] Could not append block: %s&quot;, cs.ChainID(), err) } logger.Debugf(&quot;[channel: %s] Wrote block %d&quot;, cs.ChainID(), block.GetHeader().Number) return block } 点Receiver进去，看区块切割，在blockcutter.go中： func (r *receiver) Ordered(msg *cb.Envelope) (messageBatches [][]*cb.Envelope, committerBatches [][]filter.Committer, validTx bool, pending bool) { //将交易信息再次过滤 //第一次过滤是orderer接收到交易请求时 committer, err := r.filters.Apply(msg) if err != nil { logger.Debugf(&quot;Rejecting message: %s&quot;, err) return // We don&#39;t bother to determine `pending` here as it&#39;s not processed in error case } // message is valid //将交易标记为有效 validTx = true //计算交易体的大小 messageSizeBytes := messageSizeBytes(msg) //判断是否交易隔离，配置交易进行隔离 //交易体的大小，如果比最大交易体大小大，认为交易内容过大，进行单独切块 if committer.Isolated() || messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes { if committer.Isolated() { logger.Debugf(&quot;Found message which requested to be isolated, cutting into its own batch&quot;) } else { logger.Debugf(&quot;The current message, with %v bytes, is larger than the preferred batch size of %v bytes and will be isolated.&quot;, messageSizeBytes, r.sharedConfigManager.BatchSize().PreferredMaxBytes) } //若存在每被七个的交易 //将未被切割的交易存放到区块 if len(r.pendingBatch) &gt; 0 { messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } //单独切割当前交易 messageBatches = append(messageBatches, []*cb.Envelope{msg}) committerBatches = append(committerBatches, []filter.Committer{committer}) return } //不隔离的交易，这里处理 //判断加上当前交易后，区块大小是否超出预先设定的大小 messageWillOverflowBatchSizeBytes := r.pendingBatchSizeBytes+messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes //如果超出了预定大小，进入if if messageWillOverflowBatchSizeBytes { logger.Debugf(&quot;The current message, with %v bytes, will overflow the pending batch of %v bytes.&quot;, messageSizeBytes, r.pendingBatchSizeBytes) logger.Debugf(&quot;Pending batch would overflow if current message is added, cutting batch now.&quot;) //进行切割 messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) } logger.Debugf(&quot;Enqueuing message into batch&quot;) r.pendingBatch = append(r.pendingBatch, msg) r.pendingBatchSizeBytes += messageSizeBytes r.pendingCommitters = append(r.pendingCommitters, committer) pending = true //若区块队列超出阈值范围，进行切割 if uint32(len(r.pendingBatch)) &gt;= r.sharedConfigManager.BatchSize().MaxMessageCount { logger.Debugf(&quot;Batch size met, cutting batch&quot;) messageBatch, committerBatch := r.Cut() messageBatches = append(messageBatches, messageBatch) committerBatches = append(committerBatches, committerBatch) pending = false } return } //完成切割这个动作 func (r *receiver) Cut() ([]*cb.Envelope, []filter.Committer) { batch := r.pendingBatch r.pendingBatch = nil committers := r.pendingCommitters r.pendingCommitters = nil r.pendingBatchSizeBytes = 0 return batch, committers } func messageSizeBytes(message *cb.Envelope) uint32 { //将消息体和签名加起来求长度 return uint32(len(message.Payload) + len(message.Signature)) } 在consensus.go中是共识： func (ch *chain) main() { //定义定时器 var timer &lt;-chan time.Time //循环 for { select { //不停的从交易的channel中获取交易 //将获取到的交易，发送给区块切割对象 //返回需要切割的区块 case msg := &lt;-ch.sendChan: //区块切割 batches, committers, ok, _ := ch.support.BlockCutter().Ordered(msg) //判断交易是否有效 //判断定时器是否未空 if ok &amp;&amp; len(batches) == 0 &amp;&amp; timer == nil { //实例化定时器 timer = time.After(ch.support.SharedConfig().BatchTimeout()) continue } //创建区块 //最终保存到orderer节点的临时账本中 for i, batch := range batches { block := ch.support.CreateNextBlock(batch) ch.support.WriteBlock(block, committers[i], nil) } //判断交易的有效性 if len(batches) &gt; 0 { //定时器重新计时 timer = nil } //定时器触发 //马上进行区块切割 case &lt;-timer: //clear the timer timer = nil //区块切割 batch, committers := ch.support.BlockCutter().Cut() if len(batch) == 0 { logger.Warningf(&quot;Batch timer expired with no pending requests, this might indicate a bug&quot;) continue } logger.Debugf(&quot;Batch timer expired, creating block&quot;) //创建区块 block := ch.support.CreateNextBlock(batch) //写区块 ch.support.WriteBlock(block, committers, nil) case &lt;-ch.exitChan: logger.Debugf(&quot;Exiting&quot;) //直接退出 return } } } &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/11/07/ce605768f92900b551ea7065f7374026.html","headline":"超级账本hyperledger fabric第五集：共识排序及源码阅读","dateModified":"2018-11-07T00:00:00+08:00","datePublished":"2018-11-07T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/11/07/ce605768f92900b551ea7065f7374026.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>超级账本hyperledger fabric第五集：共识排序及源码阅读</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-d7e2a68c7c.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <h2><strong><strong><span style="color:#ff0000;"><strong>一.共识机制</strong></span></strong></strong></h2> 
+  <p>达成共识需要3个阶段，交易背书，交易排序，交易验证</p> 
+  <ul>
+   <li>交易背书：模拟的</li> 
+   <li>交易排序：确定交易顺序，最终将排序好的交易打包区块分发</li> 
+   <li>交易验证：区块存储前要进行一下交易验证</li> 
+  </ul>
+  <h2><strong><strong><span style="color:#ff0000;"><strong>二.o</strong></span></strong><strong><span style="color:#ff0000;"><strong>rderer</strong></span></strong><strong><span style="color:#ff0000;"><strong>节点的作用</strong></span></strong></strong></h2> 
+  <ul>
+   <li>交易排序 
+    <ol>
+     <li>目的：保证系统的最终一致性（有限状态机）</li> 
+     <li>solo：单节点排序</li> 
+     <li>kafka：外置的分布式消息队列</li> 
+    </ol></li> 
+   <li>区块分发 
+    <ol>
+     <li>orderer中的区块并不是最终持久化的区块</li> 
+     <li>是一个中间状态的区块</li> 
+     <li>包含了所有交易，不管是有效还是无效，都会打包传给组织的锚节点</li> 
+    </ol></li> 
+   <li>多通道的数据隔离 
+    <ol>
+     <li>客户端可以使用某个通道，发送交易</li> 
+    </ol></li> 
+  </ul>
+  <p style="text-align:center;"><img alt="" class="has" height="392" src="https://img-blog.csdnimg.cn/20181107144701284.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="741"></p> 
+  <h2><strong><strong><span style="color:#ff0000;"><strong>三.源码目录</strong></span></strong></strong></h2> 
+  <ul>
+   <li>从goland中阅读</li> 
+  </ul>
+  <p><img alt="" class="has" height="559" src="https://img-blog.csdnimg.cn/2018110714510229.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="350"></p> 
+  <ul>
+   <li>源码目录 
+    <ol>
+     <li>bccsp：与密码学相关的，加密，数字签名，证书，将密码学中的函数抽象成了接口，方便调用和扩展</li> 
+     <li>bddtests：行为驱动开发，从需求直接到开发</li> 
+     <li>common：公共库、错误处理、日志出项，账本存储，相关工具</li> 
+     <li>core：是fabric的核心库，子目录是各个模块的目录 /&nbsp; comm：网络通信相关</li> 
+     <li>devenv：官方提供的开发环境，使用的是Vagrant</li> 
+     <li>docs：文档</li> 
+     <li>events：事件监听机制</li> 
+     <li>examples：例子程序</li> 
+     <li>gossip：通信协议，组织内部的通信，区块同步</li> 
+     <li>gotools：用于编译</li> 
+     <li>images：docker镜像相关</li> 
+     <li>msp：成员服务管理，member serivce provider，读取证书做签名</li> 
+     <li>orderer：排序节点</li> 
+     <li>peer：peer节点</li> 
+     <li>proposals：用于扩展，新功能的提案</li> 
+     <li>protos：数据结构的定义</li> 
+    </ol></li> 
+  </ul>
+  <hr>
+  <h2><strong><strong><span style="color:#ff0000;"><strong>四.共识机制源码</strong></span></strong></strong></h2> 
+  <h3>orderer节点的源码</h3> 
+  <ul>
+   <li>首先看orderer目录下的main.go ，main.go里有一个NewServer可以进入server.go</li> 
+  </ul>
+  <p>main.go中func main()&nbsp;主要起到判断作用，如果接收到的是start命令，就加载和初始化各种配置，如果接收到的是version指令，就打印版本号；之后在下面定义了上面的各种方法。</p> 
+  <pre class="has">
+<code class="language-Go">func main() {
+
+	kingpin.Version("0.0.1")
+	//判断接受到的参数Args
+	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
+
+	// 如果接受到"start" command
+	case start.FullCommand():
+		logger.Infof("Starting %s", metadata.GetVersionInfo())
+		//加载配置
+		conf := config.Load()
+		//初始化日志级别
+		//生产环境下日志级别调高
+		initializeLoggingLevel(conf)
+		//初始化profile，go内置的观察程序运行的工具
+		//可以通过http调用
+		initializeProfilingService(conf)
+		//初始化grpc服务端
+		grpcServer := initializeGrpcServer(conf)
+		//加载msp签名证书
+		initializeLocalMsp(conf)
+		//msp证书给签名者实例化
+		signer := localmsp.NewSigner()
+		//初始化链的管理者（也就是主节点）
+		manager := initializeMultiChainManager(conf, signer)
+		//实例化服务
+		server := NewServer(manager, signer)
+		//绑定服务
+		ab.RegisterAtomicBroadcastServer(grpcServer.Server(), server)
+		logger.Info("Beginning to serve requests")
+		//启动服务
+		grpcServer.Start()
+	// 如果接受到"version" command
+	case version.FullCommand():
+		//打印版本号
+		fmt.Println(metadata.GetVersionInfo())
+	}
+
+}</code></pre> 
+  <p>我们来看下初始化管理者的代码</p> 
+  <pre class="has">
+<code class="language-Go">func initializeMultiChainManager(conf *config.TopLevel, signer crypto.LocalSigner) multichain.Manager {
+	//创建账本工厂，产生临时区块
+	lf, _ := createLedgerFactory(conf)
+	//判断链是否存在
+	if len(lf.ChainIDs()) == 0 {
+		//链不存在
+		//启动引导链
+		initializeBootstrapChannel(conf, lf)
+	} else {
+		logger.Info("Not bootstrapping because of existing chains")
+	}
+	//实例化共识机制
+	//有solo和kafka两种模式
+	consenters := make(map[string]multichain.Consenter)
+	consenters["solo"] = solo.New()
+	consenters["kafka"] = kafka.New(conf.Kafka.TLS, conf.Kafka.Retry, conf.Kafka.Version)
+
+	return multichain.NewManagerImpl(lf, consenters, signer)
+}</code></pre> 
+  <ul>
+   <li>orderer的配置文件在orderer.yaml中，监听的地址是127.0.0.1；监听的端口是7050；BCCSP是密码学，账本存储最终还是存储到硬盘中。</li> 
+  </ul>
+  <ul>
+   <li>接下来咱们看下实例化服务server.go，这里面定义了交易收集和广播区块。</li> 
+  </ul>
+  <pre class="has">
+<code class="language-Go">type server struct {
+	//交易收集
+	bh broadcast.Handler
+	//广播区块
+	dh deliver.Handler
+}
+</code></pre> 
+  <p>我们具体看下交易收集：broadcast.go</p> 
+  <pre class="has">
+<code class="language-Go">func (bh *handlerImpl) Handle(srv ab.AtomicBroadcast_BroadcastServer) error {
+	logger.Debugf("Starting new broadcast loop")
+	for {
+		//接收交易
+		msg, err := srv.Recv()
+		if err == io.EOF {
+			logger.Debugf("Received EOF, hangup")
+			return nil
+		}
+		if err != nil {
+			logger.Warningf("Error reading from stream: %s", err)
+			return err
+		}
+
+		payload, err := utils.UnmarshalPayload(msg.Payload)
+		if err != nil {
+			logger.Warningf("Received malformed message, dropping connection: %s", err)
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST})
+		}
+
+		//验证消息体的内容，有错误则返回Status_BAD_REQUEST
+		if payload.Header == nil {
+			logger.Warningf("Received malformed message, with missing header, dropping connection")
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST})
+		}
+
+		chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+		if err != nil {
+			logger.Warningf("Received malformed message (bad channel header), dropping connection: %s", err)
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST})
+		}
+
+		if chdr.Type == int32(cb.HeaderType_CONFIG_UPDATE) {
+			logger.Debugf("Preprocessing CONFIG_UPDATE")
+			msg, err = bh.sm.Process(msg)
+			if err != nil {
+				logger.Warningf("Rejecting CONFIG_UPDATE because: %s", err)
+				return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST})
+			}
+
+			err = proto.Unmarshal(msg.Payload, payload)
+			if err != nil || payload.Header == nil {
+				logger.Criticalf("Generated bad transaction after CONFIG_UPDATE processing")
+				return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR})
+			}
+
+			chdr, err = utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+			if err != nil {
+				logger.Criticalf("Generated bad transaction after CONFIG_UPDATE processing (bad channel header): %s", err)
+				return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR})
+			}
+
+			if chdr.ChannelId == "" {
+				logger.Criticalf("Generated bad transaction after CONFIG_UPDATE processing (empty channel ID)")
+				return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_INTERNAL_SERVER_ERROR})
+			}
+		}
+
+		//获取support对象
+		support, ok := bh.sm.GetChain(chdr.ChannelId)
+		if !ok {
+			logger.Warningf("Rejecting broadcast because channel %s was not found", chdr.ChannelId)
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_NOT_FOUND})
+		}
+
+		logger.Debugf("[channel: %s] Broadcast is filtering message of type %s", chdr.ChannelId, cb.HeaderType_name[chdr.Type])
+
+		//将消息传到support的过滤器中过滤
+		//是区块的第一次过滤，第二次是在区块切割时过滤的
+		_, filterErr := support.Filters().Apply(msg)
+
+		if filterErr != nil {
+			logger.Warningf("[channel: %s] Rejecting broadcast message because of filter error: %s", chdr.ChannelId, filterErr)
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_BAD_REQUEST})
+		}
+		//消息入列，然后被solo或kafka处理
+		if !support.Enqueue(msg) {
+			return srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SERVICE_UNAVAILABLE})
+		}
+
+		if logger.IsEnabledFor(logging.DEBUG) {
+			logger.Debugf("[channel: %s] Broadcast has successfully enqueued message of type %s", chdr.ChannelId, cb.HeaderType_name[chdr.Type])
+		}
+		//返回正确的200码
+		err = srv.Send(&amp;ab.BroadcastResponse{Status: cb.Status_SUCCESS})
+		if err != nil {
+			logger.Warningf("[channel: %s] Error sending to stream: %s", chdr.ChannelId, err)
+			return err
+		}
+	}
+}</code></pre> 
+  <p>我们具体看下广播区块：deliver.go</p> 
+  <pre class="has">
+<code class="language-Go">func (ds *deliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error {
+	logger.Debugf("Starting new deliver loop")
+	for {
+		logger.Debugf("Attempting to read seek info message")
+		//接收请求
+		envelope, err := srv.Recv()
+		if err == io.EOF {
+			logger.Debugf("Received EOF, hangup")
+			return nil
+		}
+
+		if err != nil {
+			logger.Warningf("Error reading from stream: %s", err)
+			return err
+		}
+		//做校验
+		payload, err := utils.UnmarshalPayload(envelope.Payload)
+		if err != nil {
+			logger.Warningf("Received an envelope with no payload: %s", err)
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		if payload.Header == nil {
+			logger.Warningf("Malformed envelope received with bad header")
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+		if err != nil {
+			logger.Warningf("Failed to unmarshal channel header: %s", err)
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+		//获取chain对象
+		chain, ok := ds.sm.GetChain(chdr.ChannelId)
+		if !ok {
+			// Note, we log this at DEBUG because SDKs will poll waiting for channels to be created
+			// So we would expect our log to be somewhat flooded with these
+			logger.Debugf("Rejecting deliver because channel %s not found", chdr.ChannelId)
+			return sendStatusReply(srv, cb.Status_NOT_FOUND)
+		}
+		//监听是否有错误发生
+		//有错误，返回503
+		erroredChan := chain.Errored()
+		select {
+		case &lt;-erroredChan:
+			logger.Warningf("[channel: %s] Rejecting deliver request because of consenter error", chdr.ChannelId)
+			return sendStatusReply(srv, cb.Status_SERVICE_UNAVAILABLE)
+		default:
+
+		}
+
+		lastConfigSequence := chain.Sequence()
+		//对链配置信息校验
+		sf := sigfilter.New(policies.ChannelReaders, chain.PolicyManager())
+		result, _ := sf.Apply(envelope)
+		if result != filter.Forward {
+			logger.Warningf("[channel: %s] Received unauthorized deliver request", chdr.ChannelId)
+			return sendStatusReply(srv, cb.Status_FORBIDDEN)
+		}
+		//解析请求消息内容
+		seekInfo := &amp;ab.SeekInfo{}
+		if err = proto.Unmarshal(payload.Data, seekInfo); err != nil {
+			logger.Warningf("[channel: %s] Received a signed deliver request with malformed seekInfo payload: %s", chdr.ChannelId, err)
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}</code></pre> 
+  <ul>
+   <li>在server.go中会遇到chain调用Manager&nbsp; &nbsp; Manage.go</li> 
+  </ul>
+  <pre class="has">
+<code class="language-Go">
+type Manager interface {
+	//获取链对象
+	GetChain(chainID string) (ChainSupport, bool)
+
+	//获取系统链，用于引导其他链的生成
+	SystemChannelID() string
+
+	//生成或更新链的配置
+	NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error)
+}
+
+//配置资源
+type configResources struct {
+	configtxapi.Manager
+}
+
+//获取orderer相关的配置
+//点进Orderer可以看相关配置
+func (cr *configResources) SharedConfig() config.Orderer {
+	oc, ok := cr.OrdererConfig()
+	if !ok {
+		logger.Panicf("[channel %s] has no orderer configuration", cr.ChainID())
+	}
+	return oc
+}
+
+//定义账本资源
+type ledgerResources struct {
+	//配置资源
+	*configResources
+	//账本的读写对象
+	//对账本操作的入口
+	ledger ledger.ReadWriter
+}
+
+//manager的实现类
+type multiLedger struct {
+	//链
+	chains          map[string]*chainSupport
+	//共识机制
+	consenters      map[string]Consenter
+	//账本读写工厂
+	ledgerFactory   ledger.Factory
+	//签名对象
+	signer          crypto.LocalSigner
+	//系统链的标识
+	systemChannelID string
+	//定义系统链
+	systemChannel   *chainSupport
+}
+
+//获取某条链更新的配置交易
+func getConfigTx(reader ledger.Reader) *cb.Envelope {
+	//获取链上最新的一个区块
+	lastBlock := ledger.GetBlock(reader, reader.Height()-1)
+	//根据最新的区块信息，可以找到最新的配置交易的区块
+	index, err := utils.GetLastConfigIndexFromBlock(lastBlock)
+	if err != nil {
+		logger.Panicf("Chain did not have appropriately encoded last config in its latest block: %s", err)
+	}
+	//读取配置区块
+	configBlock := ledger.GetBlock(reader, index)
+	if configBlock == nil {
+		logger.Panicf("Config block does not exist")
+	}
+	//读取最新的配置交易
+	return utils.ExtractEnvelopeOrPanic(configBlock, 0)
+}
+
+//manager的实例化
+func NewManagerImpl(ledgerFactory ledger.Factory, consenters map[string]Consenter, signer crypto.LocalSigner) Manager {
+	//接收传来的参数
+	//直接赋值，上面定义的
+	ml := &amp;multiLedger{
+		chains:        make(map[string]*chainSupport),
+		ledgerFactory: ledgerFactory,
+		consenters:    consenters,
+		signer:        signer,
+	}
+
+	//读取本地存储的链的ID
+	existingChains := ledgerFactory.ChainIDs()
+	//循环
+	for _, chainID := range existingChains {
+		//根据账本工厂实例化账本读的对象
+		//rl：read ledger
+		rl, err := ledgerFactory.GetOrCreate(chainID)
+		if err != nil {
+			logger.Panicf("Ledger factory reported chainID %s but could not retrieve it: %s", chainID, err)
+		}
+		//获取最新的配置交易
+		configTx := getConfigTx(rl)
+		if configTx == nil {
+			logger.Panic("Programming error, configTx should never be nil here")
+		}
+		//将配置交易和ledger对象绑定
+		ledgerResources := ml.newLedgerResources(configTx)
+		chainID := ledgerResources.ChainID()
+
+		//读取链是否有联盟配置
+		//联盟配置：是否有创建其他链的权限
+		//一般只有系统链有联盟配置
+		if _, ok := ledgerResources.ConsortiumsConfig(); ok {
+			//有联盟配置
+			if ml.systemChannelID != "" {
+				//已经存在系统链，报错
+				logger.Panicf("There appear to be two system chains %s and %s", ml.systemChannelID, chainID)
+			}
+			//实例化ChainSupport，依次赋值
+			chain := newChainSupport(createSystemChainFilters(ml, ledgerResources),
+				ledgerResources,
+				consenters,
+				signer)
+			logger.Infof("Starting with system channel %s and orderer type %s", chainID, chain.SharedConfig().ConsensusType())
+			ml.chains[chainID] = chain
+			ml.systemChannelID = chainID
+			ml.systemChannel = chain
+			// We delay starting this chain, as it might try to copy and replace the chains map via newChain before the map is fully built
+			//延迟启动
+			//其他链完成后，启动系统链
+			defer chain.start()
+		} else {
+			logger.Debugf("Starting chain: %s", chainID)
+			chain := newChainSupport(createStandardFilters(ledgerResources),
+				ledgerResources,
+				consenters,
+				signer)
+			//创建标准链
+			ml.chains[chainID] = chain
+			//启动
+			chain.start()
+		}
+
+	}
+	//系统链不存在，则报错
+	if ml.systemChannelID == "" {
+		logger.Panicf("No system chain found.  If bootstrapping, does your system channel contain a consortiums group definition?")
+	}
+	//返回ml
+	return ml
+}
+
+//返回系统链id
+func (ml *multiLedger) SystemChannelID() string {
+	return ml.systemChannelID
+}
+
+// GetChain retrieves the chain support for a chain (and whether it exists)
+//得到链
+func (ml *multiLedger) GetChain(chainID string) (ChainSupport, bool) {
+	cs, ok := ml.chains[chainID]
+	return cs, ok
+}
+
+//实例化一个账本资源对象
+func (ml *multiLedger) newLedgerResources(configTx *cb.Envelope) *ledgerResources {
+	//初始化配置交易
+	initializer := configtx.NewInitializer()
+	//生成配置manager
+	configManager, err := configtx.NewManagerImpl(configTx, initializer, nil)
+	if err != nil {
+		logger.Panicf("Error creating configtx manager and handlers: %s", err)
+	}
+	//得到chainID
+	chainID := configManager.ChainID()
+	//根据chainID，实例化账本对象
+	ledger, err := ml.ledgerFactory.GetOrCreate(chainID)
+	if err != nil {
+		logger.Panicf("Error getting ledger for %s", chainID)
+	}
+	//最终返回赋值后的账本资源对象
+	return &amp;ledgerResources{
+		configResources: &amp;configResources{Manager: configManager},
+		ledger:          ledger,
+	}
+}
+
+//生成一条新链
+func (ml *multiLedger) newChain(configtx *cb.Envelope) {
+	//创建账本资源对象
+	ledgerResources := ml.newLedgerResources(configtx)
+	//组装区块，通过Append加到链上
+	ledgerResources.ledger.Append(ledger.CreateNextBlock(ledgerResources.ledger, []*cb.Envelope{configtx}))
+
+	// Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is
+	//得到新的链，可以加锁
+	newChains := make(map[string]*chainSupport)
+	for key, value := range ml.chains {
+		newChains[key] = value
+	}
+
+	cs := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, ml.consenters, ml.signer)
+	chainID := ledgerResources.ChainID()
+
+	logger.Infof("Created and starting new chain %s", chainID)
+
+	newChains[string(chainID)] = cs
+	cs.start()
+
+	ml.chains = newChains
+}
+
+func (ml *multiLedger) channelsCount() int {
+	return len(ml.chains)
+}
+
+//生成新的链的配置
+func (ml *multiLedger) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) {
+
+	//下面是生成新链前，做各种校验
+	configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("Failing initial channel config creation because of payload unmarshaling error: %s", err)
+	}</code></pre> 
+  <ul>
+   <li>接下来看chainsupport.go</li> 
+  </ul>
+  <p style="text-align:center;"><img alt="" class="has" height="124" src="https://img-blog.csdnimg.cn/20181107181323872.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="451"></p> 
+  <pre class="has">
+<code class="language-Go">//定义共识机制的接口
+type ConsenterSupport interface {
+	//本地签名
+	crypto.LocalSigner
+	//区块切割对象
+	BlockCutter() blockcutter.Receiver
+	//配置
+	SharedConfig() config.Orderer
+	//切割好的交易打包成区块
+	CreateNextBlock(messages []*cb.Envelope) *cb.Block
+	//将区块写入
+	WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block
+	//获取链的ID
+	ChainID() string 
+	//获取链当前的区块高度
+	Height() uint64  // Returns the number of blocks on the chain this specific consenter instance is associated with
+}
+
+type ChainSupport interface {
+	//背书策略
+	PolicyManager() policies.Manager
+
+	//读取账本的接口
+	Reader() ledger.Reader
+
+	//处理账本的错误
+	Errored() &lt;-chan struct{}
+
+	//处理交易输入的接口
+	broadcast.Support
+	//定义共识机制的接口
+	ConsenterSupport
+
+	//序列
+	//每次对链进行修改，Sequence是加1的
+	Sequence() uint64
+
+	//将一个交易转为配置交易
+	//Envelope：可以理解为交易
+	ProposeConfigUpdate(env *cb.Envelope) (*cb.ConfigEnvelope, error)
+}
+
+type chainSupport struct {
+	//链的资源信息，链的配置和账本读写对象
+	*ledgerResources
+	//链
+	chain         Chain
+	//区块切割
+	cutter        blockcutter.Receiver
+	//过滤器
+	//orderer过滤一些交易为空的数据
+	filters       *filter.RuleSet
+	//签名
+	signer        crypto.LocalSigner
+	//最新配置信息所在的区块高度
+	lastConfig    uint64
+	//最新配置信息所在的序列化
+	lastConfigSeq uint64
+}
+
+func newChainSupport(
+	filters *filter.RuleSet,
+	ledgerResources *ledgerResources,
+	consenters map[string]Consenter,
+	signer crypto.LocalSigner,
+) *chainSupport {
+	//创建区块切割对象
+	cutter := blockcutter.NewReceiverImpl(ledgerResources.SharedConfig(), filters)
+	//根据配置查询orderer使用的共识机制
+	consenterType := ledgerResources.SharedConfig().ConsensusType()
+	//得到共识机制
+	consenter, ok := consenters[consenterType]
+	if !ok {
+		logger.Fatalf("Error retrieving consenter of type: %s", consenterType)
+	}
+
+	//赋值
+	cs := &amp;chainSupport{
+		ledgerResources: ledgerResources,
+		cutter:          cutter,
+		filters:         filters,
+		signer:          signer,
+	}
+	//序列号
+	cs.lastConfigSeq = cs.Sequence()
+
+	var err error
+	//最新区块
+	lastBlock := ledger.GetBlock(cs.Reader(), cs.Reader().Height()-1)
+
+	if lastBlock.Header.Number != 0 {
+		//获取最新配置信息所在的区块高度
+		cs.lastConfig, err = utils.GetLastConfigIndexFromBlock(lastBlock)
+		if err != nil {
+			logger.Fatalf("[channel: %s] Error extracting last config block from block metadata: %s", cs.ChainID(), err)
+		}
+	}
+	//获取区块元数据信息
+	metadata, err := utils.GetMetadataFromBlock(lastBlock, cb.BlockMetadataIndex_ORDERER)
+	if err != nil {
+		logger.Fatalf("[channel: %s] Error extracting orderer metadata: %s", cs.ChainID(), err)
+	}
+	logger.Debugf("[channel: %s] Retrieved metadata for tip of chain (blockNumber=%d, lastConfig=%d, lastConfigSeq=%d): %+v", cs.ChainID(), lastBlock.Header.Number, cs.lastConfig, cs.lastConfigSeq, metadata)
+	//用共识机制操作Chain
+	cs.chain, err = consenter.HandleChain(cs, metadata)
+	if err != nil {
+		logger.Fatalf("[channel: %s] Error creating consenter: %s", cs.ChainID(), err)
+	}
+
+	return cs
+}
+
+//实例化过滤器
+func createStandardFilters(ledgerResources *ledgerResources) *filter.RuleSet {
+	return filter.NewRuleSet([]filter.Rule{
+		filter.EmptyRejectRule,
+		sizefilter.MaxBytesRule(ledgerResources.SharedConfig()),
+		sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()),
+		configtxfilter.NewFilter(ledgerResources),
+		filter.AcceptRule,
+	})
+
+}</code></pre> 
+  <pre class="has">
+<code class="language-Go">func (cs *chainSupport) WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block {
+	//遍历所有提交的交易
+	for _, committer := range committers {
+		committer.Commit()
+	}
+	// Set the orderer-related metadata field
+	//判断元数据
+	if encodedMetadataValue != nil {
+		block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&amp;cb.Metadata{Value: encodedMetadataValue})
+	}
+	//进行区块签名
+	cs.addBlockSignature(block)
+	//配置签名
+	cs.addLastConfigSignature(block)
+
+	//将区块写入账本中
+	err := cs.ledger.Append(block)
+	if err != nil {
+		logger.Panicf("[channel: %s] Could not append block: %s", cs.ChainID(), err)
+	}
+	logger.Debugf("[channel: %s] Wrote block %d", cs.ChainID(), block.GetHeader().Number)
+
+	return block
+}</code></pre> 
+  <ul>
+   <li>点Receiver进去，看区块切割，在blockcutter.go中：</li> 
+  </ul>
+  <p style="text-align:center;"><img alt="" class="has" height="167" src="https://img-blog.csdnimg.cn/20181107181600448.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="416"></p> 
+  <pre class="has">
+<code class="language-Go">func (r *receiver) Ordered(msg *cb.Envelope) (messageBatches [][]*cb.Envelope, committerBatches [][]filter.Committer, validTx bool, pending bool) {
+	//将交易信息再次过滤
+	//第一次过滤是orderer接收到交易请求时
+	committer, err := r.filters.Apply(msg)
+	if err != nil {
+		logger.Debugf("Rejecting message: %s", err)
+		return // We don't bother to determine `pending` here as it's not processed in error case
+	}
+
+	// message is valid
+	//将交易标记为有效
+	validTx = true
+
+	//计算交易体的大小
+	messageSizeBytes := messageSizeBytes(msg)
+
+	//判断是否交易隔离，配置交易进行隔离
+	//交易体的大小，如果比最大交易体大小大，认为交易内容过大，进行单独切块
+	if committer.Isolated() || messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes {
+
+		if committer.Isolated() {
+			logger.Debugf("Found message which requested to be isolated, cutting into its own batch")
+		} else {
+			logger.Debugf("The current message, with %v bytes, is larger than the preferred batch size of %v bytes and will be isolated.", messageSizeBytes, r.sharedConfigManager.BatchSize().PreferredMaxBytes)
+		}
+
+		//若存在每被七个的交易
+		//将未被切割的交易存放到区块
+		if len(r.pendingBatch) &gt; 0 {
+			messageBatch, committerBatch := r.Cut()
+			messageBatches = append(messageBatches, messageBatch)
+			committerBatches = append(committerBatches, committerBatch)
+		}
+
+		//单独切割当前交易
+		messageBatches = append(messageBatches, []*cb.Envelope{msg})
+		committerBatches = append(committerBatches, []filter.Committer{committer})
+
+		return
+	}
+	//不隔离的交易，这里处理
+	//判断加上当前交易后，区块大小是否超出预先设定的大小
+	messageWillOverflowBatchSizeBytes := r.pendingBatchSizeBytes+messageSizeBytes &gt; r.sharedConfigManager.BatchSize().PreferredMaxBytes
+
+	//如果超出了预定大小，进入if
+	if messageWillOverflowBatchSizeBytes {
+		logger.Debugf("The current message, with %v bytes, will overflow the pending batch of %v bytes.", messageSizeBytes, r.pendingBatchSizeBytes)
+		logger.Debugf("Pending batch would overflow if current message is added, cutting batch now.")
+		//进行切割
+		messageBatch, committerBatch := r.Cut()
+		messageBatches = append(messageBatches, messageBatch)
+		committerBatches = append(committerBatches, committerBatch)
+	}
+
+	logger.Debugf("Enqueuing message into batch")
+	r.pendingBatch = append(r.pendingBatch, msg)
+	r.pendingBatchSizeBytes += messageSizeBytes
+	r.pendingCommitters = append(r.pendingCommitters, committer)
+	pending = true
+
+	//若区块队列超出阈值范围，进行切割
+	if uint32(len(r.pendingBatch)) &gt;= r.sharedConfigManager.BatchSize().MaxMessageCount {
+		logger.Debugf("Batch size met, cutting batch")
+		messageBatch, committerBatch := r.Cut()
+		messageBatches = append(messageBatches, messageBatch)
+		committerBatches = append(committerBatches, committerBatch)
+		pending = false
+	}
+
+	return
+}
+
+//完成切割这个动作
+func (r *receiver) Cut() ([]*cb.Envelope, []filter.Committer) {
+	batch := r.pendingBatch
+	r.pendingBatch = nil
+	committers := r.pendingCommitters
+	r.pendingCommitters = nil
+	r.pendingBatchSizeBytes = 0
+	return batch, committers
+}
+
+func messageSizeBytes(message *cb.Envelope) uint32 {
+	//将消息体和签名加起来求长度
+	return uint32(len(message.Payload) + len(message.Signature))
+}
+</code></pre> 
+  <ul>
+   <li>在consensus.go中是共识：</li> 
+  </ul>
+  <pre class="has">
+<code class="language-Go">func (ch *chain) main() {
+	//定义定时器
+	var timer &lt;-chan time.Time
+	//循环
+	for {
+		select {
+		//不停的从交易的channel中获取交易
+		//将获取到的交易，发送给区块切割对象
+		//返回需要切割的区块
+		case msg := &lt;-ch.sendChan:
+			//区块切割
+			batches, committers, ok, _ := ch.support.BlockCutter().Ordered(msg)
+			//判断交易是否有效
+			//判断定时器是否未空
+			if ok &amp;&amp; len(batches) == 0 &amp;&amp; timer == nil {
+				//实例化定时器
+				timer = time.After(ch.support.SharedConfig().BatchTimeout())
+				continue
+			}
+			//创建区块
+			//最终保存到orderer节点的临时账本中
+			for i, batch := range batches {
+				block := ch.support.CreateNextBlock(batch)
+				ch.support.WriteBlock(block, committers[i], nil)
+			}
+			//判断交易的有效性
+			if len(batches) &gt; 0 {
+				//定时器重新计时
+				timer = nil
+			}
+			//定时器触发
+			//马上进行区块切割
+		case &lt;-timer:
+			//clear the timer
+			timer = nil
+			//区块切割
+			batch, committers := ch.support.BlockCutter().Cut()
+			if len(batch) == 0 {
+				logger.Warningf("Batch timer expired with no pending requests, this might indicate a bug")
+				continue
+			}
+			logger.Debugf("Batch timer expired, creating block")
+			//创建区块
+			block := ch.support.CreateNextBlock(batch)
+			//写区块
+			ch.support.WriteBlock(block, committers, nil)
+		case &lt;-ch.exitChan:
+			logger.Debugf("Exiting")
+		//直接退出
+			return
+		}
+	}
+}</code></pre> 
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/super_lixiang/article/details/83823796,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/super_lixiang/article/details/83823796,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										if(typeof window.localStorage === "object" && typeof window.csdn.anonymousUserLimit === "object"){
+											if(!window.csdn.anonymousUserLimit.judgment()){
+												window.csdn.anonymousUserLimit.Jumplogin();
+												return false;
+											}else if(!currentUserName){
+												window.csdn.anonymousUserLimit.updata();
+											}
+										}
+										
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

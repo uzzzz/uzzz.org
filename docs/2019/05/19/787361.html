@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>spark2原理分析—shuffle框架的实现概要分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="spark2原理分析—shuffle框架的实现概要分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="概述 本文分析spark2的shuffle过程的实现的一个概要。 shuffle过程介绍 shuffle总体流程 spark2的shuffle过程可以分为shuffle write和shuffle read。shuffle write把map阶段计算完成的数据写入到本地。而shuffle read是从不同的计算节点获取shuffle write计算出来的数据，这样就会发生网络的数据传输和磁盘的i/o。 为什么shuffle的代价很大 由于shuffle过程有可能要做以下一些事情： 重新进行数据分区 数据传输 数据压缩 磁盘I/O spark2的shuffle框架介绍 spark2中的框架主要包括以下几个部分： ShuffleManager 这是一个接口，负责管理shuffle相关的组件，比如：通过它来注册shuffle的操作函数，获取writer和reader等。在sparkenv中注册，通过sprkconf进行配置，配置参数是：spark.shuffle.manager，默认是sort，也就是：SortShuffleManager类。在早期的spark版本中，也实现过hashmanager后来全部统一成sort。 ShuffleReader 在reduce任务中去获取来自多个mapper任务的合并记录数据。实现该接口的类只有一个：BlockStoreShuffleReader。 ShuffleWriter 在mapper任务中把记录到shuffle系统。这是一个抽象类，实现该抽象类的有：SortShuffleWriter，UnsafeShuffleWriter，BypassMergeSortShuffleWriter三个。 ShuffleBlockResolver 该接口的实现类需要理解：如何为逻辑的shuffle块标识(map,reduce,shuffle等)获取数据。实现者可以通过文件或文件片段来封装shuffle数据。当获取到shuffle数据时，BlockStore使用它来抽象不同的shuffle实现。该接口的实现类为：IndexShuffleBlockResolver。 ShuffleManager的实现 ShuffleManager接口 private[spark] trait ShuffleManager { /** * Register a shuffle with the manager and obtain a handle for it to pass to tasks. */ def registerShuffle[K, V, C]( shuffleId: Int, numMaps: Int, dependency: ShuffleDependency[K, V, C]): ShuffleHandle /** Get a writer for a given partition. Called on executors by map tasks. */ def getWriter[K, V](handle: ShuffleHandle, mapId: Int, context: TaskContext): ShuffleWriter[K, V] /** * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive). * Called on executors by reduce tasks. */ def getReader[K, C]( handle: ShuffleHandle, startPartition: Int, endPartition: Int, context: TaskContext): ShuffleReader[K, C] /** * Remove a shuffle&#39;s metadata from the ShuffleManager. * @return true if the metadata removed successfully, otherwise false. */ def unregisterShuffle(shuffleId: Int): Boolean /** * Return a resolver capable of retrieving shuffle block data based on block coordinates. */ def shuffleBlockResolver: ShuffleBlockResolver /** Shut down this ShuffleManager. */ def stop(): Unit } 在spark2.4中实现该接口的类只有一个：SortShuffleManager。下面我们来看一下该类的具体实现。 ShuffleHandle shuffle的一个不透明句柄(handle)，由ShuffleManager用于将有关它的信息传递给任务(task)。 ShuffleBlockFetcherIterator 一个获取多个块的迭代器。 对于本地块，它从本地块管理器(local blocks manager)获取。对于远程块，它使用提供的BlockTransferService服务来获取。 它会创建（BlockID，InputStream）元组的迭代器，以便调用者可以在收到块时以流水线方式处理块。 SortShuffleManager类介绍 实现概要 在基于排序的shuffle中，输入的数据会根据其目标分区ID进行排序，然后写入单个map输出文件。 Reducers获取此文件的连续区域，以便读取它们map的输出部分。 如果map输出数据太大而无法放入内存，则可以将输出的已排序数据的一部分写到磁盘，并合并那些磁盘上的文件以生成最终输出文件。 基于排序的shuffle有两个不同的写路径用于生成其映射输出文件： 序列化排序：在满足以下所有三个条件时使用： shuffle依赖项指定没有聚合或输出顺序 shuffle序列化程序支持重新定位序列化值（目前这是由KryoSerializer和Spark SQL的自定义序列化程序支持）。 shuffle产生的输出分区少于16777216。 反序列化排序：用于处理所有其他情况。 序列化排序模式 在序列化排序模式下，输入记录会在它被传递给shuffler writer时被序列化，并在排序期间以序列化形式进行缓冲。 该写入模式实现了几个优化： 它的排序操作是序列化的二进制数据而不是Java对象，这样可以减少内存消耗和GC开销。 此优化要求记录序列化程序具有某些属性，以允许重新排序序列化记录，而无需反序列化。 有关详细信息，请参见SPARK-4550，其中首次提出并实施了此优化。 它使用专门的缓存高效排序器（[[ShuffleExternalSorter]]）来排序压缩记录指针和分区ID的数组。 通过在排序数组中每个记录仅使用8个字节的空间，这样就可以把更多的数组放到内存中。 溢出合并过程对属于同一分区的序列化记录块进行操作，并且在合并期间不需要对记录进行反序列化。 当溢出压缩编解码器支持压缩数据的连接时，溢出合并只是简单地连接序列化和压缩的溢出分区以生成最终输出分区。 这允许使用高效的数据复制方法，如NIO的transferTo，并避免在合并期间分配解压缩或复制缓冲区的需要。 ShuffleWriter的实现 ShuffleWriter抽象类 该接口有三个实现类： BypassMergeSortShuffleWriter SortShuffleWriter UnsafeShuffleWriter 该抽象类的实现代码如下： private[spark] abstract class ShuffleWriter[K, V] { /** Write a sequence of records to this task&#39;s output */ @throws[IOException] def write(records: Iterator[Product2[K, V]]): Unit /** Close this writer, passing along whether the map completed */ def stop(success: Boolean): Option[MapStatus] } SortShuffleWriter类介绍 在mapper任务中把记录到shuffle系统。在该类中，写出数据时会使用外部排序对数据进行排序。 ShuffleReader的实现 ShuffleReader抽象类 该抽象类实现：在reduce任务中获取以从映射器中读取组合记录。目前只有一个实现类：BlockStoreShuffleReader。 private[spark] trait ShuffleReader[K, C] { /** Read the combined key-values for this reduce task */ def read(): Iterator[Product2[K, C]] /** * Close this reader. * TODO: Add this back when we make the ShuffleReader a developer API that others can implement * (at which point this will likely be necessary). */ // def stop(): Unit } BlockStoreShuffleReader介绍 该类实现了ShuffleReader抽象类，其实就只是实现了一个read函数，该函数返回一个迭代器。 该实现类的主要功能是：当其他节点的块存储(block store)请求分区时，将会读取一个shuffle过程中的多个分区，分区的范围是[startPartition，endPartition]。 总结 本文讲述了spark2的shuffle框架的实现概要分析。主要分析了spark2中的shuffle框架的实现接口和相关实现类的大概实现逻辑。接下来的文章会对shuffle框架的三个部分的详细实现进行分析。" />
+<meta property="og:description" content="概述 本文分析spark2的shuffle过程的实现的一个概要。 shuffle过程介绍 shuffle总体流程 spark2的shuffle过程可以分为shuffle write和shuffle read。shuffle write把map阶段计算完成的数据写入到本地。而shuffle read是从不同的计算节点获取shuffle write计算出来的数据，这样就会发生网络的数据传输和磁盘的i/o。 为什么shuffle的代价很大 由于shuffle过程有可能要做以下一些事情： 重新进行数据分区 数据传输 数据压缩 磁盘I/O spark2的shuffle框架介绍 spark2中的框架主要包括以下几个部分： ShuffleManager 这是一个接口，负责管理shuffle相关的组件，比如：通过它来注册shuffle的操作函数，获取writer和reader等。在sparkenv中注册，通过sprkconf进行配置，配置参数是：spark.shuffle.manager，默认是sort，也就是：SortShuffleManager类。在早期的spark版本中，也实现过hashmanager后来全部统一成sort。 ShuffleReader 在reduce任务中去获取来自多个mapper任务的合并记录数据。实现该接口的类只有一个：BlockStoreShuffleReader。 ShuffleWriter 在mapper任务中把记录到shuffle系统。这是一个抽象类，实现该抽象类的有：SortShuffleWriter，UnsafeShuffleWriter，BypassMergeSortShuffleWriter三个。 ShuffleBlockResolver 该接口的实现类需要理解：如何为逻辑的shuffle块标识(map,reduce,shuffle等)获取数据。实现者可以通过文件或文件片段来封装shuffle数据。当获取到shuffle数据时，BlockStore使用它来抽象不同的shuffle实现。该接口的实现类为：IndexShuffleBlockResolver。 ShuffleManager的实现 ShuffleManager接口 private[spark] trait ShuffleManager { /** * Register a shuffle with the manager and obtain a handle for it to pass to tasks. */ def registerShuffle[K, V, C]( shuffleId: Int, numMaps: Int, dependency: ShuffleDependency[K, V, C]): ShuffleHandle /** Get a writer for a given partition. Called on executors by map tasks. */ def getWriter[K, V](handle: ShuffleHandle, mapId: Int, context: TaskContext): ShuffleWriter[K, V] /** * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive). * Called on executors by reduce tasks. */ def getReader[K, C]( handle: ShuffleHandle, startPartition: Int, endPartition: Int, context: TaskContext): ShuffleReader[K, C] /** * Remove a shuffle&#39;s metadata from the ShuffleManager. * @return true if the metadata removed successfully, otherwise false. */ def unregisterShuffle(shuffleId: Int): Boolean /** * Return a resolver capable of retrieving shuffle block data based on block coordinates. */ def shuffleBlockResolver: ShuffleBlockResolver /** Shut down this ShuffleManager. */ def stop(): Unit } 在spark2.4中实现该接口的类只有一个：SortShuffleManager。下面我们来看一下该类的具体实现。 ShuffleHandle shuffle的一个不透明句柄(handle)，由ShuffleManager用于将有关它的信息传递给任务(task)。 ShuffleBlockFetcherIterator 一个获取多个块的迭代器。 对于本地块，它从本地块管理器(local blocks manager)获取。对于远程块，它使用提供的BlockTransferService服务来获取。 它会创建（BlockID，InputStream）元组的迭代器，以便调用者可以在收到块时以流水线方式处理块。 SortShuffleManager类介绍 实现概要 在基于排序的shuffle中，输入的数据会根据其目标分区ID进行排序，然后写入单个map输出文件。 Reducers获取此文件的连续区域，以便读取它们map的输出部分。 如果map输出数据太大而无法放入内存，则可以将输出的已排序数据的一部分写到磁盘，并合并那些磁盘上的文件以生成最终输出文件。 基于排序的shuffle有两个不同的写路径用于生成其映射输出文件： 序列化排序：在满足以下所有三个条件时使用： shuffle依赖项指定没有聚合或输出顺序 shuffle序列化程序支持重新定位序列化值（目前这是由KryoSerializer和Spark SQL的自定义序列化程序支持）。 shuffle产生的输出分区少于16777216。 反序列化排序：用于处理所有其他情况。 序列化排序模式 在序列化排序模式下，输入记录会在它被传递给shuffler writer时被序列化，并在排序期间以序列化形式进行缓冲。 该写入模式实现了几个优化： 它的排序操作是序列化的二进制数据而不是Java对象，这样可以减少内存消耗和GC开销。 此优化要求记录序列化程序具有某些属性，以允许重新排序序列化记录，而无需反序列化。 有关详细信息，请参见SPARK-4550，其中首次提出并实施了此优化。 它使用专门的缓存高效排序器（[[ShuffleExternalSorter]]）来排序压缩记录指针和分区ID的数组。 通过在排序数组中每个记录仅使用8个字节的空间，这样就可以把更多的数组放到内存中。 溢出合并过程对属于同一分区的序列化记录块进行操作，并且在合并期间不需要对记录进行反序列化。 当溢出压缩编解码器支持压缩数据的连接时，溢出合并只是简单地连接序列化和压缩的溢出分区以生成最终输出分区。 这允许使用高效的数据复制方法，如NIO的transferTo，并避免在合并期间分配解压缩或复制缓冲区的需要。 ShuffleWriter的实现 ShuffleWriter抽象类 该接口有三个实现类： BypassMergeSortShuffleWriter SortShuffleWriter UnsafeShuffleWriter 该抽象类的实现代码如下： private[spark] abstract class ShuffleWriter[K, V] { /** Write a sequence of records to this task&#39;s output */ @throws[IOException] def write(records: Iterator[Product2[K, V]]): Unit /** Close this writer, passing along whether the map completed */ def stop(success: Boolean): Option[MapStatus] } SortShuffleWriter类介绍 在mapper任务中把记录到shuffle系统。在该类中，写出数据时会使用外部排序对数据进行排序。 ShuffleReader的实现 ShuffleReader抽象类 该抽象类实现：在reduce任务中获取以从映射器中读取组合记录。目前只有一个实现类：BlockStoreShuffleReader。 private[spark] trait ShuffleReader[K, C] { /** Read the combined key-values for this reduce task */ def read(): Iterator[Product2[K, C]] /** * Close this reader. * TODO: Add this back when we make the ShuffleReader a developer API that others can implement * (at which point this will likely be necessary). */ // def stop(): Unit } BlockStoreShuffleReader介绍 该类实现了ShuffleReader抽象类，其实就只是实现了一个read函数，该函数返回一个迭代器。 该实现类的主要功能是：当其他节点的块存储(block store)请求分区时，将会读取一个shuffle过程中的多个分区，分区的范围是[startPartition，endPartition]。 总结 本文讲述了spark2的shuffle框架的实现概要分析。主要分析了spark2中的shuffle框架的实现接口和相关实现类的大概实现逻辑。接下来的文章会对shuffle框架的三个部分的详细实现进行分析。" />
+<link rel="canonical" href="https://uzzz.org/2019/05/19/787361.html" />
+<meta property="og:url" content="https://uzzz.org/2019/05/19/787361.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-05-19T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"概述 本文分析spark2的shuffle过程的实现的一个概要。 shuffle过程介绍 shuffle总体流程 spark2的shuffle过程可以分为shuffle write和shuffle read。shuffle write把map阶段计算完成的数据写入到本地。而shuffle read是从不同的计算节点获取shuffle write计算出来的数据，这样就会发生网络的数据传输和磁盘的i/o。 为什么shuffle的代价很大 由于shuffle过程有可能要做以下一些事情： 重新进行数据分区 数据传输 数据压缩 磁盘I/O spark2的shuffle框架介绍 spark2中的框架主要包括以下几个部分： ShuffleManager 这是一个接口，负责管理shuffle相关的组件，比如：通过它来注册shuffle的操作函数，获取writer和reader等。在sparkenv中注册，通过sprkconf进行配置，配置参数是：spark.shuffle.manager，默认是sort，也就是：SortShuffleManager类。在早期的spark版本中，也实现过hashmanager后来全部统一成sort。 ShuffleReader 在reduce任务中去获取来自多个mapper任务的合并记录数据。实现该接口的类只有一个：BlockStoreShuffleReader。 ShuffleWriter 在mapper任务中把记录到shuffle系统。这是一个抽象类，实现该抽象类的有：SortShuffleWriter，UnsafeShuffleWriter，BypassMergeSortShuffleWriter三个。 ShuffleBlockResolver 该接口的实现类需要理解：如何为逻辑的shuffle块标识(map,reduce,shuffle等)获取数据。实现者可以通过文件或文件片段来封装shuffle数据。当获取到shuffle数据时，BlockStore使用它来抽象不同的shuffle实现。该接口的实现类为：IndexShuffleBlockResolver。 ShuffleManager的实现 ShuffleManager接口 private[spark] trait ShuffleManager { /** * Register a shuffle with the manager and obtain a handle for it to pass to tasks. */ def registerShuffle[K, V, C]( shuffleId: Int, numMaps: Int, dependency: ShuffleDependency[K, V, C]): ShuffleHandle /** Get a writer for a given partition. Called on executors by map tasks. */ def getWriter[K, V](handle: ShuffleHandle, mapId: Int, context: TaskContext): ShuffleWriter[K, V] /** * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive). * Called on executors by reduce tasks. */ def getReader[K, C]( handle: ShuffleHandle, startPartition: Int, endPartition: Int, context: TaskContext): ShuffleReader[K, C] /** * Remove a shuffle&#39;s metadata from the ShuffleManager. * @return true if the metadata removed successfully, otherwise false. */ def unregisterShuffle(shuffleId: Int): Boolean /** * Return a resolver capable of retrieving shuffle block data based on block coordinates. */ def shuffleBlockResolver: ShuffleBlockResolver /** Shut down this ShuffleManager. */ def stop(): Unit } 在spark2.4中实现该接口的类只有一个：SortShuffleManager。下面我们来看一下该类的具体实现。 ShuffleHandle shuffle的一个不透明句柄(handle)，由ShuffleManager用于将有关它的信息传递给任务(task)。 ShuffleBlockFetcherIterator 一个获取多个块的迭代器。 对于本地块，它从本地块管理器(local blocks manager)获取。对于远程块，它使用提供的BlockTransferService服务来获取。 它会创建（BlockID，InputStream）元组的迭代器，以便调用者可以在收到块时以流水线方式处理块。 SortShuffleManager类介绍 实现概要 在基于排序的shuffle中，输入的数据会根据其目标分区ID进行排序，然后写入单个map输出文件。 Reducers获取此文件的连续区域，以便读取它们map的输出部分。 如果map输出数据太大而无法放入内存，则可以将输出的已排序数据的一部分写到磁盘，并合并那些磁盘上的文件以生成最终输出文件。 基于排序的shuffle有两个不同的写路径用于生成其映射输出文件： 序列化排序：在满足以下所有三个条件时使用： shuffle依赖项指定没有聚合或输出顺序 shuffle序列化程序支持重新定位序列化值（目前这是由KryoSerializer和Spark SQL的自定义序列化程序支持）。 shuffle产生的输出分区少于16777216。 反序列化排序：用于处理所有其他情况。 序列化排序模式 在序列化排序模式下，输入记录会在它被传递给shuffler writer时被序列化，并在排序期间以序列化形式进行缓冲。 该写入模式实现了几个优化： 它的排序操作是序列化的二进制数据而不是Java对象，这样可以减少内存消耗和GC开销。 此优化要求记录序列化程序具有某些属性，以允许重新排序序列化记录，而无需反序列化。 有关详细信息，请参见SPARK-4550，其中首次提出并实施了此优化。 它使用专门的缓存高效排序器（[[ShuffleExternalSorter]]）来排序压缩记录指针和分区ID的数组。 通过在排序数组中每个记录仅使用8个字节的空间，这样就可以把更多的数组放到内存中。 溢出合并过程对属于同一分区的序列化记录块进行操作，并且在合并期间不需要对记录进行反序列化。 当溢出压缩编解码器支持压缩数据的连接时，溢出合并只是简单地连接序列化和压缩的溢出分区以生成最终输出分区。 这允许使用高效的数据复制方法，如NIO的transferTo，并避免在合并期间分配解压缩或复制缓冲区的需要。 ShuffleWriter的实现 ShuffleWriter抽象类 该接口有三个实现类： BypassMergeSortShuffleWriter SortShuffleWriter UnsafeShuffleWriter 该抽象类的实现代码如下： private[spark] abstract class ShuffleWriter[K, V] { /** Write a sequence of records to this task&#39;s output */ @throws[IOException] def write(records: Iterator[Product2[K, V]]): Unit /** Close this writer, passing along whether the map completed */ def stop(success: Boolean): Option[MapStatus] } SortShuffleWriter类介绍 在mapper任务中把记录到shuffle系统。在该类中，写出数据时会使用外部排序对数据进行排序。 ShuffleReader的实现 ShuffleReader抽象类 该抽象类实现：在reduce任务中获取以从映射器中读取组合记录。目前只有一个实现类：BlockStoreShuffleReader。 private[spark] trait ShuffleReader[K, C] { /** Read the combined key-values for this reduce task */ def read(): Iterator[Product2[K, C]] /** * Close this reader. * TODO: Add this back when we make the ShuffleReader a developer API that others can implement * (at which point this will likely be necessary). */ // def stop(): Unit } BlockStoreShuffleReader介绍 该类实现了ShuffleReader抽象类，其实就只是实现了一个read函数，该函数返回一个迭代器。 该实现类的主要功能是：当其他节点的块存储(block store)请求分区时，将会读取一个shuffle过程中的多个分区，分区的范围是[startPartition，endPartition]。 总结 本文讲述了spark2的shuffle框架的实现概要分析。主要分析了spark2中的shuffle框架的实现接口和相关实现类的大概实现逻辑。接下来的文章会对shuffle框架的三个部分的详细实现进行分析。","@type":"BlogPosting","url":"https://uzzz.org/2019/05/19/787361.html","headline":"spark2原理分析—shuffle框架的实现概要分析","dateModified":"2019-05-19T00:00:00+08:00","datePublished":"2019-05-19T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/05/19/787361.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>spark2原理分析—shuffle框架的实现概要分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post">  
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <h2><a id="_0"></a>概述</h2> 
+  <p>本文分析spark2的shuffle过程的实现的一个概要。</p> 
+  <h2><a id="shuffle_3"></a>shuffle过程介绍</h2> 
+  <h3><a id="shuffle_4"></a>shuffle总体流程</h3> 
+  <p>spark2的shuffle过程可以分为shuffle write和shuffle read。shuffle write把map阶段计算完成的数据写入到本地。而shuffle read是从不同的计算节点获取shuffle write计算出来的数据，这样就会发生网络的数据传输和磁盘的i/o。</p> 
+  <h3><a id="shuffle_7"></a>为什么shuffle的代价很大</h3> 
+  <p>由于shuffle过程有可能要做以下一些事情：</p> 
+  <ul> 
+   <li>重新进行数据分区</li> 
+   <li>数据传输</li> 
+   <li>数据压缩</li> 
+   <li>磁盘I/O</li> 
+  </ul> 
+  <h2><a id="spark2shuffle_15"></a>spark2的shuffle框架介绍</h2> 
+  <p>spark2中的框架主要包括以下几个部分：</p> 
+  <ul> 
+   <li> <p>ShuffleManager<br><br> 这是一个接口，负责管理shuffle相关的组件，比如：通过它来注册shuffle的操作函数，获取writer和reader等。在sparkenv中注册，通过sprkconf进行配置，配置参数是：spark.shuffle.manager，默认是sort，也就是：SortShuffleManager类。在早期的spark版本中，也实现过hashmanager后来全部统一成sort。</p> </li> 
+   <li> <p>ShuffleReader<br><br> 在reduce任务中去获取来自多个mapper任务的合并记录数据。实现该接口的类只有一个：BlockStoreShuffleReader。</p> </li> 
+   <li> <p>ShuffleWriter<br><br> 在mapper任务中把记录到shuffle系统。这是一个抽象类，实现该抽象类的有：SortShuffleWriter，UnsafeShuffleWriter，BypassMergeSortShuffleWriter三个。</p> </li> 
+   <li> <p>ShuffleBlockResolver<br><br> 该接口的实现类需要理解：如何为逻辑的shuffle块标识(map,reduce,shuffle等)获取数据。实现者可以通过文件或文件片段来封装shuffle数据。当获取到shuffle数据时，BlockStore使用它来抽象不同的shuffle实现。该接口的实现类为：IndexShuffleBlockResolver。</p> </li> 
+  </ul> 
+  <h2><a id="ShuffleManager_29"></a>ShuffleManager的实现</h2> 
+  <h3><a id="ShuffleManager_30"></a>ShuffleManager接口</h3> 
+  <pre><code>private[spark] trait ShuffleManager {
+
+  /**
+   * Register a shuffle with the manager and obtain a handle for it to pass to tasks.
+   */
+  def registerShuffle[K, V, C](
+      shuffleId: Int,
+      numMaps: Int,
+      dependency: ShuffleDependency[K, V, C]): ShuffleHandle
+
+  /** Get a writer for a given partition. Called on executors by map tasks. */
+  def getWriter[K, V](handle: ShuffleHandle, mapId: Int, context: TaskContext): ShuffleWriter[K, V]
+
+  /**
+   * Get a reader for a range of reduce partitions (startPartition to endPartition-1, inclusive).
+   * Called on executors by reduce tasks.
+   */
+  def getReader[K, C](
+      handle: ShuffleHandle,
+      startPartition: Int,
+      endPartition: Int,
+      context: TaskContext): ShuffleReader[K, C]
+
+  /**
+   * Remove a shuffle's metadata from the ShuffleManager.
+   * @return true if the metadata removed successfully, otherwise false.
+   */
+  def unregisterShuffle(shuffleId: Int): Boolean
+
+  /**
+   * Return a resolver capable of retrieving shuffle block data based on block coordinates.
+   */
+  def shuffleBlockResolver: ShuffleBlockResolver
+
+  /** Shut down this ShuffleManager. */
+  def stop(): Unit
+}
+</code></pre> 
+  <p>在spark2.4中实现该接口的类只有一个：SortShuffleManager。下面我们来看一下该类的具体实现。</p> 
+  <h3><a id="ShuffleHandle_73"></a>ShuffleHandle</h3> 
+  <p>shuffle的一个不透明句柄(handle)，由ShuffleManager用于将有关它的信息传递给任务(task)。</p> 
+  <h3><a id="ShuffleBlockFetcherIterator_76"></a>ShuffleBlockFetcherIterator</h3> 
+  <p>一个获取多个块的迭代器。 对于本地块，它从本地块管理器(local blocks manager)获取。对于远程块，它使用提供的BlockTransferService服务来获取。</p> 
+  <p>它会创建（BlockID，InputStream）元组的迭代器，以便调用者可以在收到块时以流水线方式处理块。</p> 
+  <h3><a id="SortShuffleManager_81"></a>SortShuffleManager类介绍</h3> 
+  <h4><a id="_82"></a>实现概要</h4> 
+  <p>在基于排序的shuffle中，输入的数据会根据其目标分区ID进行排序，然后写入单个map输出文件。 Reducers获取此文件的连续区域，以便读取它们map的输出部分。 如果map输出数据太大而无法放入内存，则可以将输出的已排序数据的一部分写到磁盘，并合并那些磁盘上的文件以生成最终输出文件。</p> 
+  <p>基于排序的shuffle有两个不同的写路径用于生成其映射输出文件：</p> 
+  <ul> 
+   <li> <p>序列化排序：在满足以下所有三个条件时使用：</p> 
+    <ul> 
+     <li>shuffle依赖项指定没有聚合或输出顺序</li> 
+     <li>shuffle序列化程序支持重新定位序列化值（目前这是由KryoSerializer和Spark SQL的自定义序列化程序支持）。</li> 
+     <li>shuffle产生的输出分区少于16777216。</li> 
+    </ul> </li> 
+   <li> <p>反序列化排序：用于处理所有其他情况。</p> </li> 
+  </ul> 
+  <h4><a id="_93"></a>序列化排序模式</h4> 
+  <p>在序列化排序模式下，输入记录会在它被传递给shuffler writer时被序列化，并在排序期间以序列化形式进行缓冲。 该写入模式实现了几个优化：</p> 
+  <ul> 
+   <li>它的排序操作是序列化的二进制数据而不是Java对象，这样可以减少内存消耗和GC开销。 此优化要求记录序列化程序具有某些属性，以允许重新排序序列化记录，而无需反序列化。 有关详细信息，请参见SPARK-4550，其中首次提出并实施了此优化。</li> 
+   <li>它使用专门的缓存高效排序器（[[ShuffleExternalSorter]]）来排序压缩记录指针和分区ID的数组。 通过在排序数组中每个记录仅使用8个字节的空间，这样就可以把更多的数组放到内存中。</li> 
+   <li>溢出合并过程对属于同一分区的序列化记录块进行操作，并且在合并期间不需要对记录进行反序列化。</li> 
+   <li>当溢出压缩编解码器支持压缩数据的连接时，溢出合并只是简单地连接序列化和压缩的溢出分区以生成最终输出分区。 这允许使用高效的数据复制方法，如NIO的<code>transferTo</code>，并避免在合并期间分配解压缩或复制缓冲区的需要。</li> 
+  </ul> 
+  <h2><a id="ShuffleWriter_103"></a>ShuffleWriter的实现</h2> 
+  <h3><a id="ShuffleWriter_104"></a>ShuffleWriter抽象类</h3> 
+  <p>该接口有三个实现类：</p> 
+  <ul> 
+   <li>BypassMergeSortShuffleWriter</li> 
+   <li>SortShuffleWriter</li> 
+   <li>UnsafeShuffleWriter</li> 
+  </ul> 
+  <p>该抽象类的实现代码如下：</p> 
+  <pre><code>private[spark] abstract class ShuffleWriter[K, V] {
+  /** Write a sequence of records to this task's output */
+  @throws[IOException]
+  def write(records: Iterator[Product2[K, V]]): Unit
+
+  /** Close this writer, passing along whether the map completed */
+  def stop(success: Boolean): Option[MapStatus]
+}
+</code></pre> 
+  <h3><a id="SortShuffleWriter_122"></a>SortShuffleWriter类介绍</h3> 
+  <p>在mapper任务中把记录到shuffle系统。在该类中，写出数据时会使用外部排序对数据进行排序。</p> 
+  <h2><a id="ShuffleReader_126"></a>ShuffleReader的实现</h2> 
+  <h3><a id="ShuffleReader_127"></a>ShuffleReader抽象类</h3> 
+  <p>该抽象类实现：在reduce任务中获取以从映射器中读取组合记录。目前只有一个实现类：BlockStoreShuffleReader。</p> 
+  <pre><code>private[spark] trait ShuffleReader[K, C] {
+  /** Read the combined key-values for this reduce task */
+  def read(): Iterator[Product2[K, C]]
+
+  /**
+   * Close this reader.
+   * TODO: Add this back when we make the ShuffleReader a developer API that others can implement
+   * (at which point this will likely be necessary).
+   */
+  // def stop(): Unit
+}
+</code></pre> 
+  <h3><a id="BlockStoreShuffleReader_144"></a>BlockStoreShuffleReader介绍</h3> 
+  <p>该类实现了ShuffleReader抽象类，其实就只是实现了一个read函数，该函数返回一个迭代器。<br> 该实现类的主要功能是：当其他节点的块存储(block store)请求分区时，将会读取一个shuffle过程中的多个分区，分区的范围是[startPartition，endPartition]。</p> 
+  <h2><a id="_149"></a>总结</h2> 
+  <p>本文讲述了spark2的shuffle框架的实现概要分析。主要分析了spark2中的shuffle框架的实现接口和相关实现类的大概实现逻辑。接下来的文章会对shuffle框架的三个部分的详细实现进行分析。</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

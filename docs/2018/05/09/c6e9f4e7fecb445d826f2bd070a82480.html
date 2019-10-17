@@ -1,0 +1,832 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码深入分析（8）– 以太坊核心BlockChain源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码深入分析（8）– 以太坊核心BlockChain源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="前面几节都在分析以太坊的通信协议，怎么广播，怎么同步，怎么下载。这一节讲讲以太坊的核心模块BlockChain，也就是以太坊的区块链。 一，BlockChain的初始化 Ethereum服务初始化的时候会调用core.SetupGenesisBlock来加载创始区块。顾名思义，创始区块就是以太坊区块链中的第一个区块，number值为0。紧接着调用core.NewBlockChain来加载以太坊的区块链。 func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) { if cacheConfig == nil { cacheConfig = &amp;CacheConfig{ TrieNodeLimit: 256 * 1024 * 1024, TrieTimeLimit: 5 * time.Minute, } } bodyCache, _ := lru.New(bodyCacheLimit) bodyRLPCache, _ := lru.New(bodyCacheLimit) blockCache, _ := lru.New(blockCacheLimit) futureBlocks, _ := lru.New(maxFutureBlocks) badBlocks, _ := lru.New(badBlockLimit) bc := &amp;BlockChain{ chainConfig: chainConfig, cacheConfig: cacheConfig, db: db, triegc: prque.New(), stateCache: state.NewDatabase(db), quit: make(chan struct{}), bodyCache: bodyCache, bodyRLPCache: bodyRLPCache, blockCache: blockCache, futureBlocks: futureBlocks, engine: engine, vmConfig: vmConfig, badBlocks: badBlocks, } bc.SetValidator(NewBlockValidator(chainConfig, bc, engine)) bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine)) var err error bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.getProcInterrupt) if err != nil { return nil, err } bc.genesisBlock = bc.GetBlockByNumber(0) if bc.genesisBlock == nil { return nil, ErrNoGenesis } if err := bc.loadLastState(); err != nil { return nil, err } // Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain for hash := range BadHashes { if header := bc.GetHeaderByHash(hash); header != nil { // get the canonical block corresponding to the offending header&#39;s number headerByNumber := bc.GetHeaderByNumber(header.Number.Uint64()) // make sure the headerByNumber (if present) is in our current canonical chain if headerByNumber != nil &amp;&amp; headerByNumber.Hash() == header.Hash() { log.Error(&quot;Found bad hash, rewinding chain&quot;, &quot;number&quot;, header.Number, &quot;hash&quot;, header.ParentHash) bc.SetHead(header.Number.Uint64() - 1) log.Error(&quot;Chain rewind was successful, resuming normal operation&quot;) } } } // Take ownership of this particular state go bc.update() return bc, nil }初始化方法做了这么几件事： 1，创建各种lru缓存(最近最少使用的算法) 2，初始化triegc（用于垃圾回收的区块number 对应的优先级队列），初始化stateDb，NewBlockValidator()初始化区块和状态验证器，NewStateProcessor()初始化区块状态处理器 3，NewHeaderChain()初始化区块头部链 4，bc.genesisBlock = bc.GetBlockByNumber(0) &nbsp;拿到第0个区块，也就是创世区块 5，bc.loadLastState() 加载最新的状态数据 6，查找本地区块链上时候有硬分叉的区块，如果有调用bc.SetHead回到硬分叉之前的区块头 7，go bc.update() 定时处理future block 二，看看bc.loadLastState()方法 func (bc *BlockChain) loadLastState() error { // Restore the last known head block head := GetHeadBlockHash(bc.db) if head == (common.Hash{}) { // Corrupt or empty database, init from scratch log.Warn(&quot;Empty database, resetting chain&quot;) return bc.Reset() } // Make sure the entire head block is available currentBlock := bc.GetBlockByHash(head) if currentBlock == nil { // Corrupt or empty database, init from scratch log.Warn(&quot;Head block missing, resetting chain&quot;, &quot;hash&quot;, head) return bc.Reset() } // Make sure the state associated with the block is available if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Dangling block without a state associated, init from scratch log.Warn(&quot;Head state missing, repairing chain&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash()) if err := bc.repair(¤tBlock); err != nil { return err } } // Everything seems to be fine, set as the head block bc.currentBlock.Store(currentBlock) // Restore the last known head header currentHeader := currentBlock.Header() if head := GetHeadHeaderHash(bc.db); head != (common.Hash{}) { if header := bc.GetHeaderByHash(head); header != nil { currentHeader = header } } bc.hc.SetCurrentHeader(currentHeader) // Restore the last known head fast block bc.currentFastBlock.Store(currentBlock) if head := GetHeadFastBlockHash(bc.db); head != (common.Hash{}) { if block := bc.GetBlockByHash(head); block != nil { bc.currentFastBlock.Store(block) } } // Issue a status log for the user currentFastBlock := bc.CurrentFastBlock() headerTd := bc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64()) blockTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) fastTd := bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()) log.Info(&quot;Loaded most recent local header&quot;, &quot;number&quot;, currentHeader.Number, &quot;hash&quot;, currentHeader.Hash(), &quot;td&quot;, headerTd) log.Info(&quot;Loaded most recent local full block&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash(), &quot;td&quot;, blockTd) log.Info(&quot;Loaded most recent local fast block&quot;, &quot;number&quot;, currentFastBlock.Number(), &quot;hash&quot;, currentFastBlock.Hash(), &quot;td&quot;, fastTd) return nil }1，获取到最新区块以及它的hash 2，从stateDb中打开最新区块的状态trie，如果打开失败调用bc.repair(&amp;currentBlock)方法进行修复。修复方法就是从当前区块一个个的往前面找，直到找到好的区块，然后赋值给currentBlock。 3，获取到最新的区块头 4，找到最新的fast模式下的block，并设置bc.currentFastBlock 三，再看看用来回滚区块的bc.SetHead()方法 func (bc *BlockChain) SetHead(head uint64) error { log.Warn(&quot;Rewinding blockchain&quot;, &quot;target&quot;, head) bc.mu.Lock() defer bc.mu.Unlock() // Rewind the header chain, deleting all block bodies until then delFn := func(hash common.Hash, num uint64) { DeleteBody(bc.db, hash, num) } bc.hc.SetHead(head, delFn) currentHeader := bc.hc.CurrentHeader() // Clear out any stale content from the caches bc.bodyCache.Purge() bc.bodyRLPCache.Purge() bc.blockCache.Purge() bc.futureBlocks.Purge() // Rewind the block chain, ensuring we don&#39;t end up with a stateless head block if currentBlock := bc.CurrentBlock(); currentBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentBlock.NumberU64() { bc.currentBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } if currentBlock := bc.CurrentBlock(); currentBlock != nil { if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Rewound state missing, rolled back to before pivot, reset to genesis bc.currentBlock.Store(bc.genesisBlock) } } // Rewind the fast block in a simpleton way to the target head if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentFastBlock.NumberU64() { bc.currentFastBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } // If either blocks reached nil, reset to the genesis state if currentBlock := bc.CurrentBlock(); currentBlock == nil { bc.currentBlock.Store(bc.genesisBlock) } if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock == nil { bc.currentFastBlock.Store(bc.genesisBlock) } currentBlock := bc.CurrentBlock() currentFastBlock := bc.CurrentFastBlock() if err := WriteHeadBlockHash(bc.db, currentBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head full block&quot;, &quot;err&quot;, err) } if err := WriteHeadFastBlockHash(bc.db, currentFastBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head fast block&quot;, &quot;err&quot;, err) } return bc.loadLastState() }1，首先调用bc.hc.SetHead(head, delFn)，回滚head对应的区块头。并清除中间区块头所有的数据和缓存。设置head为新的currentHeadr。 2，重新设置bc.currentBlock，bc.currentFastBlock 3，调用bc.loadLastState()，重新加载状态 四，之前分析Downloader和Fetcher的时候，在同步完区块后会调用InsertChain方法插入到本地BlockChain中。我们看看InsertChain怎么工作的 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) { n, events, logs, err := bc.insertChain(chain) bc.PostChainEvents(events, logs) return n, err } 调用bc.insertChain(chain)，并将插入的结果广播给订阅了blockChain事件的对象。 func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(chain); i++ { if chain[i].NumberU64() != chain[i-1].NumberU64()+1 || chain[i].ParentHash() != chain[i-1].Hash() { // Chain broke ancestry, log a messge (programming error) and skip insertion log.Error(&quot;Non contiguous block insert&quot;, &quot;number&quot;, chain[i].Number(), &quot;hash&quot;, chain[i].Hash(), &quot;parent&quot;, chain[i].ParentHash(), &quot;prevnumber&quot;, chain[i-1].Number(), &quot;prevhash&quot;, chain[i-1].Hash()) return 0, nil, nil, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, chain[i-1].NumberU64(), chain[i-1].Hash().Bytes()[:4], i, chain[i].NumberU64(), chain[i].Hash().Bytes()[:4], chain[i].ParentHash().Bytes()[:4]) } } // Pre-checks passed, start the full block imports bc.wg.Add(1) defer bc.wg.Done() bc.chainmu.Lock() defer bc.chainmu.Unlock() // A queued approach to delivering events. This is generally // faster than direct delivery and requires much less mutex // acquiring. var ( stats = insertStats{startTime: mclock.Now()} events = make([]interface{}, 0, len(chain)) lastCanon *types.Block coalescedLogs []*types.Log ) // Start the parallel header verifier headers := make([]*types.Header, len(chain)) seals := make([]bool, len(chain)) for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) defer close(abort) // Iterate over the blocks and insert when the verifier permits for i, block := range chain { // If the chain is terminating, stop processing blocks if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { log.Debug(&quot;Premature abort during blocks processing&quot;) break } // If the header is a banned one, straight out abort if BadHashes[block.Hash()] { bc.reportBlock(block, nil, ErrBlacklistedHash) return i, events, coalescedLogs, ErrBlacklistedHash } // Wait for the block&#39;s verification to complete bstart := time.Now() err := &lt;-results if err == nil { err = bc.Validator().ValidateBody(block) } switch { case err == ErrKnownBlock: // Block and state both already known. However if the current block is below // this number we did a rollback and we should reimport it nonetheless. if bc.CurrentBlock().NumberU64() &gt;= block.NumberU64() { stats.ignored++ continue } case err == consensus.ErrFutureBlock: // Allow up to MaxFuture second in the future blocks. If this limit is exceeded // the chain is discarded and processed at a later time if given. max := big.NewInt(time.Now().Unix() + maxTimeFutureBlocks) if block.Time().Cmp(max) &gt; 0 { return i, events, coalescedLogs, fmt.Errorf(&quot;future block: %v &gt; %v&quot;, block.Time(), max) } bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrUnknownAncestor &amp;&amp; bc.futureBlocks.Contains(block.ParentHash()): bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrPrunedAncestor: // Block competing with the canonical chain, store in the db, but don&#39;t process // until the competitor TD goes above the canonical TD currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty()) if localTd.Cmp(externTd) &gt; 0 { if err = bc.WriteBlockWithoutState(block, externTd); err != nil { return i, events, coalescedLogs, err } continue } // Competitor chain beat canonical, gather all blocks from the common ancestor var winner []*types.Block parent := bc.GetBlock(block.ParentHash(), block.NumberU64()-1) for !bc.HasState(parent.Root()) { winner = append(winner, parent) parent = bc.GetBlock(parent.ParentHash(), parent.NumberU64()-1) } for j := 0; j &lt; len(winner)/2; j++ { winner[j], winner[len(winner)-1-j] = winner[len(winner)-1-j], winner[j] } // Import all the pruned blocks to make the state available bc.chainmu.Unlock() _, evs, logs, err := bc.insertChain(winner) bc.chainmu.Lock() events, coalescedLogs = evs, logs if err != nil { return i, events, coalescedLogs, err } case err != nil: bc.reportBlock(block, nil, err) return i, events, coalescedLogs, err } // Create a new statedb using the parent block and report an // error if it fails. var parent *types.Block if i == 0 { parent = bc.GetBlock(block.ParentHash(), block.NumberU64()-1) } else { parent = chain[i-1] } state, err := state.New(parent.Root(), bc.stateCache) if err != nil { return i, events, coalescedLogs, err } // Process block using the parent state as reference point. receipts, logs, usedGas, err := bc.processor.Process(block, state, bc.vmConfig) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } // Validate the state using the default validator err = bc.Validator().ValidateState(block, parent, state, receipts, usedGas) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } proctime := time.Since(bstart) // Write the block to the chain and get the status. status, err := bc.WriteBlockWithState(block, receipts, state) if err != nil { return i, events, coalescedLogs, err } switch status { case CanonStatTy: log.Debug(&quot;Inserted new block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;uncles&quot;, len(block.Uncles()), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart))) coalescedLogs = append(coalescedLogs, logs...) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainEvent{block, block.Hash(), logs}) lastCanon = block // Only count canonical blocks for GC processing time bc.gcproc += proctime case SideStatTy: log.Debug(&quot;Inserted forked block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;diff&quot;, block.Difficulty(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart)), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;uncles&quot;, len(block.Uncles())) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainSideEvent{block}) } stats.processed++ stats.usedGas += usedGas stats.report(chain, i, bc.stateCache.TrieDB().Size()) } // Append a single chain head event if we&#39;ve progressed the chain if lastCanon != nil &amp;&amp; bc.CurrentBlock().Hash() == lastCanon.Hash() { events = append(events, ChainHeadEvent{lastCanon}) } return 0, events, coalescedLogs, nil }1，首先确保插入的blocks是安次序排列的 2，调用共识引擎bc.engine.VerifyHeaders，验证区块链的这些headers。（共识验证是个复杂的事情，在讲共识机制的时候再分析） 3，如果共识验证没有问题，再调用bc.Validator().ValidateBody(block)验证block的Body，这个方法只验证block的叔区块hash和区块交易列表的hash。 4，根据ValidateBody验证结果，如果是还没有插入本地的区块，但是其父区块在bc.futureBlocks就加入bc.futureBlocks。如果父区块是本地区块，但是没有状态，就递归调用bc.insertChain(winner)，直到有状态才插入。 5，获得父区块的状态，调用processor.Process（）处理block的交易数据,并生成收据,日志等信息，产生本区块的状态。Process()方法，执行了Block里面包含的的所有交易，根据交易的过程和结果生成所有交易的收据和日志信息。（fast模式下收据数据是同步过来的，full模式下是本地重现了交易并生成了收据数据） 6，调用bc.Validator().ValidateState，对产生的区块交易收据数据，和消费的gas于收到的block相关数据进行对比验证。对比消费的gas是否一样，对比bloom是否一致，根据收据生成hash是否一致，对比header.root和stateDb的merkle树的根hash是否一致。 7，调用bc.WriteBlockWithState(block, receipts, state)，将block写入到本地的区块链中，并返回status。根据status判断插入的是主链还是side链，如果是主链bc.gcproc需要加上验证花费的时间。 8，返回结果事件和日志信息，用于通知给订阅了区块插入事件的对象 五, &nbsp;再分析一下bc.WriteBlockWithState是怎么工作的： func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (status WriteStatus, err error) { bc.wg.Add(1) defer bc.wg.Done() // Calculate the total difficulty of the block ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1) if ptd == nil { return NonStatTy, consensus.ErrUnknownAncestor } // Make sure no inconsistent state is leaked during insertion bc.mu.Lock() defer bc.mu.Unlock() currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(block.Difficulty(), ptd) // Irrelevant of the canonical status, write the block itself to the database if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil { return NonStatTy, err } // Write other block data using a batch. batch := bc.db.NewBatch() if err := WriteBlock(batch, block); err != nil { return NonStatTy, err } root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number())) if err != nil { return NonStatTy, err } triedb := bc.stateCache.TrieDB() // If we&#39;re running an archive node, always flush if bc.cacheConfig.Disabled { if err := triedb.Commit(root, false); err != nil { return NonStatTy, err } } else { // Full but not archive node, do proper garbage collection triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive bc.triegc.Push(root, -float32(block.NumberU64())) if current := block.NumberU64(); current &gt; triesInMemory { // Find the next state trie we need to commit header := bc.GetHeaderByNumber(current - triesInMemory) chosen := header.Number.Uint64() // Only write to disk if we exceeded our memory allowance *and* also have at // least a given number of tries gapped. var ( size = triedb.Size() limit = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024 ) if size &gt; limit || bc.gcproc &gt; bc.cacheConfig.TrieTimeLimit { // If we&#39;re exceeding limits but haven&#39;t reached a large enough memory gap, // warn the user that the system is becoming unstable. if chosen &lt; lastWrite+triesInMemory { switch { case size &gt;= 2*limit: log.Warn(&quot;State memory usage too high, committing&quot;, &quot;size&quot;, size, &quot;limit&quot;, limit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) case bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit: log.Info(&quot;State in memory for too long, committing&quot;, &quot;time&quot;, bc.gcproc, &quot;allowance&quot;, bc.cacheConfig.TrieTimeLimit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) } } // If optimum or critical limits reached, write to disk if chosen &gt;= lastWrite+triesInMemory || size &gt;= 2*limit || bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit { triedb.Commit(header.Root, true) lastWrite = chosen bc.gcproc = 0 } } // Garbage collect anything below our required write retention for !bc.triegc.Empty() { root, number := bc.triegc.Pop() if uint64(-number) &gt; chosen { bc.triegc.Push(root, number) break } triedb.Dereference(root.(common.Hash), common.Hash{}) } } } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return NonStatTy, err } // If the total difficulty is higher than our known, add it to the canonical chain // Second clause in the if statement reduces the vulnerability to selfish mining. // Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf reorg := externTd.Cmp(localTd) &gt; 0 currentBlock = bc.CurrentBlock() if !reorg &amp;&amp; externTd.Cmp(localTd) == 0 { // Split same-difficulty blocks by number, then at random reorg = block.NumberU64() &lt; currentBlock.NumberU64() || (block.NumberU64() == currentBlock.NumberU64() &amp;&amp; mrand.Float64() &lt; 0.5) } if reorg { // Reorganise the chain if the parent is not the head block if block.ParentHash() != currentBlock.Hash() { if err := bc.reorg(currentBlock, block); err != nil { return NonStatTy, err } } // Write the positional metadata for transaction and receipt lookups if err := WriteTxLookupEntries(batch, block); err != nil { return NonStatTy, err } // Write hash preimages if err := WritePreimages(bc.db, block.NumberU64(), state.Preimages()); err != nil { return NonStatTy, err } status = CanonStatTy } else { status = SideStatTy } if err := batch.Write(); err != nil { return NonStatTy, err } // Set new head. if status == CanonStatTy { bc.insert(block) } bc.futureBlocks.Remove(block.Hash()) return status, nil }1，从数据库中获取到parent的td。加上block 的difficulty，计算新的total difficulty值，并写入数据库。 2，调用WriteBlock(batch, block) 把block的body和header都写到数据库 3，调用state.Commit(bc.chainConfig.IsEIP158(block.Number()))把状态写入数据库并获取到状态root。 4，按规则处理bc.stateCache缓存，并清理垃圾回收器 5，调用WriteBlockReceipts，把收据数据写入数据库 6，如果发现block的父区块不是本地当前最新区块，调用bc.reorg(currentBlock, block)，如果新区块比老区块td高，则把高出来的区块一一insert进blockChain。 7，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。调用WritePreimages，把Preimages写入数据库，Preimages在evm执行sha3指令时产生。 8，如果新的td大于或等于本地td，说明是主链区块，调用bc.insert(block)，更新blockChain的currentBlock，currentHeader，currentFastBolck等信息。如果不是主链区块则不会。 六，在分析Downloader的时候，只有full模式才会调用InsertChain()方法，而fast模式是InsertReceiptChain()方法。我们来看看InsertReceiptChain()方法做了什么，它和InsertChain()方法有什么区别。 func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain []types.Receipts) (int, error) { bc.wg.Add(1) defer bc.wg.Done() // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(blockChain); i++ { if blockChain[i].NumberU64() != blockChain[i-1].NumberU64()+1 || blockChain[i].ParentHash() != blockChain[i-1].Hash() { log.Error(&quot;Non contiguous receipt insert&quot;, &quot;number&quot;, blockChain[i].Number(), &quot;hash&quot;, blockChain[i].Hash(), &quot;parent&quot;, blockChain[i].ParentHash(), &quot;prevnumber&quot;, blockChain[i-1].Number(), &quot;prevhash&quot;, blockChain[i-1].Hash()) return 0, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, blockChain[i-1].NumberU64(), blockChain[i-1].Hash().Bytes()[:4], i, blockChain[i].NumberU64(), blockChain[i].Hash().Bytes()[:4], blockChain[i].ParentHash().Bytes()[:4]) } } var ( stats = struct{ processed, ignored int32 }{} start = time.Now() bytes = 0 batch = bc.db.NewBatch() ) for i, block := range blockChain { receipts := receiptChain[i] // Short circuit insertion if shutting down or processing failed if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { return 0, nil } // Short circuit if the owner header is unknown if !bc.HasHeader(block.Hash(), block.NumberU64()) { return i, fmt.Errorf(&quot;containing header #%d [%x…] unknown&quot;, block.Number(), block.Hash().Bytes()[:4]) } // Skip if the entire data is already known if bc.HasBlock(block.Hash(), block.NumberU64()) { stats.ignored++ continue } // Compute all the non-consensus fields of the receipts SetReceiptsData(bc.chainConfig, block, receipts) // Write all the data out into the database if err := WriteBody(batch, block.Hash(), block.NumberU64(), block.Body()); err != nil { return i, fmt.Errorf(&quot;failed to write block body: %v&quot;, err) } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return i, fmt.Errorf(&quot;failed to write block receipts: %v&quot;, err) } if err := WriteTxLookupEntries(batch, block); err != nil { return i, fmt.Errorf(&quot;failed to write lookup metadata: %v&quot;, err) } stats.processed++ if batch.ValueSize() &gt;= ethdb.IdealBatchSize { if err := batch.Write(); err != nil { return 0, err } bytes += batch.ValueSize() batch.Reset() } } if batch.ValueSize() &gt; 0 { bytes += batch.ValueSize() if err := batch.Write(); err != nil { return 0, err } } // Update the head fast sync block if better bc.mu.Lock() head := blockChain[len(blockChain)-1] if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case currentFastBlock := bc.CurrentFastBlock() if bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()).Cmp(td) &lt; 0 { if err := WriteHeadFastBlockHash(bc.db, head.Hash()); err != nil { log.Crit(&quot;Failed to update head fast block hash&quot;, &quot;err&quot;, err) } bc.currentFastBlock.Store(head) } } bc.mu.Unlock() log.Info(&quot;Imported new block receipts&quot;, &quot;count&quot;, stats.processed, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start)), &quot;number&quot;, head.Number(), &quot;hash&quot;, head.Hash(), &quot;size&quot;, common.StorageSize(bytes), &quot;ignored&quot;, stats.ignored) return 0, nil }1，首先确保插入的blocks是安次序排列的 2，调用SetReceiptsData(bc.chainConfig, block, receipts)把收到的交易收据数据加入到block中 3，调用WriteBody()，把blockbody数据写入数据库 4，调用WriteBlockReceipts()，把收据数据写入数据库 5，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。 6，更新BlockChain的currentFastBlock信息 总结BlockChain模块的代码不多，逻辑也不复杂，不像Downloader和Fetcher 那样一堆goroutine满天飞，很好读。BlockChain模块是以太坊所有数据的大集合，所有数据都在这里汇集，并在这里对数据进行校验，把结果写入数据库。这个模块最重要的是要区分Full模式同步数据处理和Fast模式处理的区别。我们发现Fast模式把最耗时的数据验证和交易回放都跳过了，大大的缩减了同步的时间，同时也节约了计算的能源消耗。 阅读更多 登录后自动展开" />
+<meta property="og:description" content="前面几节都在分析以太坊的通信协议，怎么广播，怎么同步，怎么下载。这一节讲讲以太坊的核心模块BlockChain，也就是以太坊的区块链。 一，BlockChain的初始化 Ethereum服务初始化的时候会调用core.SetupGenesisBlock来加载创始区块。顾名思义，创始区块就是以太坊区块链中的第一个区块，number值为0。紧接着调用core.NewBlockChain来加载以太坊的区块链。 func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) { if cacheConfig == nil { cacheConfig = &amp;CacheConfig{ TrieNodeLimit: 256 * 1024 * 1024, TrieTimeLimit: 5 * time.Minute, } } bodyCache, _ := lru.New(bodyCacheLimit) bodyRLPCache, _ := lru.New(bodyCacheLimit) blockCache, _ := lru.New(blockCacheLimit) futureBlocks, _ := lru.New(maxFutureBlocks) badBlocks, _ := lru.New(badBlockLimit) bc := &amp;BlockChain{ chainConfig: chainConfig, cacheConfig: cacheConfig, db: db, triegc: prque.New(), stateCache: state.NewDatabase(db), quit: make(chan struct{}), bodyCache: bodyCache, bodyRLPCache: bodyRLPCache, blockCache: blockCache, futureBlocks: futureBlocks, engine: engine, vmConfig: vmConfig, badBlocks: badBlocks, } bc.SetValidator(NewBlockValidator(chainConfig, bc, engine)) bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine)) var err error bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.getProcInterrupt) if err != nil { return nil, err } bc.genesisBlock = bc.GetBlockByNumber(0) if bc.genesisBlock == nil { return nil, ErrNoGenesis } if err := bc.loadLastState(); err != nil { return nil, err } // Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain for hash := range BadHashes { if header := bc.GetHeaderByHash(hash); header != nil { // get the canonical block corresponding to the offending header&#39;s number headerByNumber := bc.GetHeaderByNumber(header.Number.Uint64()) // make sure the headerByNumber (if present) is in our current canonical chain if headerByNumber != nil &amp;&amp; headerByNumber.Hash() == header.Hash() { log.Error(&quot;Found bad hash, rewinding chain&quot;, &quot;number&quot;, header.Number, &quot;hash&quot;, header.ParentHash) bc.SetHead(header.Number.Uint64() - 1) log.Error(&quot;Chain rewind was successful, resuming normal operation&quot;) } } } // Take ownership of this particular state go bc.update() return bc, nil }初始化方法做了这么几件事： 1，创建各种lru缓存(最近最少使用的算法) 2，初始化triegc（用于垃圾回收的区块number 对应的优先级队列），初始化stateDb，NewBlockValidator()初始化区块和状态验证器，NewStateProcessor()初始化区块状态处理器 3，NewHeaderChain()初始化区块头部链 4，bc.genesisBlock = bc.GetBlockByNumber(0) &nbsp;拿到第0个区块，也就是创世区块 5，bc.loadLastState() 加载最新的状态数据 6，查找本地区块链上时候有硬分叉的区块，如果有调用bc.SetHead回到硬分叉之前的区块头 7，go bc.update() 定时处理future block 二，看看bc.loadLastState()方法 func (bc *BlockChain) loadLastState() error { // Restore the last known head block head := GetHeadBlockHash(bc.db) if head == (common.Hash{}) { // Corrupt or empty database, init from scratch log.Warn(&quot;Empty database, resetting chain&quot;) return bc.Reset() } // Make sure the entire head block is available currentBlock := bc.GetBlockByHash(head) if currentBlock == nil { // Corrupt or empty database, init from scratch log.Warn(&quot;Head block missing, resetting chain&quot;, &quot;hash&quot;, head) return bc.Reset() } // Make sure the state associated with the block is available if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Dangling block without a state associated, init from scratch log.Warn(&quot;Head state missing, repairing chain&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash()) if err := bc.repair(¤tBlock); err != nil { return err } } // Everything seems to be fine, set as the head block bc.currentBlock.Store(currentBlock) // Restore the last known head header currentHeader := currentBlock.Header() if head := GetHeadHeaderHash(bc.db); head != (common.Hash{}) { if header := bc.GetHeaderByHash(head); header != nil { currentHeader = header } } bc.hc.SetCurrentHeader(currentHeader) // Restore the last known head fast block bc.currentFastBlock.Store(currentBlock) if head := GetHeadFastBlockHash(bc.db); head != (common.Hash{}) { if block := bc.GetBlockByHash(head); block != nil { bc.currentFastBlock.Store(block) } } // Issue a status log for the user currentFastBlock := bc.CurrentFastBlock() headerTd := bc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64()) blockTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) fastTd := bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()) log.Info(&quot;Loaded most recent local header&quot;, &quot;number&quot;, currentHeader.Number, &quot;hash&quot;, currentHeader.Hash(), &quot;td&quot;, headerTd) log.Info(&quot;Loaded most recent local full block&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash(), &quot;td&quot;, blockTd) log.Info(&quot;Loaded most recent local fast block&quot;, &quot;number&quot;, currentFastBlock.Number(), &quot;hash&quot;, currentFastBlock.Hash(), &quot;td&quot;, fastTd) return nil }1，获取到最新区块以及它的hash 2，从stateDb中打开最新区块的状态trie，如果打开失败调用bc.repair(&amp;currentBlock)方法进行修复。修复方法就是从当前区块一个个的往前面找，直到找到好的区块，然后赋值给currentBlock。 3，获取到最新的区块头 4，找到最新的fast模式下的block，并设置bc.currentFastBlock 三，再看看用来回滚区块的bc.SetHead()方法 func (bc *BlockChain) SetHead(head uint64) error { log.Warn(&quot;Rewinding blockchain&quot;, &quot;target&quot;, head) bc.mu.Lock() defer bc.mu.Unlock() // Rewind the header chain, deleting all block bodies until then delFn := func(hash common.Hash, num uint64) { DeleteBody(bc.db, hash, num) } bc.hc.SetHead(head, delFn) currentHeader := bc.hc.CurrentHeader() // Clear out any stale content from the caches bc.bodyCache.Purge() bc.bodyRLPCache.Purge() bc.blockCache.Purge() bc.futureBlocks.Purge() // Rewind the block chain, ensuring we don&#39;t end up with a stateless head block if currentBlock := bc.CurrentBlock(); currentBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentBlock.NumberU64() { bc.currentBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } if currentBlock := bc.CurrentBlock(); currentBlock != nil { if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Rewound state missing, rolled back to before pivot, reset to genesis bc.currentBlock.Store(bc.genesisBlock) } } // Rewind the fast block in a simpleton way to the target head if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentFastBlock.NumberU64() { bc.currentFastBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } // If either blocks reached nil, reset to the genesis state if currentBlock := bc.CurrentBlock(); currentBlock == nil { bc.currentBlock.Store(bc.genesisBlock) } if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock == nil { bc.currentFastBlock.Store(bc.genesisBlock) } currentBlock := bc.CurrentBlock() currentFastBlock := bc.CurrentFastBlock() if err := WriteHeadBlockHash(bc.db, currentBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head full block&quot;, &quot;err&quot;, err) } if err := WriteHeadFastBlockHash(bc.db, currentFastBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head fast block&quot;, &quot;err&quot;, err) } return bc.loadLastState() }1，首先调用bc.hc.SetHead(head, delFn)，回滚head对应的区块头。并清除中间区块头所有的数据和缓存。设置head为新的currentHeadr。 2，重新设置bc.currentBlock，bc.currentFastBlock 3，调用bc.loadLastState()，重新加载状态 四，之前分析Downloader和Fetcher的时候，在同步完区块后会调用InsertChain方法插入到本地BlockChain中。我们看看InsertChain怎么工作的 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) { n, events, logs, err := bc.insertChain(chain) bc.PostChainEvents(events, logs) return n, err } 调用bc.insertChain(chain)，并将插入的结果广播给订阅了blockChain事件的对象。 func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(chain); i++ { if chain[i].NumberU64() != chain[i-1].NumberU64()+1 || chain[i].ParentHash() != chain[i-1].Hash() { // Chain broke ancestry, log a messge (programming error) and skip insertion log.Error(&quot;Non contiguous block insert&quot;, &quot;number&quot;, chain[i].Number(), &quot;hash&quot;, chain[i].Hash(), &quot;parent&quot;, chain[i].ParentHash(), &quot;prevnumber&quot;, chain[i-1].Number(), &quot;prevhash&quot;, chain[i-1].Hash()) return 0, nil, nil, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, chain[i-1].NumberU64(), chain[i-1].Hash().Bytes()[:4], i, chain[i].NumberU64(), chain[i].Hash().Bytes()[:4], chain[i].ParentHash().Bytes()[:4]) } } // Pre-checks passed, start the full block imports bc.wg.Add(1) defer bc.wg.Done() bc.chainmu.Lock() defer bc.chainmu.Unlock() // A queued approach to delivering events. This is generally // faster than direct delivery and requires much less mutex // acquiring. var ( stats = insertStats{startTime: mclock.Now()} events = make([]interface{}, 0, len(chain)) lastCanon *types.Block coalescedLogs []*types.Log ) // Start the parallel header verifier headers := make([]*types.Header, len(chain)) seals := make([]bool, len(chain)) for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) defer close(abort) // Iterate over the blocks and insert when the verifier permits for i, block := range chain { // If the chain is terminating, stop processing blocks if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { log.Debug(&quot;Premature abort during blocks processing&quot;) break } // If the header is a banned one, straight out abort if BadHashes[block.Hash()] { bc.reportBlock(block, nil, ErrBlacklistedHash) return i, events, coalescedLogs, ErrBlacklistedHash } // Wait for the block&#39;s verification to complete bstart := time.Now() err := &lt;-results if err == nil { err = bc.Validator().ValidateBody(block) } switch { case err == ErrKnownBlock: // Block and state both already known. However if the current block is below // this number we did a rollback and we should reimport it nonetheless. if bc.CurrentBlock().NumberU64() &gt;= block.NumberU64() { stats.ignored++ continue } case err == consensus.ErrFutureBlock: // Allow up to MaxFuture second in the future blocks. If this limit is exceeded // the chain is discarded and processed at a later time if given. max := big.NewInt(time.Now().Unix() + maxTimeFutureBlocks) if block.Time().Cmp(max) &gt; 0 { return i, events, coalescedLogs, fmt.Errorf(&quot;future block: %v &gt; %v&quot;, block.Time(), max) } bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrUnknownAncestor &amp;&amp; bc.futureBlocks.Contains(block.ParentHash()): bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrPrunedAncestor: // Block competing with the canonical chain, store in the db, but don&#39;t process // until the competitor TD goes above the canonical TD currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty()) if localTd.Cmp(externTd) &gt; 0 { if err = bc.WriteBlockWithoutState(block, externTd); err != nil { return i, events, coalescedLogs, err } continue } // Competitor chain beat canonical, gather all blocks from the common ancestor var winner []*types.Block parent := bc.GetBlock(block.ParentHash(), block.NumberU64()-1) for !bc.HasState(parent.Root()) { winner = append(winner, parent) parent = bc.GetBlock(parent.ParentHash(), parent.NumberU64()-1) } for j := 0; j &lt; len(winner)/2; j++ { winner[j], winner[len(winner)-1-j] = winner[len(winner)-1-j], winner[j] } // Import all the pruned blocks to make the state available bc.chainmu.Unlock() _, evs, logs, err := bc.insertChain(winner) bc.chainmu.Lock() events, coalescedLogs = evs, logs if err != nil { return i, events, coalescedLogs, err } case err != nil: bc.reportBlock(block, nil, err) return i, events, coalescedLogs, err } // Create a new statedb using the parent block and report an // error if it fails. var parent *types.Block if i == 0 { parent = bc.GetBlock(block.ParentHash(), block.NumberU64()-1) } else { parent = chain[i-1] } state, err := state.New(parent.Root(), bc.stateCache) if err != nil { return i, events, coalescedLogs, err } // Process block using the parent state as reference point. receipts, logs, usedGas, err := bc.processor.Process(block, state, bc.vmConfig) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } // Validate the state using the default validator err = bc.Validator().ValidateState(block, parent, state, receipts, usedGas) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } proctime := time.Since(bstart) // Write the block to the chain and get the status. status, err := bc.WriteBlockWithState(block, receipts, state) if err != nil { return i, events, coalescedLogs, err } switch status { case CanonStatTy: log.Debug(&quot;Inserted new block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;uncles&quot;, len(block.Uncles()), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart))) coalescedLogs = append(coalescedLogs, logs...) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainEvent{block, block.Hash(), logs}) lastCanon = block // Only count canonical blocks for GC processing time bc.gcproc += proctime case SideStatTy: log.Debug(&quot;Inserted forked block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;diff&quot;, block.Difficulty(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart)), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;uncles&quot;, len(block.Uncles())) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainSideEvent{block}) } stats.processed++ stats.usedGas += usedGas stats.report(chain, i, bc.stateCache.TrieDB().Size()) } // Append a single chain head event if we&#39;ve progressed the chain if lastCanon != nil &amp;&amp; bc.CurrentBlock().Hash() == lastCanon.Hash() { events = append(events, ChainHeadEvent{lastCanon}) } return 0, events, coalescedLogs, nil }1，首先确保插入的blocks是安次序排列的 2，调用共识引擎bc.engine.VerifyHeaders，验证区块链的这些headers。（共识验证是个复杂的事情，在讲共识机制的时候再分析） 3，如果共识验证没有问题，再调用bc.Validator().ValidateBody(block)验证block的Body，这个方法只验证block的叔区块hash和区块交易列表的hash。 4，根据ValidateBody验证结果，如果是还没有插入本地的区块，但是其父区块在bc.futureBlocks就加入bc.futureBlocks。如果父区块是本地区块，但是没有状态，就递归调用bc.insertChain(winner)，直到有状态才插入。 5，获得父区块的状态，调用processor.Process（）处理block的交易数据,并生成收据,日志等信息，产生本区块的状态。Process()方法，执行了Block里面包含的的所有交易，根据交易的过程和结果生成所有交易的收据和日志信息。（fast模式下收据数据是同步过来的，full模式下是本地重现了交易并生成了收据数据） 6，调用bc.Validator().ValidateState，对产生的区块交易收据数据，和消费的gas于收到的block相关数据进行对比验证。对比消费的gas是否一样，对比bloom是否一致，根据收据生成hash是否一致，对比header.root和stateDb的merkle树的根hash是否一致。 7，调用bc.WriteBlockWithState(block, receipts, state)，将block写入到本地的区块链中，并返回status。根据status判断插入的是主链还是side链，如果是主链bc.gcproc需要加上验证花费的时间。 8，返回结果事件和日志信息，用于通知给订阅了区块插入事件的对象 五, &nbsp;再分析一下bc.WriteBlockWithState是怎么工作的： func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (status WriteStatus, err error) { bc.wg.Add(1) defer bc.wg.Done() // Calculate the total difficulty of the block ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1) if ptd == nil { return NonStatTy, consensus.ErrUnknownAncestor } // Make sure no inconsistent state is leaked during insertion bc.mu.Lock() defer bc.mu.Unlock() currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(block.Difficulty(), ptd) // Irrelevant of the canonical status, write the block itself to the database if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil { return NonStatTy, err } // Write other block data using a batch. batch := bc.db.NewBatch() if err := WriteBlock(batch, block); err != nil { return NonStatTy, err } root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number())) if err != nil { return NonStatTy, err } triedb := bc.stateCache.TrieDB() // If we&#39;re running an archive node, always flush if bc.cacheConfig.Disabled { if err := triedb.Commit(root, false); err != nil { return NonStatTy, err } } else { // Full but not archive node, do proper garbage collection triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive bc.triegc.Push(root, -float32(block.NumberU64())) if current := block.NumberU64(); current &gt; triesInMemory { // Find the next state trie we need to commit header := bc.GetHeaderByNumber(current - triesInMemory) chosen := header.Number.Uint64() // Only write to disk if we exceeded our memory allowance *and* also have at // least a given number of tries gapped. var ( size = triedb.Size() limit = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024 ) if size &gt; limit || bc.gcproc &gt; bc.cacheConfig.TrieTimeLimit { // If we&#39;re exceeding limits but haven&#39;t reached a large enough memory gap, // warn the user that the system is becoming unstable. if chosen &lt; lastWrite+triesInMemory { switch { case size &gt;= 2*limit: log.Warn(&quot;State memory usage too high, committing&quot;, &quot;size&quot;, size, &quot;limit&quot;, limit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) case bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit: log.Info(&quot;State in memory for too long, committing&quot;, &quot;time&quot;, bc.gcproc, &quot;allowance&quot;, bc.cacheConfig.TrieTimeLimit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) } } // If optimum or critical limits reached, write to disk if chosen &gt;= lastWrite+triesInMemory || size &gt;= 2*limit || bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit { triedb.Commit(header.Root, true) lastWrite = chosen bc.gcproc = 0 } } // Garbage collect anything below our required write retention for !bc.triegc.Empty() { root, number := bc.triegc.Pop() if uint64(-number) &gt; chosen { bc.triegc.Push(root, number) break } triedb.Dereference(root.(common.Hash), common.Hash{}) } } } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return NonStatTy, err } // If the total difficulty is higher than our known, add it to the canonical chain // Second clause in the if statement reduces the vulnerability to selfish mining. // Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf reorg := externTd.Cmp(localTd) &gt; 0 currentBlock = bc.CurrentBlock() if !reorg &amp;&amp; externTd.Cmp(localTd) == 0 { // Split same-difficulty blocks by number, then at random reorg = block.NumberU64() &lt; currentBlock.NumberU64() || (block.NumberU64() == currentBlock.NumberU64() &amp;&amp; mrand.Float64() &lt; 0.5) } if reorg { // Reorganise the chain if the parent is not the head block if block.ParentHash() != currentBlock.Hash() { if err := bc.reorg(currentBlock, block); err != nil { return NonStatTy, err } } // Write the positional metadata for transaction and receipt lookups if err := WriteTxLookupEntries(batch, block); err != nil { return NonStatTy, err } // Write hash preimages if err := WritePreimages(bc.db, block.NumberU64(), state.Preimages()); err != nil { return NonStatTy, err } status = CanonStatTy } else { status = SideStatTy } if err := batch.Write(); err != nil { return NonStatTy, err } // Set new head. if status == CanonStatTy { bc.insert(block) } bc.futureBlocks.Remove(block.Hash()) return status, nil }1，从数据库中获取到parent的td。加上block 的difficulty，计算新的total difficulty值，并写入数据库。 2，调用WriteBlock(batch, block) 把block的body和header都写到数据库 3，调用state.Commit(bc.chainConfig.IsEIP158(block.Number()))把状态写入数据库并获取到状态root。 4，按规则处理bc.stateCache缓存，并清理垃圾回收器 5，调用WriteBlockReceipts，把收据数据写入数据库 6，如果发现block的父区块不是本地当前最新区块，调用bc.reorg(currentBlock, block)，如果新区块比老区块td高，则把高出来的区块一一insert进blockChain。 7，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。调用WritePreimages，把Preimages写入数据库，Preimages在evm执行sha3指令时产生。 8，如果新的td大于或等于本地td，说明是主链区块，调用bc.insert(block)，更新blockChain的currentBlock，currentHeader，currentFastBolck等信息。如果不是主链区块则不会。 六，在分析Downloader的时候，只有full模式才会调用InsertChain()方法，而fast模式是InsertReceiptChain()方法。我们来看看InsertReceiptChain()方法做了什么，它和InsertChain()方法有什么区别。 func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain []types.Receipts) (int, error) { bc.wg.Add(1) defer bc.wg.Done() // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(blockChain); i++ { if blockChain[i].NumberU64() != blockChain[i-1].NumberU64()+1 || blockChain[i].ParentHash() != blockChain[i-1].Hash() { log.Error(&quot;Non contiguous receipt insert&quot;, &quot;number&quot;, blockChain[i].Number(), &quot;hash&quot;, blockChain[i].Hash(), &quot;parent&quot;, blockChain[i].ParentHash(), &quot;prevnumber&quot;, blockChain[i-1].Number(), &quot;prevhash&quot;, blockChain[i-1].Hash()) return 0, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, blockChain[i-1].NumberU64(), blockChain[i-1].Hash().Bytes()[:4], i, blockChain[i].NumberU64(), blockChain[i].Hash().Bytes()[:4], blockChain[i].ParentHash().Bytes()[:4]) } } var ( stats = struct{ processed, ignored int32 }{} start = time.Now() bytes = 0 batch = bc.db.NewBatch() ) for i, block := range blockChain { receipts := receiptChain[i] // Short circuit insertion if shutting down or processing failed if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { return 0, nil } // Short circuit if the owner header is unknown if !bc.HasHeader(block.Hash(), block.NumberU64()) { return i, fmt.Errorf(&quot;containing header #%d [%x…] unknown&quot;, block.Number(), block.Hash().Bytes()[:4]) } // Skip if the entire data is already known if bc.HasBlock(block.Hash(), block.NumberU64()) { stats.ignored++ continue } // Compute all the non-consensus fields of the receipts SetReceiptsData(bc.chainConfig, block, receipts) // Write all the data out into the database if err := WriteBody(batch, block.Hash(), block.NumberU64(), block.Body()); err != nil { return i, fmt.Errorf(&quot;failed to write block body: %v&quot;, err) } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return i, fmt.Errorf(&quot;failed to write block receipts: %v&quot;, err) } if err := WriteTxLookupEntries(batch, block); err != nil { return i, fmt.Errorf(&quot;failed to write lookup metadata: %v&quot;, err) } stats.processed++ if batch.ValueSize() &gt;= ethdb.IdealBatchSize { if err := batch.Write(); err != nil { return 0, err } bytes += batch.ValueSize() batch.Reset() } } if batch.ValueSize() &gt; 0 { bytes += batch.ValueSize() if err := batch.Write(); err != nil { return 0, err } } // Update the head fast sync block if better bc.mu.Lock() head := blockChain[len(blockChain)-1] if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case currentFastBlock := bc.CurrentFastBlock() if bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()).Cmp(td) &lt; 0 { if err := WriteHeadFastBlockHash(bc.db, head.Hash()); err != nil { log.Crit(&quot;Failed to update head fast block hash&quot;, &quot;err&quot;, err) } bc.currentFastBlock.Store(head) } } bc.mu.Unlock() log.Info(&quot;Imported new block receipts&quot;, &quot;count&quot;, stats.processed, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start)), &quot;number&quot;, head.Number(), &quot;hash&quot;, head.Hash(), &quot;size&quot;, common.StorageSize(bytes), &quot;ignored&quot;, stats.ignored) return 0, nil }1，首先确保插入的blocks是安次序排列的 2，调用SetReceiptsData(bc.chainConfig, block, receipts)把收到的交易收据数据加入到block中 3，调用WriteBody()，把blockbody数据写入数据库 4，调用WriteBlockReceipts()，把收据数据写入数据库 5，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。 6，更新BlockChain的currentFastBlock信息 总结BlockChain模块的代码不多，逻辑也不复杂，不像Downloader和Fetcher 那样一堆goroutine满天飞，很好读。BlockChain模块是以太坊所有数据的大集合，所有数据都在这里汇集，并在这里对数据进行校验，把结果写入数据库。这个模块最重要的是要区分Full模式同步数据处理和Fast模式处理的区别。我们发现Fast模式把最耗时的数据验证和交易回放都跳过了，大大的缩减了同步的时间，同时也节约了计算的能源消耗。 阅读更多 登录后自动展开" />
+<link rel="canonical" href="https://uzzz.org/2018/05/09/c6e9f4e7fecb445d826f2bd070a82480.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/09/c6e9f4e7fecb445d826f2bd070a82480.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-09T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"前面几节都在分析以太坊的通信协议，怎么广播，怎么同步，怎么下载。这一节讲讲以太坊的核心模块BlockChain，也就是以太坊的区块链。 一，BlockChain的初始化 Ethereum服务初始化的时候会调用core.SetupGenesisBlock来加载创始区块。顾名思义，创始区块就是以太坊区块链中的第一个区块，number值为0。紧接着调用core.NewBlockChain来加载以太坊的区块链。 func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) { if cacheConfig == nil { cacheConfig = &amp;CacheConfig{ TrieNodeLimit: 256 * 1024 * 1024, TrieTimeLimit: 5 * time.Minute, } } bodyCache, _ := lru.New(bodyCacheLimit) bodyRLPCache, _ := lru.New(bodyCacheLimit) blockCache, _ := lru.New(blockCacheLimit) futureBlocks, _ := lru.New(maxFutureBlocks) badBlocks, _ := lru.New(badBlockLimit) bc := &amp;BlockChain{ chainConfig: chainConfig, cacheConfig: cacheConfig, db: db, triegc: prque.New(), stateCache: state.NewDatabase(db), quit: make(chan struct{}), bodyCache: bodyCache, bodyRLPCache: bodyRLPCache, blockCache: blockCache, futureBlocks: futureBlocks, engine: engine, vmConfig: vmConfig, badBlocks: badBlocks, } bc.SetValidator(NewBlockValidator(chainConfig, bc, engine)) bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine)) var err error bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.getProcInterrupt) if err != nil { return nil, err } bc.genesisBlock = bc.GetBlockByNumber(0) if bc.genesisBlock == nil { return nil, ErrNoGenesis } if err := bc.loadLastState(); err != nil { return nil, err } // Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain for hash := range BadHashes { if header := bc.GetHeaderByHash(hash); header != nil { // get the canonical block corresponding to the offending header&#39;s number headerByNumber := bc.GetHeaderByNumber(header.Number.Uint64()) // make sure the headerByNumber (if present) is in our current canonical chain if headerByNumber != nil &amp;&amp; headerByNumber.Hash() == header.Hash() { log.Error(&quot;Found bad hash, rewinding chain&quot;, &quot;number&quot;, header.Number, &quot;hash&quot;, header.ParentHash) bc.SetHead(header.Number.Uint64() - 1) log.Error(&quot;Chain rewind was successful, resuming normal operation&quot;) } } } // Take ownership of this particular state go bc.update() return bc, nil }初始化方法做了这么几件事： 1，创建各种lru缓存(最近最少使用的算法) 2，初始化triegc（用于垃圾回收的区块number 对应的优先级队列），初始化stateDb，NewBlockValidator()初始化区块和状态验证器，NewStateProcessor()初始化区块状态处理器 3，NewHeaderChain()初始化区块头部链 4，bc.genesisBlock = bc.GetBlockByNumber(0) &nbsp;拿到第0个区块，也就是创世区块 5，bc.loadLastState() 加载最新的状态数据 6，查找本地区块链上时候有硬分叉的区块，如果有调用bc.SetHead回到硬分叉之前的区块头 7，go bc.update() 定时处理future block 二，看看bc.loadLastState()方法 func (bc *BlockChain) loadLastState() error { // Restore the last known head block head := GetHeadBlockHash(bc.db) if head == (common.Hash{}) { // Corrupt or empty database, init from scratch log.Warn(&quot;Empty database, resetting chain&quot;) return bc.Reset() } // Make sure the entire head block is available currentBlock := bc.GetBlockByHash(head) if currentBlock == nil { // Corrupt or empty database, init from scratch log.Warn(&quot;Head block missing, resetting chain&quot;, &quot;hash&quot;, head) return bc.Reset() } // Make sure the state associated with the block is available if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Dangling block without a state associated, init from scratch log.Warn(&quot;Head state missing, repairing chain&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash()) if err := bc.repair(¤tBlock); err != nil { return err } } // Everything seems to be fine, set as the head block bc.currentBlock.Store(currentBlock) // Restore the last known head header currentHeader := currentBlock.Header() if head := GetHeadHeaderHash(bc.db); head != (common.Hash{}) { if header := bc.GetHeaderByHash(head); header != nil { currentHeader = header } } bc.hc.SetCurrentHeader(currentHeader) // Restore the last known head fast block bc.currentFastBlock.Store(currentBlock) if head := GetHeadFastBlockHash(bc.db); head != (common.Hash{}) { if block := bc.GetBlockByHash(head); block != nil { bc.currentFastBlock.Store(block) } } // Issue a status log for the user currentFastBlock := bc.CurrentFastBlock() headerTd := bc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64()) blockTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) fastTd := bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()) log.Info(&quot;Loaded most recent local header&quot;, &quot;number&quot;, currentHeader.Number, &quot;hash&quot;, currentHeader.Hash(), &quot;td&quot;, headerTd) log.Info(&quot;Loaded most recent local full block&quot;, &quot;number&quot;, currentBlock.Number(), &quot;hash&quot;, currentBlock.Hash(), &quot;td&quot;, blockTd) log.Info(&quot;Loaded most recent local fast block&quot;, &quot;number&quot;, currentFastBlock.Number(), &quot;hash&quot;, currentFastBlock.Hash(), &quot;td&quot;, fastTd) return nil }1，获取到最新区块以及它的hash 2，从stateDb中打开最新区块的状态trie，如果打开失败调用bc.repair(&amp;currentBlock)方法进行修复。修复方法就是从当前区块一个个的往前面找，直到找到好的区块，然后赋值给currentBlock。 3，获取到最新的区块头 4，找到最新的fast模式下的block，并设置bc.currentFastBlock 三，再看看用来回滚区块的bc.SetHead()方法 func (bc *BlockChain) SetHead(head uint64) error { log.Warn(&quot;Rewinding blockchain&quot;, &quot;target&quot;, head) bc.mu.Lock() defer bc.mu.Unlock() // Rewind the header chain, deleting all block bodies until then delFn := func(hash common.Hash, num uint64) { DeleteBody(bc.db, hash, num) } bc.hc.SetHead(head, delFn) currentHeader := bc.hc.CurrentHeader() // Clear out any stale content from the caches bc.bodyCache.Purge() bc.bodyRLPCache.Purge() bc.blockCache.Purge() bc.futureBlocks.Purge() // Rewind the block chain, ensuring we don&#39;t end up with a stateless head block if currentBlock := bc.CurrentBlock(); currentBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentBlock.NumberU64() { bc.currentBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } if currentBlock := bc.CurrentBlock(); currentBlock != nil { if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil { // Rewound state missing, rolled back to before pivot, reset to genesis bc.currentBlock.Store(bc.genesisBlock) } } // Rewind the fast block in a simpleton way to the target head if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentFastBlock.NumberU64() { bc.currentFastBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64())) } // If either blocks reached nil, reset to the genesis state if currentBlock := bc.CurrentBlock(); currentBlock == nil { bc.currentBlock.Store(bc.genesisBlock) } if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock == nil { bc.currentFastBlock.Store(bc.genesisBlock) } currentBlock := bc.CurrentBlock() currentFastBlock := bc.CurrentFastBlock() if err := WriteHeadBlockHash(bc.db, currentBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head full block&quot;, &quot;err&quot;, err) } if err := WriteHeadFastBlockHash(bc.db, currentFastBlock.Hash()); err != nil { log.Crit(&quot;Failed to reset head fast block&quot;, &quot;err&quot;, err) } return bc.loadLastState() }1，首先调用bc.hc.SetHead(head, delFn)，回滚head对应的区块头。并清除中间区块头所有的数据和缓存。设置head为新的currentHeadr。 2，重新设置bc.currentBlock，bc.currentFastBlock 3，调用bc.loadLastState()，重新加载状态 四，之前分析Downloader和Fetcher的时候，在同步完区块后会调用InsertChain方法插入到本地BlockChain中。我们看看InsertChain怎么工作的 func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) { n, events, logs, err := bc.insertChain(chain) bc.PostChainEvents(events, logs) return n, err } 调用bc.insertChain(chain)，并将插入的结果广播给订阅了blockChain事件的对象。 func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) { // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(chain); i++ { if chain[i].NumberU64() != chain[i-1].NumberU64()+1 || chain[i].ParentHash() != chain[i-1].Hash() { // Chain broke ancestry, log a messge (programming error) and skip insertion log.Error(&quot;Non contiguous block insert&quot;, &quot;number&quot;, chain[i].Number(), &quot;hash&quot;, chain[i].Hash(), &quot;parent&quot;, chain[i].ParentHash(), &quot;prevnumber&quot;, chain[i-1].Number(), &quot;prevhash&quot;, chain[i-1].Hash()) return 0, nil, nil, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, chain[i-1].NumberU64(), chain[i-1].Hash().Bytes()[:4], i, chain[i].NumberU64(), chain[i].Hash().Bytes()[:4], chain[i].ParentHash().Bytes()[:4]) } } // Pre-checks passed, start the full block imports bc.wg.Add(1) defer bc.wg.Done() bc.chainmu.Lock() defer bc.chainmu.Unlock() // A queued approach to delivering events. This is generally // faster than direct delivery and requires much less mutex // acquiring. var ( stats = insertStats{startTime: mclock.Now()} events = make([]interface{}, 0, len(chain)) lastCanon *types.Block coalescedLogs []*types.Log ) // Start the parallel header verifier headers := make([]*types.Header, len(chain)) seals := make([]bool, len(chain)) for i, block := range chain { headers[i] = block.Header() seals[i] = true } abort, results := bc.engine.VerifyHeaders(bc, headers, seals) defer close(abort) // Iterate over the blocks and insert when the verifier permits for i, block := range chain { // If the chain is terminating, stop processing blocks if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { log.Debug(&quot;Premature abort during blocks processing&quot;) break } // If the header is a banned one, straight out abort if BadHashes[block.Hash()] { bc.reportBlock(block, nil, ErrBlacklistedHash) return i, events, coalescedLogs, ErrBlacklistedHash } // Wait for the block&#39;s verification to complete bstart := time.Now() err := &lt;-results if err == nil { err = bc.Validator().ValidateBody(block) } switch { case err == ErrKnownBlock: // Block and state both already known. However if the current block is below // this number we did a rollback and we should reimport it nonetheless. if bc.CurrentBlock().NumberU64() &gt;= block.NumberU64() { stats.ignored++ continue } case err == consensus.ErrFutureBlock: // Allow up to MaxFuture second in the future blocks. If this limit is exceeded // the chain is discarded and processed at a later time if given. max := big.NewInt(time.Now().Unix() + maxTimeFutureBlocks) if block.Time().Cmp(max) &gt; 0 { return i, events, coalescedLogs, fmt.Errorf(&quot;future block: %v &gt; %v&quot;, block.Time(), max) } bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrUnknownAncestor &amp;&amp; bc.futureBlocks.Contains(block.ParentHash()): bc.futureBlocks.Add(block.Hash(), block) stats.queued++ continue case err == consensus.ErrPrunedAncestor: // Block competing with the canonical chain, store in the db, but don&#39;t process // until the competitor TD goes above the canonical TD currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty()) if localTd.Cmp(externTd) &gt; 0 { if err = bc.WriteBlockWithoutState(block, externTd); err != nil { return i, events, coalescedLogs, err } continue } // Competitor chain beat canonical, gather all blocks from the common ancestor var winner []*types.Block parent := bc.GetBlock(block.ParentHash(), block.NumberU64()-1) for !bc.HasState(parent.Root()) { winner = append(winner, parent) parent = bc.GetBlock(parent.ParentHash(), parent.NumberU64()-1) } for j := 0; j &lt; len(winner)/2; j++ { winner[j], winner[len(winner)-1-j] = winner[len(winner)-1-j], winner[j] } // Import all the pruned blocks to make the state available bc.chainmu.Unlock() _, evs, logs, err := bc.insertChain(winner) bc.chainmu.Lock() events, coalescedLogs = evs, logs if err != nil { return i, events, coalescedLogs, err } case err != nil: bc.reportBlock(block, nil, err) return i, events, coalescedLogs, err } // Create a new statedb using the parent block and report an // error if it fails. var parent *types.Block if i == 0 { parent = bc.GetBlock(block.ParentHash(), block.NumberU64()-1) } else { parent = chain[i-1] } state, err := state.New(parent.Root(), bc.stateCache) if err != nil { return i, events, coalescedLogs, err } // Process block using the parent state as reference point. receipts, logs, usedGas, err := bc.processor.Process(block, state, bc.vmConfig) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } // Validate the state using the default validator err = bc.Validator().ValidateState(block, parent, state, receipts, usedGas) if err != nil { bc.reportBlock(block, receipts, err) return i, events, coalescedLogs, err } proctime := time.Since(bstart) // Write the block to the chain and get the status. status, err := bc.WriteBlockWithState(block, receipts, state) if err != nil { return i, events, coalescedLogs, err } switch status { case CanonStatTy: log.Debug(&quot;Inserted new block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;uncles&quot;, len(block.Uncles()), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart))) coalescedLogs = append(coalescedLogs, logs...) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainEvent{block, block.Hash(), logs}) lastCanon = block // Only count canonical blocks for GC processing time bc.gcproc += proctime case SideStatTy: log.Debug(&quot;Inserted forked block&quot;, &quot;number&quot;, block.Number(), &quot;hash&quot;, block.Hash(), &quot;diff&quot;, block.Difficulty(), &quot;elapsed&quot;, common.PrettyDuration(time.Since(bstart)), &quot;txs&quot;, len(block.Transactions()), &quot;gas&quot;, block.GasUsed(), &quot;uncles&quot;, len(block.Uncles())) blockInsertTimer.UpdateSince(bstart) events = append(events, ChainSideEvent{block}) } stats.processed++ stats.usedGas += usedGas stats.report(chain, i, bc.stateCache.TrieDB().Size()) } // Append a single chain head event if we&#39;ve progressed the chain if lastCanon != nil &amp;&amp; bc.CurrentBlock().Hash() == lastCanon.Hash() { events = append(events, ChainHeadEvent{lastCanon}) } return 0, events, coalescedLogs, nil }1，首先确保插入的blocks是安次序排列的 2，调用共识引擎bc.engine.VerifyHeaders，验证区块链的这些headers。（共识验证是个复杂的事情，在讲共识机制的时候再分析） 3，如果共识验证没有问题，再调用bc.Validator().ValidateBody(block)验证block的Body，这个方法只验证block的叔区块hash和区块交易列表的hash。 4，根据ValidateBody验证结果，如果是还没有插入本地的区块，但是其父区块在bc.futureBlocks就加入bc.futureBlocks。如果父区块是本地区块，但是没有状态，就递归调用bc.insertChain(winner)，直到有状态才插入。 5，获得父区块的状态，调用processor.Process（）处理block的交易数据,并生成收据,日志等信息，产生本区块的状态。Process()方法，执行了Block里面包含的的所有交易，根据交易的过程和结果生成所有交易的收据和日志信息。（fast模式下收据数据是同步过来的，full模式下是本地重现了交易并生成了收据数据） 6，调用bc.Validator().ValidateState，对产生的区块交易收据数据，和消费的gas于收到的block相关数据进行对比验证。对比消费的gas是否一样，对比bloom是否一致，根据收据生成hash是否一致，对比header.root和stateDb的merkle树的根hash是否一致。 7，调用bc.WriteBlockWithState(block, receipts, state)，将block写入到本地的区块链中，并返回status。根据status判断插入的是主链还是side链，如果是主链bc.gcproc需要加上验证花费的时间。 8，返回结果事件和日志信息，用于通知给订阅了区块插入事件的对象 五, &nbsp;再分析一下bc.WriteBlockWithState是怎么工作的： func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (status WriteStatus, err error) { bc.wg.Add(1) defer bc.wg.Done() // Calculate the total difficulty of the block ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1) if ptd == nil { return NonStatTy, consensus.ErrUnknownAncestor } // Make sure no inconsistent state is leaked during insertion bc.mu.Lock() defer bc.mu.Unlock() currentBlock := bc.CurrentBlock() localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64()) externTd := new(big.Int).Add(block.Difficulty(), ptd) // Irrelevant of the canonical status, write the block itself to the database if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil { return NonStatTy, err } // Write other block data using a batch. batch := bc.db.NewBatch() if err := WriteBlock(batch, block); err != nil { return NonStatTy, err } root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number())) if err != nil { return NonStatTy, err } triedb := bc.stateCache.TrieDB() // If we&#39;re running an archive node, always flush if bc.cacheConfig.Disabled { if err := triedb.Commit(root, false); err != nil { return NonStatTy, err } } else { // Full but not archive node, do proper garbage collection triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive bc.triegc.Push(root, -float32(block.NumberU64())) if current := block.NumberU64(); current &gt; triesInMemory { // Find the next state trie we need to commit header := bc.GetHeaderByNumber(current - triesInMemory) chosen := header.Number.Uint64() // Only write to disk if we exceeded our memory allowance *and* also have at // least a given number of tries gapped. var ( size = triedb.Size() limit = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024 ) if size &gt; limit || bc.gcproc &gt; bc.cacheConfig.TrieTimeLimit { // If we&#39;re exceeding limits but haven&#39;t reached a large enough memory gap, // warn the user that the system is becoming unstable. if chosen &lt; lastWrite+triesInMemory { switch { case size &gt;= 2*limit: log.Warn(&quot;State memory usage too high, committing&quot;, &quot;size&quot;, size, &quot;limit&quot;, limit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) case bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit: log.Info(&quot;State in memory for too long, committing&quot;, &quot;time&quot;, bc.gcproc, &quot;allowance&quot;, bc.cacheConfig.TrieTimeLimit, &quot;optimum&quot;, float64(chosen-lastWrite)/triesInMemory) } } // If optimum or critical limits reached, write to disk if chosen &gt;= lastWrite+triesInMemory || size &gt;= 2*limit || bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit { triedb.Commit(header.Root, true) lastWrite = chosen bc.gcproc = 0 } } // Garbage collect anything below our required write retention for !bc.triegc.Empty() { root, number := bc.triegc.Pop() if uint64(-number) &gt; chosen { bc.triegc.Push(root, number) break } triedb.Dereference(root.(common.Hash), common.Hash{}) } } } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return NonStatTy, err } // If the total difficulty is higher than our known, add it to the canonical chain // Second clause in the if statement reduces the vulnerability to selfish mining. // Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf reorg := externTd.Cmp(localTd) &gt; 0 currentBlock = bc.CurrentBlock() if !reorg &amp;&amp; externTd.Cmp(localTd) == 0 { // Split same-difficulty blocks by number, then at random reorg = block.NumberU64() &lt; currentBlock.NumberU64() || (block.NumberU64() == currentBlock.NumberU64() &amp;&amp; mrand.Float64() &lt; 0.5) } if reorg { // Reorganise the chain if the parent is not the head block if block.ParentHash() != currentBlock.Hash() { if err := bc.reorg(currentBlock, block); err != nil { return NonStatTy, err } } // Write the positional metadata for transaction and receipt lookups if err := WriteTxLookupEntries(batch, block); err != nil { return NonStatTy, err } // Write hash preimages if err := WritePreimages(bc.db, block.NumberU64(), state.Preimages()); err != nil { return NonStatTy, err } status = CanonStatTy } else { status = SideStatTy } if err := batch.Write(); err != nil { return NonStatTy, err } // Set new head. if status == CanonStatTy { bc.insert(block) } bc.futureBlocks.Remove(block.Hash()) return status, nil }1，从数据库中获取到parent的td。加上block 的difficulty，计算新的total difficulty值，并写入数据库。 2，调用WriteBlock(batch, block) 把block的body和header都写到数据库 3，调用state.Commit(bc.chainConfig.IsEIP158(block.Number()))把状态写入数据库并获取到状态root。 4，按规则处理bc.stateCache缓存，并清理垃圾回收器 5，调用WriteBlockReceipts，把收据数据写入数据库 6，如果发现block的父区块不是本地当前最新区块，调用bc.reorg(currentBlock, block)，如果新区块比老区块td高，则把高出来的区块一一insert进blockChain。 7，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。调用WritePreimages，把Preimages写入数据库，Preimages在evm执行sha3指令时产生。 8，如果新的td大于或等于本地td，说明是主链区块，调用bc.insert(block)，更新blockChain的currentBlock，currentHeader，currentFastBolck等信息。如果不是主链区块则不会。 六，在分析Downloader的时候，只有full模式才会调用InsertChain()方法，而fast模式是InsertReceiptChain()方法。我们来看看InsertReceiptChain()方法做了什么，它和InsertChain()方法有什么区别。 func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain []types.Receipts) (int, error) { bc.wg.Add(1) defer bc.wg.Done() // Do a sanity check that the provided chain is actually ordered and linked for i := 1; i &lt; len(blockChain); i++ { if blockChain[i].NumberU64() != blockChain[i-1].NumberU64()+1 || blockChain[i].ParentHash() != blockChain[i-1].Hash() { log.Error(&quot;Non contiguous receipt insert&quot;, &quot;number&quot;, blockChain[i].Number(), &quot;hash&quot;, blockChain[i].Hash(), &quot;parent&quot;, blockChain[i].ParentHash(), &quot;prevnumber&quot;, blockChain[i-1].Number(), &quot;prevhash&quot;, blockChain[i-1].Hash()) return 0, fmt.Errorf(&quot;non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])&quot;, i-1, blockChain[i-1].NumberU64(), blockChain[i-1].Hash().Bytes()[:4], i, blockChain[i].NumberU64(), blockChain[i].Hash().Bytes()[:4], blockChain[i].ParentHash().Bytes()[:4]) } } var ( stats = struct{ processed, ignored int32 }{} start = time.Now() bytes = 0 batch = bc.db.NewBatch() ) for i, block := range blockChain { receipts := receiptChain[i] // Short circuit insertion if shutting down or processing failed if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 { return 0, nil } // Short circuit if the owner header is unknown if !bc.HasHeader(block.Hash(), block.NumberU64()) { return i, fmt.Errorf(&quot;containing header #%d [%x…] unknown&quot;, block.Number(), block.Hash().Bytes()[:4]) } // Skip if the entire data is already known if bc.HasBlock(block.Hash(), block.NumberU64()) { stats.ignored++ continue } // Compute all the non-consensus fields of the receipts SetReceiptsData(bc.chainConfig, block, receipts) // Write all the data out into the database if err := WriteBody(batch, block.Hash(), block.NumberU64(), block.Body()); err != nil { return i, fmt.Errorf(&quot;failed to write block body: %v&quot;, err) } if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil { return i, fmt.Errorf(&quot;failed to write block receipts: %v&quot;, err) } if err := WriteTxLookupEntries(batch, block); err != nil { return i, fmt.Errorf(&quot;failed to write lookup metadata: %v&quot;, err) } stats.processed++ if batch.ValueSize() &gt;= ethdb.IdealBatchSize { if err := batch.Write(); err != nil { return 0, err } bytes += batch.ValueSize() batch.Reset() } } if batch.ValueSize() &gt; 0 { bytes += batch.ValueSize() if err := batch.Write(); err != nil { return 0, err } } // Update the head fast sync block if better bc.mu.Lock() head := blockChain[len(blockChain)-1] if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case currentFastBlock := bc.CurrentFastBlock() if bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()).Cmp(td) &lt; 0 { if err := WriteHeadFastBlockHash(bc.db, head.Hash()); err != nil { log.Crit(&quot;Failed to update head fast block hash&quot;, &quot;err&quot;, err) } bc.currentFastBlock.Store(head) } } bc.mu.Unlock() log.Info(&quot;Imported new block receipts&quot;, &quot;count&quot;, stats.processed, &quot;elapsed&quot;, common.PrettyDuration(time.Since(start)), &quot;number&quot;, head.Number(), &quot;hash&quot;, head.Hash(), &quot;size&quot;, common.StorageSize(bytes), &quot;ignored&quot;, stats.ignored) return 0, nil }1，首先确保插入的blocks是安次序排列的 2，调用SetReceiptsData(bc.chainConfig, block, receipts)把收到的交易收据数据加入到block中 3，调用WriteBody()，把blockbody数据写入数据库 4，调用WriteBlockReceipts()，把收据数据写入数据库 5，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。 6，更新BlockChain的currentFastBlock信息 总结BlockChain模块的代码不多，逻辑也不复杂，不像Downloader和Fetcher 那样一堆goroutine满天飞，很好读。BlockChain模块是以太坊所有数据的大集合，所有数据都在这里汇集，并在这里对数据进行校验，把结果写入数据库。这个模块最重要的是要区分Full模式同步数据处理和Fast模式处理的区别。我们发现Fast模式把最耗时的数据验证和交易回放都跳过了，大大的缩减了同步的时间，同时也节约了计算的能源消耗。 阅读更多 登录后自动展开","@type":"BlogPosting","url":"https://uzzz.org/2018/05/09/c6e9f4e7fecb445d826f2bd070a82480.html","headline":"以太坊源码深入分析（8）– 以太坊核心BlockChain源码分析","dateModified":"2018-05-09T00:00:00+08:00","datePublished":"2018-05-09T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/09/c6e9f4e7fecb445d826f2bd070a82480.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码深入分析（8）-- 以太坊核心BlockChain源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views">
+   前面几节都在分析以太坊的通信协议，怎么广播，怎么同步，怎么下载。这一节讲讲以太坊的核心模块BlockChain，也就是以太坊的区块链。
+  <br>
+  <br>
+  <h4>一，BlockChain的初始化</h4>
+  <p>Ethereum服务初始化的时候会调用core.SetupGenesisBlock来加载创始区块。顾名思义，创始区块就是以太坊区块链中的第一个区块，number值为0。紧接着调用core.NewBlockChain来加载以太坊的区块链。</p>
+  <pre><code class="language-plain">func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config) (*BlockChain, error) {
+	if cacheConfig == nil {
+		cacheConfig = &amp;CacheConfig{
+			TrieNodeLimit: 256 * 1024 * 1024,
+			TrieTimeLimit: 5 * time.Minute,
+		}
+	}
+	bodyCache, _ := lru.New(bodyCacheLimit)
+	bodyRLPCache, _ := lru.New(bodyCacheLimit)
+	blockCache, _ := lru.New(blockCacheLimit)
+	futureBlocks, _ := lru.New(maxFutureBlocks)
+	badBlocks, _ := lru.New(badBlockLimit)
+
+
+	bc := &amp;BlockChain{
+		chainConfig:  chainConfig,
+		cacheConfig:  cacheConfig,
+		db:           db,
+		triegc:       prque.New(),
+		stateCache:   state.NewDatabase(db),
+		quit:         make(chan struct{}),
+		bodyCache:    bodyCache,
+		bodyRLPCache: bodyRLPCache,
+		blockCache:   blockCache,
+		futureBlocks: futureBlocks,
+		engine:       engine,
+		vmConfig:     vmConfig,
+		badBlocks:    badBlocks,
+	}
+	bc.SetValidator(NewBlockValidator(chainConfig, bc, engine))
+	bc.SetProcessor(NewStateProcessor(chainConfig, bc, engine))
+
+
+	var err error
+	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.getProcInterrupt)
+	if err != nil {
+		return nil, err
+	}
+	bc.genesisBlock = bc.GetBlockByNumber(0)
+	if bc.genesisBlock == nil {
+		return nil, ErrNoGenesis
+	}
+	if err := bc.loadLastState(); err != nil {
+		return nil, err
+	}
+	// Check the current state of the block hashes and make sure that we do not have any of the bad blocks in our chain
+	for hash := range BadHashes {
+		if header := bc.GetHeaderByHash(hash); header != nil {
+			// get the canonical block corresponding to the offending header's number
+			headerByNumber := bc.GetHeaderByNumber(header.Number.Uint64())
+			// make sure the headerByNumber (if present) is in our current canonical chain
+			if headerByNumber != nil &amp;&amp; headerByNumber.Hash() == header.Hash() {
+				log.Error("Found bad hash, rewinding chain", "number", header.Number, "hash", header.ParentHash)
+				bc.SetHead(header.Number.Uint64() - 1)
+				log.Error("Chain rewind was successful, resuming normal operation")
+			}
+		}
+	}
+	// Take ownership of this particular state
+	go bc.update()
+	return bc, nil
+}</code></pre>初始化方法做了这么几件事：
+  <br>1，创建各种lru缓存(最近最少使用的算法)
+  <br>2，初始化triegc（用于垃圾回收的区块number 对应的优先级队列），初始化stateDb，NewBlockValidator()初始化区块和状态验证器，NewStateProcessor()初始化区块状态处理器
+  <br>3，NewHeaderChain()初始化区块头部链
+  <br>4，bc.genesisBlock = bc.GetBlockByNumber(0) &nbsp;拿到第0个区块，也就是创世区块
+  <br>5，bc.loadLastState() 加载最新的状态数据
+  <br>6，查找本地区块链上时候有硬分叉的区块，如果有调用bc.SetHead回到硬分叉之前的区块头
+  <br>7，go bc.update() 定时处理future block
+  <br>
+  <p><br></p>
+  <h4>二，看看bc.loadLastState()方法</h4>
+  <pre><code class="language-plain">func (bc *BlockChain) loadLastState() error {
+	// Restore the last known head block
+	head := GetHeadBlockHash(bc.db)
+	if head == (common.Hash{}) {
+		// Corrupt or empty database, init from scratch
+		log.Warn("Empty database, resetting chain")
+		return bc.Reset()
+	}
+	// Make sure the entire head block is available
+	currentBlock := bc.GetBlockByHash(head)
+	if currentBlock == nil {
+		// Corrupt or empty database, init from scratch
+		log.Warn("Head block missing, resetting chain", "hash", head)
+		return bc.Reset()
+	}
+	// Make sure the state associated with the block is available
+	if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil {
+		// Dangling block without a state associated, init from scratch
+		log.Warn("Head state missing, repairing chain", "number", currentBlock.Number(), "hash", currentBlock.Hash())
+		if err := bc.repair(¤tBlock); err != nil {
+			return err
+		}
+	}
+	// Everything seems to be fine, set as the head block
+	bc.currentBlock.Store(currentBlock)
+
+
+	// Restore the last known head header
+	currentHeader := currentBlock.Header()
+	if head := GetHeadHeaderHash(bc.db); head != (common.Hash{}) {
+		if header := bc.GetHeaderByHash(head); header != nil {
+			currentHeader = header
+		}
+	}
+	bc.hc.SetCurrentHeader(currentHeader)
+
+
+	// Restore the last known head fast block
+	bc.currentFastBlock.Store(currentBlock)
+	if head := GetHeadFastBlockHash(bc.db); head != (common.Hash{}) {
+		if block := bc.GetBlockByHash(head); block != nil {
+			bc.currentFastBlock.Store(block)
+		}
+	}
+
+
+	// Issue a status log for the user
+	currentFastBlock := bc.CurrentFastBlock()
+
+
+	headerTd := bc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64())
+	blockTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
+	fastTd := bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64())
+
+
+	log.Info("Loaded most recent local header", "number", currentHeader.Number, "hash", currentHeader.Hash(), "td", headerTd)
+	log.Info("Loaded most recent local full block", "number", currentBlock.Number(), "hash", currentBlock.Hash(), "td", blockTd)
+	log.Info("Loaded most recent local fast block", "number", currentFastBlock.Number(), "hash", currentFastBlock.Hash(), "td", fastTd)
+
+
+	return nil
+}</code></pre>1，获取到最新区块以及它的hash
+  <br>2，从stateDb中打开最新区块的状态trie，如果打开失败调用bc.repair(&amp;currentBlock)方法进行修复。修复方法就是从当前区块一个个的往前面找，直到找到好的区块，然后赋值给currentBlock。
+  <br>3，获取到最新的区块头
+  <br>
+  <p>4，找到最新的fast模式下的block，并设置bc.currentFastBlock</p>
+  <p><br></p>
+  <h4>三，再看看用来回滚区块的bc.SetHead()方法</h4>
+  <pre><code class="language-plain">func (bc *BlockChain) SetHead(head uint64) error {
+	log.Warn("Rewinding blockchain", "target", head)
+
+
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+
+	// Rewind the header chain, deleting all block bodies until then
+	delFn := func(hash common.Hash, num uint64) {
+		DeleteBody(bc.db, hash, num)
+	}
+	bc.hc.SetHead(head, delFn)
+	currentHeader := bc.hc.CurrentHeader()
+
+
+	// Clear out any stale content from the caches
+	bc.bodyCache.Purge()
+	bc.bodyRLPCache.Purge()
+	bc.blockCache.Purge()
+	bc.futureBlocks.Purge()
+
+
+	// Rewind the block chain, ensuring we don't end up with a stateless head block
+	if currentBlock := bc.CurrentBlock(); currentBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentBlock.NumberU64() {
+		bc.currentBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64()))
+	}
+	if currentBlock := bc.CurrentBlock(); currentBlock != nil {
+		if _, err := state.New(currentBlock.Root(), bc.stateCache); err != nil {
+			// Rewound state missing, rolled back to before pivot, reset to genesis
+			bc.currentBlock.Store(bc.genesisBlock)
+		}
+	}
+	// Rewind the fast block in a simpleton way to the target head
+	if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock != nil &amp;&amp; currentHeader.Number.Uint64() &lt; currentFastBlock.NumberU64() {
+		bc.currentFastBlock.Store(bc.GetBlock(currentHeader.Hash(), currentHeader.Number.Uint64()))
+	}
+	// If either blocks reached nil, reset to the genesis state
+	if currentBlock := bc.CurrentBlock(); currentBlock == nil {
+		bc.currentBlock.Store(bc.genesisBlock)
+	}
+	if currentFastBlock := bc.CurrentFastBlock(); currentFastBlock == nil {
+		bc.currentFastBlock.Store(bc.genesisBlock)
+	}
+	currentBlock := bc.CurrentBlock()
+	currentFastBlock := bc.CurrentFastBlock()
+	if err := WriteHeadBlockHash(bc.db, currentBlock.Hash()); err != nil {
+		log.Crit("Failed to reset head full block", "err", err)
+	}
+	if err := WriteHeadFastBlockHash(bc.db, currentFastBlock.Hash()); err != nil {
+		log.Crit("Failed to reset head fast block", "err", err)
+	}
+	return bc.loadLastState()
+}</code></pre>1，首先调用bc.hc.SetHead(head, delFn)，回滚head对应的区块头。并清除中间区块头所有的数据和缓存。设置head为新的currentHeadr。
+  <br>2，重新设置bc.currentBlock，bc.currentFastBlock
+  <br>3，调用bc.loadLastState()，重新加载状态
+  <br>
+  <p><br></p>
+  <h4>四，之前分析Downloader和Fetcher的时候，在同步完区块后会调用InsertChain方法插入到本地BlockChain中。我们看看InsertChain怎么工作的</h4>
+  <pre><code class="language-plain">func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
+	n, events, logs, err := bc.insertChain(chain)
+	bc.PostChainEvents(events, logs)
+	return n, err
+}</code></pre>
+  <p>调用bc.insertChain(chain)，并将插入的结果广播给订阅了blockChain事件的对象。</p>
+  <pre><code class="language-plain">func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*types.Log, error) {
+	// Do a sanity check that the provided chain is actually ordered and linked
+	for i := 1; i &lt; len(chain); i++ {
+		if chain[i].NumberU64() != chain[i-1].NumberU64()+1 || chain[i].ParentHash() != chain[i-1].Hash() {
+			// Chain broke ancestry, log a messge (programming error) and skip insertion
+			log.Error("Non contiguous block insert", "number", chain[i].Number(), "hash", chain[i].Hash(),
+				"parent", chain[i].ParentHash(), "prevnumber", chain[i-1].Number(), "prevhash", chain[i-1].Hash())
+
+
+			return 0, nil, nil, fmt.Errorf("non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])", i-1, chain[i-1].NumberU64(),
+				chain[i-1].Hash().Bytes()[:4], i, chain[i].NumberU64(), chain[i].Hash().Bytes()[:4], chain[i].ParentHash().Bytes()[:4])
+		}
+	}
+	// Pre-checks passed, start the full block imports
+	bc.wg.Add(1)
+	defer bc.wg.Done()
+
+
+	bc.chainmu.Lock()
+	defer bc.chainmu.Unlock()
+
+
+	// A queued approach to delivering events. This is generally
+	// faster than direct delivery and requires much less mutex
+	// acquiring.
+	var (
+		stats         = insertStats{startTime: mclock.Now()}
+		events        = make([]interface{}, 0, len(chain))
+		lastCanon     *types.Block
+		coalescedLogs []*types.Log
+	)
+	// Start the parallel header verifier
+	headers := make([]*types.Header, len(chain))
+	seals := make([]bool, len(chain))
+
+
+	for i, block := range chain {
+		headers[i] = block.Header()
+		seals[i] = true
+	}
+	abort, results := bc.engine.VerifyHeaders(bc, headers, seals)
+	defer close(abort)
+
+
+	// Iterate over the blocks and insert when the verifier permits
+	for i, block := range chain {
+		// If the chain is terminating, stop processing blocks
+		if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 {
+			log.Debug("Premature abort during blocks processing")
+			break
+		}
+		// If the header is a banned one, straight out abort
+		if BadHashes[block.Hash()] {
+			bc.reportBlock(block, nil, ErrBlacklistedHash)
+			return i, events, coalescedLogs, ErrBlacklistedHash
+		}
+		// Wait for the block's verification to complete
+		bstart := time.Now()
+
+
+		err := &lt;-results
+		if err == nil {
+			err = bc.Validator().ValidateBody(block)
+		}
+		switch {
+		case err == ErrKnownBlock:
+			// Block and state both already known. However if the current block is below
+			// this number we did a rollback and we should reimport it nonetheless.
+			if bc.CurrentBlock().NumberU64() &gt;= block.NumberU64() {
+				stats.ignored++
+				continue
+			}
+
+
+		case err == consensus.ErrFutureBlock:
+			// Allow up to MaxFuture second in the future blocks. If this limit is exceeded
+			// the chain is discarded and processed at a later time if given.
+			max := big.NewInt(time.Now().Unix() + maxTimeFutureBlocks)
+			if block.Time().Cmp(max) &gt; 0 {
+				return i, events, coalescedLogs, fmt.Errorf("future block: %v &gt; %v", block.Time(), max)
+			}
+			bc.futureBlocks.Add(block.Hash(), block)
+			stats.queued++
+			continue
+
+
+		case err == consensus.ErrUnknownAncestor &amp;&amp; bc.futureBlocks.Contains(block.ParentHash()):
+			bc.futureBlocks.Add(block.Hash(), block)
+			stats.queued++
+			continue
+
+
+		case err == consensus.ErrPrunedAncestor:
+			// Block competing with the canonical chain, store in the db, but don't process
+			// until the competitor TD goes above the canonical TD
+			currentBlock := bc.CurrentBlock()
+			localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
+			externTd := new(big.Int).Add(bc.GetTd(block.ParentHash(), block.NumberU64()-1), block.Difficulty())
+			if localTd.Cmp(externTd) &gt; 0 {
+				if err = bc.WriteBlockWithoutState(block, externTd); err != nil {
+					return i, events, coalescedLogs, err
+				}
+				continue
+			}
+			// Competitor chain beat canonical, gather all blocks from the common ancestor
+			var winner []*types.Block
+
+
+			parent := bc.GetBlock(block.ParentHash(), block.NumberU64()-1)
+			for !bc.HasState(parent.Root()) {
+				winner = append(winner, parent)
+				parent = bc.GetBlock(parent.ParentHash(), parent.NumberU64()-1)
+			}
+			for j := 0; j &lt; len(winner)/2; j++ {
+				winner[j], winner[len(winner)-1-j] = winner[len(winner)-1-j], winner[j]
+			}
+			// Import all the pruned blocks to make the state available
+			bc.chainmu.Unlock()
+			_, evs, logs, err := bc.insertChain(winner)
+			bc.chainmu.Lock()
+			events, coalescedLogs = evs, logs
+
+
+			if err != nil {
+				return i, events, coalescedLogs, err
+			}
+
+
+		case err != nil:
+			bc.reportBlock(block, nil, err)
+			return i, events, coalescedLogs, err
+		}
+		// Create a new statedb using the parent block and report an
+		// error if it fails.
+		var parent *types.Block
+		if i == 0 {
+			parent = bc.GetBlock(block.ParentHash(), block.NumberU64()-1)
+		} else {
+			parent = chain[i-1]
+		}
+		state, err := state.New(parent.Root(), bc.stateCache)
+		if err != nil {
+			return i, events, coalescedLogs, err
+		}
+		// Process block using the parent state as reference point.
+		receipts, logs, usedGas, err := bc.processor.Process(block, state, bc.vmConfig)
+		if err != nil {
+			bc.reportBlock(block, receipts, err)
+			return i, events, coalescedLogs, err
+		}
+		// Validate the state using the default validator
+		err = bc.Validator().ValidateState(block, parent, state, receipts, usedGas)
+		if err != nil {
+			bc.reportBlock(block, receipts, err)
+			return i, events, coalescedLogs, err
+		}
+		proctime := time.Since(bstart)
+
+
+		// Write the block to the chain and get the status.
+		status, err := bc.WriteBlockWithState(block, receipts, state)
+		if err != nil {
+			return i, events, coalescedLogs, err
+		}
+		switch status {
+		case CanonStatTy:
+			log.Debug("Inserted new block", "number", block.Number(), "hash", block.Hash(), "uncles", len(block.Uncles()),
+				"txs", len(block.Transactions()), "gas", block.GasUsed(), "elapsed", common.PrettyDuration(time.Since(bstart)))
+
+
+			coalescedLogs = append(coalescedLogs, logs...)
+			blockInsertTimer.UpdateSince(bstart)
+			events = append(events, ChainEvent{block, block.Hash(), logs})
+			lastCanon = block
+
+
+			// Only count canonical blocks for GC processing time
+			bc.gcproc += proctime
+
+
+		case SideStatTy:
+			log.Debug("Inserted forked block", "number", block.Number(), "hash", block.Hash(), "diff", block.Difficulty(), "elapsed",
+				common.PrettyDuration(time.Since(bstart)), "txs", len(block.Transactions()), "gas", block.GasUsed(), "uncles", len(block.Uncles()))
+
+
+			blockInsertTimer.UpdateSince(bstart)
+			events = append(events, ChainSideEvent{block})
+		}
+		stats.processed++
+		stats.usedGas += usedGas
+		stats.report(chain, i, bc.stateCache.TrieDB().Size())
+	}
+	// Append a single chain head event if we've progressed the chain
+	if lastCanon != nil &amp;&amp; bc.CurrentBlock().Hash() == lastCanon.Hash() {
+		events = append(events, ChainHeadEvent{lastCanon})
+	}
+	return 0, events, coalescedLogs, nil
+}</code></pre>1，首先确保插入的blocks是安次序排列的
+  <br>2，调用共识引擎bc.engine.VerifyHeaders，验证区块链的这些headers。（共识验证是个复杂的事情，在讲共识机制的时候再分析）
+  <br>3，如果共识验证没有问题，再调用bc.Validator().ValidateBody(block)验证block的Body，这个方法只验证block的叔区块hash和区块交易列表的hash。
+  <br>4，根据ValidateBody验证结果，如果是还没有插入本地的区块，但是其父区块在bc.futureBlocks就加入bc.futureBlocks。如果父区块是本地区块，但是没有状态，就递归调用bc.insertChain(winner)，直到有状态才插入。
+  <br>5，获得父区块的状态，调用processor.Process（）处理block的交易数据,并生成收据,日志等信息，产生本区块的状态。Process()方法，执行了Block里面包含的的所有交易，根据交易的过程和结果生成所有交易的收据和日志信息。（fast模式下收据数据是同步过来的，full模式下是本地重现了交易并生成了收据数据）
+  <br>6，调用bc.Validator().ValidateState，对产生的区块交易收据数据，和消费的gas于收到的block相关数据进行对比验证。对比消费的gas是否一样，对比bloom是否一致，根据收据生成hash是否一致，对比header.root和stateDb的merkle树的根hash是否一致。
+  <br>7，调用bc.WriteBlockWithState(block, receipts, state)，将block写入到本地的区块链中，并返回status。根据status判断插入的是主链还是side链，如果是主链bc.gcproc需要加上验证花费的时间。
+  <br>
+  <p>8，返回结果事件和日志信息，用于通知给订阅了区块插入事件的对象</p>
+  <p><br></p>
+  <h4>五, &nbsp;再分析一下bc.WriteBlockWithState是怎么工作的：</h4>
+  <pre><code class="language-plain">func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) (status WriteStatus, err error) {
+	bc.wg.Add(1)
+	defer bc.wg.Done()
+
+
+	// Calculate the total difficulty of the block
+	ptd := bc.GetTd(block.ParentHash(), block.NumberU64()-1)
+	if ptd == nil {
+		return NonStatTy, consensus.ErrUnknownAncestor
+	}
+	// Make sure no inconsistent state is leaked during insertion
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+
+	currentBlock := bc.CurrentBlock()
+	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
+	externTd := new(big.Int).Add(block.Difficulty(), ptd)
+
+
+	// Irrelevant of the canonical status, write the block itself to the database
+	if err := bc.hc.WriteTd(block.Hash(), block.NumberU64(), externTd); err != nil {
+		return NonStatTy, err
+	}
+	// Write other block data using a batch.
+	batch := bc.db.NewBatch()
+	if err := WriteBlock(batch, block); err != nil {
+		return NonStatTy, err
+	}
+	root, err := state.Commit(bc.chainConfig.IsEIP158(block.Number()))
+	if err != nil {
+		return NonStatTy, err
+	}
+	triedb := bc.stateCache.TrieDB()
+
+
+	// If we're running an archive node, always flush
+	if bc.cacheConfig.Disabled {
+		if err := triedb.Commit(root, false); err != nil {
+			return NonStatTy, err
+		}
+	} else {
+		// Full but not archive node, do proper garbage collection
+		triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive
+		bc.triegc.Push(root, -float32(block.NumberU64()))
+
+
+		if current := block.NumberU64(); current &gt; triesInMemory {
+			// Find the next state trie we need to commit
+			header := bc.GetHeaderByNumber(current - triesInMemory)
+			chosen := header.Number.Uint64()
+
+
+			// Only write to disk if we exceeded our memory allowance *and* also have at
+			// least a given number of tries gapped.
+			var (
+				size  = triedb.Size()
+				limit = common.StorageSize(bc.cacheConfig.TrieNodeLimit) * 1024 * 1024
+			)
+			if size &gt; limit || bc.gcproc &gt; bc.cacheConfig.TrieTimeLimit {
+				// If we're exceeding limits but haven't reached a large enough memory gap,
+				// warn the user that the system is becoming unstable.
+				if chosen &lt; lastWrite+triesInMemory {
+					switch {
+					case size &gt;= 2*limit:
+						log.Warn("State memory usage too high, committing", "size", size, "limit", limit, "optimum", float64(chosen-lastWrite)/triesInMemory)
+					case bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit:
+						log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", bc.cacheConfig.TrieTimeLimit, "optimum", float64(chosen-lastWrite)/triesInMemory)
+					}
+				}
+				// If optimum or critical limits reached, write to disk
+				if chosen &gt;= lastWrite+triesInMemory || size &gt;= 2*limit || bc.gcproc &gt;= 2*bc.cacheConfig.TrieTimeLimit {
+					triedb.Commit(header.Root, true)
+					lastWrite = chosen
+					bc.gcproc = 0
+				}
+			}
+			// Garbage collect anything below our required write retention
+			for !bc.triegc.Empty() {
+				root, number := bc.triegc.Pop()
+				if uint64(-number) &gt; chosen {
+					bc.triegc.Push(root, number)
+					break
+				}
+				triedb.Dereference(root.(common.Hash), common.Hash{})
+			}
+		}
+	}
+	if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil {
+		return NonStatTy, err
+	}
+	// If the total difficulty is higher than our known, add it to the canonical chain
+	// Second clause in the if statement reduces the vulnerability to selfish mining.
+	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
+	reorg := externTd.Cmp(localTd) &gt; 0
+	currentBlock = bc.CurrentBlock()
+	if !reorg &amp;&amp; externTd.Cmp(localTd) == 0 {
+		// Split same-difficulty blocks by number, then at random
+		reorg = block.NumberU64() &lt; currentBlock.NumberU64() || (block.NumberU64() == currentBlock.NumberU64() &amp;&amp; mrand.Float64() &lt; 0.5)
+	}
+	if reorg {
+		// Reorganise the chain if the parent is not the head block
+		if block.ParentHash() != currentBlock.Hash() {
+			if err := bc.reorg(currentBlock, block); err != nil {
+				return NonStatTy, err
+			}
+		}
+		// Write the positional metadata for transaction and receipt lookups
+		if err := WriteTxLookupEntries(batch, block); err != nil {
+			return NonStatTy, err
+		}
+		// Write hash preimages
+		if err := WritePreimages(bc.db, block.NumberU64(), state.Preimages()); err != nil {
+			return NonStatTy, err
+		}
+		status = CanonStatTy
+	} else {
+		status = SideStatTy
+	}
+	if err := batch.Write(); err != nil {
+		return NonStatTy, err
+	}
+
+
+	// Set new head.
+	if status == CanonStatTy {
+		bc.insert(block)
+	}
+	bc.futureBlocks.Remove(block.Hash())
+	return status, nil
+}</code></pre>1，从数据库中获取到parent的td。加上block 的difficulty，计算新的total difficulty值，并写入数据库。
+  <br>2，调用WriteBlock(batch, block) 把block的body和header都写到数据库
+  <br>3，调用state.Commit(bc.chainConfig.IsEIP158(block.Number()))把状态写入数据库并获取到状态root。
+  <br>4，按规则处理bc.stateCache缓存，并清理垃圾回收器
+  <br>5，调用WriteBlockReceipts，把收据数据写入数据库
+  <br>6，如果发现block的父区块不是本地当前最新区块，调用bc.reorg(currentBlock, block)，如果新区块比老区块td高，则把高出来的区块一一insert进blockChain。
+  <br>7，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。调用WritePreimages，把Preimages写入数据库，Preimages在evm执行sha3指令时产生。
+  <br>
+  <p>8，如果新的td大于或等于本地td，说明是主链区块，调用bc.insert(block)，更新blockChain的currentBlock，currentHeader，currentFastBolck等信息。如果不是主链区块则不会。</p>
+  <p><br></p>
+  <h4>六，在分析Downloader的时候，只有full模式才会调用InsertChain()方法，而fast模式是InsertReceiptChain()方法。我们来看看InsertReceiptChain()方法做了什么，它和InsertChain()方法有什么区别。</h4>
+  <pre><code class="language-plain">func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain []types.Receipts) (int, error) {
+	bc.wg.Add(1)
+	defer bc.wg.Done()
+
+
+	// Do a sanity check that the provided chain is actually ordered and linked
+	for i := 1; i &lt; len(blockChain); i++ {
+		if blockChain[i].NumberU64() != blockChain[i-1].NumberU64()+1 || blockChain[i].ParentHash() != blockChain[i-1].Hash() {
+			log.Error("Non contiguous receipt insert", "number", blockChain[i].Number(), "hash", blockChain[i].Hash(), "parent", blockChain[i].ParentHash(),
+				"prevnumber", blockChain[i-1].Number(), "prevhash", blockChain[i-1].Hash())
+			return 0, fmt.Errorf("non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])", i-1, blockChain[i-1].NumberU64(),
+				blockChain[i-1].Hash().Bytes()[:4], i, blockChain[i].NumberU64(), blockChain[i].Hash().Bytes()[:4], blockChain[i].ParentHash().Bytes()[:4])
+		}
+	}
+
+
+	var (
+		stats = struct{ processed, ignored int32 }{}
+		start = time.Now()
+		bytes = 0
+		batch = bc.db.NewBatch()
+	)
+	for i, block := range blockChain {
+		receipts := receiptChain[i]
+		// Short circuit insertion if shutting down or processing failed
+		if atomic.LoadInt32(&amp;bc.procInterrupt) == 1 {
+			return 0, nil
+		}
+		// Short circuit if the owner header is unknown
+		if !bc.HasHeader(block.Hash(), block.NumberU64()) {
+			return i, fmt.Errorf("containing header #%d [%x…] unknown", block.Number(), block.Hash().Bytes()[:4])
+		}
+		// Skip if the entire data is already known
+		if bc.HasBlock(block.Hash(), block.NumberU64()) {
+			stats.ignored++
+			continue
+		}
+		// Compute all the non-consensus fields of the receipts
+		SetReceiptsData(bc.chainConfig, block, receipts)
+		// Write all the data out into the database
+		if err := WriteBody(batch, block.Hash(), block.NumberU64(), block.Body()); err != nil {
+			return i, fmt.Errorf("failed to write block body: %v", err)
+		}
+		if err := WriteBlockReceipts(batch, block.Hash(), block.NumberU64(), receipts); err != nil {
+			return i, fmt.Errorf("failed to write block receipts: %v", err)
+		}
+		if err := WriteTxLookupEntries(batch, block); err != nil {
+			return i, fmt.Errorf("failed to write lookup metadata: %v", err)
+		}
+		stats.processed++
+
+
+		if batch.ValueSize() &gt;= ethdb.IdealBatchSize {
+			if err := batch.Write(); err != nil {
+				return 0, err
+			}
+			bytes += batch.ValueSize()
+			batch.Reset()
+		}
+	}
+	if batch.ValueSize() &gt; 0 {
+		bytes += batch.ValueSize()
+		if err := batch.Write(); err != nil {
+			return 0, err
+		}
+	}
+
+
+	// Update the head fast sync block if better
+	bc.mu.Lock()
+	head := blockChain[len(blockChain)-1]
+	if td := bc.GetTd(head.Hash(), head.NumberU64()); td != nil { // Rewind may have occurred, skip in that case
+		currentFastBlock := bc.CurrentFastBlock()
+		if bc.GetTd(currentFastBlock.Hash(), currentFastBlock.NumberU64()).Cmp(td) &lt; 0 {
+			if err := WriteHeadFastBlockHash(bc.db, head.Hash()); err != nil {
+				log.Crit("Failed to update head fast block hash", "err", err)
+			}
+			bc.currentFastBlock.Store(head)
+		}
+	}
+	bc.mu.Unlock()
+
+
+	log.Info("Imported new block receipts",
+		"count", stats.processed,
+		"elapsed", common.PrettyDuration(time.Since(start)),
+		"number", head.Number(),
+		"hash", head.Hash(),
+		"size", common.StorageSize(bytes),
+		"ignored", stats.ignored)
+	return 0, nil
+}</code></pre>1，首先确保插入的blocks是安次序排列的
+  <br>2，调用SetReceiptsData(bc.chainConfig, block, receipts)把收到的交易收据数据加入到block中
+  <br>3，调用WriteBody()，把blockbody数据写入数据库
+  <br>4，调用WriteBlockReceipts()，把收据数据写入数据库
+  <br>5，调用WriteTxLookupEntries，根据交易hash建立数据库的索引。
+  <br>6，更新BlockChain的currentFastBlock信息
+  <br>
+  <br>
+  <h4>总结</h4>BlockChain模块的代码不多，逻辑也不复杂，不像Downloader和Fetcher 那样一堆goroutine满天飞，很好读。BlockChain模块是以太坊所有数据的大集合，所有数据都在这里汇集，并在这里对数据进行校验，把结果写入数据库。这个模块最重要的是要区分Full模式同步数据处理和Fast模式处理的区别。我们发现Fast模式把最耗时的数据验证和交易回放都跳过了，大大的缩减了同步的时间，同时也节约了计算的能源消耗。 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80258115,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80258115,&quot;}">阅读更多</a> 
+ <a class="btn" href="https://passport.csdn.net/account/login?utm_source=csdn_blog_pc_more_login" target="_self" id="btn-lobinreadmore" data-track-view="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80258115,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_557&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80258115,&quot;}">登录后自动展开</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

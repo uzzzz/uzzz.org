@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>跨链系统构建-basecoin的IBC | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="跨链系统构建-basecoin的IBC" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="basecoin的IBC 一、概述 cosmos网络中最重要的功能实现是InterBlockchainCommunication(IBC)，IBC协议支持不同区块链之间的互操作性。cosmos网络将IBC作为一个basecoin插件实现，我们将使用cosmos来跨区块链发送token。 IBC插件定义了一组交易集合作为AppTx的子类型，要使用这个插件，需要设置AppTx.Name为“IBC“，同时需要设置data域为序列化的IBC交易类型。 二、IBC IBC的目的是使一个区块链能够作为另一个区块链的轻客户端，由于我们使用的是经典的PBFT算法，因此轻客户端验证成本低且简单：因为需要做的就是检查最新块上的验证者签名并验证merkle证明。 在tendermint中，验证者在处理一个节点之前需要共识，这意味着区块签名和区块状态根不会包含在当前这个区块中，而是下一个区块中，这样每个区块包含一个叫做lastcommit的域，包含了前一个区块的commit，区块头还包含一个叫做apphash的域，是merkle的根hash。所以如果我们想验证高度H的区块的apphash，我们需要区块高度H+1的lastcommit中的签名。 轻客户端协议不需要下载一个区块链所有的区块头，客户端总是维护最新的区块头，只要验证者没有变动。如果验证者有变动，客户端需要跟踪这些变动，需要下载每个区块的头，因为签名有变动。 现在我们可以准确描述出IBC的工作原理，假如我们有两个链chain1和chain2，我们想要从chain1发送一些数据到chain2，大概的工作流程如下： 1. 在chain2上注册chain1的详细信息（如chainID，genesis配置） 2. 在chain1上收到一个交易，需要进行IBC，目标地址为chain2 3. 向chain2同步chain1最新的状态（区块头信息，commit签名） 4. chain1将IBC数据包发送到chain2，包括在chain1上已经提交的交易的证明，chain2可以验证该交易因为其包含了当前的区块头和commit 以上每一步都需要一个IBC的交易： 1. IBCRegisterChainTx type IBCRegisterChainTx struct { BlockchainGenesis } type BlockchainGenesis struct { ChainID string Genesis string } IBCRegisterChainTx用于在另一条链上注册当前链，包含了需要注册的链的chainID和genesis配置，这个交易仅仅发送一次，多次发送将给出error的response。 2. IBCUpdateChainTx type IBCUpdateChainTx struct { Header tm.Header Commit tm.Commit } IBCUpdateChainTx用于在另一条链上更新当前链的状态，包含了区块头和commit的签名数据，后续会包含验证者的变动信息，任何人都可以转发IBCUpdateChainTx，就像发送固定频率的链状态更新包和验证者变动包一样。 3. IBCPacketCreateTx type IBCPacketCreateTx struct { Packet } type Packet struct { SrcChainID string DstChainID string Sequence uint64 Type string Payload []byte } IBCPacketCreateTx用于创建一个跨链通信的数据包，包含了源chainID和目标chainID、包类型、和payload。 payload数据格式还没有定义，可以是任意的字节。 这个IBC交易主要用于以下场景： chain2在chain1上有一个账户，在chain1上使用IBCPacketCreateTx发送资金到这个账户，这样我们可以给chain2证明在chain1链上已经有到其账户的一个交易，这些资金只能被chain2到chain1的IBC消息解锁，消息需要指定发送锁定的资金到chain1的另一个账户上。 4. IBCPacketPostTx type IBCPacketPostTx struct { FromChainID string // The immediate source of the packet, not always Packet.SrcChainID FromChainHeight uint64 // The block height in which Packet was committed, to check Proof Packet Proof *merkle.IAVLProof } IBCPacketPostTx用于从一个链发送IBC包到另一个链，包含了另一个链的交易数据和当前链上已经commit的交易的验证信息。 交易的验证信息是IAVL树的一个merkle验证，IAVL树是一个平衡二叉搜索树，包含了节点列表，这些节点通过hash到最后形成一个merkle根hash，这个hash一定和高度H+1的区块的头中AppHash匹配。 三、IBC State 我们已经分析了所有的交易类型，接下来看看状态，每个链在merkle树中存储了一些IBC状态，被跟踪的每条链，我们需要存储： 1. genesis配置 2. 最新的状态 3. 当前高度的header 我们还需要存储所有incoming包和outgoing包。 每当一个IBCUpdateChainTx交易被提交，链的状态会被更新，当IBCPacketCreateTx的时候，新的数据包被加入到outgoing，当IBCPacketPostTx的时候，新的数据包被加入到incoming。 四、merkle查询 basecoin应用程序使用一个单独的merkle树，该树在其所有状态中共享，包括内置账户状态和所有的插件状态，所以，使用明确的键名和/或hash来确保没有冲突。 我们可以使用ABCI Query方法来查询merkle树，如果我们传入正确的key，它将返回相应的值，以及证明key和值包含在merkle树中。 查询的结果可以用来作为IBCPacketPostTx的证明。 五、中继 虽然我们在内部需要所有这些数据包类型以便以安全的方式跟踪两条链，但对于正常的流程，我们可以运行一个中继节点来处理跨链交互。 使用中继的情况下，需要两个步骤，首先basecoin relay init，必须运行一次从而让链间注册，确保链准备好发送和接收包，然后basecoin relay start，一个守护进程，在每条链上轮询队列，转发所有的新消息到对应的链。 这个需要中继能访问通信的两条链上的资金账户，从而支付需要转发的IBC包。 六、准备 确保安装了basecoin和basecli，basecoin是创建新的加密货币应用程序的框架，它带有一个默认就启动的IBC插件。 设置一些环境变量： [kingnet@pdev3 ~]$ rm -rf ~/.ibcdemo [kingnet@pdev3 ~]$ export BCHOME1_CLIENT=~/.ibcdemo/chain1/client [kingnet@pdev3 ~]$ export BCHOME1_SERVER=~/.ibcdemo/chain1/server [kingnet@pdev3 ~]$ export BCHOME2_CLIENT=~/.ibcdemo/chain2/client [kingnet@pdev3 ~]$ export BCHOME2_SERVER=~/.ibcdemo/chain2/server [kingnet@pdev3 ~]$ alias basecli1=&quot;basecli --home $BCHOME1_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecli2=&quot;basecli --home $BCHOME2_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecoin1=&quot;basecoin --home $BCHOME1_SERVER&quot; [kingnet@pdev3 ~]$ alias basecoin2=&quot;basecoin --home $BCHOME2_SERVER&quot; [kingnet@pdev3 ~]$ export CHAINID1=&quot;test-chain-1&quot; [kingnet@pdev3 ~]$ export CHAINID2=&quot;test-chain-2&quot; [kingnet@pdev3 ~]$ export PORT_PREFIX1=1234 [kingnet@pdev3 ~]$ export PORT_PREFIX2=2345 [kingnet@pdev3 ~]$ export RPC_PORT1=${PORT_PREFIX1}7 [kingnet@pdev3 ~]$ export RPC_PORT2=${PORT_PREFIX2}7 [kingnet@pdev3 ~]$ 七、安装第一条链 创建test-chian-1链上的账户： [kingnet@pdev3 ~]$ basecli1 keys new money Enter a passphrase: Repeat the passphrase: money 5DA404DC686F44E78810E8DE63EBC2D6D440FAF2 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. lesson they festival spider robot put close jaguar work minimum song wish shop measure virus obscure image gossip abstract material rotate castle cluster rigid place balance recipe salt level solution typical bunker hat click toss food female claim empty minute large budget motor crumble maximum recall raven curve vote almost abandon [kingnet@pdev3 ~]$ basecli1 keys new gotnone Enter a passphrase: Repeat the passphrase: gotnone D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. drama fiber tomato message sort aim surprise cheap prevent exhaust door veteran video junior film install soldier gorilla artefact foam trigger steak stick cave payment senior arrange palace melt whisper betray absent number fall brain suggest hobby suit assume syrup arrive fence hurt river tent device rebel shift clap amateur abandon [kingnet@pdev3 ~]$ export MONEY=$(basecli1 keys get money | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ export GOTNONE=$(basecli1 keys get gotnone | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置配置，给money用户提供大量初始coin： [kingnet@pdev3 ~]$ basecoin1 init --chain-id $CHAINID1 $MONEY [kingnet@pdev3 ~]$ 启动test-chain-1: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX1/&quot; $BCHOME1_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin1 start &amp;&gt; basecoin1.log &amp; [2] 193294 [kingnet@pdev3 ~]$ sed命令用于修改配置文件的端口，日志输出到basecoin1.log，检查日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin1.log I[05-28|12:19:33.072] Executed block module=state height=80 validTxs=0 invalidTxs=0 I[05-28|12:19:33.073] Committed state module=state height=80 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 I[05-28|12:19:34.059] Executed block module=state height=81 validTxs=0 invalidTxs=0 I[05-28|12:19:34.061] Committed state module=state height=81 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 ^C [kingnet@pdev3 ~]$ 使用客户端来验证test-chain-1已经正确启动，第一个账户有余额，第二个没有： [kingnet@pdev3 ~]$ basecli1 init --node=tcp://localhost:${RPC_PORT1} --genesis=${BCHOME1_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli1 query account $MONEY { &quot;height&quot;: 233, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli1 query account $GOTNONE ERROR: Account bytes are empty for address D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 [kingnet@pdev3 ~]$ 八、安装第二条链 第二条链的安装基本与第一条相同，主要是需要修改端口，因为运行在一台机器上。 为test-chain-2创建账户密钥： [kingnet@pdev3 ~]$ basecli2 keys new moremoney Enter a passphrase: Repeat the passphrase: moremoney 3A4F8C378CFAB5E59F39C3F1B90B87B8CB22489B **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. marble vague cricket anger during match that liberty dignity sound ankle best salon fancy will message ketchup fringe tag truly space trial emerge noise about clean tribe spell treat fox coach zone invite noble state bind letter table goddess federal fantasy satoshi exist federal wet neither cloth cliff benefit amateur abandon [kingnet@pdev3 ~]$ basecli2 keys new broke Enter a passphrase: Repeat the passphrase: broke A65BE96A51C251537F481096AA3775B55EB0A596 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. raven tiger sadness soup emerge hobby patrol excite torch social end brisk catch keep sphere question actor riot section fold spy security bar senior fog educate nut income solve danger fringe rough blush define slender velvet wrap unfold quality poem attract relief soft sea real stock kitten arrive write advice abandon [kingnet@pdev3 ~]$ MOREMONEY=$(basecli2 keys get moremoney | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ BROKE=$(basecli2 keys get broke | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置： [kingnet@pdev3 ~]$ basecoin2 init --chain-id $CHAINID2 $MOREMONEY [kingnet@pdev3 ~]$ 启动test-chain-2: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX2/&quot; $BCHOME2_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin2 start &amp;&gt; basecoin2.log &amp; [3] 195019 [kingnet@pdev3 ~]$ 检查启动日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin2.log I[05-28|12:28:58.509] Executed block module=state height=64 validTxs=0 invalidTxs=0 I[05-28|12:28:58.511] Committed state module=state height=64 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:28:59.488] Executed block module=state height=65 validTxs=0 invalidTxs=0 I[05-28|12:28:59.490] Committed state module=state height=65 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:00.508] Executed block module=state height=66 validTxs=0 invalidTxs=0 I[05-28|12:29:00.510] Committed state module=state height=66 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:01.513] Executed block module=state height=67 validTxs=0 invalidTxs=0 I[05-28|12:29:01.514] Committed state module=state height=67 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:02.499] Executed block module=state height=68 validTxs=0 invalidTxs=0 I[05-28|12:29:02.501] Committed state module=state height=68 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:03.519] Executed block module=state height=69 validTxs=0 invalidTxs=0 I[05-28|12:29:03.520] Committed state module=state height=69 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:04.524] Executed block module=state height=70 validTxs=0 invalidTxs=0 I[05-28|12:29:04.526] Committed state module=state height=70 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 ^C [kingnet@pdev3 ~]$ 使用客户端连接test-chain-2来验证账户： [kingnet@pdev3 ~]$ basecli2 init --node=tcp://localhost:${RPC_PORT2} --genesis=${BCHOME2_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli2 query account $MOREMONEY { &quot;height&quot;: 142, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ 九、连接链 两条链已经运行，每条链有不同的密钥，接下来启动一个中继将消息从一条链转发到另一条链上，从而进行IBC。 中继账户需要一些钱来支付IBC消息，所以在我们开始中继之前从富裕账户转账一些资金。 [kingnet@pdev3 ~]$ RELAY_KEY=$BCHOME1_SERVER/key.json [kingnet@pdev3 ~]$ RELAY_ADDR=$(cat $RELAY_KEY | jq .address | tr -d \&quot;) [kingnet@pdev3 ~]$ basecli1 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;B23167DF11932BEC3C5C2483AC18C8338B72240C&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;2B83744A7A854E64D98E2F7299A27C4D13A971BB&quot;, &quot;height&quot;: 1138 } [kingnet@pdev3 ~]$ basecli1 query account $RELAY_ADDR { &quot;height&quot;: 1160, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ basecli2 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=moremoney Please enter passphrase for moremoney: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;9905BA121EE6650B277B1D2CDE6E993EF45AA097&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;147AF3D21D67028661BEE9425EA062496C6D2842&quot;, &quot;height&quot;: 646 } [kingnet@pdev3 ~]$ basecli2 query account $RELAY_ADDR { &quot;height&quot;: 659, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ 配置中继： [kingnet@pdev3 ~]$ basecoin relay init --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --genesis1=${BCHOME1_SERVER}/genesis.json --genesis2=${BCHOME2_SERVER}/genesis.json --from=$RELAY_KEY [kingnet@pdev3 ~]$ 启动中继： [kingnet@pdev3 ~]$ basecoin relay start --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --from=$RELAY_KEY &amp;&gt; relay.log &amp; [4] 197724 [kingnet@pdev3 ~]$ 两条链已经通过IBC连接，接下来发送一个跨链的tx。 十、跨链转账 [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ basecli1 tx send --amount=12345mycoin --sequence=2 --to=test-chain-2/$BROKE --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;DF5745E4838C4F5B9A8E05D78EDA717B6D925DEC&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;F7EB450C6326D0FC9FFF6F1F72AAB156D919469A&quot;, &quot;height&quot;: 1896 } [kingnet@pdev3 ~]$ basecli2 query account $BROKE { &quot;height&quot;: 1328, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 12345 } ] } } [kingnet@pdev3 ~]$ 十一、结论 真可以跨链转账啊，价值传输网就来了！！！！！！ 阅读更多" />
+<meta property="og:description" content="basecoin的IBC 一、概述 cosmos网络中最重要的功能实现是InterBlockchainCommunication(IBC)，IBC协议支持不同区块链之间的互操作性。cosmos网络将IBC作为一个basecoin插件实现，我们将使用cosmos来跨区块链发送token。 IBC插件定义了一组交易集合作为AppTx的子类型，要使用这个插件，需要设置AppTx.Name为“IBC“，同时需要设置data域为序列化的IBC交易类型。 二、IBC IBC的目的是使一个区块链能够作为另一个区块链的轻客户端，由于我们使用的是经典的PBFT算法，因此轻客户端验证成本低且简单：因为需要做的就是检查最新块上的验证者签名并验证merkle证明。 在tendermint中，验证者在处理一个节点之前需要共识，这意味着区块签名和区块状态根不会包含在当前这个区块中，而是下一个区块中，这样每个区块包含一个叫做lastcommit的域，包含了前一个区块的commit，区块头还包含一个叫做apphash的域，是merkle的根hash。所以如果我们想验证高度H的区块的apphash，我们需要区块高度H+1的lastcommit中的签名。 轻客户端协议不需要下载一个区块链所有的区块头，客户端总是维护最新的区块头，只要验证者没有变动。如果验证者有变动，客户端需要跟踪这些变动，需要下载每个区块的头，因为签名有变动。 现在我们可以准确描述出IBC的工作原理，假如我们有两个链chain1和chain2，我们想要从chain1发送一些数据到chain2，大概的工作流程如下： 1. 在chain2上注册chain1的详细信息（如chainID，genesis配置） 2. 在chain1上收到一个交易，需要进行IBC，目标地址为chain2 3. 向chain2同步chain1最新的状态（区块头信息，commit签名） 4. chain1将IBC数据包发送到chain2，包括在chain1上已经提交的交易的证明，chain2可以验证该交易因为其包含了当前的区块头和commit 以上每一步都需要一个IBC的交易： 1. IBCRegisterChainTx type IBCRegisterChainTx struct { BlockchainGenesis } type BlockchainGenesis struct { ChainID string Genesis string } IBCRegisterChainTx用于在另一条链上注册当前链，包含了需要注册的链的chainID和genesis配置，这个交易仅仅发送一次，多次发送将给出error的response。 2. IBCUpdateChainTx type IBCUpdateChainTx struct { Header tm.Header Commit tm.Commit } IBCUpdateChainTx用于在另一条链上更新当前链的状态，包含了区块头和commit的签名数据，后续会包含验证者的变动信息，任何人都可以转发IBCUpdateChainTx，就像发送固定频率的链状态更新包和验证者变动包一样。 3. IBCPacketCreateTx type IBCPacketCreateTx struct { Packet } type Packet struct { SrcChainID string DstChainID string Sequence uint64 Type string Payload []byte } IBCPacketCreateTx用于创建一个跨链通信的数据包，包含了源chainID和目标chainID、包类型、和payload。 payload数据格式还没有定义，可以是任意的字节。 这个IBC交易主要用于以下场景： chain2在chain1上有一个账户，在chain1上使用IBCPacketCreateTx发送资金到这个账户，这样我们可以给chain2证明在chain1链上已经有到其账户的一个交易，这些资金只能被chain2到chain1的IBC消息解锁，消息需要指定发送锁定的资金到chain1的另一个账户上。 4. IBCPacketPostTx type IBCPacketPostTx struct { FromChainID string // The immediate source of the packet, not always Packet.SrcChainID FromChainHeight uint64 // The block height in which Packet was committed, to check Proof Packet Proof *merkle.IAVLProof } IBCPacketPostTx用于从一个链发送IBC包到另一个链，包含了另一个链的交易数据和当前链上已经commit的交易的验证信息。 交易的验证信息是IAVL树的一个merkle验证，IAVL树是一个平衡二叉搜索树，包含了节点列表，这些节点通过hash到最后形成一个merkle根hash，这个hash一定和高度H+1的区块的头中AppHash匹配。 三、IBC State 我们已经分析了所有的交易类型，接下来看看状态，每个链在merkle树中存储了一些IBC状态，被跟踪的每条链，我们需要存储： 1. genesis配置 2. 最新的状态 3. 当前高度的header 我们还需要存储所有incoming包和outgoing包。 每当一个IBCUpdateChainTx交易被提交，链的状态会被更新，当IBCPacketCreateTx的时候，新的数据包被加入到outgoing，当IBCPacketPostTx的时候，新的数据包被加入到incoming。 四、merkle查询 basecoin应用程序使用一个单独的merkle树，该树在其所有状态中共享，包括内置账户状态和所有的插件状态，所以，使用明确的键名和/或hash来确保没有冲突。 我们可以使用ABCI Query方法来查询merkle树，如果我们传入正确的key，它将返回相应的值，以及证明key和值包含在merkle树中。 查询的结果可以用来作为IBCPacketPostTx的证明。 五、中继 虽然我们在内部需要所有这些数据包类型以便以安全的方式跟踪两条链，但对于正常的流程，我们可以运行一个中继节点来处理跨链交互。 使用中继的情况下，需要两个步骤，首先basecoin relay init，必须运行一次从而让链间注册，确保链准备好发送和接收包，然后basecoin relay start，一个守护进程，在每条链上轮询队列，转发所有的新消息到对应的链。 这个需要中继能访问通信的两条链上的资金账户，从而支付需要转发的IBC包。 六、准备 确保安装了basecoin和basecli，basecoin是创建新的加密货币应用程序的框架，它带有一个默认就启动的IBC插件。 设置一些环境变量： [kingnet@pdev3 ~]$ rm -rf ~/.ibcdemo [kingnet@pdev3 ~]$ export BCHOME1_CLIENT=~/.ibcdemo/chain1/client [kingnet@pdev3 ~]$ export BCHOME1_SERVER=~/.ibcdemo/chain1/server [kingnet@pdev3 ~]$ export BCHOME2_CLIENT=~/.ibcdemo/chain2/client [kingnet@pdev3 ~]$ export BCHOME2_SERVER=~/.ibcdemo/chain2/server [kingnet@pdev3 ~]$ alias basecli1=&quot;basecli --home $BCHOME1_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecli2=&quot;basecli --home $BCHOME2_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecoin1=&quot;basecoin --home $BCHOME1_SERVER&quot; [kingnet@pdev3 ~]$ alias basecoin2=&quot;basecoin --home $BCHOME2_SERVER&quot; [kingnet@pdev3 ~]$ export CHAINID1=&quot;test-chain-1&quot; [kingnet@pdev3 ~]$ export CHAINID2=&quot;test-chain-2&quot; [kingnet@pdev3 ~]$ export PORT_PREFIX1=1234 [kingnet@pdev3 ~]$ export PORT_PREFIX2=2345 [kingnet@pdev3 ~]$ export RPC_PORT1=${PORT_PREFIX1}7 [kingnet@pdev3 ~]$ export RPC_PORT2=${PORT_PREFIX2}7 [kingnet@pdev3 ~]$ 七、安装第一条链 创建test-chian-1链上的账户： [kingnet@pdev3 ~]$ basecli1 keys new money Enter a passphrase: Repeat the passphrase: money 5DA404DC686F44E78810E8DE63EBC2D6D440FAF2 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. lesson they festival spider robot put close jaguar work minimum song wish shop measure virus obscure image gossip abstract material rotate castle cluster rigid place balance recipe salt level solution typical bunker hat click toss food female claim empty minute large budget motor crumble maximum recall raven curve vote almost abandon [kingnet@pdev3 ~]$ basecli1 keys new gotnone Enter a passphrase: Repeat the passphrase: gotnone D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. drama fiber tomato message sort aim surprise cheap prevent exhaust door veteran video junior film install soldier gorilla artefact foam trigger steak stick cave payment senior arrange palace melt whisper betray absent number fall brain suggest hobby suit assume syrup arrive fence hurt river tent device rebel shift clap amateur abandon [kingnet@pdev3 ~]$ export MONEY=$(basecli1 keys get money | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ export GOTNONE=$(basecli1 keys get gotnone | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置配置，给money用户提供大量初始coin： [kingnet@pdev3 ~]$ basecoin1 init --chain-id $CHAINID1 $MONEY [kingnet@pdev3 ~]$ 启动test-chain-1: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX1/&quot; $BCHOME1_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin1 start &amp;&gt; basecoin1.log &amp; [2] 193294 [kingnet@pdev3 ~]$ sed命令用于修改配置文件的端口，日志输出到basecoin1.log，检查日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin1.log I[05-28|12:19:33.072] Executed block module=state height=80 validTxs=0 invalidTxs=0 I[05-28|12:19:33.073] Committed state module=state height=80 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 I[05-28|12:19:34.059] Executed block module=state height=81 validTxs=0 invalidTxs=0 I[05-28|12:19:34.061] Committed state module=state height=81 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 ^C [kingnet@pdev3 ~]$ 使用客户端来验证test-chain-1已经正确启动，第一个账户有余额，第二个没有： [kingnet@pdev3 ~]$ basecli1 init --node=tcp://localhost:${RPC_PORT1} --genesis=${BCHOME1_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli1 query account $MONEY { &quot;height&quot;: 233, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli1 query account $GOTNONE ERROR: Account bytes are empty for address D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 [kingnet@pdev3 ~]$ 八、安装第二条链 第二条链的安装基本与第一条相同，主要是需要修改端口，因为运行在一台机器上。 为test-chain-2创建账户密钥： [kingnet@pdev3 ~]$ basecli2 keys new moremoney Enter a passphrase: Repeat the passphrase: moremoney 3A4F8C378CFAB5E59F39C3F1B90B87B8CB22489B **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. marble vague cricket anger during match that liberty dignity sound ankle best salon fancy will message ketchup fringe tag truly space trial emerge noise about clean tribe spell treat fox coach zone invite noble state bind letter table goddess federal fantasy satoshi exist federal wet neither cloth cliff benefit amateur abandon [kingnet@pdev3 ~]$ basecli2 keys new broke Enter a passphrase: Repeat the passphrase: broke A65BE96A51C251537F481096AA3775B55EB0A596 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. raven tiger sadness soup emerge hobby patrol excite torch social end brisk catch keep sphere question actor riot section fold spy security bar senior fog educate nut income solve danger fringe rough blush define slender velvet wrap unfold quality poem attract relief soft sea real stock kitten arrive write advice abandon [kingnet@pdev3 ~]$ MOREMONEY=$(basecli2 keys get moremoney | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ BROKE=$(basecli2 keys get broke | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置： [kingnet@pdev3 ~]$ basecoin2 init --chain-id $CHAINID2 $MOREMONEY [kingnet@pdev3 ~]$ 启动test-chain-2: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX2/&quot; $BCHOME2_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin2 start &amp;&gt; basecoin2.log &amp; [3] 195019 [kingnet@pdev3 ~]$ 检查启动日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin2.log I[05-28|12:28:58.509] Executed block module=state height=64 validTxs=0 invalidTxs=0 I[05-28|12:28:58.511] Committed state module=state height=64 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:28:59.488] Executed block module=state height=65 validTxs=0 invalidTxs=0 I[05-28|12:28:59.490] Committed state module=state height=65 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:00.508] Executed block module=state height=66 validTxs=0 invalidTxs=0 I[05-28|12:29:00.510] Committed state module=state height=66 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:01.513] Executed block module=state height=67 validTxs=0 invalidTxs=0 I[05-28|12:29:01.514] Committed state module=state height=67 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:02.499] Executed block module=state height=68 validTxs=0 invalidTxs=0 I[05-28|12:29:02.501] Committed state module=state height=68 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:03.519] Executed block module=state height=69 validTxs=0 invalidTxs=0 I[05-28|12:29:03.520] Committed state module=state height=69 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:04.524] Executed block module=state height=70 validTxs=0 invalidTxs=0 I[05-28|12:29:04.526] Committed state module=state height=70 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 ^C [kingnet@pdev3 ~]$ 使用客户端连接test-chain-2来验证账户： [kingnet@pdev3 ~]$ basecli2 init --node=tcp://localhost:${RPC_PORT2} --genesis=${BCHOME2_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli2 query account $MOREMONEY { &quot;height&quot;: 142, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ 九、连接链 两条链已经运行，每条链有不同的密钥，接下来启动一个中继将消息从一条链转发到另一条链上，从而进行IBC。 中继账户需要一些钱来支付IBC消息，所以在我们开始中继之前从富裕账户转账一些资金。 [kingnet@pdev3 ~]$ RELAY_KEY=$BCHOME1_SERVER/key.json [kingnet@pdev3 ~]$ RELAY_ADDR=$(cat $RELAY_KEY | jq .address | tr -d \&quot;) [kingnet@pdev3 ~]$ basecli1 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;B23167DF11932BEC3C5C2483AC18C8338B72240C&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;2B83744A7A854E64D98E2F7299A27C4D13A971BB&quot;, &quot;height&quot;: 1138 } [kingnet@pdev3 ~]$ basecli1 query account $RELAY_ADDR { &quot;height&quot;: 1160, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ basecli2 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=moremoney Please enter passphrase for moremoney: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;9905BA121EE6650B277B1D2CDE6E993EF45AA097&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;147AF3D21D67028661BEE9425EA062496C6D2842&quot;, &quot;height&quot;: 646 } [kingnet@pdev3 ~]$ basecli2 query account $RELAY_ADDR { &quot;height&quot;: 659, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ 配置中继： [kingnet@pdev3 ~]$ basecoin relay init --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --genesis1=${BCHOME1_SERVER}/genesis.json --genesis2=${BCHOME2_SERVER}/genesis.json --from=$RELAY_KEY [kingnet@pdev3 ~]$ 启动中继： [kingnet@pdev3 ~]$ basecoin relay start --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --from=$RELAY_KEY &amp;&gt; relay.log &amp; [4] 197724 [kingnet@pdev3 ~]$ 两条链已经通过IBC连接，接下来发送一个跨链的tx。 十、跨链转账 [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ basecli1 tx send --amount=12345mycoin --sequence=2 --to=test-chain-2/$BROKE --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;DF5745E4838C4F5B9A8E05D78EDA717B6D925DEC&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;F7EB450C6326D0FC9FFF6F1F72AAB156D919469A&quot;, &quot;height&quot;: 1896 } [kingnet@pdev3 ~]$ basecli2 query account $BROKE { &quot;height&quot;: 1328, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 12345 } ] } } [kingnet@pdev3 ~]$ 十一、结论 真可以跨链转账啊，价值传输网就来了！！！！！！ 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/28/a49b4a464e2f4d2b9d5c2edfc21f3f01.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/28/a49b4a464e2f4d2b9d5c2edfc21f3f01.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-28T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"basecoin的IBC 一、概述 cosmos网络中最重要的功能实现是InterBlockchainCommunication(IBC)，IBC协议支持不同区块链之间的互操作性。cosmos网络将IBC作为一个basecoin插件实现，我们将使用cosmos来跨区块链发送token。 IBC插件定义了一组交易集合作为AppTx的子类型，要使用这个插件，需要设置AppTx.Name为“IBC“，同时需要设置data域为序列化的IBC交易类型。 二、IBC IBC的目的是使一个区块链能够作为另一个区块链的轻客户端，由于我们使用的是经典的PBFT算法，因此轻客户端验证成本低且简单：因为需要做的就是检查最新块上的验证者签名并验证merkle证明。 在tendermint中，验证者在处理一个节点之前需要共识，这意味着区块签名和区块状态根不会包含在当前这个区块中，而是下一个区块中，这样每个区块包含一个叫做lastcommit的域，包含了前一个区块的commit，区块头还包含一个叫做apphash的域，是merkle的根hash。所以如果我们想验证高度H的区块的apphash，我们需要区块高度H+1的lastcommit中的签名。 轻客户端协议不需要下载一个区块链所有的区块头，客户端总是维护最新的区块头，只要验证者没有变动。如果验证者有变动，客户端需要跟踪这些变动，需要下载每个区块的头，因为签名有变动。 现在我们可以准确描述出IBC的工作原理，假如我们有两个链chain1和chain2，我们想要从chain1发送一些数据到chain2，大概的工作流程如下： 1. 在chain2上注册chain1的详细信息（如chainID，genesis配置） 2. 在chain1上收到一个交易，需要进行IBC，目标地址为chain2 3. 向chain2同步chain1最新的状态（区块头信息，commit签名） 4. chain1将IBC数据包发送到chain2，包括在chain1上已经提交的交易的证明，chain2可以验证该交易因为其包含了当前的区块头和commit 以上每一步都需要一个IBC的交易： 1. IBCRegisterChainTx type IBCRegisterChainTx struct { BlockchainGenesis } type BlockchainGenesis struct { ChainID string Genesis string } IBCRegisterChainTx用于在另一条链上注册当前链，包含了需要注册的链的chainID和genesis配置，这个交易仅仅发送一次，多次发送将给出error的response。 2. IBCUpdateChainTx type IBCUpdateChainTx struct { Header tm.Header Commit tm.Commit } IBCUpdateChainTx用于在另一条链上更新当前链的状态，包含了区块头和commit的签名数据，后续会包含验证者的变动信息，任何人都可以转发IBCUpdateChainTx，就像发送固定频率的链状态更新包和验证者变动包一样。 3. IBCPacketCreateTx type IBCPacketCreateTx struct { Packet } type Packet struct { SrcChainID string DstChainID string Sequence uint64 Type string Payload []byte } IBCPacketCreateTx用于创建一个跨链通信的数据包，包含了源chainID和目标chainID、包类型、和payload。 payload数据格式还没有定义，可以是任意的字节。 这个IBC交易主要用于以下场景： chain2在chain1上有一个账户，在chain1上使用IBCPacketCreateTx发送资金到这个账户，这样我们可以给chain2证明在chain1链上已经有到其账户的一个交易，这些资金只能被chain2到chain1的IBC消息解锁，消息需要指定发送锁定的资金到chain1的另一个账户上。 4. IBCPacketPostTx type IBCPacketPostTx struct { FromChainID string // The immediate source of the packet, not always Packet.SrcChainID FromChainHeight uint64 // The block height in which Packet was committed, to check Proof Packet Proof *merkle.IAVLProof } IBCPacketPostTx用于从一个链发送IBC包到另一个链，包含了另一个链的交易数据和当前链上已经commit的交易的验证信息。 交易的验证信息是IAVL树的一个merkle验证，IAVL树是一个平衡二叉搜索树，包含了节点列表，这些节点通过hash到最后形成一个merkle根hash，这个hash一定和高度H+1的区块的头中AppHash匹配。 三、IBC State 我们已经分析了所有的交易类型，接下来看看状态，每个链在merkle树中存储了一些IBC状态，被跟踪的每条链，我们需要存储： 1. genesis配置 2. 最新的状态 3. 当前高度的header 我们还需要存储所有incoming包和outgoing包。 每当一个IBCUpdateChainTx交易被提交，链的状态会被更新，当IBCPacketCreateTx的时候，新的数据包被加入到outgoing，当IBCPacketPostTx的时候，新的数据包被加入到incoming。 四、merkle查询 basecoin应用程序使用一个单独的merkle树，该树在其所有状态中共享，包括内置账户状态和所有的插件状态，所以，使用明确的键名和/或hash来确保没有冲突。 我们可以使用ABCI Query方法来查询merkle树，如果我们传入正确的key，它将返回相应的值，以及证明key和值包含在merkle树中。 查询的结果可以用来作为IBCPacketPostTx的证明。 五、中继 虽然我们在内部需要所有这些数据包类型以便以安全的方式跟踪两条链，但对于正常的流程，我们可以运行一个中继节点来处理跨链交互。 使用中继的情况下，需要两个步骤，首先basecoin relay init，必须运行一次从而让链间注册，确保链准备好发送和接收包，然后basecoin relay start，一个守护进程，在每条链上轮询队列，转发所有的新消息到对应的链。 这个需要中继能访问通信的两条链上的资金账户，从而支付需要转发的IBC包。 六、准备 确保安装了basecoin和basecli，basecoin是创建新的加密货币应用程序的框架，它带有一个默认就启动的IBC插件。 设置一些环境变量： [kingnet@pdev3 ~]$ rm -rf ~/.ibcdemo [kingnet@pdev3 ~]$ export BCHOME1_CLIENT=~/.ibcdemo/chain1/client [kingnet@pdev3 ~]$ export BCHOME1_SERVER=~/.ibcdemo/chain1/server [kingnet@pdev3 ~]$ export BCHOME2_CLIENT=~/.ibcdemo/chain2/client [kingnet@pdev3 ~]$ export BCHOME2_SERVER=~/.ibcdemo/chain2/server [kingnet@pdev3 ~]$ alias basecli1=&quot;basecli --home $BCHOME1_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecli2=&quot;basecli --home $BCHOME2_CLIENT&quot; [kingnet@pdev3 ~]$ alias basecoin1=&quot;basecoin --home $BCHOME1_SERVER&quot; [kingnet@pdev3 ~]$ alias basecoin2=&quot;basecoin --home $BCHOME2_SERVER&quot; [kingnet@pdev3 ~]$ export CHAINID1=&quot;test-chain-1&quot; [kingnet@pdev3 ~]$ export CHAINID2=&quot;test-chain-2&quot; [kingnet@pdev3 ~]$ export PORT_PREFIX1=1234 [kingnet@pdev3 ~]$ export PORT_PREFIX2=2345 [kingnet@pdev3 ~]$ export RPC_PORT1=${PORT_PREFIX1}7 [kingnet@pdev3 ~]$ export RPC_PORT2=${PORT_PREFIX2}7 [kingnet@pdev3 ~]$ 七、安装第一条链 创建test-chian-1链上的账户： [kingnet@pdev3 ~]$ basecli1 keys new money Enter a passphrase: Repeat the passphrase: money 5DA404DC686F44E78810E8DE63EBC2D6D440FAF2 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. lesson they festival spider robot put close jaguar work minimum song wish shop measure virus obscure image gossip abstract material rotate castle cluster rigid place balance recipe salt level solution typical bunker hat click toss food female claim empty minute large budget motor crumble maximum recall raven curve vote almost abandon [kingnet@pdev3 ~]$ basecli1 keys new gotnone Enter a passphrase: Repeat the passphrase: gotnone D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. drama fiber tomato message sort aim surprise cheap prevent exhaust door veteran video junior film install soldier gorilla artefact foam trigger steak stick cave payment senior arrange palace melt whisper betray absent number fall brain suggest hobby suit assume syrup arrive fence hurt river tent device rebel shift clap amateur abandon [kingnet@pdev3 ~]$ export MONEY=$(basecli1 keys get money | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ export GOTNONE=$(basecli1 keys get gotnone | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置配置，给money用户提供大量初始coin： [kingnet@pdev3 ~]$ basecoin1 init --chain-id $CHAINID1 $MONEY [kingnet@pdev3 ~]$ 启动test-chain-1: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX1/&quot; $BCHOME1_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin1 start &amp;&gt; basecoin1.log &amp; [2] 193294 [kingnet@pdev3 ~]$ sed命令用于修改配置文件的端口，日志输出到basecoin1.log，检查日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin1.log I[05-28|12:19:33.072] Executed block module=state height=80 validTxs=0 invalidTxs=0 I[05-28|12:19:33.073] Committed state module=state height=80 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 I[05-28|12:19:34.059] Executed block module=state height=81 validTxs=0 invalidTxs=0 I[05-28|12:19:34.061] Committed state module=state height=81 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864 ^C [kingnet@pdev3 ~]$ 使用客户端来验证test-chain-1已经正确启动，第一个账户有余额，第二个没有： [kingnet@pdev3 ~]$ basecli1 init --node=tcp://localhost:${RPC_PORT1} --genesis=${BCHOME1_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli1 query account $MONEY { &quot;height&quot;: 233, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli1 query account $GOTNONE ERROR: Account bytes are empty for address D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359 [kingnet@pdev3 ~]$ 八、安装第二条链 第二条链的安装基本与第一条相同，主要是需要修改端口，因为运行在一台机器上。 为test-chain-2创建账户密钥： [kingnet@pdev3 ~]$ basecli2 keys new moremoney Enter a passphrase: Repeat the passphrase: moremoney 3A4F8C378CFAB5E59F39C3F1B90B87B8CB22489B **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. marble vague cricket anger during match that liberty dignity sound ankle best salon fancy will message ketchup fringe tag truly space trial emerge noise about clean tribe spell treat fox coach zone invite noble state bind letter table goddess federal fantasy satoshi exist federal wet neither cloth cliff benefit amateur abandon [kingnet@pdev3 ~]$ basecli2 keys new broke Enter a passphrase: Repeat the passphrase: broke A65BE96A51C251537F481096AA3775B55EB0A596 **Important** write this seed phrase in a safe place. It is the only way to recover your account if you ever forget your password. raven tiger sadness soup emerge hobby patrol excite torch social end brisk catch keep sphere question actor riot section fold spy security bar senior fog educate nut income solve danger fringe rough blush define slender velvet wrap unfold quality poem attract relief soft sea real stock kitten arrive write advice abandon [kingnet@pdev3 ~]$ MOREMONEY=$(basecli2 keys get moremoney | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ BROKE=$(basecli2 keys get broke | awk &#39;{print $2}&#39;) [kingnet@pdev3 ~]$ 初始配置： [kingnet@pdev3 ~]$ basecoin2 init --chain-id $CHAINID2 $MOREMONEY [kingnet@pdev3 ~]$ 启动test-chain-2: [kingnet@pdev3 ~]$ sed -ie &quot;s/4665/$PORT_PREFIX2/&quot; $BCHOME2_SERVER/config.toml [kingnet@pdev3 ~]$ basecoin2 start &amp;&gt; basecoin2.log &amp; [3] 195019 [kingnet@pdev3 ~]$ 检查启动日志看是否正确出块： [kingnet@pdev3 ~]$ tail -f basecoin2.log I[05-28|12:28:58.509] Executed block module=state height=64 validTxs=0 invalidTxs=0 I[05-28|12:28:58.511] Committed state module=state height=64 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:28:59.488] Executed block module=state height=65 validTxs=0 invalidTxs=0 I[05-28|12:28:59.490] Committed state module=state height=65 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:00.508] Executed block module=state height=66 validTxs=0 invalidTxs=0 I[05-28|12:29:00.510] Committed state module=state height=66 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:01.513] Executed block module=state height=67 validTxs=0 invalidTxs=0 I[05-28|12:29:01.514] Committed state module=state height=67 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:02.499] Executed block module=state height=68 validTxs=0 invalidTxs=0 I[05-28|12:29:02.501] Committed state module=state height=68 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:03.519] Executed block module=state height=69 validTxs=0 invalidTxs=0 I[05-28|12:29:03.520] Committed state module=state height=69 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 I[05-28|12:29:04.524] Executed block module=state height=70 validTxs=0 invalidTxs=0 I[05-28|12:29:04.526] Committed state module=state height=70 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0 ^C [kingnet@pdev3 ~]$ 使用客户端连接test-chain-2来验证账户： [kingnet@pdev3 ~]$ basecli2 init --node=tcp://localhost:${RPC_PORT2} --genesis=${BCHOME2_SERVER}/genesis.json Loading validator set from tendermint rpc... [kingnet@pdev3 ~]$ basecli2 query account $MOREMONEY { &quot;height&quot;: 142, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 9007199254740992 } ] } } [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ 九、连接链 两条链已经运行，每条链有不同的密钥，接下来启动一个中继将消息从一条链转发到另一条链上，从而进行IBC。 中继账户需要一些钱来支付IBC消息，所以在我们开始中继之前从富裕账户转账一些资金。 [kingnet@pdev3 ~]$ RELAY_KEY=$BCHOME1_SERVER/key.json [kingnet@pdev3 ~]$ RELAY_ADDR=$(cat $RELAY_KEY | jq .address | tr -d \\&quot;) [kingnet@pdev3 ~]$ basecli1 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;B23167DF11932BEC3C5C2483AC18C8338B72240C&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;2B83744A7A854E64D98E2F7299A27C4D13A971BB&quot;, &quot;height&quot;: 1138 } [kingnet@pdev3 ~]$ basecli1 query account $RELAY_ADDR { &quot;height&quot;: 1160, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ basecli2 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=moremoney Please enter passphrase for moremoney: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;9905BA121EE6650B277B1D2CDE6E993EF45AA097&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;147AF3D21D67028661BEE9425EA062496C6D2842&quot;, &quot;height&quot;: 646 } [kingnet@pdev3 ~]$ basecli2 query account $RELAY_ADDR { &quot;height&quot;: 659, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 100000 } ] } } [kingnet@pdev3 ~]$ 配置中继： [kingnet@pdev3 ~]$ basecoin relay init --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --genesis1=${BCHOME1_SERVER}/genesis.json --genesis2=${BCHOME2_SERVER}/genesis.json --from=$RELAY_KEY [kingnet@pdev3 ~]$ 启动中继： [kingnet@pdev3 ~]$ basecoin relay start --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --from=$RELAY_KEY &amp;&gt; relay.log &amp; [4] 197724 [kingnet@pdev3 ~]$ 两条链已经通过IBC连接，接下来发送一个跨链的tx。 十、跨链转账 [kingnet@pdev3 ~]$ basecli2 query account $BROKE ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596 [kingnet@pdev3 ~]$ basecli1 tx send --amount=12345mycoin --sequence=2 --to=test-chain-2/$BROKE --name=money Please enter passphrase for money: { &quot;check_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;&quot;, &quot;log&quot;: &quot;&quot; }, &quot;deliver_tx&quot;: { &quot;code&quot;: 0, &quot;data&quot;: &quot;DF5745E4838C4F5B9A8E05D78EDA717B6D925DEC&quot;, &quot;log&quot;: &quot;&quot; }, &quot;hash&quot;: &quot;F7EB450C6326D0FC9FFF6F1F72AAB156D919469A&quot;, &quot;height&quot;: 1896 } [kingnet@pdev3 ~]$ basecli2 query account $BROKE { &quot;height&quot;: 1328, &quot;data&quot;: { &quot;pub_key&quot;: null, &quot;sequence&quot;: 0, &quot;coins&quot;: [ { &quot;denom&quot;: &quot;mycoin&quot;, &quot;amount&quot;: 12345 } ] } } [kingnet@pdev3 ~]$ 十一、结论 真可以跨链转账啊，价值传输网就来了！！！！！！ 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/28/a49b4a464e2f4d2b9d5c2edfc21f3f01.html","headline":"跨链系统构建-basecoin的IBC","dateModified":"2018-05-28T00:00:00+08:00","datePublished":"2018-05-28T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/28/a49b4a464e2f4d2b9d5c2edfc21f3f01.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>跨链系统构建-basecoin的IBC</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h1 style="text-align:center;">basecoin的IBC</h1>
+  <h3>一、概述</h3>
+  <p>cosmos网络中最重要的功能实现是InterBlockchainC<a href="http://www.baidu.com/link?url=pGdiDG6TMEE-4MOktbMDA71C4iGdJ-5hQ0Y3IhO2m7vG684LkpbGjghVGUvXR2Fg9TzhevPlM-wsiTczH8IXrYc_HdBuNZUkSMjHlzof_97" rel="nofollow" style="color:rgb(51,51,51);font-size:13px;font-family:arial;background-color:rgb(255,255,255);">ommunication</a>(IBC)，IBC协议支持不同区块链之间的互操作性。cosmos网络将IBC作为一个basecoin插件实现，我们将使用cosmos来跨区块链发送token。</p>
+  <p>IBC插件定义了一组交易集合作为AppTx的子类型，要使用这个插件，需要设置AppTx.Name为“IBC“，同时需要设置data域为序列化的IBC交易类型。</p>
+  <h3>二、IBC</h3>
+  <p>IBC的目的是使一个区块链能够作为另一个区块链的轻客户端，由于我们使用的是经典的PBFT算法，因此轻客户端验证成本低且简单：因为需要做的就是检查最新块上的验证者签名并验证merkle证明。</p>
+  <p>在tendermint中，验证者在处理一个节点之前需要共识，这意味着区块签名和区块状态根不会包含在当前这个区块中，而是下一个区块中，这样每个区块包含一个叫做lastcommit的域，包含了前一个区块的commit，区块头还包含一个叫做apphash的域，是merkle的根hash。所以如果我们想验证高度H的区块的apphash，我们需要区块高度H+1的lastcommit中的签名。</p>
+  <p>轻客户端协议不需要下载一个区块链所有的区块头，客户端总是维护最新的区块头，只要验证者没有变动。如果验证者有变动，客户端需要跟踪这些变动，需要下载每个区块的头，因为签名有变动。</p>
+  <p>现在我们可以准确描述出IBC的工作原理，假如我们有两个链chain1和chain2，我们想要从chain1发送一些数据到chain2，大概的工作流程如下：</p>
+  <p>1. 在chain2上注册chain1的详细信息（如chainID，genesis配置）</p>
+  <p>2. 在chain1上收到一个交易，需要进行IBC，目标地址为chain2</p>
+  <p>3. 向chain2同步chain1最新的状态（区块头信息，commit签名）</p>
+  <p>4. chain1将IBC数据包发送到chain2，包括在chain1上已经提交的交易的证明，chain2可以验证该交易因为其包含了当前的区块头和commit</p>
+  <p>以上每一步都需要一个IBC的交易：</p>
+  <p>1. IBCRegisterChainTx</p>
+  <pre><code class="language-plain">type IBCRegisterChainTx struct { BlockchainGenesis }
+type BlockchainGenesis struct { ChainID string Genesis string }</code></pre>
+  <p>IBCRegisterChainTx用于在另一条链上注册当前链，包含了需要注册的链的chainID和genesis配置，这个交易仅仅发送一次，多次发送将给出error的response。</p>
+  <p>2. IBCUpdateChainTx</p>
+  <pre><code class="language-plain">type IBCUpdateChainTx struct {
+  Header tm.Header
+  Commit tm.Commit
+}</code></pre>
+  <p>IBCUpdateChainTx用于在另一条链上更新当前链的状态，包含了区块头和commit的签名数据，后续会包含验证者的变动信息，任何人都可以转发IBCUpdateChainTx，就像发送固定频率的链状态更新包和验证者变动包一样。</p>
+  <p>3. IBCPacketCreateTx</p>
+  <pre><code class="language-plain">type IBCPacketCreateTx struct {
+  Packet
+}
+
+type Packet struct {
+  SrcChainID string
+  DstChainID string
+  Sequence   uint64
+  Type string
+  Payload    []byte
+}</code></pre>
+  <p>IBCPacketCreateTx用于创建一个跨链通信的数据包，包含了源chainID和目标chainID、包类型、和payload。</p>
+  <p>payload数据格式还没有定义，可以是任意的字节。</p>
+  <p>这个IBC交易主要用于以下场景：</p>
+  <p>chain2在chain1上有一个账户，在chain1上使用IBCPacketCreateTx发送资金到这个账户，这样我们可以给chain2证明在chain1链上已经有到其账户的一个交易，这些资金只能被chain2到chain1的IBC消息解锁，消息需要指定发送锁定的资金到chain1的另一个账户上。</p>
+  <p>4. IBCPacketPostTx</p>
+  <pre><code class="language-plain">type IBCPacketPostTx struct {
+  FromChainID     string // The immediate source of the packet, not always Packet.SrcChainID
+  FromChainHeight uint64 // The block height in which Packet was committed, to check Proof Packet
+  Proof *merkle.IAVLProof
+}</code></pre>
+  <p>IBCPacketPostTx用于从一个链发送IBC包到另一个链，包含了另一个链的交易数据和当前链上已经commit的交易的验证信息。</p>
+  <p>交易的验证信息是IAVL树的一个merkle验证，IAVL树是一个平衡二叉搜索树，包含了节点列表，这些节点通过hash到最后形成一个merkle根hash，这个hash一定和高度H+1的区块的头中AppHash匹配。</p>
+  <h3>三、IBC State</h3>
+  <p>我们已经分析了所有的交易类型，接下来看看状态，每个链在merkle树中存储了一些IBC状态，被跟踪的每条链，我们需要存储：</p>
+  <p>1. genesis配置</p>
+  <p>2. 最新的状态</p>
+  <p>3. 当前高度的header</p>
+  <p>我们还需要存储所有incoming包和outgoing包。</p>
+  <p>每当一个IBCUpdateChainTx交易被提交，链的状态会被更新，当IBCPacketCreateTx的时候，新的数据包被加入到outgoing，当IBCPacketPostTx的时候，新的数据包被加入到incoming。</p>
+  <h3>四、merkle查询</h3>
+  <p>basecoin应用程序使用一个单独的merkle树，该树在其所有状态中共享，包括内置账户状态和所有的插件状态，所以，使用明确的键名和/或hash来确保没有冲突。</p>
+  <p>我们可以使用ABCI Query方法来查询merkle树，如果我们传入正确的key，它将返回相应的值，以及证明key和值包含在merkle树中。</p>
+  <p>查询的结果可以用来作为IBCPacketPostTx的证明。</p>
+  <h3>五、中继</h3>
+  <p>虽然我们在内部需要所有这些数据包类型以便以安全的方式跟踪两条链，但对于正常的流程，我们可以运行一个中继节点来处理跨链交互。</p>
+  <p>使用中继的情况下，需要两个步骤，首先basecoin relay init，必须运行一次从而让链间注册，确保链准备好发送和接收包，然后basecoin relay start，一个守护进程，在每条链上轮询队列，转发所有的新消息到对应的链。</p>
+  <p>这个需要中继能访问通信的两条链上的资金账户，从而支付需要转发的IBC包。</p>
+  <h3>六、准备</h3>
+  <p>确保安装了basecoin和basecli，basecoin是创建新的加密货币应用程序的框架，它带有一个默认就启动的IBC插件。</p>
+  <p>设置一些环境变量：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ rm -rf ~/.ibcdemo
+[kingnet@pdev3 ~]$ export BCHOME1_CLIENT=~/.ibcdemo/chain1/client
+[kingnet@pdev3 ~]$ export BCHOME1_SERVER=~/.ibcdemo/chain1/server
+[kingnet@pdev3 ~]$ export BCHOME2_CLIENT=~/.ibcdemo/chain2/client
+[kingnet@pdev3 ~]$ export BCHOME2_SERVER=~/.ibcdemo/chain2/server
+[kingnet@pdev3 ~]$ alias basecli1="basecli --home $BCHOME1_CLIENT"
+[kingnet@pdev3 ~]$ alias basecli2="basecli --home $BCHOME2_CLIENT"
+[kingnet@pdev3 ~]$ alias basecoin1="basecoin --home $BCHOME1_SERVER"
+[kingnet@pdev3 ~]$ alias basecoin2="basecoin --home $BCHOME2_SERVER"
+[kingnet@pdev3 ~]$ export CHAINID1="test-chain-1"
+[kingnet@pdev3 ~]$ export CHAINID2="test-chain-2"
+[kingnet@pdev3 ~]$ export PORT_PREFIX1=1234
+[kingnet@pdev3 ~]$ export PORT_PREFIX2=2345
+[kingnet@pdev3 ~]$ export RPC_PORT1=${PORT_PREFIX1}7
+[kingnet@pdev3 ~]$ export RPC_PORT2=${PORT_PREFIX2}7
+[kingnet@pdev3 ~]$</code></pre>
+  <h3>七、安装第一条链</h3>
+  <p>创建test-chian-1链上的账户：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecli1 keys new money
+Enter a passphrase:
+Repeat the passphrase:
+money           5DA404DC686F44E78810E8DE63EBC2D6D440FAF2
+**Important** write this seed phrase in a safe place.
+It is the only way to recover your account if you ever forget your password.
+
+lesson they festival spider robot put close jaguar work minimum song wish shop measure virus obscure image gossip abstract material rotate castle cluster rigid place balance recipe salt level solution typical bunker hat click toss food female claim empty minute large budget motor crumble maximum recall raven curve vote almost abandon
+[kingnet@pdev3 ~]$ basecli1 keys new gotnone
+Enter a passphrase:
+Repeat the passphrase:
+gotnone         D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359
+**Important** write this seed phrase in a safe place.
+It is the only way to recover your account if you ever forget your password.
+
+drama fiber tomato message sort aim surprise cheap prevent exhaust door veteran video junior film install soldier gorilla artefact foam trigger steak stick cave payment senior arrange palace melt whisper betray absent number fall brain suggest hobby suit assume syrup arrive fence hurt river tent device rebel shift clap amateur abandon
+[kingnet@pdev3 ~]$ export MONEY=$(basecli1 keys get money | awk '{print $2}')
+[kingnet@pdev3 ~]$ export GOTNONE=$(basecli1 keys get gotnone | awk '{print $2}')
+[kingnet@pdev3 ~]$</code></pre>
+  <p>初始配置配置，给money用户提供大量初始coin：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecoin1 init --chain-id $CHAINID1 $MONEY
+[kingnet@pdev3 ~]$</code></pre>
+  <p>启动test-chain-1:</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ sed -ie "s/4665/$PORT_PREFIX1/" $BCHOME1_SERVER/config.toml
+[kingnet@pdev3 ~]$ basecoin1 start &amp;&gt; basecoin1.log &amp;
+[2] 193294
+[kingnet@pdev3 ~]$</code></pre>
+  <p>sed命令用于修改配置文件的端口，日志输出到basecoin1.log，检查日志看是否正确出块：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ tail -f basecoin1.log
+I[05-28|12:19:33.072] Executed block                               module=state height=80 validTxs=0 invalidTxs=0
+I[05-28|12:19:33.073] Committed state                              module=state height=80 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864
+I[05-28|12:19:34.059] Executed block                               module=state height=81 validTxs=0 invalidTxs=0
+I[05-28|12:19:34.061] Committed state                              module=state height=81 txs=0 hash=C6D89553EBD974A4F946775CD1D6620BD661A864
+^C
+[kingnet@pdev3 ~]$ </code></pre>
+  <p>使用客户端来验证test-chain-1已经正确启动，第一个账户有余额，第二个没有：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecli1 init --node=tcp://localhost:${RPC_PORT1} --genesis=${BCHOME1_SERVER}/genesis.json
+Loading validator set from tendermint rpc...
+[kingnet@pdev3 ~]$ basecli1 query account $MONEY
+{
+  "height": 233,
+  "data": {
+    "pub_key": null,
+    "sequence": 0,
+    "coins": [
+      {
+        "denom": "mycoin",
+        "amount": 9007199254740992
+      }
+    ]
+  }
+}
+[kingnet@pdev3 ~]$ basecli1 query account $GOTNONE
+ERROR: Account bytes are empty for address D8A5932E4D6FAF6B8C84D2DB6EF2D4FACA40C359
+[kingnet@pdev3 ~]$</code></pre>
+  <h3>八、安装第二条链</h3>
+  <p>第二条链的安装基本与第一条相同，主要是需要修改端口，因为运行在一台机器上。</p>
+  <p>为test-chain-2创建账户密钥：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecli2 keys new moremoney
+Enter a passphrase:
+Repeat the passphrase:
+moremoney       3A4F8C378CFAB5E59F39C3F1B90B87B8CB22489B
+**Important** write this seed phrase in a safe place.
+It is the only way to recover your account if you ever forget your password.
+
+marble vague cricket anger during match that liberty dignity sound ankle best salon fancy will message ketchup fringe tag truly space trial emerge noise about clean tribe spell treat fox coach zone invite noble state bind letter table goddess federal fantasy satoshi exist federal wet neither cloth cliff benefit amateur abandon
+[kingnet@pdev3 ~]$ basecli2 keys new broke
+Enter a passphrase:
+Repeat the passphrase:
+broke           A65BE96A51C251537F481096AA3775B55EB0A596
+**Important** write this seed phrase in a safe place.
+It is the only way to recover your account if you ever forget your password.
+
+raven tiger sadness soup emerge hobby patrol excite torch social end brisk catch keep sphere question actor riot section fold spy security bar senior fog educate nut income solve danger fringe rough blush define slender velvet wrap unfold quality poem attract relief soft sea real stock kitten arrive write advice abandon
+[kingnet@pdev3 ~]$ MOREMONEY=$(basecli2 keys get moremoney | awk '{print $2}')
+[kingnet@pdev3 ~]$ BROKE=$(basecli2 keys get broke | awk '{print $2}')
+[kingnet@pdev3 ~]$</code></pre>
+  <p>初始配置：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecoin2 init --chain-id $CHAINID2 $MOREMONEY
+[kingnet@pdev3 ~]$</code></pre>
+  <p>启动test-chain-2:</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ sed -ie "s/4665/$PORT_PREFIX2/" $BCHOME2_SERVER/config.toml
+[kingnet@pdev3 ~]$ basecoin2 start &amp;&gt; basecoin2.log &amp;
+[3] 195019
+[kingnet@pdev3 ~]$</code></pre>
+  <p>检查启动日志看是否正确出块：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ tail -f basecoin2.log
+I[05-28|12:28:58.509] Executed block                               module=state height=64 validTxs=0 invalidTxs=0
+I[05-28|12:28:58.511] Committed state                              module=state height=64 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:28:59.488] Executed block                               module=state height=65 validTxs=0 invalidTxs=0
+I[05-28|12:28:59.490] Committed state                              module=state height=65 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:29:00.508] Executed block                               module=state height=66 validTxs=0 invalidTxs=0
+I[05-28|12:29:00.510] Committed state                              module=state height=66 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:29:01.513] Executed block                               module=state height=67 validTxs=0 invalidTxs=0
+I[05-28|12:29:01.514] Committed state                              module=state height=67 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:29:02.499] Executed block                               module=state height=68 validTxs=0 invalidTxs=0
+I[05-28|12:29:02.501] Committed state                              module=state height=68 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:29:03.519] Executed block                               module=state height=69 validTxs=0 invalidTxs=0
+I[05-28|12:29:03.520] Committed state                              module=state height=69 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+I[05-28|12:29:04.524] Executed block                               module=state height=70 validTxs=0 invalidTxs=0
+I[05-28|12:29:04.526] Committed state                              module=state height=70 txs=0 hash=B5EACFA6EA4A1F5A8F88CE4E701CED0F927491C0
+^C
+[kingnet@pdev3 ~]$</code></pre>
+  <p>使用客户端连接test-chain-2来验证账户：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecli2 init --node=tcp://localhost:${RPC_PORT2} --genesis=${BCHOME2_SERVER}/genesis.json
+Loading validator set from tendermint rpc...
+[kingnet@pdev3 ~]$ basecli2 query account $MOREMONEY
+{
+  "height": 142,
+  "data": {
+    "pub_key": null,
+    "sequence": 0,
+    "coins": [
+      {
+        "denom": "mycoin",
+        "amount": 9007199254740992
+      }
+    ]
+  }
+}
+[kingnet@pdev3 ~]$ basecli2 query account $BROKE
+ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596
+[kingnet@pdev3 ~]$</code></pre>
+  <h3>九、连接链</h3>
+  <p>两条链已经运行，每条链有不同的密钥，接下来启动一个中继将消息从一条链转发到另一条链上，从而进行IBC。</p>
+  <p>中继账户需要一些钱来支付IBC消息，所以在我们开始中继之前从富裕账户转账一些资金。</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ RELAY_KEY=$BCHOME1_SERVER/key.json
+[kingnet@pdev3 ~]$ RELAY_ADDR=$(cat $RELAY_KEY | jq .address | tr -d \")
+[kingnet@pdev3 ~]$ basecli1 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=money
+Please enter passphrase for money:
+{
+  "check_tx": {
+    "code": 0,
+    "data": "",
+    "log": ""
+  },
+  "deliver_tx": {
+    "code": 0,
+    "data": "B23167DF11932BEC3C5C2483AC18C8338B72240C",
+    "log": ""
+  },
+  "hash": "2B83744A7A854E64D98E2F7299A27C4D13A971BB",
+  "height": 1138
+}
+[kingnet@pdev3 ~]$ basecli1 query account $RELAY_ADDR
+{
+  "height": 1160,
+  "data": {
+    "pub_key": null,
+    "sequence": 0,
+    "coins": [
+      {
+        "denom": "mycoin",
+        "amount": 100000
+      }
+    ]
+  }
+}
+[kingnet@pdev3 ~]$ basecli2 tx send --amount=100000mycoin --sequence=1 --to=$RELAY_ADDR --name=moremoney
+Please enter passphrase for moremoney:
+{
+  "check_tx": {
+    "code": 0,
+    "data": "",
+    "log": ""
+  },
+  "deliver_tx": {
+    "code": 0,
+    "data": "9905BA121EE6650B277B1D2CDE6E993EF45AA097",
+    "log": ""
+  },
+  "hash": "147AF3D21D67028661BEE9425EA062496C6D2842",
+  "height": 646
+}
+[kingnet@pdev3 ~]$ basecli2 query account $RELAY_ADDR
+{
+  "height": 659,
+  "data": {
+    "pub_key": null,
+    "sequence": 0,
+    "coins": [
+      {
+        "denom": "mycoin",
+        "amount": 100000
+      }
+    ]
+  }
+}
+[kingnet@pdev3 ~]$</code></pre>
+  <p>配置中继：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecoin relay init --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --genesis1=${BCHOME1_SERVER}/genesis.json --genesis2=${BCHOME2_SERVER}/genesis.json --from=$RELAY_KEY
+[kingnet@pdev3 ~]$</code></pre>
+  <p>启动中继：</p>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecoin relay start --chain1-id=$CHAINID1 --chain2-id=$CHAINID2 --chain1-addr=tcp://localhost:${RPC_PORT1} --chain2-addr=tcp://localhost:${RPC_PORT2} --from=$RELAY_KEY &amp;&gt; relay.log &amp;
+[4] 197724
+[kingnet@pdev3 ~]$</code></pre>
+  <p>两条链已经通过IBC连接，接下来发送一个跨链的tx。</p>
+  <h3>十、跨链转账</h3>
+  <pre><code class="language-plain">[kingnet@pdev3 ~]$ basecli2 query account $BROKE
+ERROR: Account bytes are empty for address A65BE96A51C251537F481096AA3775B55EB0A596
+[kingnet@pdev3 ~]$ basecli1 tx send --amount=12345mycoin --sequence=2 --to=test-chain-2/$BROKE --name=money
+Please enter passphrase for money:
+{
+  "check_tx": {
+    "code": 0,
+    "data": "",
+    "log": ""
+  },
+  "deliver_tx": {
+    "code": 0,
+    "data": "DF5745E4838C4F5B9A8E05D78EDA717B6D925DEC",
+    "log": ""
+  },
+  "hash": "F7EB450C6326D0FC9FFF6F1F72AAB156D919469A",
+  "height": 1896
+}
+[kingnet@pdev3 ~]$ basecli2 query account $BROKE
+{
+  "height": 1328,
+  "data": {
+    "pub_key": null,
+    "sequence": 0,
+    "coins": [
+      {
+        "denom": "mycoin",
+        "amount": 12345
+      }
+    ]
+  }
+}
+[kingnet@pdev3 ~]$</code></pre>
+  <p><span style="font-size:22px;"><strong>十一、结论</strong></span></p>
+  <p>真可以跨链转账啊，价值传输网就来了！！！！！！</p>
+  <p><br></p>
+  <p><br></p>
+  <p><br></p>
+  <p><br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/bedrock_stable/article/details/80485190,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/bedrock_stable/article/details/80485190,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

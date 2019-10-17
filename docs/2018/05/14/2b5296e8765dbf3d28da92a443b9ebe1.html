@@ -1,0 +1,1675 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码分析(29)core-vm源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码分析(29)core-vm源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="## contract.go contract 代表了以太坊 state database里面的一个合约。包含了合约代码，调用参数。 结构 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ContractRef is a reference to the contract&#39;s backing object &nbsp;&nbsp;&nbsp;&nbsp;type ContractRef interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Address() common.Address &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// AccountRef implements ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Account references are used during EVM initialisation and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s primary use is to fetch addresses. Removing this object &nbsp;&nbsp;&nbsp;&nbsp;// proves difficult because of the cached jump destinations which &nbsp;&nbsp;&nbsp;&nbsp;// are fetched from the parent contract (i.e. the caller), which &nbsp;&nbsp;&nbsp;&nbsp;// is a ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;type AccountRef common.Address &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address casts AccountRef to a Address &nbsp;&nbsp;&nbsp;&nbsp;func (ar AccountRef) Address() common.Address { return (common.Address)(ar) } &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Contract represents an ethereum contract in the state database. It contains &nbsp;&nbsp;&nbsp;&nbsp;// the the contract code, calling arguments. Contract implements ContractRef &nbsp;&nbsp;&nbsp;&nbsp;type Contract struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress is the result of the caller which initialised this &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contract. However when the &quot;call method&quot; is delegated this value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// needs to be initialised to that of the caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress是初始化这个合约的人。 如果是delegate，这个值被设置为调用者的调用者。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CallerAddress common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;caller ContractRef &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self ContractRef &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;jumpdests destinations // result of JUMPDEST analysis. JUMPDEST指令的分析 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Code []byte //代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeHash common.Hash //代码的HASH &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeAddr *common.Address //代码地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Input []byte // 入参 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 合约还有多少Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Args []byte //好像没有使用 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;DelegateCall bool &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewContract returns a new contract environment for the execution of EVM. &nbsp;&nbsp;&nbsp;&nbsp;func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c := &amp;Contract{CallerAddress: caller.Address(), caller: caller, self: object, Args: nil} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if parent, ok := caller.(*Contract); ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Reuse JUMPDEST analysis from parent context if available. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果 caller 是一个合约，说明是合约调用了我们。 jumpdests设置为caller的jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = parent.jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = make(destinations) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Gas should be a pointer so it can safely be reduced through the run &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// This pointer will be off the state transition &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas = gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// ensures a value is set &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} AsDelegate将合约设置为委托调用并返回当前合同（用于链式调用） &nbsp;&nbsp;&nbsp;&nbsp;// AsDelegate sets the contract to be a delegate call and returns the current &nbsp;&nbsp;&nbsp;&nbsp;// contract (for chaining calls) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) AsDelegate() *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.DelegateCall = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: caller must, at all times be a contract. It should never happen &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// that caller is something other than a Contract. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;parent := c.caller.(*Contract) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.CallerAddress = parent.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = parent.value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; GetOp 用来获取下一跳指令 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetOp returns the n&#39;th element in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetOp(n uint64) OpCode { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return OpCode(c.GetByte(n)) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetByte returns the n&#39;th byte in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetByte(n uint64) byte { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if n &lt; uint64(len(c.Code)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.Code[n] &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Caller returns the caller of the contract. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Caller will recursively call caller when the contract is a delegate &nbsp;&nbsp;&nbsp;&nbsp;// call, including that of caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Caller() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;} UseGas使用Gas。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// UseGas attempts the use gas and subtracts it and returns true on success &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) UseGas(gas uint64) (ok bool) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if c.Gas &lt; gas { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return false &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas -= gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address returns the contracts address &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Address() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.self.Address() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Value returns the contracts value (sent to it from it&#39;s caller) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Value() *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.value &nbsp;&nbsp;&nbsp;&nbsp;} SetCode&nbsp;，SetCallCode 设置代码。 &nbsp;&nbsp;&nbsp;&nbsp;// SetCode sets the code to the contract &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCode(hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// SetCallCode sets the code of the contract and address of the backing data &nbsp;&nbsp;&nbsp;&nbsp;// object &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCallCode(addr *common.Address, hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeAddr = addr &nbsp;&nbsp;&nbsp;&nbsp;} ## evm.go 结构 &nbsp;&nbsp;&nbsp;&nbsp;// Context provides the EVM with auxiliary information. Once provided &nbsp;&nbsp;&nbsp;&nbsp;// it shouldn&#39;t be modified. &nbsp;&nbsp;&nbsp;&nbsp;// 上下文为EVM提供辅助信息。 一旦提供，不应该修改。 &nbsp;&nbsp;&nbsp;&nbsp;type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer returns whether the account contains &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient ether to transfer the value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 函数返回账户是否有足够的ether用来转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer transfers ether from one account to the other &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer 用来从一个账户给另一个账户转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash returns the hash corresponding to n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash用来返回入参n对应的hash值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供Origin的信息 sender的地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供GasPrice信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasLimit *big.Int // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// EVM is the Ethereum Virtual Machine base object and provides &nbsp;&nbsp;&nbsp;&nbsp;// the necessary tools to run a contract on the given state with &nbsp;&nbsp;&nbsp;&nbsp;// the provided context. It should be noted that any error &nbsp;&nbsp;&nbsp;&nbsp;// generated through any of the calls should be considered a &nbsp;&nbsp;&nbsp;&nbsp;// revert-state-and-consume-all-gas operation, no checks on &nbsp;&nbsp;&nbsp;&nbsp;// specific errors should ever be performed. The interpreter makes &nbsp;&nbsp;&nbsp;&nbsp;// sure that any errors generated are to be considered faulty code. &nbsp;&nbsp;&nbsp;&nbsp;// EVM是以太坊虚拟机基础对象，并提供必要的工具，以使用提供的上下文运行给定状态的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 应该指出的是，任何调用产生的任何错误都应该被认为是一种回滚修改状态和消耗所有GAS操作， &nbsp;&nbsp;&nbsp;&nbsp;// 不应该执行对具体错误的检查。 解释器确保生成的任何错误都被认为是错误的代码。 &nbsp;&nbsp;&nbsp;&nbsp;// The EVM should never be reused and is not thread safe. &nbsp;&nbsp;&nbsp;&nbsp;type EVM struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Context provides auxiliary blockchain related information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// StateDB gives access to the underlying state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth is the current call stack &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前的调用堆栈 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;depth int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chainConfig contains information about the current chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 包含了当前的区块链的信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig *params.ChainConfig &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chain rules contains the chain rules for the current epoch &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules params.Rules &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// virtual machine configuration options used to initialise the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// evm. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig Config &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// global (to this context) ethereum virtual machine &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// used throughout the execution of the tx. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;interpreter *Interpreter &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// abort is used to abort the EVM calling operations &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: must be set atomically &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;abort int32 &nbsp;&nbsp;&nbsp;&nbsp;} 构造函数 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewEVM retutrns a new EVM . The returned EVM is not thread safe and should &nbsp;&nbsp;&nbsp;&nbsp;// only ever be used *once*. &nbsp;&nbsp;&nbsp;&nbsp;func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmConfig Config) *EVM { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm := &amp;EVM{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context: ctx, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB: statedb, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig: vmConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig: chainConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules: chainConfig.Rules(ctx.BlockNumber), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter = NewInterpreter(evm, vmConfig) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return evm &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Cancel cancels any running EVM operation. This may be called concurrently and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s safe to be called multiple times. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Cancel() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt32(&amp;evm.abort, 1) &nbsp;&nbsp;&nbsp;&nbsp;} 合约创建 Create 会创建一个新的合约。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Create creates a new contract using code as deployment code. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth check execution. Fail if we&#39;re trying to execute above the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// limit. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Ensure there&#39;s no existing contract already at the designated address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 确保特定的地址没有合约存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := evm.StateDB.GetNonce(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(caller.Address(), nonce+1) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractAddr = crypto.CreateAddress(caller.Address(), nonce) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractHash := evm.StateDB.GetCodeHash(contractAddr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { //如果已经存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, 0, ErrContractAddressCollision &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new account on the state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot := evm.StateDB.Snapshot() //创建一个StateDB的快照，以便回滚 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(contractAddr) //创建账户 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsEIP158(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(contractAddr, 1) //设置nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) //转账 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, AccountRef(contractAddr), value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, contractAddr, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, nil) //执行合约的初始化代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// check whether the max code size has been exceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 检查初始化生成的代码的长度不超过限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the contract creation ran successfully and no errors were returned &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// calculate the gas required to store the code. If the code could not &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// be stored due to not enough gas set an error and let it be handled &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// by the error checking condition below. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//如果合同创建成功并且没有错误返回，则计算存储代码所需的GAS。 如果由于没有足够的GAS而导致代码不能被存储设置错误，并通过下面的错误检查条件来处理。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err == nil &amp;&amp; !maxCodeSizeExceeded { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;createDataGas := uint64(len(ret)) * params.CreateDataGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contract.UseGas(createDataGas) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetCode(contractAddr, ret) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = ErrCodeStoreOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当错误返回我们回滚修改， &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Assign err if contract code size exceeds the max while the err is still empty. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded &amp;&amp; err == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = errMaxCodeSizeExceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contractAddr, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call executes the contract associated with the addr with the given input as &nbsp;&nbsp;&nbsp;&nbsp;// parameters. It also handles any necessary value transfer required and takes &nbsp;&nbsp;&nbsp;&nbsp;// the necessary steps to create accounts and reverses the state in case of an &nbsp;&nbsp;&nbsp;&nbsp;// execution error or failed value transfer. &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call 执行与给定的input作为参数与addr相关联的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 它还处理所需的任何必要的转账操作，并采取必要的步骤来创建帐户 &nbsp;&nbsp;&nbsp;&nbsp;// 并在任意错误的情况下回滚所做的操作。 &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 调用深度最多1024 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 查看我们的账户是否有足够的金钱。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.StateDB.Exist(addr) { // 查看指定地址是否存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果地址不存在，查看是否是 native go的合约， native go的合约在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contracts.go 文件里面 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles := PrecompiledContractsHomestead &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsByzantium(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles = PrecompiledContractsByzantium &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果不是指定的合约地址， 并且value的值为0那么返回正常，而且这次调用没有消耗Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 负责在本地状态创建addr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 执行转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是由revert指令触发的错误，因为ICO一般设置了人数限制或者资金限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 在大家抢购的时候很可能会触发这些限制条件，导致被抽走不少钱。这个时候 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 又不能设置比较低的GasPrice和GasLimit。因为要速度快。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 那么不会使用剩下的全部Gas，而是只会使用代码执行的Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 不然会被抽走 GasLimit *GasPrice的钱，那可不少。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 剩下的三个函数 CallCode, DelegateCall, 和 StaticCall，这三个函数不能由外部调用，只能由Opcode触发。 CallCode &nbsp;&nbsp;&nbsp;&nbsp;// CallCode differs from Call in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context. &nbsp;&nbsp;&nbsp;&nbsp;// CallCode与Call不同的地方在于它使用caller的context来执行给定地址的代码。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) //这里是最不同的地方 to的地址被修改为caller的地址了 而且没有转账的行为 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} DelegateCall &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall differs from CallCode in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context and the caller is set to the caller of the caller. &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall 和 CallCode不同的地方在于 caller被设置为 caller的caller &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and make initialise the delegate values &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 标识为AsDelete() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, nil, gas).AsDelegate() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall executes the contract associated with the addr with the given input &nbsp;&nbsp;&nbsp;&nbsp;// as parameters while disallowing any modifications to the state during the call. &nbsp;&nbsp;&nbsp;&nbsp;// Opcodes that attempt to perform such modifications will result in exceptions &nbsp;&nbsp;&nbsp;&nbsp;// instead of performing the modifications. &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall不允许执行任何修改状态的操作， &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure the readonly is only set if we aren&#39;t in readonly yet &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// this makes also sure that the readonly flag isn&#39;t removed for &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// child calls. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.interpreter.readOnly { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter.readOnly = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;defer func() { evm.interpreter.readOnly = false }() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// EVM. The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, new(big.Int), gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in Homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<meta property="og:description" content="## contract.go contract 代表了以太坊 state database里面的一个合约。包含了合约代码，调用参数。 结构 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ContractRef is a reference to the contract&#39;s backing object &nbsp;&nbsp;&nbsp;&nbsp;type ContractRef interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Address() common.Address &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// AccountRef implements ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Account references are used during EVM initialisation and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s primary use is to fetch addresses. Removing this object &nbsp;&nbsp;&nbsp;&nbsp;// proves difficult because of the cached jump destinations which &nbsp;&nbsp;&nbsp;&nbsp;// are fetched from the parent contract (i.e. the caller), which &nbsp;&nbsp;&nbsp;&nbsp;// is a ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;type AccountRef common.Address &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address casts AccountRef to a Address &nbsp;&nbsp;&nbsp;&nbsp;func (ar AccountRef) Address() common.Address { return (common.Address)(ar) } &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Contract represents an ethereum contract in the state database. It contains &nbsp;&nbsp;&nbsp;&nbsp;// the the contract code, calling arguments. Contract implements ContractRef &nbsp;&nbsp;&nbsp;&nbsp;type Contract struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress is the result of the caller which initialised this &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contract. However when the &quot;call method&quot; is delegated this value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// needs to be initialised to that of the caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress是初始化这个合约的人。 如果是delegate，这个值被设置为调用者的调用者。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CallerAddress common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;caller ContractRef &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self ContractRef &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;jumpdests destinations // result of JUMPDEST analysis. JUMPDEST指令的分析 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Code []byte //代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeHash common.Hash //代码的HASH &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeAddr *common.Address //代码地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Input []byte // 入参 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 合约还有多少Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Args []byte //好像没有使用 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;DelegateCall bool &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewContract returns a new contract environment for the execution of EVM. &nbsp;&nbsp;&nbsp;&nbsp;func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c := &amp;Contract{CallerAddress: caller.Address(), caller: caller, self: object, Args: nil} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if parent, ok := caller.(*Contract); ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Reuse JUMPDEST analysis from parent context if available. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果 caller 是一个合约，说明是合约调用了我们。 jumpdests设置为caller的jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = parent.jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = make(destinations) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Gas should be a pointer so it can safely be reduced through the run &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// This pointer will be off the state transition &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas = gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// ensures a value is set &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} AsDelegate将合约设置为委托调用并返回当前合同（用于链式调用） &nbsp;&nbsp;&nbsp;&nbsp;// AsDelegate sets the contract to be a delegate call and returns the current &nbsp;&nbsp;&nbsp;&nbsp;// contract (for chaining calls) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) AsDelegate() *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.DelegateCall = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: caller must, at all times be a contract. It should never happen &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// that caller is something other than a Contract. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;parent := c.caller.(*Contract) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.CallerAddress = parent.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = parent.value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; GetOp 用来获取下一跳指令 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetOp returns the n&#39;th element in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetOp(n uint64) OpCode { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return OpCode(c.GetByte(n)) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetByte returns the n&#39;th byte in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetByte(n uint64) byte { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if n &lt; uint64(len(c.Code)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.Code[n] &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Caller returns the caller of the contract. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Caller will recursively call caller when the contract is a delegate &nbsp;&nbsp;&nbsp;&nbsp;// call, including that of caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Caller() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;} UseGas使用Gas。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// UseGas attempts the use gas and subtracts it and returns true on success &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) UseGas(gas uint64) (ok bool) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if c.Gas &lt; gas { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return false &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas -= gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address returns the contracts address &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Address() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.self.Address() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Value returns the contracts value (sent to it from it&#39;s caller) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Value() *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.value &nbsp;&nbsp;&nbsp;&nbsp;} SetCode&nbsp;，SetCallCode 设置代码。 &nbsp;&nbsp;&nbsp;&nbsp;// SetCode sets the code to the contract &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCode(hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// SetCallCode sets the code of the contract and address of the backing data &nbsp;&nbsp;&nbsp;&nbsp;// object &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCallCode(addr *common.Address, hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeAddr = addr &nbsp;&nbsp;&nbsp;&nbsp;} ## evm.go 结构 &nbsp;&nbsp;&nbsp;&nbsp;// Context provides the EVM with auxiliary information. Once provided &nbsp;&nbsp;&nbsp;&nbsp;// it shouldn&#39;t be modified. &nbsp;&nbsp;&nbsp;&nbsp;// 上下文为EVM提供辅助信息。 一旦提供，不应该修改。 &nbsp;&nbsp;&nbsp;&nbsp;type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer returns whether the account contains &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient ether to transfer the value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 函数返回账户是否有足够的ether用来转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer transfers ether from one account to the other &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer 用来从一个账户给另一个账户转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash returns the hash corresponding to n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash用来返回入参n对应的hash值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供Origin的信息 sender的地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供GasPrice信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasLimit *big.Int // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// EVM is the Ethereum Virtual Machine base object and provides &nbsp;&nbsp;&nbsp;&nbsp;// the necessary tools to run a contract on the given state with &nbsp;&nbsp;&nbsp;&nbsp;// the provided context. It should be noted that any error &nbsp;&nbsp;&nbsp;&nbsp;// generated through any of the calls should be considered a &nbsp;&nbsp;&nbsp;&nbsp;// revert-state-and-consume-all-gas operation, no checks on &nbsp;&nbsp;&nbsp;&nbsp;// specific errors should ever be performed. The interpreter makes &nbsp;&nbsp;&nbsp;&nbsp;// sure that any errors generated are to be considered faulty code. &nbsp;&nbsp;&nbsp;&nbsp;// EVM是以太坊虚拟机基础对象，并提供必要的工具，以使用提供的上下文运行给定状态的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 应该指出的是，任何调用产生的任何错误都应该被认为是一种回滚修改状态和消耗所有GAS操作， &nbsp;&nbsp;&nbsp;&nbsp;// 不应该执行对具体错误的检查。 解释器确保生成的任何错误都被认为是错误的代码。 &nbsp;&nbsp;&nbsp;&nbsp;// The EVM should never be reused and is not thread safe. &nbsp;&nbsp;&nbsp;&nbsp;type EVM struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Context provides auxiliary blockchain related information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// StateDB gives access to the underlying state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth is the current call stack &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前的调用堆栈 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;depth int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chainConfig contains information about the current chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 包含了当前的区块链的信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig *params.ChainConfig &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chain rules contains the chain rules for the current epoch &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules params.Rules &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// virtual machine configuration options used to initialise the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// evm. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig Config &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// global (to this context) ethereum virtual machine &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// used throughout the execution of the tx. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;interpreter *Interpreter &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// abort is used to abort the EVM calling operations &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: must be set atomically &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;abort int32 &nbsp;&nbsp;&nbsp;&nbsp;} 构造函数 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewEVM retutrns a new EVM . The returned EVM is not thread safe and should &nbsp;&nbsp;&nbsp;&nbsp;// only ever be used *once*. &nbsp;&nbsp;&nbsp;&nbsp;func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmConfig Config) *EVM { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm := &amp;EVM{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context: ctx, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB: statedb, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig: vmConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig: chainConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules: chainConfig.Rules(ctx.BlockNumber), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter = NewInterpreter(evm, vmConfig) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return evm &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Cancel cancels any running EVM operation. This may be called concurrently and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s safe to be called multiple times. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Cancel() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt32(&amp;evm.abort, 1) &nbsp;&nbsp;&nbsp;&nbsp;} 合约创建 Create 会创建一个新的合约。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Create creates a new contract using code as deployment code. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth check execution. Fail if we&#39;re trying to execute above the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// limit. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Ensure there&#39;s no existing contract already at the designated address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 确保特定的地址没有合约存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := evm.StateDB.GetNonce(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(caller.Address(), nonce+1) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractAddr = crypto.CreateAddress(caller.Address(), nonce) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractHash := evm.StateDB.GetCodeHash(contractAddr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { //如果已经存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, 0, ErrContractAddressCollision &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new account on the state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot := evm.StateDB.Snapshot() //创建一个StateDB的快照，以便回滚 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(contractAddr) //创建账户 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsEIP158(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(contractAddr, 1) //设置nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) //转账 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, AccountRef(contractAddr), value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, contractAddr, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, nil) //执行合约的初始化代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// check whether the max code size has been exceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 检查初始化生成的代码的长度不超过限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the contract creation ran successfully and no errors were returned &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// calculate the gas required to store the code. If the code could not &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// be stored due to not enough gas set an error and let it be handled &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// by the error checking condition below. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//如果合同创建成功并且没有错误返回，则计算存储代码所需的GAS。 如果由于没有足够的GAS而导致代码不能被存储设置错误，并通过下面的错误检查条件来处理。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err == nil &amp;&amp; !maxCodeSizeExceeded { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;createDataGas := uint64(len(ret)) * params.CreateDataGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contract.UseGas(createDataGas) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetCode(contractAddr, ret) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = ErrCodeStoreOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当错误返回我们回滚修改， &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Assign err if contract code size exceeds the max while the err is still empty. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded &amp;&amp; err == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = errMaxCodeSizeExceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contractAddr, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call executes the contract associated with the addr with the given input as &nbsp;&nbsp;&nbsp;&nbsp;// parameters. It also handles any necessary value transfer required and takes &nbsp;&nbsp;&nbsp;&nbsp;// the necessary steps to create accounts and reverses the state in case of an &nbsp;&nbsp;&nbsp;&nbsp;// execution error or failed value transfer. &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call 执行与给定的input作为参数与addr相关联的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 它还处理所需的任何必要的转账操作，并采取必要的步骤来创建帐户 &nbsp;&nbsp;&nbsp;&nbsp;// 并在任意错误的情况下回滚所做的操作。 &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 调用深度最多1024 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 查看我们的账户是否有足够的金钱。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.StateDB.Exist(addr) { // 查看指定地址是否存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果地址不存在，查看是否是 native go的合约， native go的合约在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contracts.go 文件里面 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles := PrecompiledContractsHomestead &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsByzantium(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles = PrecompiledContractsByzantium &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果不是指定的合约地址， 并且value的值为0那么返回正常，而且这次调用没有消耗Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 负责在本地状态创建addr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 执行转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是由revert指令触发的错误，因为ICO一般设置了人数限制或者资金限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 在大家抢购的时候很可能会触发这些限制条件，导致被抽走不少钱。这个时候 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 又不能设置比较低的GasPrice和GasLimit。因为要速度快。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 那么不会使用剩下的全部Gas，而是只会使用代码执行的Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 不然会被抽走 GasLimit *GasPrice的钱，那可不少。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 剩下的三个函数 CallCode, DelegateCall, 和 StaticCall，这三个函数不能由外部调用，只能由Opcode触发。 CallCode &nbsp;&nbsp;&nbsp;&nbsp;// CallCode differs from Call in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context. &nbsp;&nbsp;&nbsp;&nbsp;// CallCode与Call不同的地方在于它使用caller的context来执行给定地址的代码。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) //这里是最不同的地方 to的地址被修改为caller的地址了 而且没有转账的行为 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} DelegateCall &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall differs from CallCode in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context and the caller is set to the caller of the caller. &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall 和 CallCode不同的地方在于 caller被设置为 caller的caller &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and make initialise the delegate values &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 标识为AsDelete() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, nil, gas).AsDelegate() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall executes the contract associated with the addr with the given input &nbsp;&nbsp;&nbsp;&nbsp;// as parameters while disallowing any modifications to the state during the call. &nbsp;&nbsp;&nbsp;&nbsp;// Opcodes that attempt to perform such modifications will result in exceptions &nbsp;&nbsp;&nbsp;&nbsp;// instead of performing the modifications. &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall不允许执行任何修改状态的操作， &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure the readonly is only set if we aren&#39;t in readonly yet &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// this makes also sure that the readonly flag isn&#39;t removed for &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// child calls. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.interpreter.readOnly { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter.readOnly = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;defer func() { evm.interpreter.readOnly = false }() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// EVM. The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, new(big.Int), gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in Homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/14/2b5296e8765dbf3d28da92a443b9ebe1.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/14/2b5296e8765dbf3d28da92a443b9ebe1.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-14T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"## contract.go contract 代表了以太坊 state database里面的一个合约。包含了合约代码，调用参数。 结构 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// ContractRef is a reference to the contract&#39;s backing object &nbsp;&nbsp;&nbsp;&nbsp;type ContractRef interface { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Address() common.Address &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// AccountRef implements ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Account references are used during EVM initialisation and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s primary use is to fetch addresses. Removing this object &nbsp;&nbsp;&nbsp;&nbsp;// proves difficult because of the cached jump destinations which &nbsp;&nbsp;&nbsp;&nbsp;// are fetched from the parent contract (i.e. the caller), which &nbsp;&nbsp;&nbsp;&nbsp;// is a ContractRef. &nbsp;&nbsp;&nbsp;&nbsp;type AccountRef common.Address &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address casts AccountRef to a Address &nbsp;&nbsp;&nbsp;&nbsp;func (ar AccountRef) Address() common.Address { return (common.Address)(ar) } &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Contract represents an ethereum contract in the state database. It contains &nbsp;&nbsp;&nbsp;&nbsp;// the the contract code, calling arguments. Contract implements ContractRef &nbsp;&nbsp;&nbsp;&nbsp;type Contract struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress is the result of the caller which initialised this &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contract. However when the &quot;call method&quot; is delegated this value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// needs to be initialised to that of the caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress是初始化这个合约的人。 如果是delegate，这个值被设置为调用者的调用者。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CallerAddress common.Address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;caller ContractRef &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self ContractRef &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;jumpdests destinations // result of JUMPDEST analysis. JUMPDEST指令的分析 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Code []byte //代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeHash common.Hash //代码的HASH &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeAddr *common.Address //代码地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Input []byte // 入参 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 合约还有多少Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Args []byte //好像没有使用 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;DelegateCall bool &nbsp;&nbsp;&nbsp;&nbsp;} 构造 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewContract returns a new contract environment for the execution of EVM. &nbsp;&nbsp;&nbsp;&nbsp;func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c := &amp;Contract{CallerAddress: caller.Address(), caller: caller, self: object, Args: nil} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if parent, ok := caller.(*Contract); ok { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Reuse JUMPDEST analysis from parent context if available. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果 caller 是一个合约，说明是合约调用了我们。 jumpdests设置为caller的jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = parent.jumpdests &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = make(destinations) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Gas should be a pointer so it can safely be reduced through the run &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// This pointer will be off the state transition &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas = gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// ensures a value is set &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} AsDelegate将合约设置为委托调用并返回当前合同（用于链式调用） &nbsp;&nbsp;&nbsp;&nbsp;// AsDelegate sets the contract to be a delegate call and returns the current &nbsp;&nbsp;&nbsp;&nbsp;// contract (for chaining calls) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) AsDelegate() *Contract { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.DelegateCall = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: caller must, at all times be a contract. It should never happen &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// that caller is something other than a Contract. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;parent := c.caller.(*Contract) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.CallerAddress = parent.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = parent.value &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; GetOp 用来获取下一跳指令 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetOp returns the n&#39;th element in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetOp(n uint64) OpCode { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return OpCode(c.GetByte(n)) &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// GetByte returns the n&#39;th byte in the contract&#39;s byte array &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetByte(n uint64) byte { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if n &lt; uint64(len(c.Code)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.Code[n] &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return 0 &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;// Caller returns the caller of the contract. &nbsp;&nbsp;&nbsp;&nbsp;// &nbsp;&nbsp;&nbsp;&nbsp;// Caller will recursively call caller when the contract is a delegate &nbsp;&nbsp;&nbsp;&nbsp;// call, including that of caller&#39;s caller. &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Caller() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.CallerAddress &nbsp;&nbsp;&nbsp;&nbsp;} UseGas使用Gas。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// UseGas attempts the use gas and subtracts it and returns true on success &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) UseGas(gas uint64) (ok bool) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if c.Gas &lt; gas { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return false &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas -= gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return true &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Address returns the contracts address &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Address() common.Address { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.self.Address() &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Value returns the contracts value (sent to it from it&#39;s caller) &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Value() *big.Int { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.value &nbsp;&nbsp;&nbsp;&nbsp;} SetCode&nbsp;，SetCallCode 设置代码。 &nbsp;&nbsp;&nbsp;&nbsp;// SetCode sets the code to the contract &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCode(hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// SetCallCode sets the code of the contract and address of the backing data &nbsp;&nbsp;&nbsp;&nbsp;// object &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCallCode(addr *common.Address, hash common.Hash, code []byte) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeAddr = addr &nbsp;&nbsp;&nbsp;&nbsp;} ## evm.go 结构 &nbsp;&nbsp;&nbsp;&nbsp;// Context provides the EVM with auxiliary information. Once provided &nbsp;&nbsp;&nbsp;&nbsp;// it shouldn&#39;t be modified. &nbsp;&nbsp;&nbsp;&nbsp;// 上下文为EVM提供辅助信息。 一旦提供，不应该修改。 &nbsp;&nbsp;&nbsp;&nbsp;type Context struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer returns whether the account contains &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient ether to transfer the value &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 函数返回账户是否有足够的ether用来转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CanTransfer CanTransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer transfers ether from one account to the other &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer 用来从一个账户给另一个账户转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash returns the hash corresponding to n &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash用来返回入参n对应的hash值 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供Origin的信息 sender的地址 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供GasPrice信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Block information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasLimit *big.Int // Provides information for GASLIMIT &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// EVM is the Ethereum Virtual Machine base object and provides &nbsp;&nbsp;&nbsp;&nbsp;// the necessary tools to run a contract on the given state with &nbsp;&nbsp;&nbsp;&nbsp;// the provided context. It should be noted that any error &nbsp;&nbsp;&nbsp;&nbsp;// generated through any of the calls should be considered a &nbsp;&nbsp;&nbsp;&nbsp;// revert-state-and-consume-all-gas operation, no checks on &nbsp;&nbsp;&nbsp;&nbsp;// specific errors should ever be performed. The interpreter makes &nbsp;&nbsp;&nbsp;&nbsp;// sure that any errors generated are to be considered faulty code. &nbsp;&nbsp;&nbsp;&nbsp;// EVM是以太坊虚拟机基础对象，并提供必要的工具，以使用提供的上下文运行给定状态的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 应该指出的是，任何调用产生的任何错误都应该被认为是一种回滚修改状态和消耗所有GAS操作， &nbsp;&nbsp;&nbsp;&nbsp;// 不应该执行对具体错误的检查。 解释器确保生成的任何错误都被认为是错误的代码。 &nbsp;&nbsp;&nbsp;&nbsp;// The EVM should never be reused and is not thread safe. &nbsp;&nbsp;&nbsp;&nbsp;type EVM struct { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Context provides auxiliary blockchain related information &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// StateDB gives access to the underlying state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB StateDB &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth is the current call stack &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前的调用堆栈 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;depth int &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chainConfig contains information about the current chain &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 包含了当前的区块链的信息 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig *params.ChainConfig &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chain rules contains the chain rules for the current epoch &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules params.Rules &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// virtual machine configuration options used to initialise the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// evm. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig Config &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// global (to this context) ethereum virtual machine &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// used throughout the execution of the tx. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;interpreter *Interpreter &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// abort is used to abort the EVM calling operations &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: must be set atomically &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;abort int32 &nbsp;&nbsp;&nbsp;&nbsp;} 构造函数 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// NewEVM retutrns a new EVM . The returned EVM is not thread safe and should &nbsp;&nbsp;&nbsp;&nbsp;// only ever be used *once*. &nbsp;&nbsp;&nbsp;&nbsp;func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmConfig Config) *EVM { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm := &amp;EVM{ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context: ctx, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB: statedb, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig: vmConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig: chainConfig, &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules: chainConfig.Rules(ctx.BlockNumber), &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter = NewInterpreter(evm, vmConfig) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return evm &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Cancel cancels any running EVM operation. This may be called concurrently and &nbsp;&nbsp;&nbsp;&nbsp;// it&#39;s safe to be called multiple times. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Cancel() { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt32(&amp;evm.abort, 1) &nbsp;&nbsp;&nbsp;&nbsp;} 合约创建 Create 会创建一个新的合约。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Create creates a new contract using code as deployment code. &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth check execution. Fail if we&#39;re trying to execute above the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// limit. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Ensure there&#39;s no existing contract already at the designated address &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 确保特定的地址没有合约存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := evm.StateDB.GetNonce(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(caller.Address(), nonce+1) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractAddr = crypto.CreateAddress(caller.Address(), nonce) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractHash := evm.StateDB.GetCodeHash(contractAddr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { //如果已经存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, 0, ErrContractAddressCollision &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new account on the state &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot := evm.StateDB.Snapshot() //创建一个StateDB的快照，以便回滚 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(contractAddr) //创建账户 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsEIP158(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(contractAddr, 1) //设置nonce &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) //转账 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, AccountRef(contractAddr), value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, contractAddr, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, nil) //执行合约的初始化代码 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// check whether the max code size has been exceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 检查初始化生成的代码的长度不超过限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the contract creation ran successfully and no errors were returned &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// calculate the gas required to store the code. If the code could not &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// be stored due to not enough gas set an error and let it be handled &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// by the error checking condition below. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//如果合同创建成功并且没有错误返回，则计算存储代码所需的GAS。 如果由于没有足够的GAS而导致代码不能被存储设置错误，并通过下面的错误检查条件来处理。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err == nil &amp;&amp; !maxCodeSizeExceeded { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;createDataGas := uint64(len(ret)) * params.CreateDataGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contract.UseGas(createDataGas) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetCode(contractAddr, ret) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = ErrCodeStoreOutOfGas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当错误返回我们回滚修改， &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Assign err if contract code size exceeds the max while the err is still empty. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded &amp;&amp; err == nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = errMaxCodeSizeExceeded &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contractAddr, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call executes the contract associated with the addr with the given input as &nbsp;&nbsp;&nbsp;&nbsp;// parameters. It also handles any necessary value transfer required and takes &nbsp;&nbsp;&nbsp;&nbsp;// the necessary steps to create accounts and reverses the state in case of an &nbsp;&nbsp;&nbsp;&nbsp;// execution error or failed value transfer. &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// Call 执行与给定的input作为参数与addr相关联的合约。 &nbsp;&nbsp;&nbsp;&nbsp;// 它还处理所需的任何必要的转账操作，并采取必要的步骤来创建帐户 &nbsp;&nbsp;&nbsp;&nbsp;// 并在任意错误的情况下回滚所做的操作。 &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 调用深度最多1024 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 查看我们的账户是否有足够的金钱。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.StateDB.Exist(addr) { // 查看指定地址是否存在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果地址不存在，查看是否是 native go的合约， native go的合约在 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contracts.go 文件里面 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles := PrecompiledContractsHomestead &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsByzantium(evm.BlockNumber) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles = PrecompiledContractsByzantium &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果不是指定的合约地址， 并且value的值为0那么返回正常，而且这次调用没有消耗Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 负责在本地状态创建addr &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 执行转账 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是由revert指令触发的错误，因为ICO一般设置了人数限制或者资金限制 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 在大家抢购的时候很可能会触发这些限制条件，导致被抽走不少钱。这个时候 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 又不能设置比较低的GasPrice和GasLimit。因为要速度快。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 那么不会使用剩下的全部Gas，而是只会使用代码执行的Gas &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 不然会被抽走 GasLimit *GasPrice的钱，那可不少。 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 剩下的三个函数 CallCode, DelegateCall, 和 StaticCall，这三个函数不能由外部调用，只能由Opcode触发。 CallCode &nbsp;&nbsp;&nbsp;&nbsp;// CallCode differs from Call in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context. &nbsp;&nbsp;&nbsp;&nbsp;// CallCode与Call不同的地方在于它使用caller的context来执行给定地址的代码。 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to transfer more than the available balance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) //这里是最不同的地方 to的地址被修改为caller的地址了 而且没有转账的行为 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} DelegateCall &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall differs from CallCode in the sense that it executes the given address&#39; &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context and the caller is set to the caller of the caller. &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall 和 CallCode不同的地方在于 caller被设置为 caller的caller &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and make initialise the delegate values &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 标识为AsDelete() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, nil, gas).AsDelegate() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall executes the contract associated with the addr with the given input &nbsp;&nbsp;&nbsp;&nbsp;// as parameters while disallowing any modifications to the state during the call. &nbsp;&nbsp;&nbsp;&nbsp;// Opcodes that attempt to perform such modifications will result in exceptions &nbsp;&nbsp;&nbsp;&nbsp;// instead of performing the modifications. &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall不允许执行任何修改状态的操作， &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we&#39;re trying to execute above the call depth limit &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure the readonly is only set if we aren&#39;t in readonly yet &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// this makes also sure that the readonly flag isn&#39;t removed for &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// child calls. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.interpreter.readOnly { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter.readOnly = true &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;defer func() { evm.interpreter.readOnly = false }() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var ( &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot() &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and set the code that is to be used by the &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// EVM. The contract is a scoped environment for this execution context &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, new(big.Int), gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we&#39;re in Homestead this also counts for code storage gas errors. &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err &nbsp;&nbsp;&nbsp;&nbsp;} 网址：http://www.qukuailianxueyuan.io/ 欲领取造币技术与全套虚拟机资料 区块链技术交流QQ群：756146052&nbsp;&nbsp;备注：CSDN 尹成学院微信：备注：CSDN 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/14/2b5296e8765dbf3d28da92a443b9ebe1.html","headline":"以太坊源码分析(29)core-vm源码分析","dateModified":"2018-05-14T00:00:00+08:00","datePublished":"2018-05-14T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/14/2b5296e8765dbf3d28da92a443b9ebe1.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码分析(29)core-vm源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="color:rgb(212,212,212);background-color:rgb(30,30,30);font-family:Consolas, 'Courier New', monospace;font-size:14px;line-height:19px;">
+   <div>
+    <span style="color:#569cd6;"><strong>## contract.go</strong></span>
+   </div>
+   <div>
+    contract 代表了以太坊 state database里面的一个合约。包含了合约代码，调用参数。
+   </div>
+   <br>
+   <br>
+   <div>
+    结构
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// ContractRef is a reference to the contract's backing object
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type ContractRef interface {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Address() common.Address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// AccountRef implements ContractRef.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;//
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Account references are used during EVM initialisation and
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// it's primary use is to fetch addresses. Removing this object
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// proves difficult because of the cached jump destinations which
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// are fetched from the parent contract (i.e. the caller), which
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// is a ContractRef.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type AccountRef common.Address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Address casts AccountRef to a Address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (ar AccountRef) Address() common.Address { return (common.Address)(ar) }
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Contract represents an ethereum contract in the state database. It contains
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the the contract code, calling arguments. Contract implements ContractRef
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type Contract struct {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress is the result of the caller which initialised this
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contract. However when the "call method" is delegated this value
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// needs to be initialised to that of the caller's caller.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CallerAddress是初始化这个合约的人。 如果是delegate，这个值被设置为调用者的调用者。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CallerAddress common.Address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;caller ContractRef
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self ContractRef
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;jumpdests destinations // result of JUMPDEST analysis. JUMPDEST指令的分析
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Code []byte //代码
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeHash common.Hash //代码的HASH
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CodeAddr *common.Address //代码地址
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Input []byte // 入参
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gas uint64 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 合约还有多少Gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;value *big.Int 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Args []byte //好像没有使用
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;DelegateCall bool 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    构造
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// NewContract returns a new contract environment for the execution of EVM.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func NewContract(caller ContractRef, object ContractRef, value *big.Int, gas uint64) *Contract {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c := &amp;Contract{CallerAddress: caller.Address(), caller: caller, self: object, Args: nil}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if parent, ok := caller.(*Contract); ok {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Reuse JUMPDEST analysis from parent context if available.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果 caller 是一个合约，说明是合约调用了我们。 jumpdests设置为caller的jumpdests
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = parent.jumpdests
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.jumpdests = make(destinations)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Gas should be a pointer so it can safely be reduced through the run
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// This pointer will be off the state transition
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas = gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// ensures a value is set
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = value
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    AsDelegate将合约设置为委托调用并返回当前合同（用于链式调用）
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// AsDelegate sets the contract to be a delegate call and returns the current
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// contract (for chaining calls)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) AsDelegate() *Contract {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.DelegateCall = true
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: caller must, at all times be a contract. It should never happen
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// that caller is something other than a Contract.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;parent := c.caller.(*Contract)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.CallerAddress = parent.CallerAddress
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.value = parent.value
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    GetOp 用来获取下一跳指令
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// GetOp returns the n'th element in the contract's byte array
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetOp(n uint64) OpCode {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return OpCode(c.GetByte(n))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// GetByte returns the n'th byte in the contract's byte array
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) GetByte(n uint64) byte {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if n &lt; uint64(len(c.Code)) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.Code[n]
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return 0
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Caller returns the caller of the contract.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;//
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Caller will recursively call caller when the contract is a delegate
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// call, including that of caller's caller.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Caller() common.Address {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.CallerAddress
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    UseGas使用Gas。 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// UseGas attempts the use gas and subtracts it and returns true on success
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) UseGas(gas uint64) (ok bool) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if c.Gas &lt; gas {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return false
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;c.Gas -= gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return true
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Address returns the contracts address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Address() common.Address {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.self.Address()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Value returns the contracts value (sent to it from it's caller)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (c *Contract) Value() *big.Int {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return c.value
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    SetCode&nbsp;，SetCallCode 设置代码。
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// SetCode sets the code to the contract
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCode(hash common.Hash, code []byte) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// SetCallCode sets the code of the contract and address of the backing data
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// object
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (self *Contract) SetCallCode(addr *common.Address, hash common.Hash, code []byte) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.Code = code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeHash = hash
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;self.CodeAddr = addr
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    <span style="color:#569cd6;"><strong>## evm.go</strong></span>
+   </div>
+   <br>
+   <div>
+    结构
+   </div>
+   <br>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Context provides the EVM with auxiliary information. Once provided
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// it shouldn't be modified.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 上下文为EVM提供辅助信息。 一旦提供，不应该修改。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type Context struct {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer returns whether the account contains
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// sufficient ether to transfer the value
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// CanTransfer 函数返回账户是否有足够的ether用来转账
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CanTransfer CanTransferFunc
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer transfers ether from one account to the other
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Transfer 用来从一个账户给另一个账户转账
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Transfer TransferFunc
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash returns the hash corresponding to n
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// GetHash用来返回入参n对应的hash值
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GetHash GetHashFunc
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Message information
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供Origin的信息 sender的地址
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Origin common.Address // Provides information for ORIGIN
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 用来提供GasPrice信息
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasPrice *big.Int // Provides information for GASPRICE
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Block information
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Coinbase common.Address // Provides information for COINBASE
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;GasLimit *big.Int // Provides information for GASLIMIT
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;BlockNumber *big.Int // Provides information for NUMBER
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Time *big.Int // Provides information for TIME
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Difficulty *big.Int // Provides information for DIFFICULTY
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// EVM is the Ethereum Virtual Machine base object and provides
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the necessary tools to run a contract on the given state with
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the provided context. It should be noted that any error
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// generated through any of the calls should be considered a
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// revert-state-and-consume-all-gas operation, no checks on
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// specific errors should ever be performed. The interpreter makes
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// sure that any errors generated are to be considered faulty code.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// EVM是以太坊虚拟机基础对象，并提供必要的工具，以使用提供的上下文运行给定状态的合约。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 应该指出的是，任何调用产生的任何错误都应该被认为是一种回滚修改状态和消耗所有GAS操作，
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 不应该执行对具体错误的检查。 解释器确保生成的任何错误都被认为是错误的代码。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// The EVM should never be reused and is not thread safe.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;type EVM struct {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Context provides auxiliary blockchain related information
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// StateDB gives access to the underlying state
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB StateDB
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth is the current call stack
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当前的调用堆栈
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;depth int
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chainConfig contains information about the current chain
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 包含了当前的区块链的信息
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig *params.ChainConfig
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// chain rules contains the chain rules for the current epoch
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules params.Rules
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// virtual machine configuration options used to initialise the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// evm.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig Config
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// global (to this context) ethereum virtual machine
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// used throughout the execution of the tx.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;interpreter *Interpreter
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// abort is used to abort the EVM calling operations
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// NOTE: must be set atomically
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;abort int32
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    构造函数
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// NewEVM retutrns a new EVM . The returned EVM is not thread safe and should
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// only ever be used *once*.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func NewEVM(ctx Context, statedb StateDB, chainConfig *params.ChainConfig, vmConfig Config) *EVM {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm := &amp;EVM{
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Context: ctx,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;StateDB: statedb,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;vmConfig: vmConfig,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainConfig: chainConfig,
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;chainRules: chainConfig.Rules(ctx.BlockNumber),
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter = NewInterpreter(evm, vmConfig)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return evm
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Cancel cancels any running EVM operation. This may be called concurrently and
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// it's safe to be called multiple times.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Cancel() {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;atomic.StoreInt32(&amp;evm.abort, 1)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    合约创建 Create 会创建一个新的合约。
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Create creates a new contract using code as deployment code.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Depth check execution. Fail if we're trying to execute above the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// limit.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrDepth
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, gas, ErrInsufficientBalance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Ensure there's no existing contract already at the designated address
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 确保特定的地址没有合约存在
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;nonce := evm.StateDB.GetNonce(caller.Address())
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(caller.Address(), nonce+1)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractAddr = crypto.CreateAddress(caller.Address(), nonce)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contractHash := evm.StateDB.GetCodeHash(contractAddr)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { //如果已经存在
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, common.Address{}, 0, ErrContractAddressCollision
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Create a new account on the state
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot := evm.StateDB.Snapshot() //创建一个StateDB的快照，以便回滚
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(contractAddr) //创建账户
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsEIP158(evm.BlockNumber) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetNonce(contractAddr, 1) //设置nonce
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) //转账
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, AccountRef(contractAddr), value, gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, contractAddr, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, nil) //执行合约的初始化代码
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// check whether the max code size has been exceeded
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 检查初始化生成的代码的长度不超过限制
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// if the contract creation ran successfully and no errors were returned
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// calculate the gas required to store the code. If the code could not
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// be stored due to not enough gas set an error and let it be handled
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// by the error checking condition below.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//如果合同创建成功并且没有错误返回，则计算存储代码所需的GAS。 如果由于没有足够的GAS而导致代码不能被存储设置错误，并通过下面的错误检查条件来处理。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err == nil &amp;&amp; !maxCodeSizeExceeded {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;createDataGas := uint64(len(ret)) * params.CreateDataGas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if contract.UseGas(createDataGas) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.SetCode(contractAddr, ret)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;} else {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = ErrCodeStoreOutOfGas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we're in homestead this also counts for code storage gas errors.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 当错误返回我们回滚修改，
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Assign err if contract code size exceeds the max while the err is still empty.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if maxCodeSizeExceeded &amp;&amp; err == nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;err = errMaxCodeSizeExceeded
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contractAddr, contract.Gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    Call方法, 无论我们转账或者是执行合约代码都会调用到这里， 同时合约里面的call指令也会执行到这里。
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Call executes the contract associated with the addr with the given input as
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// parameters. It also handles any necessary value transfer required and takes
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// the necessary steps to create accounts and reverses the state in case of an
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// execution error or failed value transfer.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Call 执行与给定的input作为参数与addr相关联的合约。 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 它还处理所需的任何必要的转账操作，并采取必要的步骤来创建帐户
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// 并在任意错误的情况下回滚所做的操作。
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to execute above the call depth limit
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 调用深度最多1024
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to transfer more than the available balance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 查看我们的账户是否有足够的金钱。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.StateDB.Exist(addr) { // 查看指定地址是否存在
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果地址不存在，查看是否是 native go的合约， native go的合约在
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// contracts.go 文件里面
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles := PrecompiledContractsHomestead
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;precompiles = PrecompiledContractsByzantium
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果不是指定的合约地址， 并且value的值为0那么返回正常，而且这次调用没有消耗Gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 负责在本地状态创建addr
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.CreateAccount(addr)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 执行转账
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped environment for this execution context
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we're in homestead this also counts for code storage gas errors.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted { 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 如果是由revert指令触发的错误，因为ICO一般设置了人数限制或者资金限制
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 在大家抢购的时候很可能会触发这些限制条件，导致被抽走不少钱。这个时候
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 又不能设置比较低的GasPrice和GasLimit。因为要速度快。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 那么不会使用剩下的全部Gas，而是只会使用代码执行的Gas
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 不然会被抽走 GasLimit *GasPrice的钱，那可不少。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <br>
+   <div>
+    剩下的三个函数 CallCode, DelegateCall, 和 StaticCall，这三个函数不能由外部调用，只能由Opcode触发。
+   </div>
+   <br>
+   <br>
+   <div>
+    CallCode
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// CallCode differs from Call in the sense that it executes the given address'
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// CallCode与Call不同的地方在于它使用caller的context来执行给定地址的代码。
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to execute above the call depth limit
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to transfer more than the available balance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrInsufficientBalance
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) //这里是最不同的地方 to的地址被修改为caller的地址了 而且没有转账的行为
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// initialise a new contract and set the code that is to be used by the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// E The contract is a scoped evmironment for this execution context
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, value, gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <br>
+   <div>
+    DelegateCall
+   </div>
+   <br>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall differs from CallCode in the sense that it executes the given address'
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// code with the caller as context and the caller is set to the caller of the caller.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// DelegateCall 和 CallCode不同的地方在于 caller被设置为 caller的caller
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to execute above the call depth limit
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(caller.Address()) 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and make initialise the delegate values
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// 标识为AsDelete()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, nil, gas).AsDelegate() 
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall executes the contract associated with the addr with the given input
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// as parameters while disallowing any modifications to the state during the call.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// Opcodes that attempt to perform such modifications will result in exceptions
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// instead of performing the modifications.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;// StaticCall不允许执行任何修改状态的操作，
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, nil
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Fail if we're trying to execute above the call depth limit
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if evm.depth &gt; int(params.CallCreateDepth) {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return nil, gas, ErrDepth
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Make sure the readonly is only set if we aren't in readonly yet
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// this makes also sure that the readonly flag isn't removed for
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// child calls.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if !evm.interpreter.readOnly {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.interpreter.readOnly = true
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;defer func() { evm.interpreter.readOnly = false }()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var (
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;to = AccountRef(addr)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;snapshot = evm.StateDB.Snapshot()
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Initialise a new contract and set the code that is to be used by the
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// EVM. The contract is a scoped environment for this execution context
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// only.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract := NewContract(caller, to, new(big.Int), gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// When an error was returned by the EVM or when setting the creation code
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// above we revert to the snapshot and consume any gas remaining. Additionally
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// when we're in Homestead this also counts for code storage gas errors.
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ret, err = run(evm, snapshot, contract, input)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != nil {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;evm.StateDB.RevertToSnapshot(snapshot)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if err != errExecutionReverted {
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;contract.UseGas(contract.Gas)
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return ret, contract.Gas, err
+   </div>
+   <div>
+    &nbsp;&nbsp;&nbsp;&nbsp;}
+   </div>
+   <p></p>
+   <p></p>
+   <h2 style="font-family:Consolas, 'Courier New', monospace;"><img src="https://img-blog.csdn.net/20180430224554793?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br><br></h2>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://img-blog.csdn.net/20180425001235188?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><img src="https://img-blog.csdn.net/20180425001144107?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">网址：http://www.qukuailianxueyuan.io/<br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://img-blog.csdn.net/20180426145827720?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;"><img src="https://img-blog.csdn.net/2018042614570887?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""><br></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">欲领取造币技术与全套虚拟机资料</p>
+   <p style="font-family:Consolas, 'Courier New', monospace;"><span style="color:rgb(25,25,25);">区块链技术交流QQ群：</span><span style="color:rgb(255,0,0);background-color:rgb(255,255,255);">756146052&nbsp;&nbsp;</span><span style="color:rgb(25,25,25);">备注：CSDN</span></p>
+   <p style="color:rgb(25,25,25);font-family:Consolas, 'Courier New', monospace;">尹成学院微信：备注：CSDN</p>
+   <p style="color:rgb(25,25,25);text-align:center;font-family:Consolas, 'Courier New', monospace;"><img src="https://img-blog.csdn.net/20180425000635656?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3lpbmNoZW5nMDE=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt=""></p>
+   <div>
+    <br>
+   </div>
+   <br>
+   <br>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80305259,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/itcastcpp/article/details/80305259,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

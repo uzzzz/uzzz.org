@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码解读（18）以太坊交易的执行基本流程——将交易递交给EVM | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码解读（18）以太坊交易的执行基本流程——将交易递交给EVM" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="之前分析挖矿模块，miner从TxPool拿来的交易，交给worker对象。后者要调用commitTransaction在本地执行交易，生成receipt，更改世界状态，打包成挖矿的block最后递交给engine进行挖矿。而这一节我们关注的是在commitTransaction中，如何在本地执行交易。 func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) { snap := w.current.state.Snapshot() receipt, _, err := core.ApplyTransaction(w.config, w.chain, &amp;coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &amp;w.current.header.GasUsed, vm.Config{}) if err != nil { w.current.state.RevertToSnapshot(snap) return nil, err } w.current.txs = append(w.current.txs, tx) w.current.receipts = append(w.current.receipts, receipt) return receipt.Logs, nil } core.ApplyTransaction就是执行交易的入口，而交易的执行就离不开大名鼎鼎的以太坊虚拟机。 一、ApplyTransaction函数 该函数的调用有两种情况： 1、是在将区块插入区块链前需要验证区块合法性bc.insertChain ——&gt; bc.processor.Process&nbsp; ——&gt; stateProcessor.Process ——&gt; ApplyTransaction 2、是worker挖矿过程中执行交易时Worker.commitTransaction ——&gt; ApplyTransaction 主要功能是：将交易转化成Message，创建EVM对象，调用ApplyMessage执行交易，生成日志对象； 1、将交易转换成Message； 2、初始化一个EVM的执行环境； 3、执行交易，改变stateDB世界状态，然后生成收据 func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { // 转换一个Message对象 msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // 使用message初始化一个执行上下文 context := NewEVMContext(msg, header, bc, author) // 使用上下文初始化一个EVM执行环境 vmenv := vm.NewEVM(context, statedb, config, cfg) // 执行交易，返回使用的gas数量 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // 更改stateDB世界状态 var root []byte // 如果是拜占庭硬分叉，清理世界状态 if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { // 否则计算状态树根，用于产生收据 root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } // 增加header中的usedGas *usedGas += gas // 用root和usedGas产生收据，即收据里包含了该交易执行时的世界状态，这样方便进行校验 receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // 如果交易创建了一个合约，要把合约地址放在收据里 if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err } 二、StateTransition.TransitionDb 交易工作环境(StateTransition)的数据结构如下： type StateTransition struct { gp *GasPool // 区块工作环境中的gas剩余额度，就是header中的gasLimit msg Message // 交易转化的message gas uint64 // 交易的gas余额，最开始等于initialGas，随着交易执行会递减 gasPrice *big.Int initialGas uint64 // 初始gas，等于交易的gasLimit value *big.Int // 交易转账额度 data []byte // 交易的input，如果是合约创建，data就是合约代码 state vm.StateDB // 状态树 evm *vm.EVM // evm对象 } 这里gp是整个区块所有交易可用的gas，其实就是来自于header的gaslimit，而header的gasLimit是通过父区块的gasUsed推算出来的。initialGas是交易的gasLimit，gas是余额（等于initialGas减去交易usedGas）。 在ApplyMessage中，首先新建一个交易工作环境，然后紧接着调用TransitionDb方法： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } TransitionDb()的主要功能是初始化交易工作环境，执行交易，然后处理交易执行前后的gas增减。 1、预先检查nonce和gas值,初始化交易工作环境的gas初始值； 2、计算并扣除固定gas消耗； 3、调用evm创建或执行交易； 4、奖励旷工； func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { // 先检查交易的nonce和当前状态nonce是否一致，然后调用buyGas； // buyGas是要从区块的gasPool中取出一定的gas用于执行交易 if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // 计算并扣除固定的gas消耗 // 固定的gas消耗（21000） + 非0值gas + 0值gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } // 更新剩余的gas值 if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm vmerr error ) if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // evm的错误不影响共识，当且仅当vmerr是ErrInsufficientBalance时，return的gasUsed等于0，此时不影响账户状态； // 否则，即使交易执行失败，gas还是会被扣除 if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } // 返回余额给发起方，它同时调整了StateTransition中gasPool的余额 st.refundGas() // 奖励矿工，gas消耗 st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 交易执行之前，要调用bugGas()将initialGas和gas都设置为交易的gasLimit，并从总的gaspool里减去预支的gas（即gasLimit），交易发起者的账户也要减去相应的价值。 func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里实际上是preCheck中的内容，后面计算交易的具体gas后，还要调整gas的值： func (st *StateTransition) useGas(amount uint64) error { if st.gas &lt; amount { return vm.ErrOutOfGas } st.gas -= amount return nil } 最后，如果实际使用的gas超过了gasLimit，即initialGas，就返回错误；如果顺利执行，则将剩余的gas返回原来的账户，同时可能还有一笔奖励给原账户（st.gas + refund）。最后，将st.gas即交易执行后的gas余额返回给交易执行环境（st.gp）。 func (st *StateTransition) refundGas() { // Apply refund counter, capped to half of the used gas. refund := st.gasUsed() / 2 if refund &gt; st.state.GetRefund() { refund = st.state.GetRefund() } st.gas += refund // Return ETH for remaining gas, exchanged at the original rate. remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) st.state.AddBalance(st.msg.From(), remaining) // Also return remaining gas to the block gas counter so it is // available for the next transaction. st.gp.AddGas(st.gas) } 执行过程中如果是合约创建交易，则调用evm.Create()；如果是普通交易或调用智能合约，则调用evm.Call()方法。 if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) &nbsp;" />
+<meta property="og:description" content="之前分析挖矿模块，miner从TxPool拿来的交易，交给worker对象。后者要调用commitTransaction在本地执行交易，生成receipt，更改世界状态，打包成挖矿的block最后递交给engine进行挖矿。而这一节我们关注的是在commitTransaction中，如何在本地执行交易。 func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) { snap := w.current.state.Snapshot() receipt, _, err := core.ApplyTransaction(w.config, w.chain, &amp;coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &amp;w.current.header.GasUsed, vm.Config{}) if err != nil { w.current.state.RevertToSnapshot(snap) return nil, err } w.current.txs = append(w.current.txs, tx) w.current.receipts = append(w.current.receipts, receipt) return receipt.Logs, nil } core.ApplyTransaction就是执行交易的入口，而交易的执行就离不开大名鼎鼎的以太坊虚拟机。 一、ApplyTransaction函数 该函数的调用有两种情况： 1、是在将区块插入区块链前需要验证区块合法性bc.insertChain ——&gt; bc.processor.Process&nbsp; ——&gt; stateProcessor.Process ——&gt; ApplyTransaction 2、是worker挖矿过程中执行交易时Worker.commitTransaction ——&gt; ApplyTransaction 主要功能是：将交易转化成Message，创建EVM对象，调用ApplyMessage执行交易，生成日志对象； 1、将交易转换成Message； 2、初始化一个EVM的执行环境； 3、执行交易，改变stateDB世界状态，然后生成收据 func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { // 转换一个Message对象 msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // 使用message初始化一个执行上下文 context := NewEVMContext(msg, header, bc, author) // 使用上下文初始化一个EVM执行环境 vmenv := vm.NewEVM(context, statedb, config, cfg) // 执行交易，返回使用的gas数量 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // 更改stateDB世界状态 var root []byte // 如果是拜占庭硬分叉，清理世界状态 if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { // 否则计算状态树根，用于产生收据 root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } // 增加header中的usedGas *usedGas += gas // 用root和usedGas产生收据，即收据里包含了该交易执行时的世界状态，这样方便进行校验 receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // 如果交易创建了一个合约，要把合约地址放在收据里 if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err } 二、StateTransition.TransitionDb 交易工作环境(StateTransition)的数据结构如下： type StateTransition struct { gp *GasPool // 区块工作环境中的gas剩余额度，就是header中的gasLimit msg Message // 交易转化的message gas uint64 // 交易的gas余额，最开始等于initialGas，随着交易执行会递减 gasPrice *big.Int initialGas uint64 // 初始gas，等于交易的gasLimit value *big.Int // 交易转账额度 data []byte // 交易的input，如果是合约创建，data就是合约代码 state vm.StateDB // 状态树 evm *vm.EVM // evm对象 } 这里gp是整个区块所有交易可用的gas，其实就是来自于header的gaslimit，而header的gasLimit是通过父区块的gasUsed推算出来的。initialGas是交易的gasLimit，gas是余额（等于initialGas减去交易usedGas）。 在ApplyMessage中，首先新建一个交易工作环境，然后紧接着调用TransitionDb方法： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } TransitionDb()的主要功能是初始化交易工作环境，执行交易，然后处理交易执行前后的gas增减。 1、预先检查nonce和gas值,初始化交易工作环境的gas初始值； 2、计算并扣除固定gas消耗； 3、调用evm创建或执行交易； 4、奖励旷工； func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { // 先检查交易的nonce和当前状态nonce是否一致，然后调用buyGas； // buyGas是要从区块的gasPool中取出一定的gas用于执行交易 if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // 计算并扣除固定的gas消耗 // 固定的gas消耗（21000） + 非0值gas + 0值gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } // 更新剩余的gas值 if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm vmerr error ) if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // evm的错误不影响共识，当且仅当vmerr是ErrInsufficientBalance时，return的gasUsed等于0，此时不影响账户状态； // 否则，即使交易执行失败，gas还是会被扣除 if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } // 返回余额给发起方，它同时调整了StateTransition中gasPool的余额 st.refundGas() // 奖励矿工，gas消耗 st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 交易执行之前，要调用bugGas()将initialGas和gas都设置为交易的gasLimit，并从总的gaspool里减去预支的gas（即gasLimit），交易发起者的账户也要减去相应的价值。 func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里实际上是preCheck中的内容，后面计算交易的具体gas后，还要调整gas的值： func (st *StateTransition) useGas(amount uint64) error { if st.gas &lt; amount { return vm.ErrOutOfGas } st.gas -= amount return nil } 最后，如果实际使用的gas超过了gasLimit，即initialGas，就返回错误；如果顺利执行，则将剩余的gas返回原来的账户，同时可能还有一笔奖励给原账户（st.gas + refund）。最后，将st.gas即交易执行后的gas余额返回给交易执行环境（st.gp）。 func (st *StateTransition) refundGas() { // Apply refund counter, capped to half of the used gas. refund := st.gasUsed() / 2 if refund &gt; st.state.GetRefund() { refund = st.state.GetRefund() } st.gas += refund // Return ETH for remaining gas, exchanged at the original rate. remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) st.state.AddBalance(st.msg.From(), remaining) // Also return remaining gas to the block gas counter so it is // available for the next transaction. st.gp.AddGas(st.gas) } 执行过程中如果是合约创建交易，则调用evm.Create()；如果是普通交易或调用智能合约，则调用evm.Call()方法。 if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) &nbsp;" />
+<link rel="canonical" href="https://uzzz.org/2018/12/09/7fda9f15b84723554e95a93fffa23a91.html" />
+<meta property="og:url" content="https://uzzz.org/2018/12/09/7fda9f15b84723554e95a93fffa23a91.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-12-09T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"之前分析挖矿模块，miner从TxPool拿来的交易，交给worker对象。后者要调用commitTransaction在本地执行交易，生成receipt，更改世界状态，打包成挖矿的block最后递交给engine进行挖矿。而这一节我们关注的是在commitTransaction中，如何在本地执行交易。 func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) { snap := w.current.state.Snapshot() receipt, _, err := core.ApplyTransaction(w.config, w.chain, &amp;coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &amp;w.current.header.GasUsed, vm.Config{}) if err != nil { w.current.state.RevertToSnapshot(snap) return nil, err } w.current.txs = append(w.current.txs, tx) w.current.receipts = append(w.current.receipts, receipt) return receipt.Logs, nil } core.ApplyTransaction就是执行交易的入口，而交易的执行就离不开大名鼎鼎的以太坊虚拟机。 一、ApplyTransaction函数 该函数的调用有两种情况： 1、是在将区块插入区块链前需要验证区块合法性bc.insertChain ——&gt; bc.processor.Process&nbsp; ——&gt; stateProcessor.Process ——&gt; ApplyTransaction 2、是worker挖矿过程中执行交易时Worker.commitTransaction ——&gt; ApplyTransaction 主要功能是：将交易转化成Message，创建EVM对象，调用ApplyMessage执行交易，生成日志对象； 1、将交易转换成Message； 2、初始化一个EVM的执行环境； 3、执行交易，改变stateDB世界状态，然后生成收据 func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { // 转换一个Message对象 msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // 使用message初始化一个执行上下文 context := NewEVMContext(msg, header, bc, author) // 使用上下文初始化一个EVM执行环境 vmenv := vm.NewEVM(context, statedb, config, cfg) // 执行交易，返回使用的gas数量 _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // 更改stateDB世界状态 var root []byte // 如果是拜占庭硬分叉，清理世界状态 if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { // 否则计算状态树根，用于产生收据 root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } // 增加header中的usedGas *usedGas += gas // 用root和usedGas产生收据，即收据里包含了该交易执行时的世界状态，这样方便进行校验 receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // 如果交易创建了一个合约，要把合约地址放在收据里 if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err } 二、StateTransition.TransitionDb 交易工作环境(StateTransition)的数据结构如下： type StateTransition struct { gp *GasPool // 区块工作环境中的gas剩余额度，就是header中的gasLimit msg Message // 交易转化的message gas uint64 // 交易的gas余额，最开始等于initialGas，随着交易执行会递减 gasPrice *big.Int initialGas uint64 // 初始gas，等于交易的gasLimit value *big.Int // 交易转账额度 data []byte // 交易的input，如果是合约创建，data就是合约代码 state vm.StateDB // 状态树 evm *vm.EVM // evm对象 } 这里gp是整个区块所有交易可用的gas，其实就是来自于header的gaslimit，而header的gasLimit是通过父区块的gasUsed推算出来的。initialGas是交易的gasLimit，gas是余额（等于initialGas减去交易usedGas）。 在ApplyMessage中，首先新建一个交易工作环境，然后紧接着调用TransitionDb方法： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } TransitionDb()的主要功能是初始化交易工作环境，执行交易，然后处理交易执行前后的gas增减。 1、预先检查nonce和gas值,初始化交易工作环境的gas初始值； 2、计算并扣除固定gas消耗； 3、调用evm创建或执行交易； 4、奖励旷工； func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { // 先检查交易的nonce和当前状态nonce是否一致，然后调用buyGas； // buyGas是要从区块的gasPool中取出一定的gas用于执行交易 if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // 计算并扣除固定的gas消耗 // 固定的gas消耗（21000） + 非0值gas + 0值gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } // 更新剩余的gas值 if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm vmerr error ) if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // evm的错误不影响共识，当且仅当vmerr是ErrInsufficientBalance时，return的gasUsed等于0，此时不影响账户状态； // 否则，即使交易执行失败，gas还是会被扣除 if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } // 返回余额给发起方，它同时调整了StateTransition中gasPool的余额 st.refundGas() // 奖励矿工，gas消耗 st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 交易执行之前，要调用bugGas()将initialGas和gas都设置为交易的gasLimit，并从总的gaspool里减去预支的gas（即gasLimit），交易发起者的账户也要减去相应的价值。 func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里实际上是preCheck中的内容，后面计算交易的具体gas后，还要调整gas的值： func (st *StateTransition) useGas(amount uint64) error { if st.gas &lt; amount { return vm.ErrOutOfGas } st.gas -= amount return nil } 最后，如果实际使用的gas超过了gasLimit，即initialGas，就返回错误；如果顺利执行，则将剩余的gas返回原来的账户，同时可能还有一笔奖励给原账户（st.gas + refund）。最后，将st.gas即交易执行后的gas余额返回给交易执行环境（st.gp）。 func (st *StateTransition) refundGas() { // Apply refund counter, capped to half of the used gas. refund := st.gasUsed() / 2 if refund &gt; st.state.GetRefund() { refund = st.state.GetRefund() } st.gas += refund // Return ETH for remaining gas, exchanged at the original rate. remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice) st.state.AddBalance(st.msg.From(), remaining) // Also return remaining gas to the block gas counter so it is // available for the next transaction. st.gp.AddGas(st.gas) } 执行过程中如果是合约创建交易，则调用evm.Create()；如果是普通交易或调用智能合约，则调用evm.Call()方法。 if contractCreation { // 如果是合约创建建议，调用evm.Create ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // 如果是交易或合约调用，则先设置交易发送方的nonce值+1 st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) // 调用evm.Call执行交易 ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) &nbsp;","@type":"BlogPosting","url":"https://uzzz.org/2018/12/09/7fda9f15b84723554e95a93fffa23a91.html","headline":"以太坊源码解读（18）以太坊交易的执行基本流程——将交易递交给EVM","dateModified":"2018-12-09T00:00:00+08:00","datePublished":"2018-12-09T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/12/09/7fda9f15b84723554e95a93fffa23a91.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码解读（18）以太坊交易的执行基本流程——将交易递交给EVM</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <p>之前分析挖矿模块，miner从TxPool拿来的交易，交给worker对象。后者要调用commitTransaction在本地执行交易，生成receipt，更改世界状态，打包成挖矿的block最后递交给engine进行挖矿。而这一节我们关注的是在commitTransaction中，如何在本地执行交易。</p> 
+  <pre class="has">
+<code class="language-Go">func (w *worker) commitTransaction(tx *types.Transaction, coinbase common.Address) ([]*types.Log, error) {
+	snap := w.current.state.Snapshot()
+
+	receipt, _, err := core.ApplyTransaction(w.config, w.chain, &amp;coinbase, w.current.gasPool, w.current.state, w.current.header, tx, &amp;w.current.header.GasUsed, vm.Config{})
+	if err != nil {
+		w.current.state.RevertToSnapshot(snap)
+		return nil, err
+	}
+	w.current.txs = append(w.current.txs, tx)
+	w.current.receipts = append(w.current.receipts, receipt)
+
+	return receipt.Logs, nil
+}</code></pre> 
+  <p>core.ApplyTransaction就是执行交易的入口，而交易的执行就离不开大名鼎鼎的以太坊虚拟机。</p> 
+  <p style="text-align:center;"><img alt="" class="has" src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20181209105015807.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2xqOTAwOTEx,size_16,color_FFFFFF,t_70"></p> 
+  <h3>一、ApplyTransaction函数</h3> 
+  <p>该函数的调用有两种情况：<br> 1、是在将区块插入区块链前需要验证区块合法性<br><span style="color:#3399ea;"><em>bc.insertChain ——&gt; bc.processor.Process&nbsp; ——&gt; stateProcessor.Process ——&gt; ApplyTransaction</em></span><br> 2、是worker挖矿过程中执行交易时<br><span style="color:#3399ea;"><em>Worker.commitTransaction ——&gt; ApplyTransaction</em></span></p> 
+  <p>主要功能是：将交易转化成Message，创建EVM对象，调用ApplyMessage执行交易，生成日志对象；<br> 1、将交易转换成Message；<br> 2、初始化一个EVM的执行环境；<br> 3、执行交易，改变stateDB世界状态，然后生成收据</p> 
+  <pre class="has">
+<code class="language-Go">func ApplyTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) {
+        // 转换一个Message对象
+	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
+	if err != nil {
+		return nil, 0, err
+	}
+	// 使用message初始化一个执行上下文
+	context := NewEVMContext(msg, header, bc, author)
+
+	// 使用上下文初始化一个EVM执行环境
+	vmenv := vm.NewEVM(context, statedb, config, cfg)
+
+	// 执行交易，返回使用的gas数量
+	_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
+	if err != nil {
+		return nil, 0, err
+	}
+	// 更改stateDB世界状态
+	var root []byte
+        // 如果是拜占庭硬分叉，清理世界状态
+	if config.IsByzantium(header.Number) {
+		statedb.Finalise(true)
+	} else {
+        // 否则计算状态树根，用于产生收据
+		root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes()
+	}
+        // 增加header中的usedGas
+	*usedGas += gas
+
+	// 用root和usedGas产生收据，即收据里包含了该交易执行时的世界状态，这样方便进行校验
+	receipt := types.NewReceipt(root, failed, *usedGas)
+	receipt.TxHash = tx.Hash()
+	receipt.GasUsed = gas
+	// 如果交易创建了一个合约，要把合约地址放在收据里
+	if msg.To() == nil {
+		receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce())
+	}
+	// Set the receipt logs and create a bloom for filtering
+	receipt.Logs = statedb.GetLogs(tx.Hash())
+	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+
+	return receipt, gas, err
+}</code></pre> 
+  <h3>二、StateTransition.TransitionDb</h3> 
+  <p>交易工作环境(StateTransition)的数据结构如下：</p> 
+  <pre class="has">
+<code class="language-Go">type StateTransition struct {
+	gp         *GasPool   // 区块工作环境中的gas剩余额度，就是header中的gasLimit
+	msg        Message    // 交易转化的message
+	gas        uint64     // 交易的gas余额，最开始等于initialGas，随着交易执行会递减
+	gasPrice   *big.Int   
+	initialGas uint64     // 初始gas，等于交易的gasLimit
+	value      *big.Int   // 交易转账额度
+	data       []byte     // 交易的input，如果是合约创建，data就是合约代码
+	state      vm.StateDB // 状态树
+	evm        *vm.EVM    // evm对象
+}</code></pre> 
+  <p>这里gp是整个区块所有交易可用的gas，其实就是来自于header的gaslimit，而header的gasLimit是通过父区块的gasUsed推算出来的。initialGas是交易的gasLimit，gas是余额（等于initialGas减去交易usedGas）。</p> 
+  <p>在ApplyMessage中，首先新建一个交易工作环境，然后紧接着调用TransitionDb方法：</p> 
+  <pre class="has">
+<code class="language-Go">func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) {
+	return NewStateTransition(evm, msg, gp).TransitionDb()
+}</code></pre> 
+  <p>TransitionDb()的主要功能是初始化交易工作环境，执行交易，然后处理交易执行前后的gas增减。</p> 
+  <p>1、预先检查nonce和gas值,初始化交易工作环境的gas初始值；<br> 2、计算并扣除固定gas消耗；<br> 3、调用evm创建或执行交易；<br> 4、奖励旷工；</p> 
+  <pre class="has">
+<code class="language-Go">func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) {
+        // 先检查交易的nonce和当前状态nonce是否一致，然后调用buyGas；
+        // buyGas是要从区块的gasPool中取出一定的gas用于执行交易
+	if err = st.preCheck(); err != nil {
+		return
+	}
+	msg := st.msg
+	sender := vm.AccountRef(msg.From())
+	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+	contractCreation := msg.To() == nil
+
+	// 计算并扣除固定的gas消耗
+        // 固定的gas消耗（21000） + 非0值gas + 0值gas
+	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
+	if err != nil {
+		return nil, 0, false, err
+	}
+        // 更新剩余的gas值
+	if err = st.useGas(gas); err != nil {
+		return nil, 0, false, err
+	}
+
+	var (
+		evm = st.evm
+		vmerr error
+	)
+	if contractCreation {
+                // 如果是合约创建建议，调用evm.Create
+		ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+	} else {
+		// 如果是交易或合约调用，则先设置交易发送方的nonce值+1
+		st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
+                // 调用evm.Call执行交易
+		ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value)
+	}
+	if vmerr != nil {
+		log.Debug("VM returned with error", "err", vmerr)
+		// evm的错误不影响共识，当且仅当vmerr是ErrInsufficientBalance时，return的gasUsed等于0，此时不影响账户状态；
+                // 否则，即使交易执行失败，gas还是会被扣除
+		if vmerr == vm.ErrInsufficientBalance {
+			return nil, 0, false, vmerr
+		}
+	}
+        // 返回余额给发起方，它同时调整了StateTransition中gasPool的余额
+	st.refundGas()
+        // 奖励矿工，gas消耗
+	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+	return ret, st.gasUsed(), vmerr != nil, err
+}</code></pre> 
+  <p>交易执行之前，要调用bugGas()将initialGas和gas都设置为交易的gasLimit，并从总的gaspool里减去预支的gas（即gasLimit），交易发起者的账户也要减去相应的价值。</p> 
+  <pre class="has">
+<code class="language-Go">func (st *StateTransition) buyGas() error {
+	mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice)
+	if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 {
+		return errInsufficientBalanceForGas
+	}
+	if err := st.gp.SubGas(st.msg.Gas()); err != nil {
+		return err
+	}
+	st.gas += st.msg.Gas()
+
+	st.initialGas = st.msg.Gas()
+	st.state.SubBalance(st.msg.From(), mgval)
+	return nil
+}</code></pre> 
+  <p>这里实际上是preCheck中的内容，后面计算交易的具体gas后，还要调整gas的值：</p> 
+  <pre class="has">
+<code class="language-Go">func (st *StateTransition) useGas(amount uint64) error {
+	if st.gas &lt; amount {
+		return vm.ErrOutOfGas
+	}
+	st.gas -= amount
+
+	return nil
+}</code></pre> 
+  <p>最后，如果实际使用的gas超过了gasLimit，即initialGas，就返回错误；如果顺利执行，则将剩余的gas返回原来的账户，同时可能还有一笔奖励给原账户（st.gas + refund）。最后，将st.gas即交易执行后的gas余额返回给交易执行环境（st.gp）。</p> 
+  <pre class="has">
+<code class="language-Go">func (st *StateTransition) refundGas() {
+	// Apply refund counter, capped to half of the used gas.
+	refund := st.gasUsed() / 2
+	if refund &gt; st.state.GetRefund() {
+		refund = st.state.GetRefund()
+	}
+	st.gas += refund
+
+	// Return ETH for remaining gas, exchanged at the original rate.
+	remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gas), st.gasPrice)
+	st.state.AddBalance(st.msg.From(), remaining)
+
+	// Also return remaining gas to the block gas counter so it is
+	// available for the next transaction.
+	st.gp.AddGas(st.gas)
+}</code></pre> 
+  <p>执行过程中如果是合约创建交易，则调用evm.Create()；如果是普通交易或调用智能合约，则调用evm.Call()方法。</p> 
+  <pre class="has">
+<code class="language-Go">if contractCreation {
+    // 如果是合约创建建议，调用evm.Create
+    ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+} else {
+    // 如果是交易或合约调用，则先设置交易发送方的nonce值+1
+    st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
+    // 调用evm.Call执行交易
+    ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value)</code></pre> 
+  <p>&nbsp;</p> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

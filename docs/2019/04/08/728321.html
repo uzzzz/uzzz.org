@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>spark streaming、kafka 内存调优、分区调优 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="spark streaming、kafka 内存调优、分区调优" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="spark Streaming 限速 spark.streaming.kafka.maxRatePerPartition 而在Direct Approach，则是通过参数 spark.streaming.kafka.maxRatePerPartition 来配置的。这里需要注意的是，这里是对每个Partition进行限速。所以你需要事先知道Kafka有多少个分区，才好评估系统的实际吞吐量，从而设置该值。 业务需要做事务，保证 Exactly Once 语义 这里业务场景被区分为两个： 幂等操作 业务代码需要自身添加事物操作 所谓幂等操作就是重复执行不会产生问题，如果是这种场景下，你不需要额外做任何工作。但如果你的应用场景是不允许数据被重复执行的，那只能通过业务自身的逻辑代码来解决了。 dstream.foreachRDD { (rdd, time) =&gt; rdd.foreachPartition { partitionIterator =&gt; val partitionId = TaskContext.get.partitionId() val uniqueId = generateUniqueId(time.milliseconds, partitionId) // use this uniqueId to transactionally commit the data in partitionIterator } } 拿ConsumerGroupid+topic+patition作为key hbase数据库自动去重 这代码啥含义呢？ 就是说针对每个partition的数据，产生一个uniqueId,只有这个partion的所有数据被完全消费，则算成功，否则算失败，要回滚。下次重复执行这个uniqueId 时，如果已经被执行成功过的，则skip掉。 这样，就能保证数据 Exactly Once 语义啦。 论SparkStreaming的数据可靠性和一致性 Driver HA 由于流计算系统是长期运行、且不断有数据流入，因此其Spark守护进程（Driver）的可靠性至关重要，它决定了Streaming程序能否一直正确地运行下去。 Driver实现HA的解决方案就是将元数据持久化，以便重启后的状态恢复。如图一所示，Driver持久化的元数据包括： Block元数据（图1中的绿色箭头）：Receiver从网络上接收到的数据，组装成Block后产生的Block元数据； Checkpoint数据（图1中的橙色箭头）：包括配置项、DStream操作、未完成的Batch状态、和生成的RDD数据等； 堆内内存(On-heap Memory) 默认情况下，Spark 仅仅使用了堆内内存。Executor 端的堆内内存区域大致可以分为以下四大块： Execution 内存：主要用于存放 Shuffle、Join、Sort、Aggregation 等计算过程中的临时数据 Storage 内存：主要用于存储 spark 的 cache 数据，例如RDD的缓存、unroll数据； 用户内存（User Memory）：主要用于存储 RDD 转换操作所需要的数据，例如 RDD 依赖等信息。 预留内存（Reserved Memory）：系统预留内存，会用来存储Spark内部对象。 堆外内存(Off-heap Memory) Spark 1.6 开始引入了Off-heap memory(详见SPARK-11389)。这种模式不在 JVM 内申请内存，而是调用 Java 的 unsafe 相关 API 进行诸如 C 语言里面的 malloc() 直接向操作系统申请内存，由于这种方式不进过 JVM 内存管理，所以可以避免频繁的 GC，这种内存申请的缺点是必须自己编写内存申请和释放的逻辑。 默认情况下，堆外内存是关闭的，我们可以通过 spark.memory.offHeap.enabled 参数启用，并且通过 spark.memory.offHeap.size 设置堆外内存大小，单位为字节。如果堆外内存被启用，那么 Executor 内将同时存在堆内和堆外内存，两者的使用互补影响，这个时候 Executor 中的 Execution 内存是堆内的 Execution 内存和堆外的 Execution 内存之和，同理，Storage 内存也一样。相比堆内内存，堆外内存只区分 Execution 内存和 Storage 内存，其内存分布如下图所示： Execution 内存和 Storage 内存动态调整 细心的同学肯定看到上面两张图中的 Execution 内存和 Storage 内存之间存在一条虚线，这是为什么呢？ 用过 Spark 的同学应该知道，在 Spark 1.5 之前，Execution 内存和 Storage 内存分配是静态的，换句话说就是如果 Execution 内存不足，即使 Storage 内存有很大空闲程序也是无法利用到的；反之亦然。这就导致我们很难进行内存的调优工作，我们必须非常清楚地了解 Execution 和 Storage 两块区域的内存分布。而目前 Execution 内存和 Storage 内存可以互相共享的。也就是说，如果 Execution 内存不足，而 Storage 内存有空闲，那么 Execution 可以从 Storage 中申请空间；反之亦然。所以上图中的虚线代表 Execution 内存和 Storage 内存是可以随着运作动态调整的，这样可以有效地利用内存资源。Execution 内存和 Storage 内存之间的动态调整可以概括如下： 具体的实现逻辑如下： 程序提交的时候我们都会设定基本的 Execution 内存和 Storage 内存区域（通过 spark.memory.storageFraction 参数设置）； 在程序运行时，如果双方的空间都不足时，则存储到硬盘；将内存中的块存储到磁盘的策略是按照 LRU 规则进行的。若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block） Execution 内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后&quot;归还&quot;借用的空间 Storage 内存的空间被对方占用后，目前的实现是无法让对方&quot;归还&quot;，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂；而且 Shuffle 过程产生的文件在后面一定会被使用到，而 Cache 在内存的数据不一定在后面使用。 注意，上面说的借用对方的内存需要借用方和被借用方的内存类型都一样，都是堆内内存或者都是堆外内存，不存在堆内内存不够去借用堆外内存的空间。 Task 之间内存分布 为了更好地使用使用内存，Executor 内运行的 Task 之间共享着 Execution 内存。具体的，Spark 内部维护了一个 HashMap 用于记录每个 Task 占用的内存。当 Task 需要在 Execution 内存区域申请 numBytes 内存，其先判断 HashMap 里面是否维护着这个 Task 的内存使用情况，如果没有，则将这个 Task 内存使用置为0，并且以 TaskId 为 key，内存使用为 value 加入到 HashMap 里面。之后为这个 Task 申请 numBytes 内存，如果 Execution 内存区域正好有大于 numBytes 的空闲内存，则在 HashMap 里面将当前 Task 使用的内存加上 numBytes，然后返回；如果当前 Execution 内存区域无法申请到每个 Task 最小可申请的内存，则当前 Task 被阻塞，直到有其他任务释放了足够的执行内存，该任务才可以被唤醒。每个 Task 可以使用 Execution 内存大小范围为 1/2N ~ 1/N，其中 N 为当前 Executor 内正在运行的 Task 个数。一个 Task 能够运行必须申请到最小内存为 (1/2N * Execution 内存)；当 N = 1 的时候，Task 可以使用全部的 Execution 内存。 比如如果 Execution 内存大小为 10GB，当前 Executor 内正在运行的 Task 个数为5，则该 Task 可以申请的内存范围为 10 / (2 * 5) ~ 10 / 5，也就是 1GB ~ 2GB的范围。 分配内存的实例 一个示例 为了更好的理解上面堆内内存和堆外内存的使用情况，这里给出一个简单的例子。 只用了堆内内存 现在我们提交的 Spark 作业关于内存的配置如下： –executor-memory 18g 由于没有设置 spark.memory.fraction 和 spark.memory.storageFraction 参数，我们可以看到 Spark UI 关于 Storage Memory 的显示如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 上图很清楚地看到 Storage Memory 的可用内存是 10.1GB，这个数是咋来的呢？根据前面的规则，我们可以得出以下的计算： systemMemory = spark.executor.memory reservedMemory = 300MB usableMemory = systemMemory - reservedMemory StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction 如果我们把数据代进去，得出以下的结果： systemMemory = 18Gb = 19327352832 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 19327352832 - 314572800 = 19012780032 StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction = 19012780032 * 0.6 * 0.5 = 5703834009.6 = 5.312109375GB 不对啊，和上面的 10.1GB 对不上啊。为什么呢？这是因为 Spark UI 上面显示的 Storage Memory 可用内存其实等于 Execution 内存和 Storage 内存之和，也就是 usableMemory * spark.memory.fraction： StorageMemory= usableMemory * spark.memory.fraction = 19012780032 * 0.6 = 11407668019.2 = 10.62421GB 还是不对，这是因为我们虽然设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，所以 systemMemory = 17179869184，然后计算的数据如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 9.42421875 GB 我们通过将上面的 16865296384 * 0.6 字节除于 1024 * 1024 * 1024 转换成 9.42421875 GB，和 UI 上显示的还是对不上，这是因为 Spark UI 是通过除于 1000 * 1000 * 1000 将字节转换成 GB，如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 字节 = 16865296384 * 0.6 / (1000 * 1000 * 1000) = 10.1GB 现在终于对上了。 具体将字节转换成 GB 的计算逻辑如下(core 模块下面的 /core/src/main/resources/org/apache/spark/ui/static/utils.js)： function formatBytes(bytes, type) { if (type !== ‘display’) return bytes; if (bytes == 0) return ‘0.0 B’; var k = 1000; var dm = 1; var sizes = [‘B’, ‘KB’, ‘MB’, ‘GB’, ‘TB’, ‘PB’, ‘EB’, ‘ZB’, ‘YB’]; var i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ’ ’ + sizes[i]; } 我们设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，这个数据是怎么计算的？ Runtime.getRuntime.maxMemory 是程序能够使用的最大内存，其值会比实际配置的执行器内存的值小。这是因为内存分配池的堆部分分为 Eden，Survivor 和 Tenured 三部分空间，而这里面一共包含了两个 Survivor 区域，而这两个 Survivor 区域在任何时候我们只能用到其中一个，所以我们可以使用下面的公式进行描述： ExecutorMemory = Eden + 2 * Survivor + Tenured Runtime.getRuntime.maxMemory = Eden + Survivor + Tenured 上面的 17179869184 字节可能因为你的 GC 配置不一样得到的数据不一样，但是上面的计算公式是一样的。 用了堆内和堆外内存 现在如果我们启用了堆外内存，情况咋样呢？我们的内存相关配置如下： spark.executor.memory 18g spark.memory.offHeap.enabled true spark.memory.offHeap.size 10737418240 从上面可以看出，堆外内存为 10GB，现在 Spark UI 上面显示的 Storage Memory 可用内存为 20.9GB，如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 其实 Spark UI 上面显示的 Storage Memory 可用内存等于堆内内存和堆外内存之和，计算公式如下： 堆内 systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 totalOnHeapStorageMemory = usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 10119177830 堆外 totalOffHeapStorageMemory = spark.memory.offHeap.size = 10737418240 StorageMemory = totalOnHeapStorageMemory + totalOffHeapStorageMemory = (10119177830 + 10737418240) 字节 = (20856596070 / (1000 * 1000 * 1000)) GB = 20.9 GB 本博文是参考别的博主自己总结,如有问题请留言" />
+<meta property="og:description" content="spark Streaming 限速 spark.streaming.kafka.maxRatePerPartition 而在Direct Approach，则是通过参数 spark.streaming.kafka.maxRatePerPartition 来配置的。这里需要注意的是，这里是对每个Partition进行限速。所以你需要事先知道Kafka有多少个分区，才好评估系统的实际吞吐量，从而设置该值。 业务需要做事务，保证 Exactly Once 语义 这里业务场景被区分为两个： 幂等操作 业务代码需要自身添加事物操作 所谓幂等操作就是重复执行不会产生问题，如果是这种场景下，你不需要额外做任何工作。但如果你的应用场景是不允许数据被重复执行的，那只能通过业务自身的逻辑代码来解决了。 dstream.foreachRDD { (rdd, time) =&gt; rdd.foreachPartition { partitionIterator =&gt; val partitionId = TaskContext.get.partitionId() val uniqueId = generateUniqueId(time.milliseconds, partitionId) // use this uniqueId to transactionally commit the data in partitionIterator } } 拿ConsumerGroupid+topic+patition作为key hbase数据库自动去重 这代码啥含义呢？ 就是说针对每个partition的数据，产生一个uniqueId,只有这个partion的所有数据被完全消费，则算成功，否则算失败，要回滚。下次重复执行这个uniqueId 时，如果已经被执行成功过的，则skip掉。 这样，就能保证数据 Exactly Once 语义啦。 论SparkStreaming的数据可靠性和一致性 Driver HA 由于流计算系统是长期运行、且不断有数据流入，因此其Spark守护进程（Driver）的可靠性至关重要，它决定了Streaming程序能否一直正确地运行下去。 Driver实现HA的解决方案就是将元数据持久化，以便重启后的状态恢复。如图一所示，Driver持久化的元数据包括： Block元数据（图1中的绿色箭头）：Receiver从网络上接收到的数据，组装成Block后产生的Block元数据； Checkpoint数据（图1中的橙色箭头）：包括配置项、DStream操作、未完成的Batch状态、和生成的RDD数据等； 堆内内存(On-heap Memory) 默认情况下，Spark 仅仅使用了堆内内存。Executor 端的堆内内存区域大致可以分为以下四大块： Execution 内存：主要用于存放 Shuffle、Join、Sort、Aggregation 等计算过程中的临时数据 Storage 内存：主要用于存储 spark 的 cache 数据，例如RDD的缓存、unroll数据； 用户内存（User Memory）：主要用于存储 RDD 转换操作所需要的数据，例如 RDD 依赖等信息。 预留内存（Reserved Memory）：系统预留内存，会用来存储Spark内部对象。 堆外内存(Off-heap Memory) Spark 1.6 开始引入了Off-heap memory(详见SPARK-11389)。这种模式不在 JVM 内申请内存，而是调用 Java 的 unsafe 相关 API 进行诸如 C 语言里面的 malloc() 直接向操作系统申请内存，由于这种方式不进过 JVM 内存管理，所以可以避免频繁的 GC，这种内存申请的缺点是必须自己编写内存申请和释放的逻辑。 默认情况下，堆外内存是关闭的，我们可以通过 spark.memory.offHeap.enabled 参数启用，并且通过 spark.memory.offHeap.size 设置堆外内存大小，单位为字节。如果堆外内存被启用，那么 Executor 内将同时存在堆内和堆外内存，两者的使用互补影响，这个时候 Executor 中的 Execution 内存是堆内的 Execution 内存和堆外的 Execution 内存之和，同理，Storage 内存也一样。相比堆内内存，堆外内存只区分 Execution 内存和 Storage 内存，其内存分布如下图所示： Execution 内存和 Storage 内存动态调整 细心的同学肯定看到上面两张图中的 Execution 内存和 Storage 内存之间存在一条虚线，这是为什么呢？ 用过 Spark 的同学应该知道，在 Spark 1.5 之前，Execution 内存和 Storage 内存分配是静态的，换句话说就是如果 Execution 内存不足，即使 Storage 内存有很大空闲程序也是无法利用到的；反之亦然。这就导致我们很难进行内存的调优工作，我们必须非常清楚地了解 Execution 和 Storage 两块区域的内存分布。而目前 Execution 内存和 Storage 内存可以互相共享的。也就是说，如果 Execution 内存不足，而 Storage 内存有空闲，那么 Execution 可以从 Storage 中申请空间；反之亦然。所以上图中的虚线代表 Execution 内存和 Storage 内存是可以随着运作动态调整的，这样可以有效地利用内存资源。Execution 内存和 Storage 内存之间的动态调整可以概括如下： 具体的实现逻辑如下： 程序提交的时候我们都会设定基本的 Execution 内存和 Storage 内存区域（通过 spark.memory.storageFraction 参数设置）； 在程序运行时，如果双方的空间都不足时，则存储到硬盘；将内存中的块存储到磁盘的策略是按照 LRU 规则进行的。若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block） Execution 内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后&quot;归还&quot;借用的空间 Storage 内存的空间被对方占用后，目前的实现是无法让对方&quot;归还&quot;，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂；而且 Shuffle 过程产生的文件在后面一定会被使用到，而 Cache 在内存的数据不一定在后面使用。 注意，上面说的借用对方的内存需要借用方和被借用方的内存类型都一样，都是堆内内存或者都是堆外内存，不存在堆内内存不够去借用堆外内存的空间。 Task 之间内存分布 为了更好地使用使用内存，Executor 内运行的 Task 之间共享着 Execution 内存。具体的，Spark 内部维护了一个 HashMap 用于记录每个 Task 占用的内存。当 Task 需要在 Execution 内存区域申请 numBytes 内存，其先判断 HashMap 里面是否维护着这个 Task 的内存使用情况，如果没有，则将这个 Task 内存使用置为0，并且以 TaskId 为 key，内存使用为 value 加入到 HashMap 里面。之后为这个 Task 申请 numBytes 内存，如果 Execution 内存区域正好有大于 numBytes 的空闲内存，则在 HashMap 里面将当前 Task 使用的内存加上 numBytes，然后返回；如果当前 Execution 内存区域无法申请到每个 Task 最小可申请的内存，则当前 Task 被阻塞，直到有其他任务释放了足够的执行内存，该任务才可以被唤醒。每个 Task 可以使用 Execution 内存大小范围为 1/2N ~ 1/N，其中 N 为当前 Executor 内正在运行的 Task 个数。一个 Task 能够运行必须申请到最小内存为 (1/2N * Execution 内存)；当 N = 1 的时候，Task 可以使用全部的 Execution 内存。 比如如果 Execution 内存大小为 10GB，当前 Executor 内正在运行的 Task 个数为5，则该 Task 可以申请的内存范围为 10 / (2 * 5) ~ 10 / 5，也就是 1GB ~ 2GB的范围。 分配内存的实例 一个示例 为了更好的理解上面堆内内存和堆外内存的使用情况，这里给出一个简单的例子。 只用了堆内内存 现在我们提交的 Spark 作业关于内存的配置如下： –executor-memory 18g 由于没有设置 spark.memory.fraction 和 spark.memory.storageFraction 参数，我们可以看到 Spark UI 关于 Storage Memory 的显示如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 上图很清楚地看到 Storage Memory 的可用内存是 10.1GB，这个数是咋来的呢？根据前面的规则，我们可以得出以下的计算： systemMemory = spark.executor.memory reservedMemory = 300MB usableMemory = systemMemory - reservedMemory StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction 如果我们把数据代进去，得出以下的结果： systemMemory = 18Gb = 19327352832 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 19327352832 - 314572800 = 19012780032 StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction = 19012780032 * 0.6 * 0.5 = 5703834009.6 = 5.312109375GB 不对啊，和上面的 10.1GB 对不上啊。为什么呢？这是因为 Spark UI 上面显示的 Storage Memory 可用内存其实等于 Execution 内存和 Storage 内存之和，也就是 usableMemory * spark.memory.fraction： StorageMemory= usableMemory * spark.memory.fraction = 19012780032 * 0.6 = 11407668019.2 = 10.62421GB 还是不对，这是因为我们虽然设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，所以 systemMemory = 17179869184，然后计算的数据如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 9.42421875 GB 我们通过将上面的 16865296384 * 0.6 字节除于 1024 * 1024 * 1024 转换成 9.42421875 GB，和 UI 上显示的还是对不上，这是因为 Spark UI 是通过除于 1000 * 1000 * 1000 将字节转换成 GB，如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 字节 = 16865296384 * 0.6 / (1000 * 1000 * 1000) = 10.1GB 现在终于对上了。 具体将字节转换成 GB 的计算逻辑如下(core 模块下面的 /core/src/main/resources/org/apache/spark/ui/static/utils.js)： function formatBytes(bytes, type) { if (type !== ‘display’) return bytes; if (bytes == 0) return ‘0.0 B’; var k = 1000; var dm = 1; var sizes = [‘B’, ‘KB’, ‘MB’, ‘GB’, ‘TB’, ‘PB’, ‘EB’, ‘ZB’, ‘YB’]; var i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ’ ’ + sizes[i]; } 我们设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，这个数据是怎么计算的？ Runtime.getRuntime.maxMemory 是程序能够使用的最大内存，其值会比实际配置的执行器内存的值小。这是因为内存分配池的堆部分分为 Eden，Survivor 和 Tenured 三部分空间，而这里面一共包含了两个 Survivor 区域，而这两个 Survivor 区域在任何时候我们只能用到其中一个，所以我们可以使用下面的公式进行描述： ExecutorMemory = Eden + 2 * Survivor + Tenured Runtime.getRuntime.maxMemory = Eden + Survivor + Tenured 上面的 17179869184 字节可能因为你的 GC 配置不一样得到的数据不一样，但是上面的计算公式是一样的。 用了堆内和堆外内存 现在如果我们启用了堆外内存，情况咋样呢？我们的内存相关配置如下： spark.executor.memory 18g spark.memory.offHeap.enabled true spark.memory.offHeap.size 10737418240 从上面可以看出，堆外内存为 10GB，现在 Spark UI 上面显示的 Storage Memory 可用内存为 20.9GB，如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 其实 Spark UI 上面显示的 Storage Memory 可用内存等于堆内内存和堆外内存之和，计算公式如下： 堆内 systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 totalOnHeapStorageMemory = usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 10119177830 堆外 totalOffHeapStorageMemory = spark.memory.offHeap.size = 10737418240 StorageMemory = totalOnHeapStorageMemory + totalOffHeapStorageMemory = (10119177830 + 10737418240) 字节 = (20856596070 / (1000 * 1000 * 1000)) GB = 20.9 GB 本博文是参考别的博主自己总结,如有问题请留言" />
+<link rel="canonical" href="https://uzzz.org/2019/04/08/728321.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/08/728321.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-08T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"spark Streaming 限速 spark.streaming.kafka.maxRatePerPartition 而在Direct Approach，则是通过参数 spark.streaming.kafka.maxRatePerPartition 来配置的。这里需要注意的是，这里是对每个Partition进行限速。所以你需要事先知道Kafka有多少个分区，才好评估系统的实际吞吐量，从而设置该值。 业务需要做事务，保证 Exactly Once 语义 这里业务场景被区分为两个： 幂等操作 业务代码需要自身添加事物操作 所谓幂等操作就是重复执行不会产生问题，如果是这种场景下，你不需要额外做任何工作。但如果你的应用场景是不允许数据被重复执行的，那只能通过业务自身的逻辑代码来解决了。 dstream.foreachRDD { (rdd, time) =&gt; rdd.foreachPartition { partitionIterator =&gt; val partitionId = TaskContext.get.partitionId() val uniqueId = generateUniqueId(time.milliseconds, partitionId) // use this uniqueId to transactionally commit the data in partitionIterator } } 拿ConsumerGroupid+topic+patition作为key hbase数据库自动去重 这代码啥含义呢？ 就是说针对每个partition的数据，产生一个uniqueId,只有这个partion的所有数据被完全消费，则算成功，否则算失败，要回滚。下次重复执行这个uniqueId 时，如果已经被执行成功过的，则skip掉。 这样，就能保证数据 Exactly Once 语义啦。 论SparkStreaming的数据可靠性和一致性 Driver HA 由于流计算系统是长期运行、且不断有数据流入，因此其Spark守护进程（Driver）的可靠性至关重要，它决定了Streaming程序能否一直正确地运行下去。 Driver实现HA的解决方案就是将元数据持久化，以便重启后的状态恢复。如图一所示，Driver持久化的元数据包括： Block元数据（图1中的绿色箭头）：Receiver从网络上接收到的数据，组装成Block后产生的Block元数据； Checkpoint数据（图1中的橙色箭头）：包括配置项、DStream操作、未完成的Batch状态、和生成的RDD数据等； 堆内内存(On-heap Memory) 默认情况下，Spark 仅仅使用了堆内内存。Executor 端的堆内内存区域大致可以分为以下四大块： Execution 内存：主要用于存放 Shuffle、Join、Sort、Aggregation 等计算过程中的临时数据 Storage 内存：主要用于存储 spark 的 cache 数据，例如RDD的缓存、unroll数据； 用户内存（User Memory）：主要用于存储 RDD 转换操作所需要的数据，例如 RDD 依赖等信息。 预留内存（Reserved Memory）：系统预留内存，会用来存储Spark内部对象。 堆外内存(Off-heap Memory) Spark 1.6 开始引入了Off-heap memory(详见SPARK-11389)。这种模式不在 JVM 内申请内存，而是调用 Java 的 unsafe 相关 API 进行诸如 C 语言里面的 malloc() 直接向操作系统申请内存，由于这种方式不进过 JVM 内存管理，所以可以避免频繁的 GC，这种内存申请的缺点是必须自己编写内存申请和释放的逻辑。 默认情况下，堆外内存是关闭的，我们可以通过 spark.memory.offHeap.enabled 参数启用，并且通过 spark.memory.offHeap.size 设置堆外内存大小，单位为字节。如果堆外内存被启用，那么 Executor 内将同时存在堆内和堆外内存，两者的使用互补影响，这个时候 Executor 中的 Execution 内存是堆内的 Execution 内存和堆外的 Execution 内存之和，同理，Storage 内存也一样。相比堆内内存，堆外内存只区分 Execution 内存和 Storage 内存，其内存分布如下图所示： Execution 内存和 Storage 内存动态调整 细心的同学肯定看到上面两张图中的 Execution 内存和 Storage 内存之间存在一条虚线，这是为什么呢？ 用过 Spark 的同学应该知道，在 Spark 1.5 之前，Execution 内存和 Storage 内存分配是静态的，换句话说就是如果 Execution 内存不足，即使 Storage 内存有很大空闲程序也是无法利用到的；反之亦然。这就导致我们很难进行内存的调优工作，我们必须非常清楚地了解 Execution 和 Storage 两块区域的内存分布。而目前 Execution 内存和 Storage 内存可以互相共享的。也就是说，如果 Execution 内存不足，而 Storage 内存有空闲，那么 Execution 可以从 Storage 中申请空间；反之亦然。所以上图中的虚线代表 Execution 内存和 Storage 内存是可以随着运作动态调整的，这样可以有效地利用内存资源。Execution 内存和 Storage 内存之间的动态调整可以概括如下： 具体的实现逻辑如下： 程序提交的时候我们都会设定基本的 Execution 内存和 Storage 内存区域（通过 spark.memory.storageFraction 参数设置）； 在程序运行时，如果双方的空间都不足时，则存储到硬盘；将内存中的块存储到磁盘的策略是按照 LRU 规则进行的。若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block） Execution 内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后&quot;归还&quot;借用的空间 Storage 内存的空间被对方占用后，目前的实现是无法让对方&quot;归还&quot;，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂；而且 Shuffle 过程产生的文件在后面一定会被使用到，而 Cache 在内存的数据不一定在后面使用。 注意，上面说的借用对方的内存需要借用方和被借用方的内存类型都一样，都是堆内内存或者都是堆外内存，不存在堆内内存不够去借用堆外内存的空间。 Task 之间内存分布 为了更好地使用使用内存，Executor 内运行的 Task 之间共享着 Execution 内存。具体的，Spark 内部维护了一个 HashMap 用于记录每个 Task 占用的内存。当 Task 需要在 Execution 内存区域申请 numBytes 内存，其先判断 HashMap 里面是否维护着这个 Task 的内存使用情况，如果没有，则将这个 Task 内存使用置为0，并且以 TaskId 为 key，内存使用为 value 加入到 HashMap 里面。之后为这个 Task 申请 numBytes 内存，如果 Execution 内存区域正好有大于 numBytes 的空闲内存，则在 HashMap 里面将当前 Task 使用的内存加上 numBytes，然后返回；如果当前 Execution 内存区域无法申请到每个 Task 最小可申请的内存，则当前 Task 被阻塞，直到有其他任务释放了足够的执行内存，该任务才可以被唤醒。每个 Task 可以使用 Execution 内存大小范围为 1/2N ~ 1/N，其中 N 为当前 Executor 内正在运行的 Task 个数。一个 Task 能够运行必须申请到最小内存为 (1/2N * Execution 内存)；当 N = 1 的时候，Task 可以使用全部的 Execution 内存。 比如如果 Execution 内存大小为 10GB，当前 Executor 内正在运行的 Task 个数为5，则该 Task 可以申请的内存范围为 10 / (2 * 5) ~ 10 / 5，也就是 1GB ~ 2GB的范围。 分配内存的实例 一个示例 为了更好的理解上面堆内内存和堆外内存的使用情况，这里给出一个简单的例子。 只用了堆内内存 现在我们提交的 Spark 作业关于内存的配置如下： –executor-memory 18g 由于没有设置 spark.memory.fraction 和 spark.memory.storageFraction 参数，我们可以看到 Spark UI 关于 Storage Memory 的显示如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 上图很清楚地看到 Storage Memory 的可用内存是 10.1GB，这个数是咋来的呢？根据前面的规则，我们可以得出以下的计算： systemMemory = spark.executor.memory reservedMemory = 300MB usableMemory = systemMemory - reservedMemory StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction 如果我们把数据代进去，得出以下的结果： systemMemory = 18Gb = 19327352832 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 19327352832 - 314572800 = 19012780032 StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction = 19012780032 * 0.6 * 0.5 = 5703834009.6 = 5.312109375GB 不对啊，和上面的 10.1GB 对不上啊。为什么呢？这是因为 Spark UI 上面显示的 Storage Memory 可用内存其实等于 Execution 内存和 Storage 内存之和，也就是 usableMemory * spark.memory.fraction： StorageMemory= usableMemory * spark.memory.fraction = 19012780032 * 0.6 = 11407668019.2 = 10.62421GB 还是不对，这是因为我们虽然设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，所以 systemMemory = 17179869184，然后计算的数据如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 9.42421875 GB 我们通过将上面的 16865296384 * 0.6 字节除于 1024 * 1024 * 1024 转换成 9.42421875 GB，和 UI 上显示的还是对不上，这是因为 Spark UI 是通过除于 1000 * 1000 * 1000 将字节转换成 GB，如下： systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 StorageMemory= usableMemory * spark.memory.fraction = 16865296384 * 0.6 字节 = 16865296384 * 0.6 / (1000 * 1000 * 1000) = 10.1GB 现在终于对上了。 具体将字节转换成 GB 的计算逻辑如下(core 模块下面的 /core/src/main/resources/org/apache/spark/ui/static/utils.js)： function formatBytes(bytes, type) { if (type !== ‘display’) return bytes; if (bytes == 0) return ‘0.0 B’; var k = 1000; var dm = 1; var sizes = [‘B’, ‘KB’, ‘MB’, ‘GB’, ‘TB’, ‘PB’, ‘EB’, ‘ZB’, ‘YB’]; var i = Math.floor(Math.log(bytes) / Math.log(k)); return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ’ ’ + sizes[i]; } 我们设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，这个数据是怎么计算的？ Runtime.getRuntime.maxMemory 是程序能够使用的最大内存，其值会比实际配置的执行器内存的值小。这是因为内存分配池的堆部分分为 Eden，Survivor 和 Tenured 三部分空间，而这里面一共包含了两个 Survivor 区域，而这两个 Survivor 区域在任何时候我们只能用到其中一个，所以我们可以使用下面的公式进行描述： ExecutorMemory = Eden + 2 * Survivor + Tenured Runtime.getRuntime.maxMemory = Eden + Survivor + Tenured 上面的 17179869184 字节可能因为你的 GC 配置不一样得到的数据不一样，但是上面的计算公式是一样的。 用了堆内和堆外内存 现在如果我们启用了堆外内存，情况咋样呢？我们的内存相关配置如下： spark.executor.memory 18g spark.memory.offHeap.enabled true spark.memory.offHeap.size 10737418240 从上面可以看出，堆外内存为 10GB，现在 Spark UI 上面显示的 Storage Memory 可用内存为 20.9GB，如下： 如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop 其实 Spark UI 上面显示的 Storage Memory 可用内存等于堆内内存和堆外内存之和，计算公式如下： 堆内 systemMemory = 17179869184 字节 reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800 usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384 totalOnHeapStorageMemory = usableMemory * spark.memory.fraction = 16865296384 * 0.6 = 10119177830 堆外 totalOffHeapStorageMemory = spark.memory.offHeap.size = 10737418240 StorageMemory = totalOnHeapStorageMemory + totalOffHeapStorageMemory = (10119177830 + 10737418240) 字节 = (20856596070 / (1000 * 1000 * 1000)) GB = 20.9 GB 本博文是参考别的博主自己总结,如有问题请留言","@type":"BlogPosting","url":"https://uzzz.org/2019/04/08/728321.html","headline":"spark streaming、kafka 内存调优、分区调优","dateModified":"2019-04-08T00:00:00+08:00","datePublished":"2019-04-08T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/08/728321.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>spark streaming、kafka 内存调优、分区调优</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <ol> 
+   <li>spark Streaming 限速<br> spark.streaming.kafka.maxRatePerPartition</li> 
+  </ol> 
+  <p>而在Direct Approach，则是通过参数 spark.streaming.kafka.maxRatePerPartition 来配置的。这里需要注意的是，这里是对每个Partition进行限速。所以你需要事先知道Kafka有多少个分区，才好评估系统的实际吞吐量，从而设置该值。</p> 
+  <p>业务需要做事务，保证 Exactly Once 语义<br> 这里业务场景被区分为两个：<br> 幂等操作<br> 业务代码需要自身添加事物操作</p> 
+  <p>所谓幂等操作就是重复执行不会产生问题，如果是这种场景下，你不需要额外做任何工作。但如果你的应用场景是不允许数据被重复执行的，那只能通过业务自身的逻辑代码来解决了。</p> 
+  <p>dstream.foreachRDD { (rdd, time) =&gt;<br> rdd.foreachPartition { partitionIterator =&gt;<br> val partitionId = TaskContext.get.partitionId()<br> val uniqueId = generateUniqueId(time.milliseconds, partitionId)<br> // use this uniqueId to transactionally commit the data in partitionIterator<br> }<br> }<br> 拿ConsumerGroupid+topic+patition作为key hbase数据库自动去重<br> 这代码啥含义呢？ 就是说针对每个partition的数据，产生一个uniqueId,只有这个partion的所有数据被完全消费，则算成功，否则算失败，要回滚。下次重复执行这个uniqueId 时，如果已经被执行成功过的，则skip掉。<br> 这样，就能保证数据 Exactly Once 语义啦。</p> 
+  <ol start="2"> 
+   <li>论SparkStreaming的数据可靠性和一致性</li> 
+  </ol> 
+  <p>Driver HA<br> 由于流计算系统是长期运行、且不断有数据流入，因此其Spark守护进程（Driver）的可靠性至关重要，它决定了Streaming程序能否一直正确地运行下去。<br> Driver实现HA的解决方案就是将元数据持久化，以便重启后的状态恢复。如图一所示，Driver持久化的元数据包括：<br> Block元数据（图1中的绿色箭头）：Receiver从网络上接收到的数据，组装成Block后产生的Block元数据；<br> Checkpoint数据（图1中的橙色箭头）：包括配置项、DStream操作、未完成的Batch状态、和生成的RDD数据等；</p> 
+  <p>堆内内存(On-heap Memory)<br> 默认情况下，Spark 仅仅使用了堆内内存。Executor 端的堆内内存区域大致可以分为以下四大块：<br> Execution 内存：主要用于存放 Shuffle、Join、Sort、Aggregation 等计算过程中的临时数据<br> Storage 内存：主要用于存储 spark 的 cache 数据，例如RDD的缓存、unroll数据；<br> 用户内存（User Memory）：主要用于存储 RDD 转换操作所需要的数据，例如 RDD 依赖等信息。<br> 预留内存（Reserved Memory）：系统预留内存，会用来存储Spark内部对象。</p> 
+  <ol start="3"> 
+   <li>堆外内存(Off-heap Memory)</li> 
+  </ol> 
+  <p>Spark 1.6 开始引入了Off-heap memory(详见SPARK-11389)。这种模式不在 JVM 内申请内存，而是调用 Java 的 unsafe 相关 API 进行诸如 C 语言里面的 malloc() 直接向操作系统申请内存，由于这种方式不进过 JVM 内存管理，所以可以避免频繁的 GC，这种内存申请的缺点是必须自己编写内存申请和释放的逻辑。<br> 默认情况下，堆外内存是关闭的，我们可以通过 spark.memory.offHeap.enabled 参数启用，并且通过 spark.memory.offHeap.size 设置堆外内存大小，单位为字节。如果堆外内存被启用，那么 Executor 内将同时存在堆内和堆外内存，两者的使用互补影响，这个时候 Executor 中的 Execution 内存是堆内的 Execution 内存和堆外的 Execution 内存之和，同理，Storage 内存也一样。相比堆内内存，堆外内存只区分 Execution 内存和 Storage 内存，其内存分布如下图所示：</p> 
+  <ol start="3"> 
+   <li>Execution 内存和 Storage 内存动态调整<br> 细心的同学肯定看到上面两张图中的 Execution 内存和 Storage 内存之间存在一条虚线，这是为什么呢？<br> 用过 Spark 的同学应该知道，在 Spark 1.5 之前，Execution 内存和 Storage 内存分配是静态的，换句话说就是如果 Execution 内存不足，即使 Storage 内存有很大空闲程序也是无法利用到的；反之亦然。这就导致我们很难进行内存的调优工作，我们必须非常清楚地了解 Execution 和 Storage 两块区域的内存分布。而目前 Execution 内存和 Storage 内存可以互相共享的。也就是说，如果 Execution 内存不足，而 Storage 内存有空闲，那么 Execution 可以从 Storage 中申请空间；反之亦然。所以上图中的虚线代表 Execution 内存和 Storage 内存是可以随着运作动态调整的，这样可以有效地利用内存资源。Execution 内存和 Storage 内存之间的动态调整可以概括如下：</li> 
+  </ol> 
+  <p>具体的实现逻辑如下：<br> 程序提交的时候我们都会设定基本的 Execution 内存和 Storage 内存区域（通过 spark.memory.storageFraction 参数设置）；<br> 在程序运行时，如果双方的空间都不足时，则存储到硬盘；将内存中的块存储到磁盘的策略是按照 LRU 规则进行的。若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block）<br> Execution 内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后"归还"借用的空间<br> Storage 内存的空间被对方占用后，目前的实现是无法让对方"归还"，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂；而且 Shuffle 过程产生的文件在后面一定会被使用到，而 Cache 在内存的数据不一定在后面使用。<br> 注意，上面说的借用对方的内存需要借用方和被借用方的内存类型都一样，都是堆内内存或者都是堆外内存，不存在堆内内存不够去借用堆外内存的空间。</p> 
+  <ol start="4"> 
+   <li> <p>Task 之间内存分布<br> 为了更好地使用使用内存，Executor 内运行的 Task 之间共享着 Execution 内存。具体的，Spark 内部维护了一个 HashMap 用于记录每个 Task 占用的内存。当 Task 需要在 Execution 内存区域申请 numBytes 内存，其先判断 HashMap 里面是否维护着这个 Task 的内存使用情况，如果没有，则将这个 Task 内存使用置为0，并且以 TaskId 为 key，内存使用为 value 加入到 HashMap 里面。之后为这个 Task 申请 numBytes 内存，如果 Execution 内存区域正好有大于 numBytes 的空闲内存，则在 HashMap 里面将当前 Task 使用的内存加上 numBytes，然后返回；如果当前 Execution 内存区域无法申请到每个 Task 最小可申请的内存，则当前 Task 被阻塞，直到有其他任务释放了足够的执行内存，该任务才可以被唤醒。每个 Task 可以使用 Execution 内存大小范围为 1/2N ~ 1/N，其中 N 为当前 Executor 内正在运行的 Task 个数。一个 Task 能够运行必须申请到最小内存为 (1/2N * Execution 内存)；当 N = 1 的时候，Task 可以使用全部的 Execution 内存。<br> 比如如果 Execution 内存大小为 10GB，当前 Executor 内正在运行的 Task 个数为5，则该 Task 可以申请的内存范围为 10 / (2 * 5) ~ 10 / 5，也就是 1GB ~ 2GB的范围。</p> </li> 
+   <li> <p>分配内存的实例</p> </li> 
+  </ol> 
+  <p>一个示例<br> 为了更好的理解上面堆内内存和堆外内存的使用情况，这里给出一个简单的例子。<br> 只用了堆内内存<br> 现在我们提交的 Spark 作业关于内存的配置如下：<br> –executor-memory 18g<br> 由于没有设置 spark.memory.fraction 和 spark.memory.storageFraction 参数，我们可以看到 Spark UI 关于 Storage Memory 的显示如下：</p> 
+  <p>如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop<br> 上图很清楚地看到 Storage Memory 的可用内存是 10.1GB，这个数是咋来的呢？根据前面的规则，我们可以得出以下的计算：<br> systemMemory = spark.executor.memory<br> reservedMemory = 300MB<br> usableMemory = systemMemory - reservedMemory<br> StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction<br> 如果我们把数据代进去，得出以下的结果：<br> systemMemory = 18Gb = 19327352832 字节<br> reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800</p> 
+  <p>usableMemory = systemMemory - reservedMemory = 19327352832 - 314572800 = 19012780032</p> 
+  <p>StorageMemory= usableMemory * spark.memory.fraction * spark.memory.storageFraction<br> = 19012780032 * 0.6 * 0.5 = 5703834009.6 = 5.312109375GB<br> 不对啊，和上面的 10.1GB 对不上啊。为什么呢？这是因为 Spark UI 上面显示的 Storage Memory 可用内存其实等于 Execution 内存和 Storage 内存之和，也就是 usableMemory * spark.memory.fraction：<br> StorageMemory= usableMemory * spark.memory.fraction<br> = 19012780032 * 0.6 = 11407668019.2 = 10.62421GB<br> 还是不对，这是因为我们虽然设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，所以 systemMemory = 17179869184，然后计算的数据如下：<br> systemMemory = 17179869184 字节<br> reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800</p> 
+  <p>usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384</p> 
+  <p>StorageMemory= usableMemory * spark.memory.fraction<br> = 16865296384 * 0.6 = 9.42421875 GB<br> 我们通过将上面的 16865296384 * 0.6 字节除于 1024 * 1024 * 1024 转换成 9.42421875 GB，和 UI 上显示的还是对不上，这是因为 Spark UI 是通过除于 1000 * 1000 * 1000 将字节转换成 GB，如下：<br> systemMemory = 17179869184 字节<br> reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800</p> 
+  <p>usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384</p> 
+  <p>StorageMemory= usableMemory * spark.memory.fraction<br> = 16865296384 * 0.6 字节 = 16865296384 * 0.6 / (1000 * 1000 * 1000) = 10.1GB<br> 现在终于对上了。<br> 具体将字节转换成 GB 的计算逻辑如下(core 模块下面的 /core/src/main/resources/org/apache/spark/ui/static/utils.js)：<br> function formatBytes(bytes, type) {<br> if (type !== ‘display’) return bytes;<br> if (bytes == 0) return ‘0.0 B’;<br> var k = 1000;<br> var dm = 1;<br> var sizes = [‘B’, ‘KB’, ‘MB’, ‘GB’, ‘TB’, ‘PB’, ‘EB’, ‘ZB’, ‘YB’];<br> var i = Math.floor(Math.log(bytes) / Math.log(k));<br> return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ’ ’ + sizes[i];<br> }<br> 我们设置了 --executor-memory 18g，但是 Spark 的 Executor 端通过 Runtime.getRuntime.maxMemory 拿到的内存其实没这么大，只有 17179869184 字节，这个数据是怎么计算的？<br> Runtime.getRuntime.maxMemory 是程序能够使用的最大内存，其值会比实际配置的执行器内存的值小。这是因为内存分配池的堆部分分为 Eden，Survivor 和 Tenured 三部分空间，而这里面一共包含了两个 Survivor 区域，而这两个 Survivor 区域在任何时候我们只能用到其中一个，所以我们可以使用下面的公式进行描述：</p> 
+  <p>ExecutorMemory = Eden + 2 * Survivor + Tenured<br> Runtime.getRuntime.maxMemory = Eden + Survivor + Tenured<br> 上面的 17179869184 字节可能因为你的 GC 配置不一样得到的数据不一样，但是上面的计算公式是一样的。<br> 用了堆内和堆外内存<br> 现在如果我们启用了堆外内存，情况咋样呢？我们的内存相关配置如下：<br> spark.executor.memory 18g<br> spark.memory.offHeap.enabled true<br> spark.memory.offHeap.size 10737418240</p> 
+  <p>从上面可以看出，堆外内存为 10GB，现在 Spark UI 上面显示的 Storage Memory 可用内存为 20.9GB，如下：</p> 
+  <p>如果想及时了解Spark、Hadoop或者Hbase相关的文章，欢迎关注微信公共帐号：iteblog_hadoop<br> 其实 Spark UI 上面显示的 Storage Memory 可用内存等于堆内内存和堆外内存之和，计算公式如下：<br> 堆内<br> systemMemory = 17179869184 字节<br> reservedMemory = 300MB = 300 * 1024 * 1024 = 314572800</p> 
+  <p>usableMemory = systemMemory - reservedMemory = 17179869184 - 314572800 = 16865296384</p> 
+  <p>totalOnHeapStorageMemory = usableMemory * spark.memory.fraction<br> = 16865296384 * 0.6 = 10119177830</p> 
+  <p>堆外<br> totalOffHeapStorageMemory = spark.memory.offHeap.size = 10737418240</p> 
+  <p>StorageMemory = totalOnHeapStorageMemory + totalOffHeapStorageMemory<br> = (10119177830 + 10737418240) 字节<br> = (20856596070 / (1000 * 1000 * 1000)) GB<br> = 20.9 GB</p> 
+  <blockquote> 
+   <p>本博文是参考别的博主自己总结,如有问题请留言</p> 
+  </blockquote> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

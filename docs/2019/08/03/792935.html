@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Elasticsearch调优实践 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Elasticsearch调优实践" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="&nbsp; 背景 Elasticsearch（ES）作为NOSQL+搜索引擎的有机结合体，不仅有近实时的查询能力，还具有强大的聚合分析能力。因此在全文检索、日志分析、监控系统、数据分析等领域ES均有广泛应用。而完整的Elastic Stack体系（Elasticsearch、Logstash、Kibana、Beats），更是提供了数据采集、清洗、存储、可视化的整套解决方案。&nbsp; 本文基于ES 5.6.4，从性能和稳定性两方面，从linux参数调优、ES节点配置和ES使用方式三个角度入手，介绍ES调优的基本方案。当然，ES的调优绝不能一概而论，需要根据实际业务场景做适当的取舍和调整，文中的疏漏之处也随时欢迎批评指正。 性能调优 一 Linux参数调优 1. 关闭交换分区，防止内存置换降低性能。 将/etc/fstab 文件中包含swap的行注释掉 sed -i &#39;/swap/s/^/#/&#39; /etc/fstab swapoff -a 2. 磁盘挂载选项 noatime：禁止记录访问时间戳，提高文件系统读写性能 data=writeback： 不记录data journal，提高文件系统写入性能 barrier=0：barrier保证journal先于data刷到磁盘，上面关闭了journal，这里的barrier也就没必要开启了 nobh：关闭buffer_head，防止内核打断大块数据的IO操作 mount -o noatime,data=writeback,barrier=0,nobh /dev/sda /es_data 3. 对于SSD磁盘，采用电梯调度算法，因为SSD提供了更智能的请求调度算法，不需要内核去做多余的调整 (仅供参考) echo noop &gt; /sys/block/sda/queue/scheduler 二 ES节点配置 conf/elasticsearch.yml文件：&nbsp; 1. 适当增大写入buffer和bulk队列长度，提高写入性能和稳定性 indices.memory.index_buffer_size: 15% thread_pool.bulk.queue_size: 1024 2. 计算disk使用量时，不考虑正在搬迁的shard 在规模比较大的集群中，可以防止新建shard时扫描所有shard的元数据，提升shard分配速度。 cluster.routing.allocation.disk.include_relocations: false 三 ES使用方式 1. 控制字段的存储选项 ES底层使用Lucene存储数据，主要包括行存（StoreFiled）、列存（DocValues）和倒排索引（InvertIndex）三部分。 大多数使用场景中，没有必要同时存储这三个部分，可以通过下面的参数来做适当调整： StoreFiled： 行存，其中占比最大的是source字段，它控制doc原始数据的存储。在写入数据时，ES把doc原始数据的整个json结构体当做一个string，存储为source字段。查询时，可以通过source字段拿到当初写入时的整个json结构体。 所以，如果没有取出整个原始json结构体的需求，可以通过下面的命令，在mapping中关闭source字段或者只在source中存储部分字段，数据查询时仍可通过ES的docvaluefields获取所有字段的值。注意：关闭source后， update, updatebyquery, reindex等接口将无法正常使用，所以有update等需求的index不能关闭source。 # 关闭 _source PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # _source只存储部分字段，通过includes指定要存储的字段或者通过excludes滤除不需要的字段 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;_doc&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;includes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;*.count&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;], &nbsp; &nbsp; &nbsp; &nbsp;&quot;excludes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.description&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.other.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } docvalues：控制列存。ES主要使用列存来支持sorting, aggregations和scripts功能，对于没有上述需求的字段，可以通过下面的命令关闭docvalues，降低存储成本。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;doc_values&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } index：控制倒排索引。ES默认对于所有字段都开启了倒排索引，用于查询。对于没有查询需求的字段，可以通过下面的命令关闭倒排索引。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } all：ES的一个特殊的字段，ES把用户写入json的所有字段值拼接成一个字符串后，做分词，然后保存倒排索引，用于支持整个json的全文检索。这种需求适用的场景较少，可以通过下面的命令将all字段关闭，节约存储成本和cpu开销。（ES 6.0+以上的版本不再支持_all字段，不需要设置） PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_all&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } fieldnames：该字段用于exists查询，来确认某个doc里面有无一个字段存在。若没有这种需求，可以将其关闭。 PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_field_names&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 2. 开启最佳压缩 对于打开了上述_source字段的index，可以通过下面的命令来把lucene适用的压缩算法替换成 DEFLATE，提高数据压缩率。 PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.codec&quot;: &quot;best_compression&quot; } 3. bulk批量写入 写入数据时尽量使用下面的bulk接口批量写入，提高写入效率。每个bulk请求的doc数量设定区间推荐为1k~1w，具体可根据业务场景选取一个适当的数量。 POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value2&quot; } 4. 调整translog同步策略 默认情况下，translog的持久化策略是，对于每个写入请求都做一次flush，刷新translog数据到磁盘上。这种频繁的磁盘IO操作是严重影响写入性能的，如果可以接受一定概率的数据丢失（这种硬件故障的概率很小），可以通过下面的命令调整 translog 持久化策略为异步周期性执行，并适当调整translog的刷盘周期。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp;&quot;translog&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;sync_interval&quot;: &quot;5s&quot;, &nbsp; &nbsp; &nbsp; &nbsp;&quot;durability&quot;: &quot;async&quot; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 5. 调整refresh_interval 写入Lucene的数据，并不是实时可搜索的，ES必须通过refresh的过程把内存中的数据转换成Lucene的完整segment后，才可以被搜索。默认情况下，ES每一秒会refresh一次，产生一个新的segment，这样会导致产生的segment较多，从而segment merge较为频繁，系统开销较大。如果对数据的实时可见性要求较低，可以通过下面的命令提高refresh的时间间隔，降低系统开销。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;refresh_interval&quot; : &quot;30s&quot; &nbsp; &nbsp;} &nbsp;} } 6. merge并发控制 ES的一个index由多个shard组成，而一个shard其实就是一个Lucene的index，它又由多个segment组成，且Lucene会不断地把一些小的segment合并成一个大的segment，这个过程被称为merge。默认值是Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))，当节点配置的cpu核数较高时，merge占用的资源可能会偏高，影响集群的性能，可以通过下面的命令调整某个index的merge过程的并发度： PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.merge.scheduler.max_thread_count&quot;: 2 } 7. 写入数据不指定_id，让ES自动产生 当用户显示指定id写入数据时，ES会先发起查询来确定index中是否已经有相同id的doc存在，若有则先删除原有doc再写入新doc。这样每次写入时，ES都会耗费一定的资源做查询。如果用户写入数据时不指定doc，ES则通过内部算法产生一个随机的id，并且保证id的唯一性，这样就可以跳过前面查询id的步骤，提高写入效率。 所以，在不需要通过id字段去重、update的使用场景中，写入不指定id可以提升写入速率。基础架构部数据库团队的测试结果显示，无id的数据写入性能可能比有_id的高出近一倍，实际损耗和具体测试场景相关。 # 写入时指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot;, &quot;_id&quot; : &quot;1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } # 写入时不指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } 8. 使用routing 对于数据量较大的index，一般会配置多个shard来分摊压力。这种场景下，一个查询会同时搜索所有的shard，然后再将各个shard的结果合并后，返回给用户。对于高并发的小查询场景，每个分片通常仅抓取极少量数据，此时查询过程中的调度开销远大于实际读取数据的开销，且查询速度取决于最慢的一个分片。开启routing功能后，ES会将routing相同的数据写入到同一个分片中（也可以是多个，由index.routingpartitionsize参数控制）。如果查询时指定routing，那么ES只会查询routing指向的那个分片，可显著降低调度开销，提升查询效率。 routing的使用方式如下： # 写入 PUT my_index/my_type/1?routing=user1 { &nbsp;&quot;title&quot;: &quot;This is a document&quot; } # 查询 GET my_index/_search?routing=user1,user2 { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;match&quot;: { &nbsp; &nbsp; &nbsp;&quot;title&quot;: &quot;document&quot; &nbsp; &nbsp;} &nbsp;} } 9. 为string类型的字段选取合适的存储方式 存为text类型的字段（string字段默认类型为text）： 做分词后存储倒排索引，支持全文检索，可以通过下面几个参数优化其存储方式： norms：用于在搜索时计算该doc的_score（代表这条数据与搜索条件的相关度），如果不需要评分，可以将其关闭。 indexoptions：控制倒排索引中包括哪些信息（docs、freqs、positions、offsets）。对于不太注重score/highlighting的使用场景，可以设为 docs来降低内存/磁盘资源消耗。 fields: 用于添加子字段。对于有sort和聚合查询需求的场景，可以添加一个keyword子字段以支持这两种功能。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;title&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;text&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;norms&quot;: false, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index_options&quot;: &quot;docs&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;fields&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;raw&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 存为keyword类型的字段： 不做分词，不支持全文检索。text分词消耗CPU资源，冗余存储keyword子字段占用存储空间。如果没有全文索引需求，只是要通过整个字段做搜索，可以设置该字段的类型为keyword，提升写入速率，降低存储成本。 设置字段类型的方法有两种：一是创建一个具体的index时，指定字段的类型；二是通过创建template，控制某一类index的字段类型。 # 1. 通过mapping指定 tags 字段为keyword类型 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;tags&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # 2. 通过template，指定my_index*类的index，其所有string字段默认为keyword类型 PUT _template/my_template { &nbsp; &nbsp;&quot;order&quot;: 0, &nbsp; &nbsp;&quot;template&quot;: &quot;my_index*&quot;, &nbsp; &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp; &nbsp;&quot;_default_&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;dynamic_templates&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;strings&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;match_mapping_type&quot;: &quot;string&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;ignore_above&quot;: 256 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;}, &nbsp; &nbsp;&quot;aliases&quot;: {} &nbsp;} 10. 查询时，使用query-bool-filter组合取代普通query 默认情况下，ES通过一定的算法计算返回的每条数据与查询语句的相关度，并通过score字段来表征。但对于非全文索引的使用场景，用户并不care查询结果与查询条件的相关度，只是想精确的查找目标数据。此时，可以通过query-bool-filter组合来让ES不计算score，并且尽可能的缓存filter的结果集，供后续包含相同filter的查询使用，提高查询效率。 # 普通查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;term&quot; : { &quot;user&quot; : &quot;Kimchy&quot; } &nbsp;} } # query-bool-filter 加速查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;bool&quot;: { &nbsp; &nbsp; &nbsp;&quot;filter&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;term&quot;: { &quot;user&quot;: &quot;Kimchy&quot; } &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 11. index按日期滚动，便于管理 写入ES的数据最好通过某种方式做分割，存入不同的index。常见的做法是将数据按模块/功能分类，写入不同的index，然后按照时间去滚动生成index。这样做的好处是各种数据分开管理不会混淆，也易于提高查询效率。同时index按时间滚动，数据过期时删除整个index，要比一条条删除数据或deletebyquery效率高很多，因为删除整个index是直接删除底层文件，而deletebyquery是查询-标记-删除。 举例说明，假如有[modulea,moduleb]两个模块产生的数据，那么index规划可以是这样的：一类index名称是modulea + {日期}，另一类index名称是module_b+ {日期}。对于名字中的日期，可以在写入数据时自己指定精确的日期，也可以通过ES的ingest pipeline中的index-name-processor实现（会有写入性能损耗）。 # module_a 类index - 创建index： PUT module_a@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_a@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_a@*/_search # &nbsp;module_b 类index - 创建index： PUT module_b@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_b@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_b@*/_search 12. 按需控制index的分片数和副本数 分片（shard）：一个ES的index由多个shard组成，每个shard承载index的一部分数据。 副本（replica）：index也可以设定副本数（numberofreplicas），也就是同一个shard有多少个备份。对于查询压力较大的index，可以考虑提高副本数（numberofreplicas），通过多个副本均摊查询压力。 shard数量（numberofshards）设置过多或过低都会引发一些问题：shard数量过多，则批量写入/查询请求被分割为过多的子写入/查询，导致该index的写入、查询拒绝率上升；对于数据量较大的inex，当其shard数量过小时，无法充分利用节点资源，造成机器资源利用率不高 或 不均衡，影响写入/查询的效率。 对于每个index的shard数量，可以根据数据总量、写入压力、节点数量等综合考量后设定，然后根据数据增长状态定期检测下shard数量是否合理。基础架构部数据库团队的推荐方案是： 对于数据量较小（100GB以下）的index，往往写入压力查询压力相对较低，一般设置3~5个shard，numberofreplicas设置为1即可（也就是一主一从，共两副本） 。 对于数据量较大（100GB以上）的index： 一般把单个shard的数据量控制在（20GB~50GB） 让index压力分摊至多个节点：可通过index.routing.allocation.totalshardsper_node参数，强制限定一个节点上该index的shard数量，让shard尽量分配到不同节点上 综合考虑整个index的shard数量，如果shard数量（不包括副本）超过50个，就很可能引发拒绝率上升的问题，此时可考虑把该index拆分为多个独立的index，分摊数据量，同时配合routing使用，降低每个查询需要访问的shard数量。 稳定性调优 一 Linux参数调优 # 修改系统资源限制 # 单用户可以打开的最大文件数量，可以设置为官方推荐的65536或更大些 echo &quot;* - nofile 655360&quot; &gt;&gt;/etc/security/limits.conf # 单用户内存地址空间 echo &quot;* - as unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户线程数 echo &quot;* - nproc 2056474&quot; &gt;&gt;/etc/security/limits.conf # 单用户文件大小 echo &quot;* - fsize unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户锁定内存 echo &quot;* - memlock unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单进程可以使用的最大map内存区域数量 echo &quot;vm.max_map_count = 655300&quot; &gt;&gt;/etc/sysctl.conf # TCP全连接队列参数设置， 这样设置的目的是防止节点数较多（比如超过100）的ES集群中，节点异常重启时全连接队列在启动瞬间打满，造成节点hang住，整个集群响应迟滞的情况 echo &quot;net.ipv4.tcp_abort_on_overflow = 1&quot; &gt;&gt;/etc/sysctl.conf echo &quot;net.core.somaxconn = 2048&quot; &gt;&gt;/etc/sysctl.conf # 降低tcp alive time，防止无效链接占用链接数 echo 300 &gt;/proc/sys/net/ipv4/tcp_keepalive_time 二 ES节点配置 1. jvm.options -Xms和-Xmx设置为相同的值，推荐设置为机器内存的一半左右，剩余一半留给系统cache使用。 jvm内存建议不要低于2G，否则有可能因为内存不足导致ES无法正常启动或OOM jvm建议不要超过32G，否则jvm会禁用内存对象指针压缩技术，造成内存浪费 2. elasticsearch.yml 设置内存熔断参数，防止写入或查询压力过高导致OOM，具体数值可根据使用场景调整。 indices.breaker.total.limit: 30% indices.breaker.request.limit: 6% indices.breaker.fielddata.limit: 3% 调小查询使用的cache，避免cache占用过多的jvm内存，具体数值可根据使用场景调整。 indices.queries.cache.count: 500 indices.queries.cache.size: 5% 单机多节点时，主从shard分配以ip为依据，分配到不同的机器上，避免单机挂掉导致数据丢失。 cluster.routing.allocation.awareness.attributes: ip node.attr.ip: 1.1.1.1 三 ES使用方式 1. 节点数较多的集群，增加专有master，提升集群稳定性 ES集群的元信息管理、index的增删操作、节点的加入剔除等集群管理的任务都是由master节点来负责的，master节点定期将最新的集群状态广播至各个节点。所以，master的稳定性对于集群整体的稳定性是至关重要的。当集群的节点数量较大时（比如超过30个节点），集群的管理工作会变得复杂很多。此时应该创建专有master节点，这些节点只负责集群管理，不存储数据，不承担数据读写压力；其他节点则仅负责数据读写，不负责集群管理的工作。 这样把集群管理和数据的写入/查询分离，互不影响，防止因读写压力过大造成集群整体不稳定。 将专有master节点和数据节点的分离，需要修改ES的配置文件，然后滚动重启各个节点。 # 专有master节点的配置文件（conf/elasticsearch.yml）增加如下属性： node.master: true node.data: false node.ingest: false # 数据节点的配置文件增加如下属性（与上面的属性相反）： node.master: false node.data: true node.ingest: true 2. 控制index、shard总数量 上面提到，ES的元信息由master节点管理，定期同步给各个节点，也就是每个节点都会存储一份。这个元信息主要存储在clusterstate中，如所有node元信息（indices、节点各种统计参数）、所有index/shard的元信息（mapping, location, size）、元数据ingest等。 ES在创建新分片时，要根据现有的分片分布情况指定分片分配策略，从而使各个节点上的分片数基本一致，此过程中就需要深入遍历clusterstate。当集群中的index/shard过多时，clusterstate结构会变得过于复杂，导致遍历clusterstate效率低下，集群响应迟滞。基础架构部数据库团队曾经在一个20个节点的集群里，创建了4w+个shard，导致新建一个index需要60s+才能完成。 当index/shard数量过多时，可以考虑从以下几方面改进： 降低数据量较小的index的shard数量 把一些有关联的index合并成一个index 数据按某个维度做拆分，写入多个集群 3. Segment Memory优化 前面提到，ES底层采用Lucene做存储，而Lucene的一个index又由若干segment组成，每个segment都会建立自己的倒排索引用于数据查询。Lucene为了加速查询，为每个segment的倒排做了一层前缀索引，这个索引在Lucene4.0以后采用的数据结构是FST (Finite State Transducer)。Lucene加载segment的时候将其全量装载到内存中，加快查询速度。这部分内存被称为SegmentMemory， 常驻内存，占用heap，无法被GC。 前面提到，为利用JVM的对象指针压缩技术来节约内存，通常建议JVM内存分配不要超过32G。当集群的数据量过大时，SegmentMemory会吃掉大量的堆内存，而JVM内存空间又有限，此时就需要想办法降低SegmentMemory的使用量了，常用方法有下面几个： 定期删除不使用的index 对于不常访问的index，可以通过close接口将其关闭，用到时再打开 通过force_merge接口强制合并segment，降低segment数量 基础架构部数据库团队在此基础上，对FST部分进行了优化，释放高达40%的Segment Memory内存空间 为了迎合技术人的兴趣，降低关注门槛，拓宽覆盖面，分享不是那么“技术”的文章。在这里给大家推荐一个微信公众号-开发爱好者社区。这个号后续会推一些开发者感兴趣的 Python、Java、大数据计算及存储相关的知识，还有业界吐槽等等。欢迎关注。很多文章相对枯燥的技术文来说更有吸引力。比如《李彦宏救不了百度&nbsp;》&nbsp;《写代码吗？&nbsp;坐牢的那种》 等等。 公众号名称：开发爱好者社区&nbsp;&nbsp;&nbsp;&nbsp;ID:&nbsp;bigdata_ai （专注Python、Java、大数据存储、计算以及 AI 前沿。分享开发者技术文章、开发者看点、业界吐槽等） &nbsp;&nbsp;扫描上方二维码关注 感谢阅读 帮忙转发一下也是不错滴" />
+<meta property="og:description" content="&nbsp; 背景 Elasticsearch（ES）作为NOSQL+搜索引擎的有机结合体，不仅有近实时的查询能力，还具有强大的聚合分析能力。因此在全文检索、日志分析、监控系统、数据分析等领域ES均有广泛应用。而完整的Elastic Stack体系（Elasticsearch、Logstash、Kibana、Beats），更是提供了数据采集、清洗、存储、可视化的整套解决方案。&nbsp; 本文基于ES 5.6.4，从性能和稳定性两方面，从linux参数调优、ES节点配置和ES使用方式三个角度入手，介绍ES调优的基本方案。当然，ES的调优绝不能一概而论，需要根据实际业务场景做适当的取舍和调整，文中的疏漏之处也随时欢迎批评指正。 性能调优 一 Linux参数调优 1. 关闭交换分区，防止内存置换降低性能。 将/etc/fstab 文件中包含swap的行注释掉 sed -i &#39;/swap/s/^/#/&#39; /etc/fstab swapoff -a 2. 磁盘挂载选项 noatime：禁止记录访问时间戳，提高文件系统读写性能 data=writeback： 不记录data journal，提高文件系统写入性能 barrier=0：barrier保证journal先于data刷到磁盘，上面关闭了journal，这里的barrier也就没必要开启了 nobh：关闭buffer_head，防止内核打断大块数据的IO操作 mount -o noatime,data=writeback,barrier=0,nobh /dev/sda /es_data 3. 对于SSD磁盘，采用电梯调度算法，因为SSD提供了更智能的请求调度算法，不需要内核去做多余的调整 (仅供参考) echo noop &gt; /sys/block/sda/queue/scheduler 二 ES节点配置 conf/elasticsearch.yml文件：&nbsp; 1. 适当增大写入buffer和bulk队列长度，提高写入性能和稳定性 indices.memory.index_buffer_size: 15% thread_pool.bulk.queue_size: 1024 2. 计算disk使用量时，不考虑正在搬迁的shard 在规模比较大的集群中，可以防止新建shard时扫描所有shard的元数据，提升shard分配速度。 cluster.routing.allocation.disk.include_relocations: false 三 ES使用方式 1. 控制字段的存储选项 ES底层使用Lucene存储数据，主要包括行存（StoreFiled）、列存（DocValues）和倒排索引（InvertIndex）三部分。 大多数使用场景中，没有必要同时存储这三个部分，可以通过下面的参数来做适当调整： StoreFiled： 行存，其中占比最大的是source字段，它控制doc原始数据的存储。在写入数据时，ES把doc原始数据的整个json结构体当做一个string，存储为source字段。查询时，可以通过source字段拿到当初写入时的整个json结构体。 所以，如果没有取出整个原始json结构体的需求，可以通过下面的命令，在mapping中关闭source字段或者只在source中存储部分字段，数据查询时仍可通过ES的docvaluefields获取所有字段的值。注意：关闭source后， update, updatebyquery, reindex等接口将无法正常使用，所以有update等需求的index不能关闭source。 # 关闭 _source PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # _source只存储部分字段，通过includes指定要存储的字段或者通过excludes滤除不需要的字段 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;_doc&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;includes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;*.count&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;], &nbsp; &nbsp; &nbsp; &nbsp;&quot;excludes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.description&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.other.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } docvalues：控制列存。ES主要使用列存来支持sorting, aggregations和scripts功能，对于没有上述需求的字段，可以通过下面的命令关闭docvalues，降低存储成本。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;doc_values&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } index：控制倒排索引。ES默认对于所有字段都开启了倒排索引，用于查询。对于没有查询需求的字段，可以通过下面的命令关闭倒排索引。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } all：ES的一个特殊的字段，ES把用户写入json的所有字段值拼接成一个字符串后，做分词，然后保存倒排索引，用于支持整个json的全文检索。这种需求适用的场景较少，可以通过下面的命令将all字段关闭，节约存储成本和cpu开销。（ES 6.0+以上的版本不再支持_all字段，不需要设置） PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_all&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } fieldnames：该字段用于exists查询，来确认某个doc里面有无一个字段存在。若没有这种需求，可以将其关闭。 PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_field_names&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 2. 开启最佳压缩 对于打开了上述_source字段的index，可以通过下面的命令来把lucene适用的压缩算法替换成 DEFLATE，提高数据压缩率。 PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.codec&quot;: &quot;best_compression&quot; } 3. bulk批量写入 写入数据时尽量使用下面的bulk接口批量写入，提高写入效率。每个bulk请求的doc数量设定区间推荐为1k~1w，具体可根据业务场景选取一个适当的数量。 POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value2&quot; } 4. 调整translog同步策略 默认情况下，translog的持久化策略是，对于每个写入请求都做一次flush，刷新translog数据到磁盘上。这种频繁的磁盘IO操作是严重影响写入性能的，如果可以接受一定概率的数据丢失（这种硬件故障的概率很小），可以通过下面的命令调整 translog 持久化策略为异步周期性执行，并适当调整translog的刷盘周期。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp;&quot;translog&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;sync_interval&quot;: &quot;5s&quot;, &nbsp; &nbsp; &nbsp; &nbsp;&quot;durability&quot;: &quot;async&quot; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 5. 调整refresh_interval 写入Lucene的数据，并不是实时可搜索的，ES必须通过refresh的过程把内存中的数据转换成Lucene的完整segment后，才可以被搜索。默认情况下，ES每一秒会refresh一次，产生一个新的segment，这样会导致产生的segment较多，从而segment merge较为频繁，系统开销较大。如果对数据的实时可见性要求较低，可以通过下面的命令提高refresh的时间间隔，降低系统开销。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;refresh_interval&quot; : &quot;30s&quot; &nbsp; &nbsp;} &nbsp;} } 6. merge并发控制 ES的一个index由多个shard组成，而一个shard其实就是一个Lucene的index，它又由多个segment组成，且Lucene会不断地把一些小的segment合并成一个大的segment，这个过程被称为merge。默认值是Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))，当节点配置的cpu核数较高时，merge占用的资源可能会偏高，影响集群的性能，可以通过下面的命令调整某个index的merge过程的并发度： PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.merge.scheduler.max_thread_count&quot;: 2 } 7. 写入数据不指定_id，让ES自动产生 当用户显示指定id写入数据时，ES会先发起查询来确定index中是否已经有相同id的doc存在，若有则先删除原有doc再写入新doc。这样每次写入时，ES都会耗费一定的资源做查询。如果用户写入数据时不指定doc，ES则通过内部算法产生一个随机的id，并且保证id的唯一性，这样就可以跳过前面查询id的步骤，提高写入效率。 所以，在不需要通过id字段去重、update的使用场景中，写入不指定id可以提升写入速率。基础架构部数据库团队的测试结果显示，无id的数据写入性能可能比有_id的高出近一倍，实际损耗和具体测试场景相关。 # 写入时指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot;, &quot;_id&quot; : &quot;1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } # 写入时不指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } 8. 使用routing 对于数据量较大的index，一般会配置多个shard来分摊压力。这种场景下，一个查询会同时搜索所有的shard，然后再将各个shard的结果合并后，返回给用户。对于高并发的小查询场景，每个分片通常仅抓取极少量数据，此时查询过程中的调度开销远大于实际读取数据的开销，且查询速度取决于最慢的一个分片。开启routing功能后，ES会将routing相同的数据写入到同一个分片中（也可以是多个，由index.routingpartitionsize参数控制）。如果查询时指定routing，那么ES只会查询routing指向的那个分片，可显著降低调度开销，提升查询效率。 routing的使用方式如下： # 写入 PUT my_index/my_type/1?routing=user1 { &nbsp;&quot;title&quot;: &quot;This is a document&quot; } # 查询 GET my_index/_search?routing=user1,user2 { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;match&quot;: { &nbsp; &nbsp; &nbsp;&quot;title&quot;: &quot;document&quot; &nbsp; &nbsp;} &nbsp;} } 9. 为string类型的字段选取合适的存储方式 存为text类型的字段（string字段默认类型为text）： 做分词后存储倒排索引，支持全文检索，可以通过下面几个参数优化其存储方式： norms：用于在搜索时计算该doc的_score（代表这条数据与搜索条件的相关度），如果不需要评分，可以将其关闭。 indexoptions：控制倒排索引中包括哪些信息（docs、freqs、positions、offsets）。对于不太注重score/highlighting的使用场景，可以设为 docs来降低内存/磁盘资源消耗。 fields: 用于添加子字段。对于有sort和聚合查询需求的场景，可以添加一个keyword子字段以支持这两种功能。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;title&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;text&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;norms&quot;: false, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index_options&quot;: &quot;docs&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;fields&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;raw&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 存为keyword类型的字段： 不做分词，不支持全文检索。text分词消耗CPU资源，冗余存储keyword子字段占用存储空间。如果没有全文索引需求，只是要通过整个字段做搜索，可以设置该字段的类型为keyword，提升写入速率，降低存储成本。 设置字段类型的方法有两种：一是创建一个具体的index时，指定字段的类型；二是通过创建template，控制某一类index的字段类型。 # 1. 通过mapping指定 tags 字段为keyword类型 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;tags&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # 2. 通过template，指定my_index*类的index，其所有string字段默认为keyword类型 PUT _template/my_template { &nbsp; &nbsp;&quot;order&quot;: 0, &nbsp; &nbsp;&quot;template&quot;: &quot;my_index*&quot;, &nbsp; &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp; &nbsp;&quot;_default_&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;dynamic_templates&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;strings&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;match_mapping_type&quot;: &quot;string&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;ignore_above&quot;: 256 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;}, &nbsp; &nbsp;&quot;aliases&quot;: {} &nbsp;} 10. 查询时，使用query-bool-filter组合取代普通query 默认情况下，ES通过一定的算法计算返回的每条数据与查询语句的相关度，并通过score字段来表征。但对于非全文索引的使用场景，用户并不care查询结果与查询条件的相关度，只是想精确的查找目标数据。此时，可以通过query-bool-filter组合来让ES不计算score，并且尽可能的缓存filter的结果集，供后续包含相同filter的查询使用，提高查询效率。 # 普通查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;term&quot; : { &quot;user&quot; : &quot;Kimchy&quot; } &nbsp;} } # query-bool-filter 加速查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;bool&quot;: { &nbsp; &nbsp; &nbsp;&quot;filter&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;term&quot;: { &quot;user&quot;: &quot;Kimchy&quot; } &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 11. index按日期滚动，便于管理 写入ES的数据最好通过某种方式做分割，存入不同的index。常见的做法是将数据按模块/功能分类，写入不同的index，然后按照时间去滚动生成index。这样做的好处是各种数据分开管理不会混淆，也易于提高查询效率。同时index按时间滚动，数据过期时删除整个index，要比一条条删除数据或deletebyquery效率高很多，因为删除整个index是直接删除底层文件，而deletebyquery是查询-标记-删除。 举例说明，假如有[modulea,moduleb]两个模块产生的数据，那么index规划可以是这样的：一类index名称是modulea + {日期}，另一类index名称是module_b+ {日期}。对于名字中的日期，可以在写入数据时自己指定精确的日期，也可以通过ES的ingest pipeline中的index-name-processor实现（会有写入性能损耗）。 # module_a 类index - 创建index： PUT module_a@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_a@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_a@*/_search # &nbsp;module_b 类index - 创建index： PUT module_b@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_b@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_b@*/_search 12. 按需控制index的分片数和副本数 分片（shard）：一个ES的index由多个shard组成，每个shard承载index的一部分数据。 副本（replica）：index也可以设定副本数（numberofreplicas），也就是同一个shard有多少个备份。对于查询压力较大的index，可以考虑提高副本数（numberofreplicas），通过多个副本均摊查询压力。 shard数量（numberofshards）设置过多或过低都会引发一些问题：shard数量过多，则批量写入/查询请求被分割为过多的子写入/查询，导致该index的写入、查询拒绝率上升；对于数据量较大的inex，当其shard数量过小时，无法充分利用节点资源，造成机器资源利用率不高 或 不均衡，影响写入/查询的效率。 对于每个index的shard数量，可以根据数据总量、写入压力、节点数量等综合考量后设定，然后根据数据增长状态定期检测下shard数量是否合理。基础架构部数据库团队的推荐方案是： 对于数据量较小（100GB以下）的index，往往写入压力查询压力相对较低，一般设置3~5个shard，numberofreplicas设置为1即可（也就是一主一从，共两副本） 。 对于数据量较大（100GB以上）的index： 一般把单个shard的数据量控制在（20GB~50GB） 让index压力分摊至多个节点：可通过index.routing.allocation.totalshardsper_node参数，强制限定一个节点上该index的shard数量，让shard尽量分配到不同节点上 综合考虑整个index的shard数量，如果shard数量（不包括副本）超过50个，就很可能引发拒绝率上升的问题，此时可考虑把该index拆分为多个独立的index，分摊数据量，同时配合routing使用，降低每个查询需要访问的shard数量。 稳定性调优 一 Linux参数调优 # 修改系统资源限制 # 单用户可以打开的最大文件数量，可以设置为官方推荐的65536或更大些 echo &quot;* - nofile 655360&quot; &gt;&gt;/etc/security/limits.conf # 单用户内存地址空间 echo &quot;* - as unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户线程数 echo &quot;* - nproc 2056474&quot; &gt;&gt;/etc/security/limits.conf # 单用户文件大小 echo &quot;* - fsize unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户锁定内存 echo &quot;* - memlock unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单进程可以使用的最大map内存区域数量 echo &quot;vm.max_map_count = 655300&quot; &gt;&gt;/etc/sysctl.conf # TCP全连接队列参数设置， 这样设置的目的是防止节点数较多（比如超过100）的ES集群中，节点异常重启时全连接队列在启动瞬间打满，造成节点hang住，整个集群响应迟滞的情况 echo &quot;net.ipv4.tcp_abort_on_overflow = 1&quot; &gt;&gt;/etc/sysctl.conf echo &quot;net.core.somaxconn = 2048&quot; &gt;&gt;/etc/sysctl.conf # 降低tcp alive time，防止无效链接占用链接数 echo 300 &gt;/proc/sys/net/ipv4/tcp_keepalive_time 二 ES节点配置 1. jvm.options -Xms和-Xmx设置为相同的值，推荐设置为机器内存的一半左右，剩余一半留给系统cache使用。 jvm内存建议不要低于2G，否则有可能因为内存不足导致ES无法正常启动或OOM jvm建议不要超过32G，否则jvm会禁用内存对象指针压缩技术，造成内存浪费 2. elasticsearch.yml 设置内存熔断参数，防止写入或查询压力过高导致OOM，具体数值可根据使用场景调整。 indices.breaker.total.limit: 30% indices.breaker.request.limit: 6% indices.breaker.fielddata.limit: 3% 调小查询使用的cache，避免cache占用过多的jvm内存，具体数值可根据使用场景调整。 indices.queries.cache.count: 500 indices.queries.cache.size: 5% 单机多节点时，主从shard分配以ip为依据，分配到不同的机器上，避免单机挂掉导致数据丢失。 cluster.routing.allocation.awareness.attributes: ip node.attr.ip: 1.1.1.1 三 ES使用方式 1. 节点数较多的集群，增加专有master，提升集群稳定性 ES集群的元信息管理、index的增删操作、节点的加入剔除等集群管理的任务都是由master节点来负责的，master节点定期将最新的集群状态广播至各个节点。所以，master的稳定性对于集群整体的稳定性是至关重要的。当集群的节点数量较大时（比如超过30个节点），集群的管理工作会变得复杂很多。此时应该创建专有master节点，这些节点只负责集群管理，不存储数据，不承担数据读写压力；其他节点则仅负责数据读写，不负责集群管理的工作。 这样把集群管理和数据的写入/查询分离，互不影响，防止因读写压力过大造成集群整体不稳定。 将专有master节点和数据节点的分离，需要修改ES的配置文件，然后滚动重启各个节点。 # 专有master节点的配置文件（conf/elasticsearch.yml）增加如下属性： node.master: true node.data: false node.ingest: false # 数据节点的配置文件增加如下属性（与上面的属性相反）： node.master: false node.data: true node.ingest: true 2. 控制index、shard总数量 上面提到，ES的元信息由master节点管理，定期同步给各个节点，也就是每个节点都会存储一份。这个元信息主要存储在clusterstate中，如所有node元信息（indices、节点各种统计参数）、所有index/shard的元信息（mapping, location, size）、元数据ingest等。 ES在创建新分片时，要根据现有的分片分布情况指定分片分配策略，从而使各个节点上的分片数基本一致，此过程中就需要深入遍历clusterstate。当集群中的index/shard过多时，clusterstate结构会变得过于复杂，导致遍历clusterstate效率低下，集群响应迟滞。基础架构部数据库团队曾经在一个20个节点的集群里，创建了4w+个shard，导致新建一个index需要60s+才能完成。 当index/shard数量过多时，可以考虑从以下几方面改进： 降低数据量较小的index的shard数量 把一些有关联的index合并成一个index 数据按某个维度做拆分，写入多个集群 3. Segment Memory优化 前面提到，ES底层采用Lucene做存储，而Lucene的一个index又由若干segment组成，每个segment都会建立自己的倒排索引用于数据查询。Lucene为了加速查询，为每个segment的倒排做了一层前缀索引，这个索引在Lucene4.0以后采用的数据结构是FST (Finite State Transducer)。Lucene加载segment的时候将其全量装载到内存中，加快查询速度。这部分内存被称为SegmentMemory， 常驻内存，占用heap，无法被GC。 前面提到，为利用JVM的对象指针压缩技术来节约内存，通常建议JVM内存分配不要超过32G。当集群的数据量过大时，SegmentMemory会吃掉大量的堆内存，而JVM内存空间又有限，此时就需要想办法降低SegmentMemory的使用量了，常用方法有下面几个： 定期删除不使用的index 对于不常访问的index，可以通过close接口将其关闭，用到时再打开 通过force_merge接口强制合并segment，降低segment数量 基础架构部数据库团队在此基础上，对FST部分进行了优化，释放高达40%的Segment Memory内存空间 为了迎合技术人的兴趣，降低关注门槛，拓宽覆盖面，分享不是那么“技术”的文章。在这里给大家推荐一个微信公众号-开发爱好者社区。这个号后续会推一些开发者感兴趣的 Python、Java、大数据计算及存储相关的知识，还有业界吐槽等等。欢迎关注。很多文章相对枯燥的技术文来说更有吸引力。比如《李彦宏救不了百度&nbsp;》&nbsp;《写代码吗？&nbsp;坐牢的那种》 等等。 公众号名称：开发爱好者社区&nbsp;&nbsp;&nbsp;&nbsp;ID:&nbsp;bigdata_ai （专注Python、Java、大数据存储、计算以及 AI 前沿。分享开发者技术文章、开发者看点、业界吐槽等） &nbsp;&nbsp;扫描上方二维码关注 感谢阅读 帮忙转发一下也是不错滴" />
+<link rel="canonical" href="https://uzzz.org/2019/08/03/792935.html" />
+<meta property="og:url" content="https://uzzz.org/2019/08/03/792935.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-08-03T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"&nbsp; 背景 Elasticsearch（ES）作为NOSQL+搜索引擎的有机结合体，不仅有近实时的查询能力，还具有强大的聚合分析能力。因此在全文检索、日志分析、监控系统、数据分析等领域ES均有广泛应用。而完整的Elastic Stack体系（Elasticsearch、Logstash、Kibana、Beats），更是提供了数据采集、清洗、存储、可视化的整套解决方案。&nbsp; 本文基于ES 5.6.4，从性能和稳定性两方面，从linux参数调优、ES节点配置和ES使用方式三个角度入手，介绍ES调优的基本方案。当然，ES的调优绝不能一概而论，需要根据实际业务场景做适当的取舍和调整，文中的疏漏之处也随时欢迎批评指正。 性能调优 一 Linux参数调优 1. 关闭交换分区，防止内存置换降低性能。 将/etc/fstab 文件中包含swap的行注释掉 sed -i &#39;/swap/s/^/#/&#39; /etc/fstab swapoff -a 2. 磁盘挂载选项 noatime：禁止记录访问时间戳，提高文件系统读写性能 data=writeback： 不记录data journal，提高文件系统写入性能 barrier=0：barrier保证journal先于data刷到磁盘，上面关闭了journal，这里的barrier也就没必要开启了 nobh：关闭buffer_head，防止内核打断大块数据的IO操作 mount -o noatime,data=writeback,barrier=0,nobh /dev/sda /es_data 3. 对于SSD磁盘，采用电梯调度算法，因为SSD提供了更智能的请求调度算法，不需要内核去做多余的调整 (仅供参考) echo noop &gt; /sys/block/sda/queue/scheduler 二 ES节点配置 conf/elasticsearch.yml文件：&nbsp; 1. 适当增大写入buffer和bulk队列长度，提高写入性能和稳定性 indices.memory.index_buffer_size: 15% thread_pool.bulk.queue_size: 1024 2. 计算disk使用量时，不考虑正在搬迁的shard 在规模比较大的集群中，可以防止新建shard时扫描所有shard的元数据，提升shard分配速度。 cluster.routing.allocation.disk.include_relocations: false 三 ES使用方式 1. 控制字段的存储选项 ES底层使用Lucene存储数据，主要包括行存（StoreFiled）、列存（DocValues）和倒排索引（InvertIndex）三部分。 大多数使用场景中，没有必要同时存储这三个部分，可以通过下面的参数来做适当调整： StoreFiled： 行存，其中占比最大的是source字段，它控制doc原始数据的存储。在写入数据时，ES把doc原始数据的整个json结构体当做一个string，存储为source字段。查询时，可以通过source字段拿到当初写入时的整个json结构体。 所以，如果没有取出整个原始json结构体的需求，可以通过下面的命令，在mapping中关闭source字段或者只在source中存储部分字段，数据查询时仍可通过ES的docvaluefields获取所有字段的值。注意：关闭source后， update, updatebyquery, reindex等接口将无法正常使用，所以有update等需求的index不能关闭source。 # 关闭 _source PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # _source只存储部分字段，通过includes指定要存储的字段或者通过excludes滤除不需要的字段 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;_doc&quot;: { &nbsp; &nbsp; &nbsp;&quot;_source&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;includes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;*.count&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;], &nbsp; &nbsp; &nbsp; &nbsp;&quot;excludes&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.description&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;meta.other.*&quot; &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } docvalues：控制列存。ES主要使用列存来支持sorting, aggregations和scripts功能，对于没有上述需求的字段，可以通过下面的命令关闭docvalues，降低存储成本。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;doc_values&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } index：控制倒排索引。ES默认对于所有字段都开启了倒排索引，用于查询。对于没有查询需求的字段，可以通过下面的命令关闭倒排索引。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;session_id&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } all：ES的一个特殊的字段，ES把用户写入json的所有字段值拼接成一个字符串后，做分词，然后保存倒排索引，用于支持整个json的全文检索。这种需求适用的场景较少，可以通过下面的命令将all字段关闭，节约存储成本和cpu开销。（ES 6.0+以上的版本不再支持_all字段，不需要设置） PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_all&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } fieldnames：该字段用于exists查询，来确认某个doc里面有无一个字段存在。若没有这种需求，可以将其关闭。 PUT /my_index { &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;_field_names&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;enabled&quot;: false &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 2. 开启最佳压缩 对于打开了上述_source字段的index，可以通过下面的命令来把lucene适用的压缩算法替换成 DEFLATE，提高数据压缩率。 PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.codec&quot;: &quot;best_compression&quot; } 3. bulk批量写入 写入数据时尽量使用下面的bulk接口批量写入，提高写入效率。每个bulk请求的doc数量设定区间推荐为1k~1w，具体可根据业务场景选取一个适当的数量。 POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value2&quot; } 4. 调整translog同步策略 默认情况下，translog的持久化策略是，对于每个写入请求都做一次flush，刷新translog数据到磁盘上。这种频繁的磁盘IO操作是严重影响写入性能的，如果可以接受一定概率的数据丢失（这种硬件故障的概率很小），可以通过下面的命令调整 translog 持久化策略为异步周期性执行，并适当调整translog的刷盘周期。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp;&quot;translog&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;sync_interval&quot;: &quot;5s&quot;, &nbsp; &nbsp; &nbsp; &nbsp;&quot;durability&quot;: &quot;async&quot; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 5. 调整refresh_interval 写入Lucene的数据，并不是实时可搜索的，ES必须通过refresh的过程把内存中的数据转换成Lucene的完整segment后，才可以被搜索。默认情况下，ES每一秒会refresh一次，产生一个新的segment，这样会导致产生的segment较多，从而segment merge较为频繁，系统开销较大。如果对数据的实时可见性要求较低，可以通过下面的命令提高refresh的时间间隔，降低系统开销。 PUT my_index { &nbsp;&quot;settings&quot;: { &nbsp; &nbsp;&quot;index&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;refresh_interval&quot; : &quot;30s&quot; &nbsp; &nbsp;} &nbsp;} } 6. merge并发控制 ES的一个index由多个shard组成，而一个shard其实就是一个Lucene的index，它又由多个segment组成，且Lucene会不断地把一些小的segment合并成一个大的segment，这个过程被称为merge。默认值是Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))，当节点配置的cpu核数较高时，merge占用的资源可能会偏高，影响集群的性能，可以通过下面的命令调整某个index的merge过程的并发度： PUT /my_index/_settings { &nbsp; &nbsp;&quot;index.merge.scheduler.max_thread_count&quot;: 2 } 7. 写入数据不指定_id，让ES自动产生 当用户显示指定id写入数据时，ES会先发起查询来确定index中是否已经有相同id的doc存在，若有则先删除原有doc再写入新doc。这样每次写入时，ES都会耗费一定的资源做查询。如果用户写入数据时不指定doc，ES则通过内部算法产生一个随机的id，并且保证id的唯一性，这样就可以跳过前面查询id的步骤，提高写入效率。 所以，在不需要通过id字段去重、update的使用场景中，写入不指定id可以提升写入速率。基础架构部数据库团队的测试结果显示，无id的数据写入性能可能比有_id的高出近一倍，实际损耗和具体测试场景相关。 # 写入时指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot;, &quot;_id&quot; : &quot;1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } # 写入时不指定_id POST _bulk { &quot;index&quot; : { &quot;_index&quot; : &quot;test&quot;, &quot;_type&quot; : &quot;type1&quot; } } { &quot;field1&quot; : &quot;value1&quot; } 8. 使用routing 对于数据量较大的index，一般会配置多个shard来分摊压力。这种场景下，一个查询会同时搜索所有的shard，然后再将各个shard的结果合并后，返回给用户。对于高并发的小查询场景，每个分片通常仅抓取极少量数据，此时查询过程中的调度开销远大于实际读取数据的开销，且查询速度取决于最慢的一个分片。开启routing功能后，ES会将routing相同的数据写入到同一个分片中（也可以是多个，由index.routingpartitionsize参数控制）。如果查询时指定routing，那么ES只会查询routing指向的那个分片，可显著降低调度开销，提升查询效率。 routing的使用方式如下： # 写入 PUT my_index/my_type/1?routing=user1 { &nbsp;&quot;title&quot;: &quot;This is a document&quot; } # 查询 GET my_index/_search?routing=user1,user2 { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;match&quot;: { &nbsp; &nbsp; &nbsp;&quot;title&quot;: &quot;document&quot; &nbsp; &nbsp;} &nbsp;} } 9. 为string类型的字段选取合适的存储方式 存为text类型的字段（string字段默认类型为text）： 做分词后存储倒排索引，支持全文检索，可以通过下面几个参数优化其存储方式： norms：用于在搜索时计算该doc的_score（代表这条数据与搜索条件的相关度），如果不需要评分，可以将其关闭。 indexoptions：控制倒排索引中包括哪些信息（docs、freqs、positions、offsets）。对于不太注重score/highlighting的使用场景，可以设为 docs来降低内存/磁盘资源消耗。 fields: 用于添加子字段。对于有sort和聚合查询需求的场景，可以添加一个keyword子字段以支持这两种功能。 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;title&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;text&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;norms&quot;: false, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;index_options&quot;: &quot;docs&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;fields&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;raw&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 存为keyword类型的字段： 不做分词，不支持全文检索。text分词消耗CPU资源，冗余存储keyword子字段占用存储空间。如果没有全文索引需求，只是要通过整个字段做搜索，可以设置该字段的类型为keyword，提升写入速率，降低存储成本。 设置字段类型的方法有两种：一是创建一个具体的index时，指定字段的类型；二是通过创建template，控制某一类index的字段类型。 # 1. 通过mapping指定 tags 字段为keyword类型 PUT my_index { &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp;&quot;my_type&quot;: { &nbsp; &nbsp; &nbsp;&quot;properties&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;tags&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &nbsp;&quot;keyword&quot; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } # 2. 通过template，指定my_index*类的index，其所有string字段默认为keyword类型 PUT _template/my_template { &nbsp; &nbsp;&quot;order&quot;: 0, &nbsp; &nbsp;&quot;template&quot;: &quot;my_index*&quot;, &nbsp; &nbsp;&quot;mappings&quot;: { &nbsp; &nbsp; &nbsp;&quot;_default_&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;dynamic_templates&quot;: [ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;strings&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;match_mapping_type&quot;: &quot;string&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;mapping&quot;: { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;type&quot;: &quot;keyword&quot;, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;ignore_above&quot;: 256 &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp; &nbsp; &nbsp;] &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;}, &nbsp; &nbsp;&quot;aliases&quot;: {} &nbsp;} 10. 查询时，使用query-bool-filter组合取代普通query 默认情况下，ES通过一定的算法计算返回的每条数据与查询语句的相关度，并通过score字段来表征。但对于非全文索引的使用场景，用户并不care查询结果与查询条件的相关度，只是想精确的查找目标数据。此时，可以通过query-bool-filter组合来让ES不计算score，并且尽可能的缓存filter的结果集，供后续包含相同filter的查询使用，提高查询效率。 # 普通查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;term&quot; : { &quot;user&quot; : &quot;Kimchy&quot; } &nbsp;} } # query-bool-filter 加速查询 POST my_index/_search { &nbsp;&quot;query&quot;: { &nbsp; &nbsp;&quot;bool&quot;: { &nbsp; &nbsp; &nbsp;&quot;filter&quot;: { &nbsp; &nbsp; &nbsp; &nbsp;&quot;term&quot;: { &quot;user&quot;: &quot;Kimchy&quot; } &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} &nbsp;} } 11. index按日期滚动，便于管理 写入ES的数据最好通过某种方式做分割，存入不同的index。常见的做法是将数据按模块/功能分类，写入不同的index，然后按照时间去滚动生成index。这样做的好处是各种数据分开管理不会混淆，也易于提高查询效率。同时index按时间滚动，数据过期时删除整个index，要比一条条删除数据或deletebyquery效率高很多，因为删除整个index是直接删除底层文件，而deletebyquery是查询-标记-删除。 举例说明，假如有[modulea,moduleb]两个模块产生的数据，那么index规划可以是这样的：一类index名称是modulea + {日期}，另一类index名称是module_b+ {日期}。对于名字中的日期，可以在写入数据时自己指定精确的日期，也可以通过ES的ingest pipeline中的index-name-processor实现（会有写入性能损耗）。 # module_a 类index - 创建index： PUT module_a@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_a@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_a@*/_search # &nbsp;module_b 类index - 创建index： PUT module_b@2018_01_01 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } PUT module_b@2018_01_02 { &nbsp; &nbsp;&quot;settings&quot; : { &nbsp; &nbsp; &nbsp; &nbsp;&quot;index&quot; : { &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_shards&quot; : 3, &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;&quot;number_of_replicas&quot; : 2 &nbsp; &nbsp; &nbsp; &nbsp;} &nbsp; &nbsp;} } ... - 查询数据： GET module_b@*/_search 12. 按需控制index的分片数和副本数 分片（shard）：一个ES的index由多个shard组成，每个shard承载index的一部分数据。 副本（replica）：index也可以设定副本数（numberofreplicas），也就是同一个shard有多少个备份。对于查询压力较大的index，可以考虑提高副本数（numberofreplicas），通过多个副本均摊查询压力。 shard数量（numberofshards）设置过多或过低都会引发一些问题：shard数量过多，则批量写入/查询请求被分割为过多的子写入/查询，导致该index的写入、查询拒绝率上升；对于数据量较大的inex，当其shard数量过小时，无法充分利用节点资源，造成机器资源利用率不高 或 不均衡，影响写入/查询的效率。 对于每个index的shard数量，可以根据数据总量、写入压力、节点数量等综合考量后设定，然后根据数据增长状态定期检测下shard数量是否合理。基础架构部数据库团队的推荐方案是： 对于数据量较小（100GB以下）的index，往往写入压力查询压力相对较低，一般设置3~5个shard，numberofreplicas设置为1即可（也就是一主一从，共两副本） 。 对于数据量较大（100GB以上）的index： 一般把单个shard的数据量控制在（20GB~50GB） 让index压力分摊至多个节点：可通过index.routing.allocation.totalshardsper_node参数，强制限定一个节点上该index的shard数量，让shard尽量分配到不同节点上 综合考虑整个index的shard数量，如果shard数量（不包括副本）超过50个，就很可能引发拒绝率上升的问题，此时可考虑把该index拆分为多个独立的index，分摊数据量，同时配合routing使用，降低每个查询需要访问的shard数量。 稳定性调优 一 Linux参数调优 # 修改系统资源限制 # 单用户可以打开的最大文件数量，可以设置为官方推荐的65536或更大些 echo &quot;* - nofile 655360&quot; &gt;&gt;/etc/security/limits.conf # 单用户内存地址空间 echo &quot;* - as unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户线程数 echo &quot;* - nproc 2056474&quot; &gt;&gt;/etc/security/limits.conf # 单用户文件大小 echo &quot;* - fsize unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单用户锁定内存 echo &quot;* - memlock unlimited&quot; &gt;&gt;/etc/security/limits.conf # 单进程可以使用的最大map内存区域数量 echo &quot;vm.max_map_count = 655300&quot; &gt;&gt;/etc/sysctl.conf # TCP全连接队列参数设置， 这样设置的目的是防止节点数较多（比如超过100）的ES集群中，节点异常重启时全连接队列在启动瞬间打满，造成节点hang住，整个集群响应迟滞的情况 echo &quot;net.ipv4.tcp_abort_on_overflow = 1&quot; &gt;&gt;/etc/sysctl.conf echo &quot;net.core.somaxconn = 2048&quot; &gt;&gt;/etc/sysctl.conf # 降低tcp alive time，防止无效链接占用链接数 echo 300 &gt;/proc/sys/net/ipv4/tcp_keepalive_time 二 ES节点配置 1. jvm.options -Xms和-Xmx设置为相同的值，推荐设置为机器内存的一半左右，剩余一半留给系统cache使用。 jvm内存建议不要低于2G，否则有可能因为内存不足导致ES无法正常启动或OOM jvm建议不要超过32G，否则jvm会禁用内存对象指针压缩技术，造成内存浪费 2. elasticsearch.yml 设置内存熔断参数，防止写入或查询压力过高导致OOM，具体数值可根据使用场景调整。 indices.breaker.total.limit: 30% indices.breaker.request.limit: 6% indices.breaker.fielddata.limit: 3% 调小查询使用的cache，避免cache占用过多的jvm内存，具体数值可根据使用场景调整。 indices.queries.cache.count: 500 indices.queries.cache.size: 5% 单机多节点时，主从shard分配以ip为依据，分配到不同的机器上，避免单机挂掉导致数据丢失。 cluster.routing.allocation.awareness.attributes: ip node.attr.ip: 1.1.1.1 三 ES使用方式 1. 节点数较多的集群，增加专有master，提升集群稳定性 ES集群的元信息管理、index的增删操作、节点的加入剔除等集群管理的任务都是由master节点来负责的，master节点定期将最新的集群状态广播至各个节点。所以，master的稳定性对于集群整体的稳定性是至关重要的。当集群的节点数量较大时（比如超过30个节点），集群的管理工作会变得复杂很多。此时应该创建专有master节点，这些节点只负责集群管理，不存储数据，不承担数据读写压力；其他节点则仅负责数据读写，不负责集群管理的工作。 这样把集群管理和数据的写入/查询分离，互不影响，防止因读写压力过大造成集群整体不稳定。 将专有master节点和数据节点的分离，需要修改ES的配置文件，然后滚动重启各个节点。 # 专有master节点的配置文件（conf/elasticsearch.yml）增加如下属性： node.master: true node.data: false node.ingest: false # 数据节点的配置文件增加如下属性（与上面的属性相反）： node.master: false node.data: true node.ingest: true 2. 控制index、shard总数量 上面提到，ES的元信息由master节点管理，定期同步给各个节点，也就是每个节点都会存储一份。这个元信息主要存储在clusterstate中，如所有node元信息（indices、节点各种统计参数）、所有index/shard的元信息（mapping, location, size）、元数据ingest等。 ES在创建新分片时，要根据现有的分片分布情况指定分片分配策略，从而使各个节点上的分片数基本一致，此过程中就需要深入遍历clusterstate。当集群中的index/shard过多时，clusterstate结构会变得过于复杂，导致遍历clusterstate效率低下，集群响应迟滞。基础架构部数据库团队曾经在一个20个节点的集群里，创建了4w+个shard，导致新建一个index需要60s+才能完成。 当index/shard数量过多时，可以考虑从以下几方面改进： 降低数据量较小的index的shard数量 把一些有关联的index合并成一个index 数据按某个维度做拆分，写入多个集群 3. Segment Memory优化 前面提到，ES底层采用Lucene做存储，而Lucene的一个index又由若干segment组成，每个segment都会建立自己的倒排索引用于数据查询。Lucene为了加速查询，为每个segment的倒排做了一层前缀索引，这个索引在Lucene4.0以后采用的数据结构是FST (Finite State Transducer)。Lucene加载segment的时候将其全量装载到内存中，加快查询速度。这部分内存被称为SegmentMemory， 常驻内存，占用heap，无法被GC。 前面提到，为利用JVM的对象指针压缩技术来节约内存，通常建议JVM内存分配不要超过32G。当集群的数据量过大时，SegmentMemory会吃掉大量的堆内存，而JVM内存空间又有限，此时就需要想办法降低SegmentMemory的使用量了，常用方法有下面几个： 定期删除不使用的index 对于不常访问的index，可以通过close接口将其关闭，用到时再打开 通过force_merge接口强制合并segment，降低segment数量 基础架构部数据库团队在此基础上，对FST部分进行了优化，释放高达40%的Segment Memory内存空间 为了迎合技术人的兴趣，降低关注门槛，拓宽覆盖面，分享不是那么“技术”的文章。在这里给大家推荐一个微信公众号-开发爱好者社区。这个号后续会推一些开发者感兴趣的 Python、Java、大数据计算及存储相关的知识，还有业界吐槽等等。欢迎关注。很多文章相对枯燥的技术文来说更有吸引力。比如《李彦宏救不了百度&nbsp;》&nbsp;《写代码吗？&nbsp;坐牢的那种》 等等。 公众号名称：开发爱好者社区&nbsp;&nbsp;&nbsp;&nbsp;ID:&nbsp;bigdata_ai （专注Python、Java、大数据存储、计算以及 AI 前沿。分享开发者技术文章、开发者看点、业界吐槽等） &nbsp;&nbsp;扫描上方二维码关注 感谢阅读 帮忙转发一下也是不错滴","@type":"BlogPosting","url":"https://uzzz.org/2019/08/03/792935.html","headline":"Elasticsearch调优实践","dateModified":"2019-08-03T00:00:00+08:00","datePublished":"2019-08-03T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/08/03/792935.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Elasticsearch调优实践</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <div class="rich_media_content" id="js_content"> 
+   <p style="text-align:left;"><strong style="text-align:justify;"><span style="font-size:16px;color:rgb(62,71,83);">&nbsp; 背景</span></strong><br></p>
+   <p style="margin-left:8px;"><span style="font-size:14px;color:rgb(62,71,83);">Elasticsearch（ES）作为NOSQL+搜索引擎的有机结合体，不仅有近实时的查询能力，还具有强大的聚合分析能力。因此在全文检索、日志分析、监控系统、数据分析等领域ES均有广泛应用。而完整的Elastic Stack体系（Elasticsearch、Logstash、Kibana、Beats），更是提供了数据采集、清洗、存储、可视化的整套解决方案。&nbsp;</span></p>
+   <p style="margin-left:8px;"><span style="font-size:14px;color:rgb(62,71,83);">本文基于ES 5.6.4，从性能和稳定性两方面，从linux参数调优、ES节点配置和ES使用方式三个角度入手，介绍ES调优的基本方案。当然，ES的调优绝不能一概而论，需要根据实际业务场景做适当的取舍和调整，文中的疏漏之处也随时欢迎批评指正。</span><span style="font-size:16px;"><em><span style="color:rgb(62,71,83);"></span></em><em><span style="color:rgb(62,71,83);"></span></em></span></p>
+   <p><em style="color:rgb(62,62,62);font-size:14px;text-align:justify;"><span style="color:rgb(62,71,83);"></span></em><br></p>
+   <strong><span style="color:rgb(62,71,83);font-size:14px;"></span></strong>
+   <p><strong><img src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/j3gficicyOvat9D7mmUPVN0erUATXwLbr3IicB8BUu4qL4KnFbY3rFLgSyCYCY8mDE8jLVzHAXbIfjhblSJUh9Tvg/640" alt="640"></strong></p>
+   <strong></strong>
+   <p><strong><br></strong></p>
+   <strong></strong>
+   <p><strong>性能调优</strong></p>
+   <p style="line-height:1.75em;margin-left:8px;text-align:justify;"><strong>一 Linux参数调优</strong><span style="color:rgb(255,255,255);"><strong><span style="font-size:16px;text-align:justify;"></span></strong></span></p>
+   <br>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="color:rgb(62,71,83);font-size:16px;">1. 关闭交换分区，防止内存置换降低性能。 将/etc/fstab 文件中包含swap的行注释掉</span><span style="font-size:16px;color:rgb(62,71,83);"></span></p>
+   <pre class="has"><code class="language-javascript">sed -i '/swap/s/^/#/' /etc/fstab	
+swapoff -a</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">2. 磁盘挂载选项</span></p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">noatime：禁止记录访问时间戳，提高文件系统读写性能</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">data=writeback： 不记录data journal，提高文件系统写入性能</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">barrier=0：barrier保证journal先于data刷到磁盘，上面关闭了journal，这里的barrier也就没必要开启了</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">nobh：关闭buffer_head，防止内核打断大块数据的IO操作</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">mount -o noatime,data=writeback,barrier=0,nobh /dev/sda /es_data</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">3. 对于SSD磁盘，采用电梯调度算法，因为SSD提供了更智能的请求调度算法，不需要内核去做多余的调整 (仅供参考)</span></p>
+   <pre class="has"><code class="language-javascript">echo noop &gt; /sys/block/sda/queue/scheduler</code></pre>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;"><br></p>
+   <p style="line-height:1.75em;margin-left:8px;text-align:left;"><strong>二 ES节点配置</strong></p>
+   <br>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;">conf/elasticsearch.yml文件：<span style="font-size:16px;color:rgb(62,71,83);"></span></p>&nbsp;
+   <span style="color:rgb(62,71,83);font-size:16px;">1. 适当增大写入buffer和bulk队列长度，提高写入性能和稳定性</span>
+   <p><br></p>
+   <pre class="has"><code class="language-javascript">indices.memory.index_buffer_size: 15%	
+thread_pool.bulk.queue_size: 1024</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">2. 计算disk使用量时，不考虑正在搬迁的shard</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">在规模比较大的集群中，可以防止新建shard时扫描所有shard的元数据，提升shard分配速度。</p>
+   <pre class="has"><code class="language-javascript">cluster.routing.allocation.disk.include_relocations: false</code></pre>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;"><br></p>
+   <p style="line-height:1.75em;margin-left:8px;text-align:justify;"><strong>三 ES使用方式</strong><span style="color:rgb(255,255,255);"><strong><span style="font-size:16px;text-align:justify;"></span></strong></span></p>
+   <br>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">1. 控制字段的存储选项</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">ES底层使用Lucene存储数据，主要包括行存（StoreFiled）、列存（DocValues）和倒排索引（InvertIndex）三部分。 大多数使用场景中，没有必要同时存储这三个部分，可以通过下面的参数来做适当调整：</p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">StoreFiled： 行存，其中占比最大的是source字段，它控制doc原始数据的存储。在写入数据时，ES把doc原始数据的整个json结构体当做一个string，存储为source字段。查询时，可以通过source字段拿到当初写入时的整个json结构体。 所以，如果没有取出整个原始json结构体的需求，可以通过下面的命令，在mapping中关闭source字段或者只在source中存储部分字段，数据查询时仍可通过ES的docvaluefields获取所有字段的值。</span></p><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;"><strong style="color:rgb(0,0,0);">注意：</strong>关闭source后， update, updatebyquery, reindex等接口将无法正常使用，所以有update等需求的index不能关闭source。</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript"># 关闭 _source	
+PUT my_index 	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"_source": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"enabled": false	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}	
+	
+# _source只存储部分字段，通过includes指定要存储的字段或者通过excludes滤除不需要的字段	
+PUT my_index	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"_doc": {	
+ &nbsp; &nbsp; &nbsp;"_source": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"includes": [	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"*.count",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"meta.*"	
+ &nbsp; &nbsp; &nbsp; &nbsp;],	
+ &nbsp; &nbsp; &nbsp; &nbsp;"excludes": [	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"meta.description",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"meta.other.*"	
+ &nbsp; &nbsp; &nbsp; &nbsp;]	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">docvalues：控制列存。</span></p><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">ES主要使用列存来支持sorting, aggregations和scripts功能，对于没有上述需求的字段，可以通过下面的命令关闭docvalues，降低存储成本。</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">PUT my_index	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"properties": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"session_id": { 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": "keyword",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"doc_values": false	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">index：控制倒排索引。</span></p><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">ES默认对于所有字段都开启了倒排索引，用于查询。对于没有查询需求的字段，可以通过下面的命令关闭倒排索引。</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">PUT my_index	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"properties": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"session_id": { 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": "keyword",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"index": false	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">all：ES的一个特殊的字段，ES把用户写入json的所有字段值拼接成一个字符串后，做分词，然后保存倒排索引，用于支持整个json的全文检索。</span></p><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">这种需求适用的场景较少，可以通过下面的命令将all字段关闭，节约存储成本和cpu开销。（ES 6.0+以上的版本不再支持_all字段，不需要设置）</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">PUT /my_index	
+{	
+ &nbsp;"mapping": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"_all": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"enabled": false &nbsp; 	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">fieldnames：该字段用于exists查询，来确认某个doc里面有无一个字段存在。若没有这种需求，可以将其关闭。</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">PUT /my_index	
+{	
+ &nbsp;"mapping": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"_field_names": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"enabled": false &nbsp; 	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">2. 开启最佳压缩</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">对于打开了上述_source字段的index，可以通过下面的命令来把lucene适用的压缩算法替换成 DEFLATE，提高数据压缩率。</p>
+   <pre class="has"><code class="language-javascript">PUT /my_index/_settings	
+{	
+ &nbsp; &nbsp;"index.codec": "best_compression"	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">3. bulk批量写入</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">写入数据时尽量使用下面的bulk接口批量写入，提高写入效率。每个bulk请求的doc数量设定区间推荐为1k~1w，具体可根据业务场景选取一个适当的数量。</p>
+   <pre class="has"><code class="language-javascript">POST _bulk	
+{ "index" : { "_index" : "test", "_type" : "type1" } }	
+{ "field1" : "value1" }	
+{ "index" : { "_index" : "test", "_type" : "type1" } }	
+{ "field1" : "value2" }</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">4. 调整translog同步策略</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">默认情况下，translog的持久化策略是，对于每个写入请求都做一次flush，刷新translog数据到磁盘上。这种频繁的磁盘IO操作是严重影响写入性能的，如果可以接受一定概率的数据丢失（这种硬件故障的概率很小），可以通过下面的命令调整 translog 持久化策略为异步周期性执行，并适当调整translog的刷盘周期。</p>
+   <pre class="has"><code class="language-javascript">PUT my_index	
+{	
+ &nbsp;"settings": {	
+ &nbsp; &nbsp;"index": {	
+ &nbsp; &nbsp; &nbsp;"translog": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"sync_interval": "5s",	
+ &nbsp; &nbsp; &nbsp; &nbsp;"durability": "async"	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">5. 调整refresh_interval</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">写入Lucene的数据，并不是实时可搜索的，ES必须通过refresh的过程把内存中的数据转换成Lucene的完整segment后，才可以被搜索。默认情况下，ES每一秒会refresh一次，产生一个新的segment，这样会导致产生的segment较多，从而segment merge较为频繁，系统开销较大。如果对数据的实时可见性要求较低，可以通过下面的命令提高refresh的时间间隔，降低系统开销。</p>
+   <pre class="has"><code class="language-javascript">PUT my_index	
+{	
+ &nbsp;"settings": {	
+ &nbsp; &nbsp;"index": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"refresh_interval" : "30s"	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">6. merge并发控制</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">ES的一个index由多个shard组成，而一个shard其实就是一个Lucene的index，它又由多个segment组成，且Lucene会不断地把一些小的segment合并成一个大的segment，这个过程被称为merge。默认值是Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2))，当节点配置的cpu核数较高时，merge占用的资源可能会偏高，影响集群的性能，可以通过下面的命令调整某个index的merge过程的并发度：</p>
+   <pre class="has"><code class="language-javascript">PUT /my_index/_settings	
+{	
+ &nbsp; &nbsp;"index.merge.scheduler.max_thread_count": 2	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">7. 写入数据不指定_id，让ES自动产生</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">当用户显示指定id写入数据时，ES会先发起查询来确定index中是否已经有相同id的doc存在，若有则先删除原有doc再写入新doc。这样每次写入时，ES都会耗费一定的资源做查询。如果用户写入数据时不指定doc，ES则通过内部算法产生一个随机的id，并且保证id的唯一性，这样就可以跳过前面查询id的步骤，提高写入效率。 所以，在不需要通过id字段去重、update的使用场景中，写入不指定id可以提升写入速率。基础架构部数据库团队的测试结果显示，无id的数据写入性能可能比有_id的高出近一倍，实际损耗和具体测试场景相关。</p>
+   <pre class="has"><code class="language-javascript"># 写入时指定_id	
+POST _bulk	
+{ "index" : { "_index" : "test", "_type" : "type1", "_id" : "1" } }	
+{ "field1" : "value1" }	
+	
+# 写入时不指定_id	
+POST _bulk	
+{ "index" : { "_index" : "test", "_type" : "type1" } }	
+{ "field1" : "value1" }</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">8. 使用routing</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">对于数据量较大的index，一般会配置多个shard来分摊压力。这种场景下，一个查询会同时搜索所有的shard，然后再将各个shard的结果合并后，返回给用户。对于高并发的小查询场景，每个分片通常仅抓取极少量数据，此时查询过程中的调度开销远大于实际读取数据的开销，且查询速度取决于最慢的一个分片。开启routing功能后，ES会将routing相同的数据写入到同一个分片中（也可以是多个，由index.routingpartitionsize参数控制）。如果查询时指定routing，那么ES只会查询routing指向的那个分片，可显著降低调度开销，提升查询效率。 routing的使用方式如下：</p>
+   <pre class="has"><code class="language-javascript"># 写入	
+PUT my_index/my_type/1?routing=user1	
+{	
+ &nbsp;"title": "This is a document"	
+}	
+	
+# 查询	
+GET my_index/_search?routing=user1,user2 	
+{	
+ &nbsp;"query": {	
+ &nbsp; &nbsp;"match": {	
+ &nbsp; &nbsp; &nbsp;"title": "document"	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">9. 为string类型的字段选取合适的存储方式</span></p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">存为text类型的字段（string字段默认类型为text）： 做分词后存储倒排索引，支持全文检索，可以通过下面几个参数优化其存储方式：</span></p>
+     <ul style="list-style-type:circle;" class="list-paddingleft-2">
+      <li><p><span style="font-size:14px;">norms：用于在搜索时计算该doc的_score（代表这条数据与搜索条件的相关度），如果不需要评分，可以将其关闭。</span></p></li>
+      <li><p><span style="font-size:14px;">indexoptions：控制倒排索引中包括哪些信息（docs、freqs、positions、offsets）。对于不太注重score/highlighting的使用场景，可以设为 docs来降低内存/磁盘资源消耗。</span></p></li>
+      <li><p><span style="font-size:14px;">fields: 用于添加子字段。对于有sort和聚合查询需求的场景，可以添加一个keyword子字段以支持这两种功能。</span></p></li>
+     </ul></li>
+   </ul>
+   <pre class="has"><code class="language-javascript">PUT my_index	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"properties": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"title": { 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": "text",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"norms": false,	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"index_options": "docs",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"fields": {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"raw": { 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": &nbsp;"keyword"	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">存为keyword类型的字段： 不做分词，不支持全文检索。text分词消耗CPU资源，冗余存储keyword子字段占用存储空间。如果没有全文索引需求，只是要通过整个字段做搜索，可以设置该字段的类型为keyword，提升写入速率，降低存储成本。 设置字段类型的方法有两种：一是创建一个具体的index时，指定字段的类型；二是通过创建template，控制某一类index的字段类型。</span></p></li>
+   </ul>
+   <pre class="has"><code class="language-javascript"># 1. 通过mapping指定 tags 字段为keyword类型	
+PUT my_index	
+{	
+ &nbsp;"mappings": {	
+ &nbsp; &nbsp;"my_type": {	
+ &nbsp; &nbsp; &nbsp;"properties": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"tags": {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": &nbsp;"keyword"	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}	
+	
+# 2. 通过template，指定my_index*类的index，其所有string字段默认为keyword类型	
+PUT _template/my_template	
+{	
+ &nbsp; &nbsp;"order": 0,	
+ &nbsp; &nbsp;"template": "my_index*",	
+ &nbsp; &nbsp;"mappings": {	
+ &nbsp; &nbsp; &nbsp;"_default_": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"dynamic_templates": [	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;{	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"strings": {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"match_mapping_type": "string",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"mapping": {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"type": "keyword",	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"ignore_above": 256	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp; &nbsp; &nbsp;]	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;},	
+ &nbsp; &nbsp;"aliases": {}	
+ &nbsp;}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">10. 查询时，使用query-bool-filter组合取代普通query</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">默认情况下，ES通过一定的算法计算返回的每条数据与查询语句的相关度，并通过score字段来表征。但对于非全文索引的使用场景，用户并不care查询结果与查询条件的相关度，只是想精确的查找目标数据。此时，可以通过query-bool-filter组合来让ES不计算score，并且尽可能的缓存filter的结果集，供后续包含相同filter的查询使用，提高查询效率。</p>
+   <pre class="has"><code class="language-javascript"># 普通查询	
+POST my_index/_search	
+{	
+ &nbsp;"query": {	
+ &nbsp; &nbsp;"term" : { "user" : "Kimchy" } 	
+ &nbsp;}	
+}	
+	
+# query-bool-filter 加速查询	
+POST my_index/_search	
+{	
+ &nbsp;"query": {	
+ &nbsp; &nbsp;"bool": {	
+ &nbsp; &nbsp; &nbsp;"filter": {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"term": { "user": "Kimchy" }	
+ &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+ &nbsp;}	
+}</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">11. index按日期滚动，便于管理</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">写入ES的数据最好通过某种方式做分割，存入不同的index。常见的做法是将数据按模块/功能分类，写入不同的index，然后按照时间去滚动生成index。这样做的好处是各种数据分开管理不会混淆，也易于提高查询效率。同时index按时间滚动，数据过期时删除整个index，要比一条条删除数据或deletebyquery效率高很多，因为删除整个index是直接删除底层文件，而deletebyquery是查询-标记-删除。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">举例说明，假如有[modulea,moduleb]两个模块产生的数据，那么index规划可以是这样的：一类index名称是modulea + {日期}，另一类index名称是module_b+ {日期}。对于名字中的日期，可以在写入数据时自己指定精确的日期，也可以通过ES的ingest pipeline中的index-name-processor实现（会有写入性能损耗）。</p>
+   <pre class="has"><code class="language-javascript"># module_a 类index	
+- 创建index：	
+PUT module_a@2018_01_01	
+{	
+ &nbsp; &nbsp;"settings" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"index" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_shards" : 3, 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_replicas" : 2 	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+}	
+PUT module_a@2018_01_02	
+{	
+ &nbsp; &nbsp;"settings" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"index" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_shards" : 3, 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_replicas" : 2 	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+}	
+...	
+	
+- 查询数据：	
+GET module_a@*/_search	
+	
+	
+# &nbsp;module_b 类index	
+	
+- 创建index：	
+PUT module_b@2018_01_01	
+{	
+ &nbsp; &nbsp;"settings" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"index" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_shards" : 3, 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_replicas" : 2 	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+}	
+PUT module_b@2018_01_02	
+{	
+ &nbsp; &nbsp;"settings" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp;"index" : {	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_shards" : 3, 	
+ &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;"number_of_replicas" : 2 	
+ &nbsp; &nbsp; &nbsp; &nbsp;}	
+ &nbsp; &nbsp;}	
+}	
+...	
+	
+- 查询数据：	
+GET module_b@*/_search</code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">12. 按需控制index的分片数和副本数</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">分片（shard）：一个ES的index由多个shard组成，每个shard承载index的一部分数据。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">副本（replica）：index也可以设定副本数（numberofreplicas），也就是同一个shard有多少个备份。对于查询压力较大的index，可以考虑提高副本数（numberofreplicas），通过多个副本均摊查询压力。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">shard数量（numberofshards）设置过多或过低都会引发一些问题：shard数量过多，则批量写入/查询请求被分割为过多的子写入/查询，导致该index的写入、查询拒绝率上升；对于数据量较大的inex，当其shard数量过小时，无法充分利用节点资源，造成机器资源利用率不高 或 不均衡，影响写入/查询的效率。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">对于每个index的shard数量，可以根据数据总量、写入压力、节点数量等综合考量后设定，然后根据数据增长状态定期检测下shard数量是否合理。基础架构部数据库团队的推荐方案是：</p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">对于数据量较小（100GB以下）的index，往往写入压力查询压力相对较低，一般设置3~5个shard，numberofreplicas设置为1即可（也就是一主一从，共两副本） 。</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">对于数据量较大（100GB以上）的index：</span></p>
+     <ul style="list-style-type:circle;" class="list-paddingleft-2">
+      <li><p><span style="font-size:14px;">一般把单个shard的数据量控制在（20GB~50GB）</span></p></li>
+      <li><p><span style="font-size:14px;">让index压力分摊至多个节点：可通过index.routing.allocation.totalshardsper_node参数，强制限定一个节点上该index的shard数量，让shard尽量分配到不同节点上</span></p></li>
+      <li><p><span style="font-size:14px;">综合考虑整个index的shard数量，如果shard数量（不包括副本）超过50个，就很可能引发拒绝率上升的问题，此时可考虑把该index拆分为多个独立的index，分摊数据量，同时配合routing使用，降低每个查询需要访问的shard数量。</span></p><p><br></p></li>
+     </ul></li>
+   </ul>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><strong><span style="font-size:16px;color:rgb(62,71,83);">稳定性调优</span></strong><br></p>
+   <p style="line-height:1.75em;margin-left:8px;text-align:justify;"><strong>一 Linux参数调优</strong><span style="color:rgb(255,255,255);"><strong><span style="font-size:16px;text-align:justify;"></span></strong></span></p>
+   <br>
+   <pre class="has"><code class="language-javascript"># 修改系统资源限制	
+# 单用户可以打开的最大文件数量，可以设置为官方推荐的65536或更大些	
+echo "* - nofile 655360" &gt;&gt;/etc/security/limits.conf	
+# 单用户内存地址空间	
+echo "* - as unlimited" &gt;&gt;/etc/security/limits.conf	
+# 单用户线程数	
+echo "* - nproc 2056474" &gt;&gt;/etc/security/limits.conf	
+# 单用户文件大小	
+echo "* - fsize unlimited" &gt;&gt;/etc/security/limits.conf	
+# 单用户锁定内存	
+echo "* - memlock unlimited" &gt;&gt;/etc/security/limits.conf	
+	
+# 单进程可以使用的最大map内存区域数量	
+echo "vm.max_map_count = 655300" &gt;&gt;/etc/sysctl.conf	
+	
+# TCP全连接队列参数设置， 这样设置的目的是防止节点数较多（比如超过100）的ES集群中，节点异常重启时全连接队列在启动瞬间打满，造成节点hang住，整个集群响应迟滞的情况	
+echo "net.ipv4.tcp_abort_on_overflow = 1" &gt;&gt;/etc/sysctl.conf	
+echo "net.core.somaxconn = 2048" &gt;&gt;/etc/sysctl.conf	
+	
+# 降低tcp alive time，防止无效链接占用链接数	
+echo 300 &gt;/proc/sys/net/ipv4/tcp_keepalive_time	
+</code></pre>
+   <p style="line-height:1.75em;margin-left:8px;text-align:justify;"><strong>二 ES节点配置</strong><span style="color:rgb(255,255,255);"><strong><span style="font-size:16px;text-align:justify;"></span></strong></span></p>
+   <br>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">1. jvm.options</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">-Xms和-Xmx设置为相同的值，推荐设置为机器内存的一半左右，剩余一半留给系统cache使用。</p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">jvm内存建议不要低于2G，否则有可能因为内存不足导致ES无法正常启动或OOM</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">jvm建议不要超过32G，否则jvm会禁用内存对象指针压缩技术，造成内存浪费</span></p></li>
+   </ul>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">2. elasticsearch.yml</span></p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;"></span></p><p style="font-size:16px;line-height:30px;">设置内存熔断参数，防止写入或查询压力过高导致OOM，具体数值可根据使用场景调整。 indices.breaker.total.limit: 30% indices.breaker.request.limit: 6% indices.breaker.fielddata.limit: 3%</p><p><br></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;"></span></p><p style="font-size:16px;line-height:30px;">调小查询使用的cache，避免cache占用过多的jvm内存，具体数值可根据使用场景调整。 indices.queries.cache.count: 500 indices.queries.cache.size: 5%</p><p><br></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;"></span></p><p style="font-size:16px;line-height:30px;">单机多节点时，主从shard分配以ip为依据，分配到不同的机器上，避免单机挂掉导致数据丢失。 cluster.routing.allocation.awareness.attributes: ip node.attr.ip: 1.1.1.1</p><p><br></p></li>
+   </ul>
+   <p style="line-height:1.75em;margin-left:8px;text-align:justify;"><strong>三 ES使用方式</strong><span style="color:rgb(255,255,255);"><strong><span style="font-size:16px;text-align:justify;"></span></strong></span></p>
+   <br>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">1. 节点数较多的集群，增加专有master，提升集群稳定性</span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">ES集群的元信息管理、index的增删操作、节点的加入剔除等集群管理的任务都是由master节点来负责的，master节点定期将最新的集群状态广播至各个节点。所以，master的稳定性对于集群整体的稳定性是至关重要的。当集群的节点数量较大时（比如超过30个节点），集群的管理工作会变得复杂很多。此时应该创建专有master节点，这些节点只负责集群管理，不存储数据，不承担数据读写压力；其他节点则仅负责数据读写，不负责集群管理的工作。</span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">这样把集群管理和数据的写入/查询分离，互不影响，防止因读写压力过大造成集群整体不稳定。 将专有master节点和数据节点的分离，需要修改ES的配置文件，然后滚动重启各个节点。</span></p>
+   <pre class="has"><code class="language-javascript"># 专有master节点的配置文件（conf/elasticsearch.yml）增加如下属性：	
+node.master: true 	
+node.data: false 	
+node.ingest: false 	
+	
+# 数据节点的配置文件增加如下属性（与上面的属性相反）：	
+node.master: false 	
+node.data: true 	
+node.ingest: true </code></pre>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">2. 控制index、shard总数量</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">上面提到，ES的元信息由master节点管理，定期同步给各个节点，也就是每个节点都会存储一份。这个元信息主要存储在clusterstate中，如所有node元信息（indices、节点各种统计参数）、所有index/shard的元信息（mapping, location, size）、元数据ingest等。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">ES在创建新分片时，要根据现有的分片分布情况指定分片分配策略，从而使各个节点上的分片数基本一致，此过程中就需要深入遍历clusterstate。当集群中的index/shard过多时，clusterstate结构会变得过于复杂，导致遍历clusterstate效率低下，集群响应迟滞。基础架构部数据库团队曾经在一个20个节点的集群里，创建了4w+个shard，导致新建一个index需要60s+才能完成。 当index/shard数量过多时，可以考虑从以下几方面改进：</p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">降低数据量较小的index的shard数量</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">把一些有关联的index合并成一个index</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">数据按某个维度做拆分，写入多个集群</span></p></li>
+   </ul>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);"><br></span></p>
+   <p style="text-align:justify;line-height:1.75em;margin-left:8px;"><span style="font-size:16px;color:rgb(62,71,83);">3. Segment Memory优化</span></p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">前面提到，ES底层采用Lucene做存储，而Lucene的一个index又由若干segment组成，每个segment都会建立自己的倒排索引用于数据查询。Lucene为了加速查询，为每个segment的倒排做了一层前缀索引，这个索引在Lucene4.0以后采用的数据结构是FST (Finite State Transducer)。Lucene加载segment的时候将其全量装载到内存中，加快查询速度。这部分内存被称为SegmentMemory， <code class="prettyprint code-in-text prettyprinted" style="background:rgb(243,241,241);color:rgb(88,88,88);line-height:18px;"><span class="pun" style="font-size:14px;">常驻内存，占用heap，无法被GC</span></code>。</p>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">前面提到，为利用JVM的对象指针压缩技术来节约内存，通常建议JVM内存分配不要超过32G。当集群的数据量过大时，SegmentMemory会吃掉大量的堆内存，而JVM内存空间又有限，此时就需要想办法降低SegmentMemory的使用量了，常用方法有下面几个：</p>
+   <ul style="list-style-type:square;" class="list-paddingleft-2">
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">定期删除不使用的index</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">对于不常访问的index，可以通过close接口将其关闭，用到时再打开</span></p></li>
+    <li><p><span style="color:rgb(74,74,74);line-height:22px;font-size:14px;">通过force_merge接口强制合并segment，降低segment数量</span></p></li>
+   </ul>
+   <p style="font-size:16px;line-height:30px;color:rgb(74,74,74);font-family:Avenir, '-apple-system-font', '微软雅黑', sans-serif;">基础架构部数据库团队在此基础上，对FST部分进行了优化，释放高达40%的Segment Memory内存空间</p>
+   <p style="line-height:1.75em;text-align:left;"><span style="font-size:16px;color:rgb(214,168,65);">为了迎合技术人的兴趣，降低关注门槛，拓宽覆盖面，分享不是那么“技术”的文章。<span style="color:rgb(214,168,65);font-size:16px;text-align:left;">在这里给大家推荐一个微信公众号-开发爱好者社区。这个号后续会推一些开发者感兴趣的 Python、Java、大数据计算及存储相关的知识，还有业界吐槽等等。欢迎关注。</span>很多文章相对枯燥的技术文来说更有吸引力。比如《<a href="https://mp.weixin.qq.com/s?__biz=MzU3NTE2NzAxNQ==&amp;mid=2247484439&amp;idx=1&amp;sn=290be0238b13b327972c14035ead2d57&amp;scene=21#wechat_redirect" rel="nofollow" data-token="893efce10042509deece63c2fdfcbfe0">李彦宏救不了百度</a>&nbsp;》&nbsp;《<a href="https://mp.weixin.qq.com/s?__biz=MzU3NTE2NzAxNQ==&amp;mid=2247484236&amp;idx=1&amp;sn=53d767f810b143666ef68989217e525a&amp;scene=21#wechat_redirect" rel="nofollow" data-token="2569e0f0a705c9388d9002e1bab23713">写代码吗？&nbsp;坐牢的那种</a>》 等等。</span></p>
+   <p style="text-align:center;"><img class="rich_pages" src="https://ss.csdn.net/p?https://mmbiz.qpic.cn/mmbiz_jpg/0yBD9iarX0nuFI8Oj29jP6wibjQPWUjz7BCUl7y4n6rmjkzyBhw9461Fk0Rk6AUjKlhqS4PPdhyiaiceTtncSLvW9w/640?wx_fmt=jpeg" alt="640?wx_fmt=jpeg"></p>
+   <p style="line-height:1.75em;text-align:left;"><span style="font-size:16px;"></span></p>
+   <p style="line-height:1.75em;text-align:center;"><span style="color:rgb(53,53,53);font-size:14px;text-align:left;">公众号名称：</span><span style="text-align:left;font-size:16px;color:rgb(255,76,65);">开发爱好者社区&nbsp;</span><span style="color:rgb(53,53,53);font-size:14px;text-align:left;">&nbsp;&nbsp;&nbsp;ID:</span><span style="font-size:14px;text-align:left;color:rgb(255,76,65);">&nbsp;bigdata_ai</span><span style="color:rgb(53,53,53);font-size:14px;text-align:left;"></span></p>
+   <p style="line-height:1.75em;text-align:left;"><span style="font-size:14px;color:rgb(53,53,53);">（专注Python、Java、大数据存储、计算以及 AI 前沿。分享开发者技术文章、开发者看点、业界吐槽等）</span><span style="color:rgb(53,53,53);font-size:12px;"></span><br></p>
+   <p style="line-height:1.75em;text-align:left;"><span style="color:rgb(53,53,53);font-size:14px;"></span></p>
+   <p style="line-height:1.75em;text-align:center;"><span style="color:rgb(53,53,53);font-size:14px;text-align:left;"><span style="color:rgb(255,76,65);">&nbsp;&nbsp;</span><span style="color:rgb(0,0,0);">扫描上方二维码关注</span></span></p>
+   <p style="line-height:1.75em;text-align:center;"><span style="font-size:14px;text-align:left;color:rgb(0,0,0);">感谢阅读<img style="width:20px;vertical-align:text-bottom;" src="https://res.wx.qq.com/mpres/htmledition/images/icon/common/emotion_panel/smiley/smiley_66.png" alt="smiley_66.png"></span></p>
+   <p style="line-height:1.75em;text-align:center;"><br></p>
+   <p style="line-height:1.75em;text-align:right;"><br></p>
+   <p style="line-height:1.75em;text-align:right;"><span style="color:rgb(0,0,0);font-size:14px;text-align:left;">帮忙转发一下也是不错滴<img style="width:20px;vertical-align:text-bottom;" src="https://res.wx.qq.com/mpres/htmledition/images/icon/common/emotion_panel/smiley/smiley_56.png" alt="smiley_56.png"></span></p> 
+  </div> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

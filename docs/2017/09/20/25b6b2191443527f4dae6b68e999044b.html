@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>python ethereum 代码分析 《3》 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="python ethereum 代码分析 《3》" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="python ethereum 代码分析 《3》 python 版本以太坊 pyethereum部分 本文主要介绍以太坊Merkle Patricia Trie以及区块的校验存储 一些关键字解释 sha3： 以太坊所用的一种hash方法 rlp ：Recursive Length Prefix,递归长度前缀编码，以太坊用于编码数据。用于编码任意的嵌套结构的二进制数据（在python中就是列表，其实rlp在Merkle Patricia Trie的实现中主要就是编码列表用的），它是以太坊中数据序列化/反序列化的主要方法，区块、交易等数据结构在持久化时会先经过RLP编码后再存储到数据库中。 BlockHeader 先看一下以太坊block区块头的结构 class BlockHeader(rlp.Serializable): &quot;&quot;&quot;A block header. If the block with this header exists as an instance of :class:`Block`, the connection can be made explicit by setting :attr:`BlockHeader.block`. Then, :attr:`BlockHeader.state_root`, :attr:`BlockHeader.tx_list_root` and :attr:`BlockHeader.receipts_root` always refer to the up-to-date value in the block instance. :ivar block: an instance of :class:`Block` or `None` :ivar prevhash: the 32 byte hash of the previous block :ivar uncles_hash: the 32 byte hash of the RLP encoded list of uncle headers :ivar coinbase: the 20 byte coinbase address :ivar state_root: the root of the block&#39;s state trie :ivar tx_list_root: the root of the block&#39;s transaction trie :ivar receipts_root: the root of the block&#39;s receipts trie :ivar bloom: TODO :ivar difficulty: the block&#39;s difficulty :ivar number: the number of ancestors of this block (0 for the genesis block) :ivar gas_limit: the block&#39;s gas limit :ivar gas_used: the total amount of gas used by all transactions in this block :ivar timestamp: a UNIX timestamp :ivar extra_data: up to 1024 bytes of additional data :ivar nonce: a 32 byte nonce constituting a proof-of-work, or the empty string as a placeholder &quot;&quot;&quot; fields = [ (&#39;prevhash&#39;, hash32),#父区块的hash (&#39;uncles_hash&#39;, hash32),#矿工引用的uncle区块列表的hash (&#39;coinbase&#39;, address),#挖出此区块矿工的地址 (&#39;state_root&#39;, trie_root),#state trie树树根 (&#39;tx_list_root&#39;, trie_root),#交易trie树树根 (&#39;receipts_root&#39;, trie_root),#收据trie树树根 (&#39;bloom&#39;, int256), (&#39;difficulty&#39;, big_endian_int),#当前区块难度 (&#39;number&#39;, big_endian_int),#区块的高度 (&#39;gas_limit&#39;, big_endian_int),#区块gas上限 (&#39;gas_used&#39;, big_endian_int),#区块使用的gas (&#39;timestamp&#39;, big_endian_int),#时间戳 (&#39;extra_data&#39;, binary), (&#39;mixhash&#39;, binary), (&#39;nonce&#39;, Binary(8, allow_empty=True))#工作量证明随机数，通过校验该值来判断矿工的工作量证明是否合法。 ] Merkle Patricia Trie 首先要提一点，以太坊用Merkle Patricia Trie 这种数据结构来做区块中交易的快速校验和全网状态state的快速验证。Merkle Patricia Trie是一种树，区块头中的state_root，tx_list_root，receipts_root 分别是State Trie ，Transactions Trie，Receipts Trie的树根，这三个树都是Merkle Patricia Trie。 普通trie树和merkle树看这篇博客 先说下trie树的一个扩展Radix Trie树，这个树也是只存key / value的一棵树 这棵树每个节点看起来是这样的[i0, i1 … in, value] ，现在如果我们的key是用16进制（hex）编码，那么n=15，每个节点列表长度为17，[i0,i1,…i15,value]，列表中的0~15的某一位就表示key中的一个16进制字符。 Radix Trie树有个问题，如果我要存储一个长度为20的hex编码的key，那么这个树的高度就有20，每一层就只存了key中一个字符，这样效率就不高，以太坊就改进了一下，增加了一些节点类型来解决这个事情。 Merkle Patricia Trie树也是用来存key / value的一棵树 Merkle Patricia Trie的四种节点类型 1.NULL (represented as the empty string) 空节点 2.branch A 17-item node [ v0 … v15, vt ] 分支节点，0~15每一位表示16进制编码的一个字符 3.leaf A 2-item node [ encodedPath, value ] 这个value是原始key在叶子节点上对应的value值 4.extension A 2-item node [ encodedPath, key ] 这个key是子节点的hash 实际在Merkle Patricia Trie的实现中，还用了HP（hex prefix）编码方式去编码的key，其实就是十六进制编码再加前缀来表示节点类型。同时key是以bytes存储的，而一个hex char只有4位，一个byte有八位，所以不够八位的时候prefix 后面再加0000补全。 HP编码前缀的规则 hex char bits node type partial path length 0 0000 extension even 1 0001 extension odd 2 0010 terminating (leaf) even 3 0011 terminating (leaf) odd 先看一个Merkle Patricia Trie存储的列子 以下是要存储到tire树中的四个键值对 &lt;64 6f&gt; : ‘verb’ &lt;64 6f 67&gt; : ‘puppy’ &lt;64 6f 67 65&gt; : ‘coin’ &lt;68 6f 72 73 65&gt; : ‘stallion’ 添加之后，trie树结构： rootHash: [ &lt;16&gt;, hashA ] // extension node hashA: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] // branch node hashC: [ &lt;20 6f 72 73 65&gt;, ‘stallion’ ] //leaf node hashB: [ &lt;00 6f&gt;, hashD ] // extension node hashD: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, verb ] // branch node hashE: [ &lt;17&gt;, hashF ] // extension node hashF: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, puppy ] // branch node hashG: [ &lt;35&gt;, ‘coin’ ] //leaf node 注意到root node 有公共前缀hex char 6 ，6前面的1表示这是个extension node，并且原来长度是奇数，补了个前缀1后正好凑成一个byte。 存储在root node上的key，value 便是 &lt;16&gt;, hashA，而hashA又是子节点在leveldb中的地址； 其中，hashA = sha3（rlp_encode（[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ]）） 这个hashA的计算方式正是体现了Merkle Patricia Trie的‘Merkle’部分，每个节点的hash地址正是节点数据rlp编码过后的hash。如果某个矿工篡改了叶子节点的数据，比如State Trie某个叶子节点一个账户的余额，并生成了State Tire的root hash，其他矿工通过transaction list算出来的State Tire的root hash一定跟他的不一致。 hashA 指向一个分支节点，分支节点中的第4位有hashB，表示有公共前缀‘4’；hashB 的公共前缀是&lt;00 6f&gt;，及公共前缀为‘6f’，一直到hashD，hashD的value为’verb’ ，经过的整个路径6-4-6f 即为原来的key。 再到hashG叶子节点 ，经过的整个路劲6-4-6f-6-7-6-5 即为value ‘coin’ 的key 在State Trie中，路径path（key）都是sha3(ethereumAddress) 账户地址的hash，value 都是该账户的信息：[nonce（当前交易次数）,balance（账户余额）,storageRoot,codeHash] Transactions Trie和Receipts Trie 与 State Trie的区别是，每个区块都有独立的Transactions Trie和Receipts Trie ，而State Trie是全局的。 在Transactions Trie中，路径path（key）都是rlp(transactionIndex)，transactionIndex是交易的编号，value都是rlp(transactionData) Merkle Patricia Trie参考资料 https://github.com/ethereum/wiki/wiki/Patricia-Tree https://easythereentropy.wordpress.com/2014/06/04/understanding-the-ethereum-trie/ 区块的校验与存储 从队里中取出一个block数据并尝试添加到本地chain 尝试实例化block对象，传入的参数有header区块头, transaction_list交易列表, uncles 叔叔区块列表 区块一致性校验： if parent: if hasattr(parent, &#39;db&#39;) and self.db != parent.db and self.db.db != parent.db: raise ValueError(&quot;Parent lives in different database&quot;) if self.prevhash != parent.header.hash: raise ValueError(&quot;Block&#39;s prevhash and parent&#39;s hash do not match&quot;) if self.number != parent.header.number + 1: raise ValueError(&quot;Block&#39;s number is not the successor of its parent number&quot;) if not check_gaslimit(parent, self.gas_limit): raise ValueError(&quot;Block&#39;s gaslimit is inconsistent with its parent&#39;s gaslimit&quot;) if self.difficulty != calc_difficulty(parent, self.timestamp): raise ValueError(&quot;Block&#39;s difficulty is inconsistent with its parent&#39;s difficulty&quot;) if self.gas_used &gt; self.gas_limit: raise ValueError(&quot;Gas used exceeds gas limit&quot;) if self.timestamp &lt;= parent.header.timestamp: raise ValueError(&quot;Timestamp equal to or before parent&quot;) 交易及状态校验： #初始化一个空的transaction trie，通过添加transaction list中的交易来重新构建transaction trie，这个transaction trie的root hash必须跟矿工给出的transaction trie root hash 一致 self.transactions = Trie(db, trie.BLANK_ROOT) self.receipts = Trie(db, trie.BLANK_ROOT) # replay transactions if state is unknown state_unknown = (header.prevhash != GENESIS_PREVHASH and header.number != 0 and header.state_root != trie.BLANK_ROOT and (len(header.state_root) != 32 or b&#39;validated:&#39; + self.hash not in db) and not making) #如果没有添加过该区块 if state_unknown: assert transaction_list is not None if not parent: parent = self.get_parent_header() #取出该区块父区块的state trie self.state = SecureTrie(Trie(db, parent.state_root)) self.transaction_count = 0 self.gas_used = 0 # replay for tx in transaction_list: #执行每一笔交易，同时更新transaction trie和state trie success, output = processblock.apply_transaction(self, tx) self.finalize() else: # trust the state root in the header self.state = SecureTrie(Trie(self.db, header._state_root)) self.transaction_count = 0 if transaction_list: for tx in transaction_list: self.add_transaction_to_list(tx) if self.transactions.root_hash != header.tx_list_root: raise ValueError(&quot;Transaction list root hash does not match&quot;) # receipts trie populated by add_transaction_to_list is incorrect # (it doesn&#39;t know intermediate states), so reset it self.receipts = Trie(self.db, header.receipts_root) processblock.apply_transaction： def apply_transaction(block, tx): #交易合法性校验 validate_transaction(block, tx) log_tx.debug(&#39;TX NEW&#39;, tx_dict=tx.log_dict()) # start transacting ################# #sender交易数nonce加1 block.increment_nonce(tx.sender) # print block.get_nonce(tx.sender), &#39;@@@&#39; # buy startgas assert block.get_balance(tx.sender) &gt;= tx.startgas * tx.gasprice #sender账户扣除startgas block.delta_balance(tx.sender, -tx.startgas * tx.gasprice) message_gas = tx.startgas - intrinsic_gas_used(tx) #合约代码 message_data = vm.CallData([safe_ord(x) for x in tx.data], 0, len(tx.data)) #交易 message = vm.Message(tx.sender, tx.to, tx.value, message_gas, message_data, code_address=tx.to) # MESSAGE ext = VMExt(block, tx) if tx.to and tx.to != CREATE_CONTRACT_ADDRESS: result, gas_remained, data = apply_msg(ext, message) log_tx.debug(&#39;_res_&#39;, result=result, gas_remained=gas_remained, data=data) else: # CREATE result, gas_remained, data = create_contract(ext, message) assert utils.is_numeric(gas_remained) log_tx.debug(&#39;_create_&#39;, result=result, gas_remained=gas_remained, data=data) assert gas_remained &gt;= 0 log_tx.debug(&quot;TX APPLIED&quot;, result=result, gas_remained=gas_remained, data=data) if not result: # 0 = OOG failure in both cases log_tx.debug(&#39;TX FAILED&#39;, reason=&#39;out of gas&#39;, startgas=tx.startgas, gas_remained=gas_remained) block.gas_used += tx.startgas #给矿工手续费 block.delta_balance(block.coinbase, tx.gasprice * tx.startgas) output = b&#39;&#39; success = 0 else: log_tx.debug(&#39;TX SUCCESS&#39;, data=data) gas_used = tx.startgas - gas_remained block.refunds += len(block.suicides) * opcodes.GSUICIDEREFUND if block.refunds &gt; 0: log_tx.debug(&#39;Refunding&#39;, gas_refunded=min(block.refunds, gas_used // 2)) gas_remained += min(block.refunds, gas_used // 2) gas_used -= min(block.refunds, gas_used // 2) block.refunds = 0 # sell remaining gas block.delta_balance(tx.sender, tx.gasprice * gas_remained) block.delta_balance(block.coinbase, tx.gasprice * gas_used) block.gas_used += gas_used if tx.to: output = b&#39;&#39;.join(map(ascii_chr, data)) else: output = data success = 1 block.commit_state() suicides = block.suicides block.suicides = [] for s in suicides: block.ether_delta -= block.get_balance(s) block.del_account(s) block.add_transaction_to_list(tx) block.logs = [] return success, output block.commit_state() 更新state trie账户状态 def commit_state(self): &quot;&quot;&quot;Commit account caches&quot;&quot;&quot; &quot;&quot;&quot;Write the acount caches on the corresponding tries.&quot;&quot;&quot; changes = [] if len(self.journal) == 0: # log_state.trace(&#39;delta&#39;, changes=[]) return addresses = sorted(list(self.caches[&#39;all&#39;].keys())) for addr in addresses: #获取一个账户 acct = self._get_acct(addr) # storage for field in (&#39;balance&#39;, &#39;nonce&#39;, &#39;code&#39;, &#39;storage&#39;): if addr in self.caches[field]: v = self.caches[field][addr] changes.append([field, addr, v]) #实例化account对象 setattr(acct, field, v) #更新account的storage trie t = SecureTrie(Trie(self.db, acct.storage)) for k, v in self.caches.get(b&#39;storage:&#39; + addr, {}).items(): enckey = utils.zpad(utils.coerce_to_bytes(k), 32) val = rlp.encode(v) changes.append([&#39;storage&#39;, addr, k, v]) # if self.number &gt; 18280 and False: # try: # self.db.logging = True # except: # pass # sys.stderr.write(&quot;pre: %r\n&quot; % self.account_to_dict(addr)[&#39;storage&#39;]) # sys.stderr.write(&quot;pre: %r\n&quot; % self.get_storage(addr).root_hash.encode(&#39;hex&#39;)) # sys.stderr.write(&quot;changed: %s %s %s\n&quot; % (encode_hex(addr), encode_hex(enckey), encode_hex(val))) if v: t.update(enckey, val) else: t.delete(enckey) acct.storage = t.root_hash #更新state trie中该账户的数据，从新生成root hash self.state.update(addr, rlp.encode(acct)) log_state.trace(&#39;delta&#39;, changes=changes) self.reset_cache() self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) block.add_transaction_to_list(tx) 根据transaction list 重新构建transaction trie def add_transaction_to_list(self, tx): &quot;&quot;&quot;Add a transaction to the transaction trie. Note that this does not execute anything, i.e. the state is not updated. &quot;&quot;&quot; k = rlp.encode(self.transaction_count) self.transactions.update(k, rlp.encode(tx)) r = self.mk_transaction_receipt(tx) self.receipts.update(k, rlp.encode(r)) self.bloom |= r.bloom # int self.transaction_count += 1 所有交易都添加完后，添加矿工奖励，self.finalize()： def finalize(self): &quot;&quot;&quot;Apply rewards and commit.&quot;&quot;&quot; delta = int(BLOCK_REWARD + NEPHEW_REWARD * len(self.uncles)) self.delta_balance(self.coinbase, delta) self.ether_delta += delta for uncle in self.uncles: r = BLOCK_REWARD * \ (UNCLE_DEPTH_PENALTY_FACTOR + uncle.number - self.number) \ / UNCLE_DEPTH_PENALTY_FACTOR r = int(r) self.delta_balance(uncle.coinbase, r) self.ether_delta += r self.commit_state() 所有交易添加完后，再来校验state root ，transaction root 是否与block header 中的值一致，不一致的化，区块不合法。Block.init if parent: must_equal(&#39;prev_hash&#39;, self.prevhash, parent.hash) must_equal(&#39;gas_used&#39;, original_values[&#39;gas_used&#39;], self.gas_used) must_equal(&#39;timestamp&#39;, self.timestamp, original_values[&#39;timestamp&#39;]) must_equal(&#39;difficulty&#39;, self.difficulty, original_values[&#39;difficulty&#39;]) must_equal(&#39;uncles_hash&#39;, utils.sha3(rlp.encode(uncles)), original_values[&#39;uncles_hash&#39;]) assert header.block is None must_equal(&#39;state_root&#39;, self.state.root_hash, header.state_root) must_equal(&#39;tx_list_root&#39;, self.transactions.root_hash, header.tx_list_root) must_equal(&#39;receipts_root&#39;, self.receipts.root_hash, header.receipts_root) must_equal(&#39;bloom&#39;, self.bloom, original_values[&#39;bloom&#39;]) # from now on, trie roots refer to block instead of header header.block = self # Basic consistency verifications if not self.check_fields(): raise ValueError(&quot;Block is invalid&quot;) if len(self.header.extra_data) &gt; MAX_EXTRADATA_LENGTH: raise ValueError(&quot;Extra data cannot exceed %d bytes&quot; % MAX_EXTRADATA_LENGTH) if self.header.coinbase == &#39;&#39;: raise ValueError(&quot;Coinbase cannot be empty address&quot;) if not self.state.root_hash_valid(): raise ValueError(&quot;State Merkle root of block %r not found in &quot; &quot;database&quot; % self) if (not self.is_genesis() and self.nonce and not self.header.check_pow()): raise ValueError(&quot;PoW check failed&quot;) if b&#39;validated:&#39; + self.hash not in self.db: if self.number == 0: self.db.put(b&#39;validated:&#39; + self.hash, &#39;1&#39;) else: self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) 至此，区块校验完成，之后便是将区块加入本地区块链 现在再回到chain service 最开始的_add_block函数中来 将区块加入本地链self.chain.add_block： def add_block(self, block, forward_pending_transactions=True): &quot;returns True if block was added sucessfully&quot; _log = log.bind(block_hash=block) # make sure we know the parent if not block.has_parent() and not block.is_genesis(): _log.debug(&#39;missing parent&#39;) return False #再次检查矿工引用的uncle区块是否合法 if not block.validate_uncles(): _log.debug(&#39;invalid uncles&#39;) return False if not len(block.nonce) == 8: _log.debug(&#39;nonce not set&#39;) return False #再次检查工作量证明是否合法 elif not block.header.check_pow(nonce=block.nonce) and\ not block.is_genesis(): _log.debug(&#39;invalid nonce&#39;) return False #再检查下父区块是否是区块头中指定的父区块 if block.has_parent(): try: processblock.verify(block, block.get_parent()) except processblock.VerificationFailed as e: _log.critical(&#39;VERIFICATION FAILED&#39;, error=e) f = os.path.join(utils.data_dir, &#39;badblock.log&#39;) open(f, &#39;w&#39;).write(to_string(block.hex_serialize())) return False if block.number &lt; self.head.number: _log.debug(&quot;older than head&quot;, head_hash=self.head) # Q: Should we have any limitations on adding blocks? self.index.add_block(block) #存入本地chain self._store_block(block) # set to head if this makes the longest chain w/ most work for that number if block.chain_difficulty() &gt; self.head.chain_difficulty(): _log.debug(&#39;new head&#39;) #更新head candidate，这个其实只针对矿工，只要不挖矿，就不用去管候选头区块也不用去打包交易 self._update_head(block, forward_pending_transactions) elif block.number &gt; self.head.number: _log.warn(&#39;has higher blk number than head but lower chain_difficulty&#39;, head_hash=self.head, block_difficulty=block.chain_difficulty(), head_difficulty=self.head.chain_difficulty()) block.transactions.clear_all() block.receipts.clear_all() block.state.db.commit_refcount_changes(block.number) block.state.db.cleanup(block.number) self.commit() # batch commits all changes that came with the new block return True 至此，新区块成功写入本地 阅读更多" />
+<meta property="og:description" content="python ethereum 代码分析 《3》 python 版本以太坊 pyethereum部分 本文主要介绍以太坊Merkle Patricia Trie以及区块的校验存储 一些关键字解释 sha3： 以太坊所用的一种hash方法 rlp ：Recursive Length Prefix,递归长度前缀编码，以太坊用于编码数据。用于编码任意的嵌套结构的二进制数据（在python中就是列表，其实rlp在Merkle Patricia Trie的实现中主要就是编码列表用的），它是以太坊中数据序列化/反序列化的主要方法，区块、交易等数据结构在持久化时会先经过RLP编码后再存储到数据库中。 BlockHeader 先看一下以太坊block区块头的结构 class BlockHeader(rlp.Serializable): &quot;&quot;&quot;A block header. If the block with this header exists as an instance of :class:`Block`, the connection can be made explicit by setting :attr:`BlockHeader.block`. Then, :attr:`BlockHeader.state_root`, :attr:`BlockHeader.tx_list_root` and :attr:`BlockHeader.receipts_root` always refer to the up-to-date value in the block instance. :ivar block: an instance of :class:`Block` or `None` :ivar prevhash: the 32 byte hash of the previous block :ivar uncles_hash: the 32 byte hash of the RLP encoded list of uncle headers :ivar coinbase: the 20 byte coinbase address :ivar state_root: the root of the block&#39;s state trie :ivar tx_list_root: the root of the block&#39;s transaction trie :ivar receipts_root: the root of the block&#39;s receipts trie :ivar bloom: TODO :ivar difficulty: the block&#39;s difficulty :ivar number: the number of ancestors of this block (0 for the genesis block) :ivar gas_limit: the block&#39;s gas limit :ivar gas_used: the total amount of gas used by all transactions in this block :ivar timestamp: a UNIX timestamp :ivar extra_data: up to 1024 bytes of additional data :ivar nonce: a 32 byte nonce constituting a proof-of-work, or the empty string as a placeholder &quot;&quot;&quot; fields = [ (&#39;prevhash&#39;, hash32),#父区块的hash (&#39;uncles_hash&#39;, hash32),#矿工引用的uncle区块列表的hash (&#39;coinbase&#39;, address),#挖出此区块矿工的地址 (&#39;state_root&#39;, trie_root),#state trie树树根 (&#39;tx_list_root&#39;, trie_root),#交易trie树树根 (&#39;receipts_root&#39;, trie_root),#收据trie树树根 (&#39;bloom&#39;, int256), (&#39;difficulty&#39;, big_endian_int),#当前区块难度 (&#39;number&#39;, big_endian_int),#区块的高度 (&#39;gas_limit&#39;, big_endian_int),#区块gas上限 (&#39;gas_used&#39;, big_endian_int),#区块使用的gas (&#39;timestamp&#39;, big_endian_int),#时间戳 (&#39;extra_data&#39;, binary), (&#39;mixhash&#39;, binary), (&#39;nonce&#39;, Binary(8, allow_empty=True))#工作量证明随机数，通过校验该值来判断矿工的工作量证明是否合法。 ] Merkle Patricia Trie 首先要提一点，以太坊用Merkle Patricia Trie 这种数据结构来做区块中交易的快速校验和全网状态state的快速验证。Merkle Patricia Trie是一种树，区块头中的state_root，tx_list_root，receipts_root 分别是State Trie ，Transactions Trie，Receipts Trie的树根，这三个树都是Merkle Patricia Trie。 普通trie树和merkle树看这篇博客 先说下trie树的一个扩展Radix Trie树，这个树也是只存key / value的一棵树 这棵树每个节点看起来是这样的[i0, i1 … in, value] ，现在如果我们的key是用16进制（hex）编码，那么n=15，每个节点列表长度为17，[i0,i1,…i15,value]，列表中的0~15的某一位就表示key中的一个16进制字符。 Radix Trie树有个问题，如果我要存储一个长度为20的hex编码的key，那么这个树的高度就有20，每一层就只存了key中一个字符，这样效率就不高，以太坊就改进了一下，增加了一些节点类型来解决这个事情。 Merkle Patricia Trie树也是用来存key / value的一棵树 Merkle Patricia Trie的四种节点类型 1.NULL (represented as the empty string) 空节点 2.branch A 17-item node [ v0 … v15, vt ] 分支节点，0~15每一位表示16进制编码的一个字符 3.leaf A 2-item node [ encodedPath, value ] 这个value是原始key在叶子节点上对应的value值 4.extension A 2-item node [ encodedPath, key ] 这个key是子节点的hash 实际在Merkle Patricia Trie的实现中，还用了HP（hex prefix）编码方式去编码的key，其实就是十六进制编码再加前缀来表示节点类型。同时key是以bytes存储的，而一个hex char只有4位，一个byte有八位，所以不够八位的时候prefix 后面再加0000补全。 HP编码前缀的规则 hex char bits node type partial path length 0 0000 extension even 1 0001 extension odd 2 0010 terminating (leaf) even 3 0011 terminating (leaf) odd 先看一个Merkle Patricia Trie存储的列子 以下是要存储到tire树中的四个键值对 &lt;64 6f&gt; : ‘verb’ &lt;64 6f 67&gt; : ‘puppy’ &lt;64 6f 67 65&gt; : ‘coin’ &lt;68 6f 72 73 65&gt; : ‘stallion’ 添加之后，trie树结构： rootHash: [ &lt;16&gt;, hashA ] // extension node hashA: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] // branch node hashC: [ &lt;20 6f 72 73 65&gt;, ‘stallion’ ] //leaf node hashB: [ &lt;00 6f&gt;, hashD ] // extension node hashD: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, verb ] // branch node hashE: [ &lt;17&gt;, hashF ] // extension node hashF: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, puppy ] // branch node hashG: [ &lt;35&gt;, ‘coin’ ] //leaf node 注意到root node 有公共前缀hex char 6 ，6前面的1表示这是个extension node，并且原来长度是奇数，补了个前缀1后正好凑成一个byte。 存储在root node上的key，value 便是 &lt;16&gt;, hashA，而hashA又是子节点在leveldb中的地址； 其中，hashA = sha3（rlp_encode（[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ]）） 这个hashA的计算方式正是体现了Merkle Patricia Trie的‘Merkle’部分，每个节点的hash地址正是节点数据rlp编码过后的hash。如果某个矿工篡改了叶子节点的数据，比如State Trie某个叶子节点一个账户的余额，并生成了State Tire的root hash，其他矿工通过transaction list算出来的State Tire的root hash一定跟他的不一致。 hashA 指向一个分支节点，分支节点中的第4位有hashB，表示有公共前缀‘4’；hashB 的公共前缀是&lt;00 6f&gt;，及公共前缀为‘6f’，一直到hashD，hashD的value为’verb’ ，经过的整个路径6-4-6f 即为原来的key。 再到hashG叶子节点 ，经过的整个路劲6-4-6f-6-7-6-5 即为value ‘coin’ 的key 在State Trie中，路径path（key）都是sha3(ethereumAddress) 账户地址的hash，value 都是该账户的信息：[nonce（当前交易次数）,balance（账户余额）,storageRoot,codeHash] Transactions Trie和Receipts Trie 与 State Trie的区别是，每个区块都有独立的Transactions Trie和Receipts Trie ，而State Trie是全局的。 在Transactions Trie中，路径path（key）都是rlp(transactionIndex)，transactionIndex是交易的编号，value都是rlp(transactionData) Merkle Patricia Trie参考资料 https://github.com/ethereum/wiki/wiki/Patricia-Tree https://easythereentropy.wordpress.com/2014/06/04/understanding-the-ethereum-trie/ 区块的校验与存储 从队里中取出一个block数据并尝试添加到本地chain 尝试实例化block对象，传入的参数有header区块头, transaction_list交易列表, uncles 叔叔区块列表 区块一致性校验： if parent: if hasattr(parent, &#39;db&#39;) and self.db != parent.db and self.db.db != parent.db: raise ValueError(&quot;Parent lives in different database&quot;) if self.prevhash != parent.header.hash: raise ValueError(&quot;Block&#39;s prevhash and parent&#39;s hash do not match&quot;) if self.number != parent.header.number + 1: raise ValueError(&quot;Block&#39;s number is not the successor of its parent number&quot;) if not check_gaslimit(parent, self.gas_limit): raise ValueError(&quot;Block&#39;s gaslimit is inconsistent with its parent&#39;s gaslimit&quot;) if self.difficulty != calc_difficulty(parent, self.timestamp): raise ValueError(&quot;Block&#39;s difficulty is inconsistent with its parent&#39;s difficulty&quot;) if self.gas_used &gt; self.gas_limit: raise ValueError(&quot;Gas used exceeds gas limit&quot;) if self.timestamp &lt;= parent.header.timestamp: raise ValueError(&quot;Timestamp equal to or before parent&quot;) 交易及状态校验： #初始化一个空的transaction trie，通过添加transaction list中的交易来重新构建transaction trie，这个transaction trie的root hash必须跟矿工给出的transaction trie root hash 一致 self.transactions = Trie(db, trie.BLANK_ROOT) self.receipts = Trie(db, trie.BLANK_ROOT) # replay transactions if state is unknown state_unknown = (header.prevhash != GENESIS_PREVHASH and header.number != 0 and header.state_root != trie.BLANK_ROOT and (len(header.state_root) != 32 or b&#39;validated:&#39; + self.hash not in db) and not making) #如果没有添加过该区块 if state_unknown: assert transaction_list is not None if not parent: parent = self.get_parent_header() #取出该区块父区块的state trie self.state = SecureTrie(Trie(db, parent.state_root)) self.transaction_count = 0 self.gas_used = 0 # replay for tx in transaction_list: #执行每一笔交易，同时更新transaction trie和state trie success, output = processblock.apply_transaction(self, tx) self.finalize() else: # trust the state root in the header self.state = SecureTrie(Trie(self.db, header._state_root)) self.transaction_count = 0 if transaction_list: for tx in transaction_list: self.add_transaction_to_list(tx) if self.transactions.root_hash != header.tx_list_root: raise ValueError(&quot;Transaction list root hash does not match&quot;) # receipts trie populated by add_transaction_to_list is incorrect # (it doesn&#39;t know intermediate states), so reset it self.receipts = Trie(self.db, header.receipts_root) processblock.apply_transaction： def apply_transaction(block, tx): #交易合法性校验 validate_transaction(block, tx) log_tx.debug(&#39;TX NEW&#39;, tx_dict=tx.log_dict()) # start transacting ################# #sender交易数nonce加1 block.increment_nonce(tx.sender) # print block.get_nonce(tx.sender), &#39;@@@&#39; # buy startgas assert block.get_balance(tx.sender) &gt;= tx.startgas * tx.gasprice #sender账户扣除startgas block.delta_balance(tx.sender, -tx.startgas * tx.gasprice) message_gas = tx.startgas - intrinsic_gas_used(tx) #合约代码 message_data = vm.CallData([safe_ord(x) for x in tx.data], 0, len(tx.data)) #交易 message = vm.Message(tx.sender, tx.to, tx.value, message_gas, message_data, code_address=tx.to) # MESSAGE ext = VMExt(block, tx) if tx.to and tx.to != CREATE_CONTRACT_ADDRESS: result, gas_remained, data = apply_msg(ext, message) log_tx.debug(&#39;_res_&#39;, result=result, gas_remained=gas_remained, data=data) else: # CREATE result, gas_remained, data = create_contract(ext, message) assert utils.is_numeric(gas_remained) log_tx.debug(&#39;_create_&#39;, result=result, gas_remained=gas_remained, data=data) assert gas_remained &gt;= 0 log_tx.debug(&quot;TX APPLIED&quot;, result=result, gas_remained=gas_remained, data=data) if not result: # 0 = OOG failure in both cases log_tx.debug(&#39;TX FAILED&#39;, reason=&#39;out of gas&#39;, startgas=tx.startgas, gas_remained=gas_remained) block.gas_used += tx.startgas #给矿工手续费 block.delta_balance(block.coinbase, tx.gasprice * tx.startgas) output = b&#39;&#39; success = 0 else: log_tx.debug(&#39;TX SUCCESS&#39;, data=data) gas_used = tx.startgas - gas_remained block.refunds += len(block.suicides) * opcodes.GSUICIDEREFUND if block.refunds &gt; 0: log_tx.debug(&#39;Refunding&#39;, gas_refunded=min(block.refunds, gas_used // 2)) gas_remained += min(block.refunds, gas_used // 2) gas_used -= min(block.refunds, gas_used // 2) block.refunds = 0 # sell remaining gas block.delta_balance(tx.sender, tx.gasprice * gas_remained) block.delta_balance(block.coinbase, tx.gasprice * gas_used) block.gas_used += gas_used if tx.to: output = b&#39;&#39;.join(map(ascii_chr, data)) else: output = data success = 1 block.commit_state() suicides = block.suicides block.suicides = [] for s in suicides: block.ether_delta -= block.get_balance(s) block.del_account(s) block.add_transaction_to_list(tx) block.logs = [] return success, output block.commit_state() 更新state trie账户状态 def commit_state(self): &quot;&quot;&quot;Commit account caches&quot;&quot;&quot; &quot;&quot;&quot;Write the acount caches on the corresponding tries.&quot;&quot;&quot; changes = [] if len(self.journal) == 0: # log_state.trace(&#39;delta&#39;, changes=[]) return addresses = sorted(list(self.caches[&#39;all&#39;].keys())) for addr in addresses: #获取一个账户 acct = self._get_acct(addr) # storage for field in (&#39;balance&#39;, &#39;nonce&#39;, &#39;code&#39;, &#39;storage&#39;): if addr in self.caches[field]: v = self.caches[field][addr] changes.append([field, addr, v]) #实例化account对象 setattr(acct, field, v) #更新account的storage trie t = SecureTrie(Trie(self.db, acct.storage)) for k, v in self.caches.get(b&#39;storage:&#39; + addr, {}).items(): enckey = utils.zpad(utils.coerce_to_bytes(k), 32) val = rlp.encode(v) changes.append([&#39;storage&#39;, addr, k, v]) # if self.number &gt; 18280 and False: # try: # self.db.logging = True # except: # pass # sys.stderr.write(&quot;pre: %r\n&quot; % self.account_to_dict(addr)[&#39;storage&#39;]) # sys.stderr.write(&quot;pre: %r\n&quot; % self.get_storage(addr).root_hash.encode(&#39;hex&#39;)) # sys.stderr.write(&quot;changed: %s %s %s\n&quot; % (encode_hex(addr), encode_hex(enckey), encode_hex(val))) if v: t.update(enckey, val) else: t.delete(enckey) acct.storage = t.root_hash #更新state trie中该账户的数据，从新生成root hash self.state.update(addr, rlp.encode(acct)) log_state.trace(&#39;delta&#39;, changes=changes) self.reset_cache() self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) block.add_transaction_to_list(tx) 根据transaction list 重新构建transaction trie def add_transaction_to_list(self, tx): &quot;&quot;&quot;Add a transaction to the transaction trie. Note that this does not execute anything, i.e. the state is not updated. &quot;&quot;&quot; k = rlp.encode(self.transaction_count) self.transactions.update(k, rlp.encode(tx)) r = self.mk_transaction_receipt(tx) self.receipts.update(k, rlp.encode(r)) self.bloom |= r.bloom # int self.transaction_count += 1 所有交易都添加完后，添加矿工奖励，self.finalize()： def finalize(self): &quot;&quot;&quot;Apply rewards and commit.&quot;&quot;&quot; delta = int(BLOCK_REWARD + NEPHEW_REWARD * len(self.uncles)) self.delta_balance(self.coinbase, delta) self.ether_delta += delta for uncle in self.uncles: r = BLOCK_REWARD * \ (UNCLE_DEPTH_PENALTY_FACTOR + uncle.number - self.number) \ / UNCLE_DEPTH_PENALTY_FACTOR r = int(r) self.delta_balance(uncle.coinbase, r) self.ether_delta += r self.commit_state() 所有交易添加完后，再来校验state root ，transaction root 是否与block header 中的值一致，不一致的化，区块不合法。Block.init if parent: must_equal(&#39;prev_hash&#39;, self.prevhash, parent.hash) must_equal(&#39;gas_used&#39;, original_values[&#39;gas_used&#39;], self.gas_used) must_equal(&#39;timestamp&#39;, self.timestamp, original_values[&#39;timestamp&#39;]) must_equal(&#39;difficulty&#39;, self.difficulty, original_values[&#39;difficulty&#39;]) must_equal(&#39;uncles_hash&#39;, utils.sha3(rlp.encode(uncles)), original_values[&#39;uncles_hash&#39;]) assert header.block is None must_equal(&#39;state_root&#39;, self.state.root_hash, header.state_root) must_equal(&#39;tx_list_root&#39;, self.transactions.root_hash, header.tx_list_root) must_equal(&#39;receipts_root&#39;, self.receipts.root_hash, header.receipts_root) must_equal(&#39;bloom&#39;, self.bloom, original_values[&#39;bloom&#39;]) # from now on, trie roots refer to block instead of header header.block = self # Basic consistency verifications if not self.check_fields(): raise ValueError(&quot;Block is invalid&quot;) if len(self.header.extra_data) &gt; MAX_EXTRADATA_LENGTH: raise ValueError(&quot;Extra data cannot exceed %d bytes&quot; % MAX_EXTRADATA_LENGTH) if self.header.coinbase == &#39;&#39;: raise ValueError(&quot;Coinbase cannot be empty address&quot;) if not self.state.root_hash_valid(): raise ValueError(&quot;State Merkle root of block %r not found in &quot; &quot;database&quot; % self) if (not self.is_genesis() and self.nonce and not self.header.check_pow()): raise ValueError(&quot;PoW check failed&quot;) if b&#39;validated:&#39; + self.hash not in self.db: if self.number == 0: self.db.put(b&#39;validated:&#39; + self.hash, &#39;1&#39;) else: self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) 至此，区块校验完成，之后便是将区块加入本地区块链 现在再回到chain service 最开始的_add_block函数中来 将区块加入本地链self.chain.add_block： def add_block(self, block, forward_pending_transactions=True): &quot;returns True if block was added sucessfully&quot; _log = log.bind(block_hash=block) # make sure we know the parent if not block.has_parent() and not block.is_genesis(): _log.debug(&#39;missing parent&#39;) return False #再次检查矿工引用的uncle区块是否合法 if not block.validate_uncles(): _log.debug(&#39;invalid uncles&#39;) return False if not len(block.nonce) == 8: _log.debug(&#39;nonce not set&#39;) return False #再次检查工作量证明是否合法 elif not block.header.check_pow(nonce=block.nonce) and\ not block.is_genesis(): _log.debug(&#39;invalid nonce&#39;) return False #再检查下父区块是否是区块头中指定的父区块 if block.has_parent(): try: processblock.verify(block, block.get_parent()) except processblock.VerificationFailed as e: _log.critical(&#39;VERIFICATION FAILED&#39;, error=e) f = os.path.join(utils.data_dir, &#39;badblock.log&#39;) open(f, &#39;w&#39;).write(to_string(block.hex_serialize())) return False if block.number &lt; self.head.number: _log.debug(&quot;older than head&quot;, head_hash=self.head) # Q: Should we have any limitations on adding blocks? self.index.add_block(block) #存入本地chain self._store_block(block) # set to head if this makes the longest chain w/ most work for that number if block.chain_difficulty() &gt; self.head.chain_difficulty(): _log.debug(&#39;new head&#39;) #更新head candidate，这个其实只针对矿工，只要不挖矿，就不用去管候选头区块也不用去打包交易 self._update_head(block, forward_pending_transactions) elif block.number &gt; self.head.number: _log.warn(&#39;has higher blk number than head but lower chain_difficulty&#39;, head_hash=self.head, block_difficulty=block.chain_difficulty(), head_difficulty=self.head.chain_difficulty()) block.transactions.clear_all() block.receipts.clear_all() block.state.db.commit_refcount_changes(block.number) block.state.db.cleanup(block.number) self.commit() # batch commits all changes that came with the new block return True 至此，新区块成功写入本地 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/09/20/25b6b2191443527f4dae6b68e999044b.html" />
+<meta property="og:url" content="https://uzzz.org/2017/09/20/25b6b2191443527f4dae6b68e999044b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-09-20T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"python ethereum 代码分析 《3》 python 版本以太坊 pyethereum部分 本文主要介绍以太坊Merkle Patricia Trie以及区块的校验存储 一些关键字解释 sha3： 以太坊所用的一种hash方法 rlp ：Recursive Length Prefix,递归长度前缀编码，以太坊用于编码数据。用于编码任意的嵌套结构的二进制数据（在python中就是列表，其实rlp在Merkle Patricia Trie的实现中主要就是编码列表用的），它是以太坊中数据序列化/反序列化的主要方法，区块、交易等数据结构在持久化时会先经过RLP编码后再存储到数据库中。 BlockHeader 先看一下以太坊block区块头的结构 class BlockHeader(rlp.Serializable): &quot;&quot;&quot;A block header. If the block with this header exists as an instance of :class:`Block`, the connection can be made explicit by setting :attr:`BlockHeader.block`. Then, :attr:`BlockHeader.state_root`, :attr:`BlockHeader.tx_list_root` and :attr:`BlockHeader.receipts_root` always refer to the up-to-date value in the block instance. :ivar block: an instance of :class:`Block` or `None` :ivar prevhash: the 32 byte hash of the previous block :ivar uncles_hash: the 32 byte hash of the RLP encoded list of uncle headers :ivar coinbase: the 20 byte coinbase address :ivar state_root: the root of the block&#39;s state trie :ivar tx_list_root: the root of the block&#39;s transaction trie :ivar receipts_root: the root of the block&#39;s receipts trie :ivar bloom: TODO :ivar difficulty: the block&#39;s difficulty :ivar number: the number of ancestors of this block (0 for the genesis block) :ivar gas_limit: the block&#39;s gas limit :ivar gas_used: the total amount of gas used by all transactions in this block :ivar timestamp: a UNIX timestamp :ivar extra_data: up to 1024 bytes of additional data :ivar nonce: a 32 byte nonce constituting a proof-of-work, or the empty string as a placeholder &quot;&quot;&quot; fields = [ (&#39;prevhash&#39;, hash32),#父区块的hash (&#39;uncles_hash&#39;, hash32),#矿工引用的uncle区块列表的hash (&#39;coinbase&#39;, address),#挖出此区块矿工的地址 (&#39;state_root&#39;, trie_root),#state trie树树根 (&#39;tx_list_root&#39;, trie_root),#交易trie树树根 (&#39;receipts_root&#39;, trie_root),#收据trie树树根 (&#39;bloom&#39;, int256), (&#39;difficulty&#39;, big_endian_int),#当前区块难度 (&#39;number&#39;, big_endian_int),#区块的高度 (&#39;gas_limit&#39;, big_endian_int),#区块gas上限 (&#39;gas_used&#39;, big_endian_int),#区块使用的gas (&#39;timestamp&#39;, big_endian_int),#时间戳 (&#39;extra_data&#39;, binary), (&#39;mixhash&#39;, binary), (&#39;nonce&#39;, Binary(8, allow_empty=True))#工作量证明随机数，通过校验该值来判断矿工的工作量证明是否合法。 ] Merkle Patricia Trie 首先要提一点，以太坊用Merkle Patricia Trie 这种数据结构来做区块中交易的快速校验和全网状态state的快速验证。Merkle Patricia Trie是一种树，区块头中的state_root，tx_list_root，receipts_root 分别是State Trie ，Transactions Trie，Receipts Trie的树根，这三个树都是Merkle Patricia Trie。 普通trie树和merkle树看这篇博客 先说下trie树的一个扩展Radix Trie树，这个树也是只存key / value的一棵树 这棵树每个节点看起来是这样的[i0, i1 … in, value] ，现在如果我们的key是用16进制（hex）编码，那么n=15，每个节点列表长度为17，[i0,i1,…i15,value]，列表中的0~15的某一位就表示key中的一个16进制字符。 Radix Trie树有个问题，如果我要存储一个长度为20的hex编码的key，那么这个树的高度就有20，每一层就只存了key中一个字符，这样效率就不高，以太坊就改进了一下，增加了一些节点类型来解决这个事情。 Merkle Patricia Trie树也是用来存key / value的一棵树 Merkle Patricia Trie的四种节点类型 1.NULL (represented as the empty string) 空节点 2.branch A 17-item node [ v0 … v15, vt ] 分支节点，0~15每一位表示16进制编码的一个字符 3.leaf A 2-item node [ encodedPath, value ] 这个value是原始key在叶子节点上对应的value值 4.extension A 2-item node [ encodedPath, key ] 这个key是子节点的hash 实际在Merkle Patricia Trie的实现中，还用了HP（hex prefix）编码方式去编码的key，其实就是十六进制编码再加前缀来表示节点类型。同时key是以bytes存储的，而一个hex char只有4位，一个byte有八位，所以不够八位的时候prefix 后面再加0000补全。 HP编码前缀的规则 hex char bits node type partial path length 0 0000 extension even 1 0001 extension odd 2 0010 terminating (leaf) even 3 0011 terminating (leaf) odd 先看一个Merkle Patricia Trie存储的列子 以下是要存储到tire树中的四个键值对 &lt;64 6f&gt; : ‘verb’ &lt;64 6f 67&gt; : ‘puppy’ &lt;64 6f 67 65&gt; : ‘coin’ &lt;68 6f 72 73 65&gt; : ‘stallion’ 添加之后，trie树结构： rootHash: [ &lt;16&gt;, hashA ] // extension node hashA: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] // branch node hashC: [ &lt;20 6f 72 73 65&gt;, ‘stallion’ ] //leaf node hashB: [ &lt;00 6f&gt;, hashD ] // extension node hashD: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, verb ] // branch node hashE: [ &lt;17&gt;, hashF ] // extension node hashF: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, puppy ] // branch node hashG: [ &lt;35&gt;, ‘coin’ ] //leaf node 注意到root node 有公共前缀hex char 6 ，6前面的1表示这是个extension node，并且原来长度是奇数，补了个前缀1后正好凑成一个byte。 存储在root node上的key，value 便是 &lt;16&gt;, hashA，而hashA又是子节点在leveldb中的地址； 其中，hashA = sha3（rlp_encode（[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ]）） 这个hashA的计算方式正是体现了Merkle Patricia Trie的‘Merkle’部分，每个节点的hash地址正是节点数据rlp编码过后的hash。如果某个矿工篡改了叶子节点的数据，比如State Trie某个叶子节点一个账户的余额，并生成了State Tire的root hash，其他矿工通过transaction list算出来的State Tire的root hash一定跟他的不一致。 hashA 指向一个分支节点，分支节点中的第4位有hashB，表示有公共前缀‘4’；hashB 的公共前缀是&lt;00 6f&gt;，及公共前缀为‘6f’，一直到hashD，hashD的value为’verb’ ，经过的整个路径6-4-6f 即为原来的key。 再到hashG叶子节点 ，经过的整个路劲6-4-6f-6-7-6-5 即为value ‘coin’ 的key 在State Trie中，路径path（key）都是sha3(ethereumAddress) 账户地址的hash，value 都是该账户的信息：[nonce（当前交易次数）,balance（账户余额）,storageRoot,codeHash] Transactions Trie和Receipts Trie 与 State Trie的区别是，每个区块都有独立的Transactions Trie和Receipts Trie ，而State Trie是全局的。 在Transactions Trie中，路径path（key）都是rlp(transactionIndex)，transactionIndex是交易的编号，value都是rlp(transactionData) Merkle Patricia Trie参考资料 https://github.com/ethereum/wiki/wiki/Patricia-Tree https://easythereentropy.wordpress.com/2014/06/04/understanding-the-ethereum-trie/ 区块的校验与存储 从队里中取出一个block数据并尝试添加到本地chain 尝试实例化block对象，传入的参数有header区块头, transaction_list交易列表, uncles 叔叔区块列表 区块一致性校验： if parent: if hasattr(parent, &#39;db&#39;) and self.db != parent.db and self.db.db != parent.db: raise ValueError(&quot;Parent lives in different database&quot;) if self.prevhash != parent.header.hash: raise ValueError(&quot;Block&#39;s prevhash and parent&#39;s hash do not match&quot;) if self.number != parent.header.number + 1: raise ValueError(&quot;Block&#39;s number is not the successor of its parent number&quot;) if not check_gaslimit(parent, self.gas_limit): raise ValueError(&quot;Block&#39;s gaslimit is inconsistent with its parent&#39;s gaslimit&quot;) if self.difficulty != calc_difficulty(parent, self.timestamp): raise ValueError(&quot;Block&#39;s difficulty is inconsistent with its parent&#39;s difficulty&quot;) if self.gas_used &gt; self.gas_limit: raise ValueError(&quot;Gas used exceeds gas limit&quot;) if self.timestamp &lt;= parent.header.timestamp: raise ValueError(&quot;Timestamp equal to or before parent&quot;) 交易及状态校验： #初始化一个空的transaction trie，通过添加transaction list中的交易来重新构建transaction trie，这个transaction trie的root hash必须跟矿工给出的transaction trie root hash 一致 self.transactions = Trie(db, trie.BLANK_ROOT) self.receipts = Trie(db, trie.BLANK_ROOT) # replay transactions if state is unknown state_unknown = (header.prevhash != GENESIS_PREVHASH and header.number != 0 and header.state_root != trie.BLANK_ROOT and (len(header.state_root) != 32 or b&#39;validated:&#39; + self.hash not in db) and not making) #如果没有添加过该区块 if state_unknown: assert transaction_list is not None if not parent: parent = self.get_parent_header() #取出该区块父区块的state trie self.state = SecureTrie(Trie(db, parent.state_root)) self.transaction_count = 0 self.gas_used = 0 # replay for tx in transaction_list: #执行每一笔交易，同时更新transaction trie和state trie success, output = processblock.apply_transaction(self, tx) self.finalize() else: # trust the state root in the header self.state = SecureTrie(Trie(self.db, header._state_root)) self.transaction_count = 0 if transaction_list: for tx in transaction_list: self.add_transaction_to_list(tx) if self.transactions.root_hash != header.tx_list_root: raise ValueError(&quot;Transaction list root hash does not match&quot;) # receipts trie populated by add_transaction_to_list is incorrect # (it doesn&#39;t know intermediate states), so reset it self.receipts = Trie(self.db, header.receipts_root) processblock.apply_transaction： def apply_transaction(block, tx): #交易合法性校验 validate_transaction(block, tx) log_tx.debug(&#39;TX NEW&#39;, tx_dict=tx.log_dict()) # start transacting ################# #sender交易数nonce加1 block.increment_nonce(tx.sender) # print block.get_nonce(tx.sender), &#39;@@@&#39; # buy startgas assert block.get_balance(tx.sender) &gt;= tx.startgas * tx.gasprice #sender账户扣除startgas block.delta_balance(tx.sender, -tx.startgas * tx.gasprice) message_gas = tx.startgas - intrinsic_gas_used(tx) #合约代码 message_data = vm.CallData([safe_ord(x) for x in tx.data], 0, len(tx.data)) #交易 message = vm.Message(tx.sender, tx.to, tx.value, message_gas, message_data, code_address=tx.to) # MESSAGE ext = VMExt(block, tx) if tx.to and tx.to != CREATE_CONTRACT_ADDRESS: result, gas_remained, data = apply_msg(ext, message) log_tx.debug(&#39;_res_&#39;, result=result, gas_remained=gas_remained, data=data) else: # CREATE result, gas_remained, data = create_contract(ext, message) assert utils.is_numeric(gas_remained) log_tx.debug(&#39;_create_&#39;, result=result, gas_remained=gas_remained, data=data) assert gas_remained &gt;= 0 log_tx.debug(&quot;TX APPLIED&quot;, result=result, gas_remained=gas_remained, data=data) if not result: # 0 = OOG failure in both cases log_tx.debug(&#39;TX FAILED&#39;, reason=&#39;out of gas&#39;, startgas=tx.startgas, gas_remained=gas_remained) block.gas_used += tx.startgas #给矿工手续费 block.delta_balance(block.coinbase, tx.gasprice * tx.startgas) output = b&#39;&#39; success = 0 else: log_tx.debug(&#39;TX SUCCESS&#39;, data=data) gas_used = tx.startgas - gas_remained block.refunds += len(block.suicides) * opcodes.GSUICIDEREFUND if block.refunds &gt; 0: log_tx.debug(&#39;Refunding&#39;, gas_refunded=min(block.refunds, gas_used // 2)) gas_remained += min(block.refunds, gas_used // 2) gas_used -= min(block.refunds, gas_used // 2) block.refunds = 0 # sell remaining gas block.delta_balance(tx.sender, tx.gasprice * gas_remained) block.delta_balance(block.coinbase, tx.gasprice * gas_used) block.gas_used += gas_used if tx.to: output = b&#39;&#39;.join(map(ascii_chr, data)) else: output = data success = 1 block.commit_state() suicides = block.suicides block.suicides = [] for s in suicides: block.ether_delta -= block.get_balance(s) block.del_account(s) block.add_transaction_to_list(tx) block.logs = [] return success, output block.commit_state() 更新state trie账户状态 def commit_state(self): &quot;&quot;&quot;Commit account caches&quot;&quot;&quot; &quot;&quot;&quot;Write the acount caches on the corresponding tries.&quot;&quot;&quot; changes = [] if len(self.journal) == 0: # log_state.trace(&#39;delta&#39;, changes=[]) return addresses = sorted(list(self.caches[&#39;all&#39;].keys())) for addr in addresses: #获取一个账户 acct = self._get_acct(addr) # storage for field in (&#39;balance&#39;, &#39;nonce&#39;, &#39;code&#39;, &#39;storage&#39;): if addr in self.caches[field]: v = self.caches[field][addr] changes.append([field, addr, v]) #实例化account对象 setattr(acct, field, v) #更新account的storage trie t = SecureTrie(Trie(self.db, acct.storage)) for k, v in self.caches.get(b&#39;storage:&#39; + addr, {}).items(): enckey = utils.zpad(utils.coerce_to_bytes(k), 32) val = rlp.encode(v) changes.append([&#39;storage&#39;, addr, k, v]) # if self.number &gt; 18280 and False: # try: # self.db.logging = True # except: # pass # sys.stderr.write(&quot;pre: %r\\n&quot; % self.account_to_dict(addr)[&#39;storage&#39;]) # sys.stderr.write(&quot;pre: %r\\n&quot; % self.get_storage(addr).root_hash.encode(&#39;hex&#39;)) # sys.stderr.write(&quot;changed: %s %s %s\\n&quot; % (encode_hex(addr), encode_hex(enckey), encode_hex(val))) if v: t.update(enckey, val) else: t.delete(enckey) acct.storage = t.root_hash #更新state trie中该账户的数据，从新生成root hash self.state.update(addr, rlp.encode(acct)) log_state.trace(&#39;delta&#39;, changes=changes) self.reset_cache() self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) block.add_transaction_to_list(tx) 根据transaction list 重新构建transaction trie def add_transaction_to_list(self, tx): &quot;&quot;&quot;Add a transaction to the transaction trie. Note that this does not execute anything, i.e. the state is not updated. &quot;&quot;&quot; k = rlp.encode(self.transaction_count) self.transactions.update(k, rlp.encode(tx)) r = self.mk_transaction_receipt(tx) self.receipts.update(k, rlp.encode(r)) self.bloom |= r.bloom # int self.transaction_count += 1 所有交易都添加完后，添加矿工奖励，self.finalize()： def finalize(self): &quot;&quot;&quot;Apply rewards and commit.&quot;&quot;&quot; delta = int(BLOCK_REWARD + NEPHEW_REWARD * len(self.uncles)) self.delta_balance(self.coinbase, delta) self.ether_delta += delta for uncle in self.uncles: r = BLOCK_REWARD * \\ (UNCLE_DEPTH_PENALTY_FACTOR + uncle.number - self.number) \\ / UNCLE_DEPTH_PENALTY_FACTOR r = int(r) self.delta_balance(uncle.coinbase, r) self.ether_delta += r self.commit_state() 所有交易添加完后，再来校验state root ，transaction root 是否与block header 中的值一致，不一致的化，区块不合法。Block.init if parent: must_equal(&#39;prev_hash&#39;, self.prevhash, parent.hash) must_equal(&#39;gas_used&#39;, original_values[&#39;gas_used&#39;], self.gas_used) must_equal(&#39;timestamp&#39;, self.timestamp, original_values[&#39;timestamp&#39;]) must_equal(&#39;difficulty&#39;, self.difficulty, original_values[&#39;difficulty&#39;]) must_equal(&#39;uncles_hash&#39;, utils.sha3(rlp.encode(uncles)), original_values[&#39;uncles_hash&#39;]) assert header.block is None must_equal(&#39;state_root&#39;, self.state.root_hash, header.state_root) must_equal(&#39;tx_list_root&#39;, self.transactions.root_hash, header.tx_list_root) must_equal(&#39;receipts_root&#39;, self.receipts.root_hash, header.receipts_root) must_equal(&#39;bloom&#39;, self.bloom, original_values[&#39;bloom&#39;]) # from now on, trie roots refer to block instead of header header.block = self # Basic consistency verifications if not self.check_fields(): raise ValueError(&quot;Block is invalid&quot;) if len(self.header.extra_data) &gt; MAX_EXTRADATA_LENGTH: raise ValueError(&quot;Extra data cannot exceed %d bytes&quot; % MAX_EXTRADATA_LENGTH) if self.header.coinbase == &#39;&#39;: raise ValueError(&quot;Coinbase cannot be empty address&quot;) if not self.state.root_hash_valid(): raise ValueError(&quot;State Merkle root of block %r not found in &quot; &quot;database&quot; % self) if (not self.is_genesis() and self.nonce and not self.header.check_pow()): raise ValueError(&quot;PoW check failed&quot;) if b&#39;validated:&#39; + self.hash not in self.db: if self.number == 0: self.db.put(b&#39;validated:&#39; + self.hash, &#39;1&#39;) else: self.db.put_temporarily(b&#39;validated:&#39; + self.hash, &#39;1&#39;) 至此，区块校验完成，之后便是将区块加入本地区块链 现在再回到chain service 最开始的_add_block函数中来 将区块加入本地链self.chain.add_block： def add_block(self, block, forward_pending_transactions=True): &quot;returns True if block was added sucessfully&quot; _log = log.bind(block_hash=block) # make sure we know the parent if not block.has_parent() and not block.is_genesis(): _log.debug(&#39;missing parent&#39;) return False #再次检查矿工引用的uncle区块是否合法 if not block.validate_uncles(): _log.debug(&#39;invalid uncles&#39;) return False if not len(block.nonce) == 8: _log.debug(&#39;nonce not set&#39;) return False #再次检查工作量证明是否合法 elif not block.header.check_pow(nonce=block.nonce) and\\ not block.is_genesis(): _log.debug(&#39;invalid nonce&#39;) return False #再检查下父区块是否是区块头中指定的父区块 if block.has_parent(): try: processblock.verify(block, block.get_parent()) except processblock.VerificationFailed as e: _log.critical(&#39;VERIFICATION FAILED&#39;, error=e) f = os.path.join(utils.data_dir, &#39;badblock.log&#39;) open(f, &#39;w&#39;).write(to_string(block.hex_serialize())) return False if block.number &lt; self.head.number: _log.debug(&quot;older than head&quot;, head_hash=self.head) # Q: Should we have any limitations on adding blocks? self.index.add_block(block) #存入本地chain self._store_block(block) # set to head if this makes the longest chain w/ most work for that number if block.chain_difficulty() &gt; self.head.chain_difficulty(): _log.debug(&#39;new head&#39;) #更新head candidate，这个其实只针对矿工，只要不挖矿，就不用去管候选头区块也不用去打包交易 self._update_head(block, forward_pending_transactions) elif block.number &gt; self.head.number: _log.warn(&#39;has higher blk number than head but lower chain_difficulty&#39;, head_hash=self.head, block_difficulty=block.chain_difficulty(), head_difficulty=self.head.chain_difficulty()) block.transactions.clear_all() block.receipts.clear_all() block.state.db.commit_refcount_changes(block.number) block.state.db.cleanup(block.number) self.commit() # batch commits all changes that came with the new block return True 至此，新区块成功写入本地 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/09/20/25b6b2191443527f4dae6b68e999044b.html","headline":"python ethereum 代码分析 《3》","dateModified":"2017-09-20T00:00:00+08:00","datePublished":"2017-09-20T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/09/20/25b6b2191443527f4dae6b68e999044b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>python ethereum 代码分析 《3》</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <h1 id="python-ethereum-代码分析-3">python ethereum 代码分析 《3》</h1> 
+  <h2 id="python-版本以太坊">python 版本以太坊</h2> 
+  <h2 id="pyethereum部分">pyethereum部分</h2> 
+  <p>本文主要介绍以太坊Merkle Patricia Trie以及区块的校验存储</p> 
+  <h3 id="一些关键字解释">一些关键字解释</h3> 
+  <p>sha3： 以太坊所用的一种hash方法</p> 
+  <p>rlp ：Recursive Length Prefix,递归长度前缀编码，以太坊用于编码数据。用于编码任意的嵌套结构的二进制数据（在python中就是列表，其实rlp在Merkle Patricia Trie的实现中主要就是编码列表用的），它是以太坊中数据序列化/反序列化的主要方法，区块、交易等数据结构在持久化时会先经过RLP编码后再存储到数据库中。</p> 
+  <h2 id="blockheader">BlockHeader</h2> 
+  <p>先看一下以太坊block<a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/blocks.py#L169" rel="nofollow" target="_blank">区块头</a>的结构</p> 
+  <pre class="prettyprint"><code class=" hljs python"><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">BlockHeader</span><span class="hljs-params">(rlp.Serializable)</span>:</span>
+
+    <span class="hljs-string">"""A block header. If the block with this header exists as an instance of :class:`Block`, the connection can be made explicit by setting :attr:`BlockHeader.block`. Then, :attr:`BlockHeader.state_root`, :attr:`BlockHeader.tx_list_root` and :attr:`BlockHeader.receipts_root` always refer to the up-to-date value in the block instance. :ivar block: an instance of :class:`Block` or `None` :ivar prevhash: the 32 byte hash of the previous block :ivar uncles_hash: the 32 byte hash of the RLP encoded list of uncle headers :ivar coinbase: the 20 byte coinbase address :ivar state_root: the root of the block's state trie :ivar tx_list_root: the root of the block's transaction trie :ivar receipts_root: the root of the block's receipts trie :ivar bloom: TODO :ivar difficulty: the block's difficulty :ivar number: the number of ancestors of this block (0 for the genesis block) :ivar gas_limit: the block's gas limit :ivar gas_used: the total amount of gas used by all transactions in this block :ivar timestamp: a UNIX timestamp :ivar extra_data: up to 1024 bytes of additional data :ivar nonce: a 32 byte nonce constituting a proof-of-work, or the empty string as a placeholder """</span>
+
+    fields = [
+        (<span class="hljs-string">'prevhash'</span>, hash32),<span class="hljs-comment">#父区块的hash</span>
+        (<span class="hljs-string">'uncles_hash'</span>, hash32),<span class="hljs-comment">#矿工引用的uncle区块列表的hash</span>
+        (<span class="hljs-string">'coinbase'</span>, address),<span class="hljs-comment">#挖出此区块矿工的地址</span>
+        (<span class="hljs-string">'state_root'</span>, trie_root),<span class="hljs-comment">#state trie树树根</span>
+        (<span class="hljs-string">'tx_list_root'</span>, trie_root),<span class="hljs-comment">#交易trie树树根</span>
+        (<span class="hljs-string">'receipts_root'</span>, trie_root),<span class="hljs-comment">#收据trie树树根</span>
+        (<span class="hljs-string">'bloom'</span>, int256),
+        (<span class="hljs-string">'difficulty'</span>, big_endian_int),<span class="hljs-comment">#当前区块难度</span>
+        (<span class="hljs-string">'number'</span>, big_endian_int),<span class="hljs-comment">#区块的高度</span>
+        (<span class="hljs-string">'gas_limit'</span>, big_endian_int),<span class="hljs-comment">#区块gas上限</span>
+        (<span class="hljs-string">'gas_used'</span>, big_endian_int),<span class="hljs-comment">#区块使用的gas</span>
+        (<span class="hljs-string">'timestamp'</span>, big_endian_int),<span class="hljs-comment">#时间戳</span>
+        (<span class="hljs-string">'extra_data'</span>, binary),
+        (<span class="hljs-string">'mixhash'</span>, binary),
+        (<span class="hljs-string">'nonce'</span>, Binary(<span class="hljs-number">8</span>, allow_empty=<span class="hljs-keyword">True</span>))<span class="hljs-comment">#工作量证明随机数，通过校验该值来判断矿工的工作量证明是否合法。</span>
+    ]</code></pre> 
+  <h2 id="merkle-patricia-trie">Merkle Patricia Trie</h2> 
+  <p>首先要提一点，以太坊用Merkle Patricia Trie 这种数据结构来做区块中交易的快速校验和全网状态state的快速验证。Merkle Patricia Trie是一种树，区块头中的state_root，tx_list_root，receipts_root 分别是State Trie ，Transactions Trie，Receipts Trie的树根，这三个树都是Merkle Patricia Trie。</p> 
+  <p>普通trie树和merkle树看<a href="http://blog.csdn.net/qq_33935254/article/details/55505472" rel="nofollow" target="_blank">这篇博客</a></p> 
+  <p>先说下trie树的一个扩展Radix Trie树，这个树也是只存key / value的一棵树 <br> 这棵树每个节点看起来是这样的[i0, i1 … in, value] ，现在如果我们的key是用16进制（hex）编码，那么n=15，每个节点列表长度为17，[i0,i1,…i15,value]，列表中的0~15的某一位就表示key中的一个16进制字符。 <br> Radix Trie树有个问题，如果我要存储一个长度为20的hex编码的key，那么这个树的高度就有20，每一层就只存了key中一个字符，这样效率就不高，以太坊就改进了一下，增加了一些节点类型来解决这个事情。 <br> Merkle Patricia Trie树也是用来存key / value的一棵树 <br> Merkle Patricia Trie的四种节点类型 <br> 1.NULL (represented as the empty string) 空节点 <br> 2.branch A 17-item node [ v0 … v15, vt ] 分支节点，0~15每一位表示16进制编码的一个字符 <br> 3.leaf A 2-item node [ encodedPath, value ] 这个value是原始key在叶子节点上对应的value值 <br> 4.extension A 2-item node [ encodedPath, key ] 这个key是子节点的hash</p> 
+  <p>实际在Merkle Patricia Trie的实现中，还用了HP（hex prefix）编码方式去编码的key，其实就是十六进制编码再加前缀来表示节点类型。同时key是以bytes存储的，而一个hex char只有4位，一个byte有八位，所以不够八位的时候prefix 后面再加0000补全。 <br> HP编码前缀的规则</p> 
+  <table> 
+   <thead> 
+    <tr> 
+     <th>hex char</th> 
+     <th align="center">bits</th> 
+     <th align="right">node type partial</th> 
+     <th>path length</th> 
+    </tr> 
+   </thead> 
+   <tbody>
+    <tr> 
+     <td>0</td> 
+     <td align="center">0000</td> 
+     <td align="right">extension</td> 
+     <td>even</td> 
+    </tr> 
+    <tr> 
+     <td>1</td> 
+     <td align="center">0001</td> 
+     <td align="right">extension</td> 
+     <td>odd</td> 
+    </tr> 
+    <tr> 
+     <td>2</td> 
+     <td align="center">0010</td> 
+     <td align="right">terminating (leaf)</td> 
+     <td>even</td> 
+    </tr> 
+    <tr> 
+     <td>3</td> 
+     <td align="center">0011</td> 
+     <td align="right">terminating (leaf)</td> 
+     <td>odd</td> 
+    </tr> 
+   </tbody>
+  </table> 
+  <p>先看一个Merkle Patricia Trie存储的列子 <br> 以下是要存储到tire树中的四个键值对 <br> &lt;64 6f&gt; : ‘verb’ <br> &lt;64 6f 67&gt; : ‘puppy’ <br> &lt;64 6f 67 65&gt; : ‘coin’ <br> &lt;68 6f 72 73 65&gt; : ‘stallion’ <br> 添加之后，trie树结构： <br> rootHash: [ &lt;16&gt;, hashA ] // extension node <br> hashA: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ] // branch node <br> hashC: [ &lt;20 6f 72 73 65&gt;, ‘stallion’ ] //leaf node <br> hashB: [ &lt;00 6f&gt;, hashD ] // extension node <br> hashD: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashE, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, verb ] // branch node <br> hashE: [ &lt;17&gt;, hashF ] // extension node <br> hashF: [ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashG, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, puppy ] // branch node <br> hashG: [ &lt;35&gt;, ‘coin’ ] //leaf node</p> 
+  <p>注意到root node 有公共前缀hex char 6 ，6前面的1表示这是个extension node，并且原来长度是奇数，补了个前缀1后正好凑成一个byte。 <br> 存储在root node上的key，value 便是 &lt;16&gt;, hashA，而hashA又是子节点在leveldb中的地址； <br> 其中，hashA = sha3（rlp_encode（[ &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashB, &lt;&gt;, &lt;&gt;, &lt;&gt;, hashC, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt;, &lt;&gt; ]）） <br> 这个hashA的计算方式正是体现了Merkle Patricia Trie的‘Merkle’部分，每个节点的hash地址正是节点数据rlp编码过后的hash。如果某个矿工篡改了叶子节点的数据，比如State Trie某个叶子节点一个账户的余额，并生成了State Tire的root hash，其他矿工通过transaction list算出来的State Tire的root hash一定跟他的不一致。 <br> hashA 指向一个分支节点，分支节点中的第4位有hashB，表示有公共前缀‘4’；hashB 的公共前缀是&lt;00 6f&gt;，及公共前缀为‘6f’，一直到hashD，hashD的value为’verb’ ，经过的整个路径6-4-6f 即为原来的key。 <br> 再到hashG叶子节点 ，经过的整个路劲6-4-6f-6-7-6-5 即为value ‘coin’ 的key</p> 
+  <p>在State Trie中，路径path（key）都是sha3(ethereumAddress) 账户地址的hash，value 都是该账户的信息：[nonce（当前交易次数）,balance（账户余额）,storageRoot,codeHash]</p> 
+  <p>Transactions Trie和Receipts Trie 与 State Trie的区别是，每个区块都有独立的Transactions Trie和Receipts Trie ，而State Trie是全局的。 <br> 在Transactions Trie中，路径path（key）都是rlp(transactionIndex)，transactionIndex是交易的编号，value都是rlp(transactionData)</p> 
+  <p>Merkle Patricia Trie参考资料 <br> <a href="https://github.com/ethereum/wiki/wiki/Patricia-Tree" rel="nofollow" target="_blank">https://github.com/ethereum/wiki/wiki/Patricia-Tree</a> <br> <a href="https://easythereentropy.wordpress.com/2014/06/04/understanding-the-ethereum-trie/" rel="nofollow" target="_blank">https://easythereentropy.wordpress.com/2014/06/04/understanding-the-ethereum-trie/</a></p> 
+  <h2 id="区块的校验与存储">区块的校验与存储</h2> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L228" rel="nofollow" target="_blank">从队里中取出一个block数据并尝试添加到本地chain</a> <br> <a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/blocks.py#L404" rel="nofollow" target="_blank">尝试实例化block对象</a>，传入的参数有header区块头, transaction_list交易列表, uncles 叔叔区块列表 <br> 区块一致性校验：</p> 
+  <pre class="prettyprint"><code class=" hljs lasso">        <span class="hljs-keyword">if</span> <span class="hljs-keyword">parent</span>:
+            <span class="hljs-keyword">if</span> hasattr(<span class="hljs-keyword">parent</span>, <span class="hljs-string">'db'</span>) <span class="hljs-literal">and</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>db <span class="hljs-subst">!=</span> <span class="hljs-keyword">parent</span><span class="hljs-built_in">.</span>db <span class="hljs-literal">and</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>db<span class="hljs-built_in">.</span>db <span class="hljs-subst">!=</span> <span class="hljs-keyword">parent</span><span class="hljs-built_in">.</span>db:
+                raise ValueError(<span class="hljs-string">"Parent lives in different database"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>prevhash <span class="hljs-subst">!=</span> <span class="hljs-keyword">parent</span><span class="hljs-built_in">.</span><span class="hljs-keyword">header</span><span class="hljs-built_in">.</span>hash:
+                raise ValueError(<span class="hljs-string">"Block's prevhash and parent's hash do not match"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>number <span class="hljs-subst">!=</span> <span class="hljs-keyword">parent</span><span class="hljs-built_in">.</span><span class="hljs-keyword">header</span><span class="hljs-built_in">.</span>number <span class="hljs-subst">+</span> <span class="hljs-number">1</span>:
+                raise ValueError(<span class="hljs-string">"Block's number is not the successor of its parent number"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-literal">not</span> check_gaslimit(<span class="hljs-keyword">parent</span>, <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>gas_limit):
+                raise ValueError(<span class="hljs-string">"Block's gaslimit is inconsistent with its parent's gaslimit"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>difficulty <span class="hljs-subst">!=</span> calc_difficulty(<span class="hljs-keyword">parent</span>, <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>timestamp):
+                raise ValueError(<span class="hljs-string">"Block's difficulty is inconsistent with its parent's difficulty"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>gas_used <span class="hljs-subst">&gt;</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>gas_limit:
+                raise ValueError(<span class="hljs-string">"Gas used exceeds gas limit"</span>)
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">self</span><span class="hljs-built_in">.</span>timestamp <span class="hljs-subst">&lt;=</span> <span class="hljs-keyword">parent</span><span class="hljs-built_in">.</span><span class="hljs-keyword">header</span><span class="hljs-built_in">.</span>timestamp:
+                raise ValueError(<span class="hljs-string">"Timestamp equal to or before parent"</span>)</code></pre> 
+  <p>交易及状态校验：</p> 
+  <pre class="prettyprint"><code class=" hljs ruby">        <span class="hljs-comment">#初始化一个空的transaction trie，通过添加transaction list中的交易来重新构建transaction trie，这个transaction trie的root hash必须跟矿工给出的transaction trie root hash 一致</span>
+        <span class="hljs-keyword">self</span>.transactions = <span class="hljs-constant">Trie</span>(db, trie.<span class="hljs-constant">BLANK_ROOT</span>)
+        <span class="hljs-keyword">self</span>.receipts = <span class="hljs-constant">Trie</span>(db, trie.<span class="hljs-constant">BLANK_ROOT</span>)
+        <span class="hljs-comment"># replay transactions if state is unknown</span>
+        state_unknown = (header.prevhash != <span class="hljs-constant">GENESIS_PREVHASH</span> <span class="hljs-keyword">and</span>
+                         header.number != <span class="hljs-number">0</span> <span class="hljs-keyword">and</span>
+                         header.state_root != trie.<span class="hljs-constant">BLANK_ROOT</span> <span class="hljs-keyword">and</span>
+                         (len(header.state_root) != <span class="hljs-number">32</span> <span class="hljs-keyword">or</span>
+                          b<span class="hljs-string">'validated:'</span> + <span class="hljs-keyword">self</span>.hash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> db) <span class="hljs-keyword">and</span>
+                         <span class="hljs-keyword">not</span> making)
+        <span class="hljs-comment">#如果没有添加过该区块</span>
+        <span class="hljs-keyword">if</span> <span class="hljs-symbol">state_unknown:</span>
+            assert transaction_list is <span class="hljs-keyword">not</span> <span class="hljs-constant">None</span>
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> <span class="hljs-symbol">parent:</span>
+                parent = <span class="hljs-keyword">self</span>.get_parent_header()
+            <span class="hljs-comment">#取出该区块父区块的state trie</span>
+            <span class="hljs-keyword">self</span>.state = <span class="hljs-constant">SecureTrie</span>(<span class="hljs-constant">Trie</span>(db, parent.state_root))
+            <span class="hljs-keyword">self</span>.transaction_count = <span class="hljs-number">0</span>
+            <span class="hljs-keyword">self</span>.gas_used = <span class="hljs-number">0</span>
+            <span class="hljs-comment"># replay</span>
+            <span class="hljs-keyword">for</span> tx <span class="hljs-keyword">in</span> <span class="hljs-symbol">transaction_list:</span>
+                <span class="hljs-comment">#执行每一笔交易，同时更新transaction trie和state trie</span>
+                success, output = processblock.apply_transaction(<span class="hljs-keyword">self</span>, tx)
+            <span class="hljs-keyword">self</span>.finalize()
+        <span class="hljs-symbol">else:</span>
+            <span class="hljs-comment"># trust the state root in the header</span>
+            <span class="hljs-keyword">self</span>.state = <span class="hljs-constant">SecureTrie</span>(<span class="hljs-constant">Trie</span>(<span class="hljs-keyword">self</span>.db, header._state_root))
+            <span class="hljs-keyword">self</span>.transaction_count = <span class="hljs-number">0</span>
+            <span class="hljs-keyword">if</span> <span class="hljs-symbol">transaction_list:</span>
+                <span class="hljs-keyword">for</span> tx <span class="hljs-keyword">in</span> <span class="hljs-symbol">transaction_list:</span>
+                    <span class="hljs-keyword">self</span>.add_transaction_to_list(tx)
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.transactions.root_hash != header.<span class="hljs-symbol">tx_list_root:</span>
+                raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"Transaction list root hash does not match"</span>)
+            <span class="hljs-comment"># receipts trie populated by add_transaction_to_list is incorrect</span>
+            <span class="hljs-comment"># (it doesn't know intermediate states), so reset it</span>
+            <span class="hljs-keyword">self</span>.receipts = <span class="hljs-constant">Trie</span>(<span class="hljs-keyword">self</span>.db, header.receipts_root)</code></pre> 
+  <p><a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/processblock.py#L119" rel="nofollow" target="_blank">processblock.apply_transaction</a>：</p> 
+  <pre class="prettyprint"><code class=" hljs vhdl">def apply_transaction(<span class="hljs-keyword">block</span>, tx):
+    #交易合法性校验
+    validate_transaction(<span class="hljs-keyword">block</span>, tx)
+
+    log_tx.debug(<span class="hljs-attribute">'TX</span> <span class="hljs-keyword">NEW</span>', tx_dict=tx.log_dict())
+    # start transacting #################
+    #sender交易数nonce加<span class="hljs-number">1</span>
+    <span class="hljs-keyword">block</span>.increment_nonce(tx.sender)
+    # print <span class="hljs-keyword">block</span>.get_nonce(tx.sender), '@@@'
+
+    # buy startgas
+    <span class="hljs-keyword">assert</span> <span class="hljs-keyword">block</span>.get_balance(tx.sender) &gt;= tx.startgas * tx.gasprice
+    #sender账户扣除startgas
+    <span class="hljs-keyword">block</span>.delta_balance(tx.sender, -tx.startgas * tx.gasprice)
+    message_gas = tx.startgas - intrinsic_gas_used(tx)
+    #合约代码
+    message_data = vm.CallData([safe_ord(x) <span class="hljs-keyword">for</span> x <span class="hljs-keyword">in</span> tx.data], <span class="hljs-number">0</span>, len(tx.data))
+    #交易
+    message = vm.Message(tx.sender, tx.<span class="hljs-keyword">to</span>, tx.value, message_gas, message_data, code_address=tx.<span class="hljs-keyword">to</span>)
+
+    # MESSAGE
+    ext = VMExt(<span class="hljs-keyword">block</span>, tx)
+    <span class="hljs-keyword">if</span> tx.<span class="hljs-keyword">to</span> <span class="hljs-keyword">and</span> tx.<span class="hljs-keyword">to</span> != CREATE_CONTRACT_ADDRESS:
+        result, gas_remained, data = apply_msg(ext, message)
+        log_tx.debug('_res_', result=result, gas_remained=gas_remained, data=data)
+    <span class="hljs-keyword">else</span>:  # CREATE
+        result, gas_remained, data = create_contract(ext, message)
+        <span class="hljs-keyword">assert</span> utils.is_numeric(gas_remained)
+        log_tx.debug('_create_', result=result, gas_remained=gas_remained, data=data)
+
+    <span class="hljs-keyword">assert</span> gas_remained &gt;= <span class="hljs-number">0</span>
+
+    log_tx.debug(<span class="hljs-string">"TX APPLIED"</span>, result=result, gas_remained=gas_remained,
+                 data=data)
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> result:  # <span class="hljs-number">0</span> = OOG failure <span class="hljs-keyword">in</span> both cases
+        log_tx.debug(<span class="hljs-attribute">'TX</span> FAILED', reason=<span class="hljs-attribute">'out</span> <span class="hljs-keyword">of</span> gas',
+                     startgas=tx.startgas, gas_remained=gas_remained)
+        <span class="hljs-keyword">block</span>.gas_used += tx.startgas
+        #给矿工手续费
+        <span class="hljs-keyword">block</span>.delta_balance(<span class="hljs-keyword">block</span>.coinbase, tx.gasprice * tx.startgas)
+        output = b''
+        success = <span class="hljs-number">0</span>
+    <span class="hljs-keyword">else</span>:
+        log_tx.debug(<span class="hljs-attribute">'TX</span> SUCCESS', data=data)
+        gas_used = tx.startgas - gas_remained
+        <span class="hljs-keyword">block</span>.refunds += len(<span class="hljs-keyword">block</span>.suicides) * opcodes.GSUICIDEREFUND
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">block</span>.refunds &gt; <span class="hljs-number">0</span>:
+            log_tx.debug(<span class="hljs-attribute">'Refunding</span>', gas_refunded=min(<span class="hljs-keyword">block</span>.refunds, gas_used // <span class="hljs-number">2</span>))
+            gas_remained += min(<span class="hljs-keyword">block</span>.refunds, gas_used // <span class="hljs-number">2</span>)
+            gas_used -= min(<span class="hljs-keyword">block</span>.refunds, gas_used // <span class="hljs-number">2</span>)
+            <span class="hljs-keyword">block</span>.refunds = <span class="hljs-number">0</span>
+        # sell remaining gas
+        <span class="hljs-keyword">block</span>.delta_balance(tx.sender, tx.gasprice * gas_remained)
+        <span class="hljs-keyword">block</span>.delta_balance(<span class="hljs-keyword">block</span>.coinbase, tx.gasprice * gas_used)
+        <span class="hljs-keyword">block</span>.gas_used += gas_used
+        <span class="hljs-keyword">if</span> tx.<span class="hljs-keyword">to</span>:
+            output = b''.join(<span class="hljs-keyword">map</span>(ascii_chr, data))
+        <span class="hljs-keyword">else</span>:
+            output = data
+        success = <span class="hljs-number">1</span>
+    <span class="hljs-keyword">block</span>.commit_state()
+    suicides = <span class="hljs-keyword">block</span>.suicides
+    <span class="hljs-keyword">block</span>.suicides = []
+    <span class="hljs-keyword">for</span> s <span class="hljs-keyword">in</span> suicides:
+        <span class="hljs-keyword">block</span>.ether_delta -= <span class="hljs-keyword">block</span>.get_balance(s)
+        <span class="hljs-keyword">block</span>.del_account(s)
+    <span class="hljs-keyword">block</span>.add_transaction_to_list(tx)
+    <span class="hljs-keyword">block</span>.logs = []
+    <span class="hljs-keyword">return</span> success, output</code></pre> 
+  <p>block.commit_state() <br> 更新state trie账户状态</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">commit_state</span><span class="hljs-params">(self)</span>:</span>
+        <span class="hljs-string">"""Commit account caches"""</span>
+        <span class="hljs-string">"""Write the acount caches on the corresponding tries."""</span>
+        changes = []
+        <span class="hljs-keyword">if</span> len(self.journal) == <span class="hljs-number">0</span>:
+            <span class="hljs-comment"># log_state.trace('delta', changes=[])</span>
+            <span class="hljs-keyword">return</span>
+        addresses = sorted(list(self.caches[<span class="hljs-string">'all'</span>].keys()))
+        <span class="hljs-keyword">for</span> addr <span class="hljs-keyword">in</span> addresses:
+            <span class="hljs-comment">#获取一个账户</span>
+            acct = self._get_acct(addr)
+
+            <span class="hljs-comment"># storage</span>
+            <span class="hljs-keyword">for</span> field <span class="hljs-keyword">in</span> (<span class="hljs-string">'balance'</span>, <span class="hljs-string">'nonce'</span>, <span class="hljs-string">'code'</span>, <span class="hljs-string">'storage'</span>):
+                <span class="hljs-keyword">if</span> addr <span class="hljs-keyword">in</span> self.caches[field]:
+                    v = self.caches[field][addr]
+                    changes.append([field, addr, v])
+                    <span class="hljs-comment">#实例化account对象</span>
+                    setattr(acct, field, v)
+            <span class="hljs-comment">#更新account的storage trie</span>
+            t = SecureTrie(Trie(self.db, acct.storage))
+            <span class="hljs-keyword">for</span> k, v <span class="hljs-keyword">in</span> self.caches.get(<span class="hljs-string">b'storage:'</span> + addr, {}).items():
+                enckey = utils.zpad(utils.coerce_to_bytes(k), <span class="hljs-number">32</span>)
+                val = rlp.encode(v)
+                changes.append([<span class="hljs-string">'storage'</span>, addr, k, v])
+                <span class="hljs-comment"># if self.number &gt; 18280 and False:</span>
+                <span class="hljs-comment"># try:</span>
+                <span class="hljs-comment"># self.db.logging = True</span>
+                <span class="hljs-comment"># except:</span>
+                <span class="hljs-comment"># pass</span>
+                <span class="hljs-comment"># sys.stderr.write("pre: %r\n" % self.account_to_dict(addr)['storage'])</span>
+                <span class="hljs-comment"># sys.stderr.write("pre: %r\n" % self.get_storage(addr).root_hash.encode('hex'))</span>
+                <span class="hljs-comment"># sys.stderr.write("changed: %s %s %s\n" % (encode_hex(addr), encode_hex(enckey), encode_hex(val)))</span>
+                <span class="hljs-keyword">if</span> v:
+                    t.update(enckey, val)
+                <span class="hljs-keyword">else</span>:
+                    t.delete(enckey)
+            acct.storage = t.root_hash
+            <span class="hljs-comment">#更新state trie中该账户的数据，从新生成root hash</span>
+            self.state.update(addr, rlp.encode(acct))
+        log_state.trace(<span class="hljs-string">'delta'</span>, changes=changes)
+        self.reset_cache()
+        self.db.put_temporarily(<span class="hljs-string">b'validated:'</span> + self.hash, <span class="hljs-string">'1'</span>)</code></pre> 
+  <p>block.add_transaction_to_list(tx) <br> 根据transaction list 重新构建transaction trie</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">add_transaction_to_list</span><span class="hljs-params">(self, tx)</span>:</span>
+        <span class="hljs-string">"""Add a transaction to the transaction trie. Note that this does not execute anything, i.e. the state is not updated. """</span>
+        k = rlp.encode(self.transaction_count)
+        self.transactions.update(k, rlp.encode(tx))
+        r = self.mk_transaction_receipt(tx)
+        self.receipts.update(k, rlp.encode(r))
+        self.bloom |= r.bloom  <span class="hljs-comment"># int</span>
+        self.transaction_count += <span class="hljs-number">1</span></code></pre> 
+  <p>所有交易都添加完后，添加矿工奖励，<a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/blocks.py#L483" rel="nofollow" target="_blank">self.finalize()</a>：</p> 
+  <pre class="prettyprint"><code class=" hljs python">    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">finalize</span><span class="hljs-params">(self)</span>:</span>
+        <span class="hljs-string">"""Apply rewards and commit."""</span>
+        delta = int(BLOCK_REWARD + NEPHEW_REWARD * len(self.uncles))
+        self.delta_balance(self.coinbase, delta)
+        self.ether_delta += delta
+
+        <span class="hljs-keyword">for</span> uncle <span class="hljs-keyword">in</span> self.uncles:
+            r = BLOCK_REWARD * \
+                (UNCLE_DEPTH_PENALTY_FACTOR + uncle.number - self.number) \
+                / UNCLE_DEPTH_PENALTY_FACTOR
+            r = int(r)
+            self.delta_balance(uncle.coinbase, r)
+            self.ether_delta += r
+        self.commit_state()</code></pre> 
+  <p>所有交易添加完后，再来校验state root ，transaction root 是否与block header 中的值一致，不一致的化，区块不合法。<a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/blocks.py#L514" rel="nofollow" target="_blank">Block.<strong>init</strong></a></p> 
+  <pre class="prettyprint"><code class=" hljs ruby">        <span class="hljs-keyword">if</span> <span class="hljs-symbol">parent:</span>
+            must_equal(<span class="hljs-string">'prev_hash'</span>, <span class="hljs-keyword">self</span>.prevhash, parent.hash)
+        must_equal(<span class="hljs-string">'gas_used'</span>, original_values[<span class="hljs-string">'gas_used'</span>], <span class="hljs-keyword">self</span>.gas_used)
+        must_equal(<span class="hljs-string">'timestamp'</span>, <span class="hljs-keyword">self</span>.timestamp, original_values[<span class="hljs-string">'timestamp'</span>])
+        must_equal(<span class="hljs-string">'difficulty'</span>, <span class="hljs-keyword">self</span>.difficulty, original_values[<span class="hljs-string">'difficulty'</span>])
+        must_equal(<span class="hljs-string">'uncles_hash'</span>, utils.sha3(rlp.encode(uncles)), original_values[<span class="hljs-string">'uncles_hash'</span>])
+        assert header.block is <span class="hljs-constant">None</span>
+        must_equal(<span class="hljs-string">'state_root'</span>, <span class="hljs-keyword">self</span>.state.root_hash, header.state_root)
+        must_equal(<span class="hljs-string">'tx_list_root'</span>, <span class="hljs-keyword">self</span>.transactions.root_hash, header.tx_list_root)
+        must_equal(<span class="hljs-string">'receipts_root'</span>, <span class="hljs-keyword">self</span>.receipts.root_hash, header.receipts_root)
+        must_equal(<span class="hljs-string">'bloom'</span>, <span class="hljs-keyword">self</span>.bloom, original_values[<span class="hljs-string">'bloom'</span>])
+
+        <span class="hljs-comment"># from now on, trie roots refer to block instead of header</span>
+        header.block = <span class="hljs-keyword">self</span>
+
+        <span class="hljs-comment"># Basic consistency verifications</span>
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">self</span>.check_fields()<span class="hljs-symbol">:</span>
+            raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"Block is invalid"</span>)
+        <span class="hljs-keyword">if</span> len(<span class="hljs-keyword">self</span>.header.extra_data) &gt; <span class="hljs-constant">MAX_EXTRADATA_LENGTH</span><span class="hljs-symbol">:</span>
+            raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"Extra data cannot exceed %d bytes"</span> % <span class="hljs-constant">MAX_EXTRADATA_LENGTH</span>)
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.header.coinbase == <span class="hljs-string">''</span><span class="hljs-symbol">:</span>
+            raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"Coinbase cannot be empty address"</span>)
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">self</span>.state.root_hash_valid()<span class="hljs-symbol">:</span>
+            raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"State Merkle root of block %r not found in "</span>
+                             <span class="hljs-string">"database"</span> % <span class="hljs-keyword">self</span>)
+        <span class="hljs-keyword">if</span> (<span class="hljs-keyword">not</span> <span class="hljs-keyword">self</span>.is_genesis() <span class="hljs-keyword">and</span> <span class="hljs-keyword">self</span>.nonce <span class="hljs-keyword">and</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">self</span>.header.check_pow())<span class="hljs-symbol">:</span>
+            raise <span class="hljs-constant">ValueError</span>(<span class="hljs-string">"PoW check failed"</span>)
+        <span class="hljs-keyword">if</span> b<span class="hljs-string">'validated:'</span> + <span class="hljs-keyword">self</span>.hash <span class="hljs-keyword">not</span> <span class="hljs-keyword">in</span> <span class="hljs-keyword">self</span>.<span class="hljs-symbol">db:</span>
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">self</span>.number == <span class="hljs-number">0</span><span class="hljs-symbol">:</span>
+                <span class="hljs-keyword">self</span>.db.put(b<span class="hljs-string">'validated:'</span> + <span class="hljs-keyword">self</span>.hash, <span class="hljs-string">'1'</span>)
+            <span class="hljs-symbol">else:</span>
+                <span class="hljs-keyword">self</span>.db.put_temporarily(b<span class="hljs-string">'validated:'</span> + <span class="hljs-keyword">self</span>.hash, <span class="hljs-string">'1'</span>)</code></pre> 
+  <p>至此，区块校验完成，之后便是将区块加入本地区块链</p> 
+  <p><a href="https://github.com/ethereum/pyethapp/blob/e4ce60854785ffec4fd2b9490fd58a015287c7c0/pyethapp/eth_service.py#L279" rel="nofollow" target="_blank">现在再回到chain service 最开始的_add_block函数中来</a> <br> 将区块加入本地链<a href="https://github.com/ethereum/pyethereum/blob/efb08554ee95aa18b08d8f5d21d76097631d2c4a/ethereum/chain.py#L274" rel="nofollow" target="_blank">self.chain.add_block</a>：</p> 
+  <pre class="prettyprint"><code class=" hljs vhdl">
+    def add_block(self, <span class="hljs-keyword">block</span>, forward_pending_transactions=True):
+        <span class="hljs-string">"returns True if block was added sucessfully"</span>
+        _log = log.bind(block_hash=<span class="hljs-keyword">block</span>)
+        # make sure we know the parent
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">block</span>.has_parent() <span class="hljs-keyword">and</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">block</span>.is_genesis():
+            _log.debug(<span class="hljs-attribute">'missing</span> parent')
+            <span class="hljs-keyword">return</span> False
+        #再次检查矿工引用的uncle区块是否合法
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> <span class="hljs-keyword">block</span>.validate_uncles():
+            _log.debug(<span class="hljs-attribute">'invalid</span> uncles')
+            <span class="hljs-keyword">return</span> False
+
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> len(<span class="hljs-keyword">block</span>.nonce) == <span class="hljs-number">8</span>:
+            _log.debug(<span class="hljs-attribute">'nonce</span> <span class="hljs-keyword">not</span> set')
+            <span class="hljs-keyword">return</span> False
+        #再次检查工作量证明是否合法
+        elif <span class="hljs-keyword">not</span> <span class="hljs-keyword">block</span>.header.check_pow(nonce=<span class="hljs-keyword">block</span>.nonce) <span class="hljs-keyword">and</span>\
+                <span class="hljs-keyword">not</span> <span class="hljs-keyword">block</span>.is_genesis():
+            _log.debug(<span class="hljs-attribute">'invalid</span> nonce')
+            <span class="hljs-keyword">return</span> False
+        #再检查下父区块是否是区块头中指定的父区块
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">block</span>.has_parent():
+            try:
+                processblock.verify(<span class="hljs-keyword">block</span>, <span class="hljs-keyword">block</span>.get_parent())
+            except processblock.VerificationFailed as e:
+                _log.critical(<span class="hljs-attribute">'VERIFICATION</span> FAILED', error=e)
+                f = os.path.join(utils.data_dir, <span class="hljs-attribute">'badblock</span>.log')
+                <span class="hljs-keyword">open</span>(f, <span class="hljs-literal">'w'</span>).write(to_string(<span class="hljs-keyword">block</span>.hex_serialize()))
+                <span class="hljs-keyword">return</span> False
+
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">block</span>.number &lt; self.head.number:
+            _log.debug(<span class="hljs-string">"older than head"</span>, head_hash=self.head)
+            # Q: Should we have any limitations <span class="hljs-keyword">on</span> adding blocks?
+
+        self.index.add_block(<span class="hljs-keyword">block</span>)
+        #存入本地chain
+        self._store_block(<span class="hljs-keyword">block</span>)
+
+        # set <span class="hljs-keyword">to</span> head <span class="hljs-keyword">if</span> this makes the longest chain w/ most work <span class="hljs-keyword">for</span> that number
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">block</span>.chain_difficulty() &gt; self.head.chain_difficulty():
+            _log.debug(<span class="hljs-attribute">'new</span> head')
+            #更新head candidate，这个其实只针对矿工，只要不挖矿，就不用去管候选头区块也不用去打包交易
+            self._update_head(<span class="hljs-keyword">block</span>, forward_pending_transactions)
+        elif <span class="hljs-keyword">block</span>.number &gt; self.head.number:
+            _log.warn(<span class="hljs-attribute">'has</span> higher blk number than head but lower chain_difficulty',
+                      head_hash=self.head, block_difficulty=<span class="hljs-keyword">block</span>.chain_difficulty(),
+                      head_difficulty=self.head.chain_difficulty())
+        <span class="hljs-keyword">block</span>.transactions.clear_all()
+        <span class="hljs-keyword">block</span>.receipts.clear_all()
+        <span class="hljs-keyword">block</span>.state.db.commit_refcount_changes(<span class="hljs-keyword">block</span>.number)
+        <span class="hljs-keyword">block</span>.state.db.cleanup(<span class="hljs-keyword">block</span>.number)
+        self.commit()  # batch commits <span class="hljs-keyword">all</span> changes that came <span class="hljs-keyword">with</span> the <span class="hljs-keyword">new</span> <span class="hljs-keyword">block</span>
+        <span class="hljs-keyword">return</span> True</code></pre> 
+  <p>至此，新区块成功写入本地</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/leon51639/article/details/78043093,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/leon51639/article/details/78043093,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

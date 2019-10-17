@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>比特币源码分析–端口映射 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="比特币源码分析–端口映射" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="&nbsp; &nbsp; 上一篇文章分析了比特币P2P网络中，一个节点是如何发现并连接到相邻节点的。在P2P网络中，一个节点既是客户又是服务器，它还要接受其他节点的连接，为网络中其他节点提供服务。这篇文章着重分析一下比特币P2P网络中是如何通过upnp来实现端口映射的。 1 从腾讯的一道面试题说起 &nbsp; &nbsp; 笔者所在团队的总监在面试的时候必然要问面试者这样一个问题： &nbsp; &nbsp; 有两台手机同时连到了一个WIFI上，然后它们都访问了外网中某个服务器，那么网络是如何做到区分出这两台设备，把服务器的应答数据分发到合适的手机上呢？ &nbsp; &nbsp; 如果在毫无准备的情况下来回答这个问题，自己还真是答不出来。 &nbsp; &nbsp; 再想象一个场景：假设我们自己写了个小的服务器程序，然后在家里的电脑上运行，此时你想让另一个同事连接你的服务器，来验证你的服务器程序是不是能正确运行，但是明显你的网络和同事家的网络是两个不同的局域网，所以除非你去同事家或者让同事提上电脑到你家，否则无法连通。那么有什么办法做到让同事在自己家里就能点对点连上你的服务来调试么？ 2 NAT和NAT穿透 &nbsp; &nbsp; 上一节提到的两个问题，实际上都和NAT有关。要弄清楚上一节的问题，需要先了解NAT，所以这里先来补点网络课，了解一下NAT以及NAT穿透。 2.1 NAT 2.1.1 NAT是什么 &nbsp; &nbsp; NAT是个什么鬼？它的全称是Network Address Translation，翻译过来就是网络地址转换。好事的人立马就得问了：好端端的为啥要地址转换，直接用IP地址不就行了么？ &nbsp; &nbsp; 在TCP/IP协议创建的时候，他的创始人（Robert E.Kahn和Vinton G.Cerf）可能都没有预料到互联网的膨胀速度会如此之快，快到短短二三十年的时间，IPV4的地址就有要枯竭之势。随着越来越多的设备加入到互联网中，IPV4地址不够用的问题成了燃眉之急。 &nbsp; &nbsp; 解决IP地址不够用的一个办法是大家已经非常熟悉的IPV6，但是这么多年过去了，IPV6似乎还是不温不火，始终普及不起来。于是就有了NAT的解决方案，可以说正是NAT把IPV4从死亡边缘拉了回来，NAT到底是用了什么方法立下如此奇功，本节我们来简单的了解一下。 &nbsp; &nbsp; 平时我们无论是在家里，还是在公司，其实都是在一个私有的局域网，此时电脑上分配到的IP地址是私有IP地址。RFC1918规范里规定了3个保留地址段：10.0.0.0-10.255.255.255，172.16.0.0-172.31.255.255，192.168.0.0-192.168.255.255，这三个范围分别处于A、B、C类的地址段，专门用于组织或者企业内部使用，不需要进行申请。和公有IP地址相比，这些私有IP地址只在企业内部使用，不能作为全球路由地址，出了企业或组织的管理范围，这类私有地址就不在有任何意义。注意：任何一个组织都可以在内部使用这些私有地址，因此两个不同网络中存在相同IP地址的情况是很可能出现的，但是同一个网络中不允许两台主机拥有相同IP地址，否则将发生地址冲突。 &nbsp; &nbsp; 当私有网络中的主机想请求公网中服务器的服务时，需要在网络出口处部署NAT网关。NAT的作用就是在报文离开私网进入Internet的时候，把报文中的源IP地址替换为公网地址，然后等服务端的响应报文到达网关时，NAT再把目的地址替换为私网中主机的IP地址。 &nbsp; &nbsp; 听上去似乎很简单，NAT不就是替换了一下IP地址么，也没干什么，但是这里需要注意两点： &nbsp; &nbsp; (1) 有了NAT以后，内网的主机不在需要申请公网IP地址，只需要将内网主机地址和端口通过NAT映射到网络出口的公网IP即可，然后通信的两端在无感知的情况下进行通信。这也是为什么前文说NAT挽救了IPV4，因为大量的内网主机有了NAT，只需要很少的公网地址做映射就可以了，如此就可以节约出很多的IPV4地址空间。 &nbsp; &nbsp; (2) 当在私网网络出口处部署了NAT网关以后，只能由内网主机发起到外网主机的连接，外网主机无法主动发起连接到内网。这样虽然对外隔离了内网主机，但同时又限制了P2P的通信，这也是NAT带来的一大弊端，下一节介绍NAT穿透技术时会看到针对这一问题有哪些解决手段。 2.1.2 NAT的分类 &nbsp; &nbsp; (1) 一对一NAT &nbsp; &nbsp; 就是一个内网主机对应一个公有IP。这种类型的NAT对于节省IP地址没什么意义。 &nbsp; &nbsp; (2) 一对多NAT&nbsp; &nbsp; &nbsp; 内网的多个主机都映射到同一个公有IP地址上。但是这里就有前文提到的那个面试问题：当内网有多台主机都请求同一服务器时，如果仅仅是替换地址，从返回信息是无法确认该将响应转发到哪一台主机的。此时还需要NAT根据传输层信息或者上层协议区分不同的会话，把不同的会话映射到公网IP不同的传输层端口上(NAPT)。 &nbsp; &nbsp; 按照端口映射的方式分类，1对多的NAT又可以细分为4种： &nbsp; &nbsp; (1) 全锥型NAT： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向svr1发起请求，内网地址在NAT网关被映射为公网地址和端口：192.169.0.1:8080，在全锥形模式下，一旦连接成功后，外网所有主机发送到192.169.0.1:8080的数据，都将被NAT网关转发到内网192.168.0.1：80设备上。 &nbsp; &nbsp; (2) 限制锥型NAT: &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1：80成功连接了svr1，内网设备的地址和端口在NAT网关被映射为192.169.0.1：8080，在限制锥形模式下，只有内网设备向svr1发送过数据，之后从svr1的任意端口发送到192.169.0.1：8080的数据，都会被网关转发给内网设备192.168.0.1：80，但是外网其他设备（图中的svr2）发送到192.169.0.1：8080的数据将不会被转发。 &nbsp; &nbsp; (3) 端口限制锥形NAT： &nbsp; &nbsp; 与限制锥形NAT相比，端口限制锥形NAT更加严格： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向外网svr1的80端口建立连接并发送数据，其内网地址和端口在NAT网关被映射为192.169.0.1：8080，在端口限制锥形模式下，只有svr1的80端口发送到网关192.169.0.1：8080的数据才会被转发到内网设备192.168.0.1：80，svr1的其他端口或者外网其他主机发送到192.168.0.1：8080的数据均不会抓发到内网设备。 &nbsp; &nbsp; 现在回头在来看看那到面试题目：两台手机连到同一WIFI，为什么外网服务器的响应可以转发到正确的手机上来不会混乱。明白了前面描述的NAT端口映射的原理，这个问题就比较容易理解：在NAT网关，将不同设备的服务请求用NAT映射到不同端口号上就可以实现： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 因为仅仅替换IP地址无法区分出内网设备，所以需要通过端口映射将不同内网设备的请求映射到不同端口上，这样当来自同一个往外服务器的响应数据到来时，NAT网关才能够把响应转发到内网的设备上。 2.2 NAT穿透 &nbsp; &nbsp; 前文提到过，使用NAT的缺陷之一就是只能由内网主机发起连接，外网主机无法主动连接到内网。这就意味着外部节点无法和内网主机进行P2P通信，就像第一节中提到的那个场景：因为两个人在不同的局域网中，相互不知道对方的公网地址和端口，所以无法直接建立起点对点连接。解决这个问题的办法就是NAT穿透技术。下面简单介绍几种常见的NAT穿越技术。 2.2.1 STUN &nbsp; &nbsp; STUN全称为Simple Tranversal of UDP through NAT。其穿透原理参考下图： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设两个不同网络中的设备A和B想穿透NAT进行点对点通信，通过STUN进行NAT穿透的过程如上图，其中STUN SERVER是部署在公网中的STUN服务器。 &nbsp; &nbsp; (1) CLIENT A通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (2) STUN SERVER响应，并将CLIENT A经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (3) CLIENT B通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (4)&nbsp;STUN SERVER响应，并将CLIENT B经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (5) 此时CLIENT A已经知道了自己映射后对应的公网IP地址和端口号，它把这些信息打包在请求中发送给STUN SERVER，请求和B进行通信； &nbsp; &nbsp; (6) STUN SERVER查询到B注册的公网地址和端口，然后将请求通过NAT网关转发给B； &nbsp; &nbsp; (7) B从消息中知道A的公网地址和端口，于是通过此地址和端口，向A发送消息，消息中包含B映射后的公网地址和端口号，A收到消息后就知道了B的公网地址及端口，这样在A和B之间建立起了通信通道。 2.2.2 TURN &nbsp; &nbsp; STUN穿透技术的缺点在于无法穿透对称型NAT，这可以通过TURN技术进行改进。TURN的工作过程和STUN非常相似，区别在于在TURN中，公网地址和端口不由NAT网关分配，而是由TURN服务器分配。 &nbsp; &nbsp; TURN可以解决STUN无法穿透对称NAT的问题，但是由于所有的请求都需要经过TURN服务器，所以网络延迟和丢包的可能性较大，实际当中通常将STUN和TURN混合使用。 2.2.3 UPNP &nbsp; &nbsp; UPNP意为通用即插即用协议，是由微软提出的一种NAT穿透技术。使用UPNP需要内网主机、网关和应用程序都支持UPNP技术。 &nbsp; &nbsp; UPNP通过网关映射请求可以动态的为客户分配映射表项，而NAT网关只需要执行地址和端口的转换。UPNP客户端发送到公网侧的信令或者控制消息中，会包含映射之后公网IP和端口，接收端根据这些信息就可以建立起P2P连接。 &nbsp; &nbsp; UPNP穿透的过程大致如下： &nbsp; &nbsp; (1) 发送查找消息： &nbsp; &nbsp; 一个设备添加到网络以后，会多播大量发现消息来通知其嵌入式设备和服务，所有的控制点都可以监听多播地址以接收通知，标准的多播地址是239.255.255.250：1900。可以通过发送http请求查询局域网中upnp设备，消息形式如下： &nbsp; &nbsp; M-SEARCH * HTTP/1.1 \r\n &nbsp; &nbsp; HOST 239.255.255.250:1900 \r\n &nbsp; &nbsp; ST:UPnP rootdevice \r\n &nbsp; &nbsp; MAN:\&quot;ssdp:discover\&quot; \r\n &nbsp; &nbsp; MX:\r\n\r\n &nbsp; &nbsp; (2) 获得根设备描述url &nbsp; &nbsp; 如果网络中存在upnp设备，此设备会向发送了查找请求的多播通道的源IP地址和端口发送响应消息，其形式如下： &nbsp; &nbsp; HTTP/1.1 200 OK &nbsp; &nbsp; CACHE_CONTROL: max-age=100 &nbsp; &nbsp; DATE: XXXX &nbsp; &nbsp; LOCATION:http://192.168.1.1:1900/igd.xml &nbsp; &nbsp; SERVER: TP-LINK Wireness Router UPnP1.0 &nbsp; &nbsp; ST: upnp:rootdevice &nbsp; 首先通过200 OK确定成功的找到了设备。然后要从响应中找到根设备的描述URL（例如上面响应报文中的http://192.168.1.1:1900/igd.xml），通过此URL就可以找到根设备的描述信息，从根设备的描述信息中又可以得到设备的控制URL，通过控制URL就可以控制UPNP的行为。上面这个响应中表示我们在局域网中成功的找到了一台支持UPNP的无线路由器设备。 &nbsp; &nbsp; (3) 通过（2）中找到的设备描述URL的地址得到设备描述URL得到XML文档。发送HTTP请求消息： &nbsp; &nbsp; GET /igd.xml HTTP/1.1 &nbsp; &nbsp; HOST:192.168.1.1:1900 &nbsp; &nbsp; Connection: Close &nbsp; &nbsp; 然后就能得到一个设备描述文档，从中可以找到服务和UPNP控制URL。每一种设备都有对应的serviceURL和controlURL。其中和端口映射有关的服务时WANIPConnection和WANPPPConnection。 &nbsp; &nbsp; (4) 进行端口映射 &nbsp; &nbsp; 拿到设备的控制URL以后就可以发送控制信息了。每一种控制都是根据HTTP请求来发送的，请求形式如下： &nbsp; &nbsp; POST path HTTP/1.1 &nbsp; &nbsp; HOST: host:port &nbsp; &nbsp; SOAPACTION:serviceType#actionName &nbsp; &nbsp; CONTENT-TYPE: text/xml &nbsp; &nbsp; CONTENT-LENGTH: XXX &nbsp; &nbsp; .... &nbsp; &nbsp; 其中path表示控制url，host:port就是目的主机地址，actionName就是控制upnp设备执行响应的指令。UPNP支持的指令如下： actionName 描述 GetStatusInfo 查看UPNP设备状态 AddPortMapping 添加一个端口映射 DeletePortMapping 删除一个端口映射 GetExternalIPAddress 查看映射的外网地址 GetConnectionTypeInfo 查看连接状态 GetSpecificPortMappingEntry 查询指定的端口映射 GetGenericPortMappingEntry 查询端口映射表 &nbsp;&nbsp;&nbsp; 通常我们需要用到的是AddPortMapping进行端口映射，以及GetExternalIPAddress获取到映射的公网地址。 &nbsp; &nbsp; UPNP完整的协议栈比较复杂，有兴趣的读者可以自行查找资料做更加深入的学习。 3 UPNP在比特币P2P网络中的应用 &nbsp; &nbsp; 区块链是建立在P2P网络基础上的。在比特币系统中，穿透NAT建立节点之间点对点的P2P网络，采用的就是上一节所说的UPNP技术。比特币使用了开源的miniupnp，基本上就是调用miniupnp封装好的接口，实现比较简单，我们来看看源代码： &nbsp; &nbsp; 在前一篇文章比特币源码分析--P2P网络初始化中介绍中知道，比特币系统的初始化大部分都是在init.cpp中的AppInitMain中进行的，我们当时略过了端口映射的部分，在这里补上： // Map ports with UPnP if (gArgs.GetBoolArg(&quot;-upnp&quot;, DEFAULT_UPNP)) { StartMapPort(); } &nbsp; &nbsp; 从代码中可以看到，如果在启动bitcoind时开启了upnp选项，将会进行端口映射，如果想将自己的节点加入到比特币p2p网络中，让其他网络中的节点访问，可以开启此选项进行端口映射，然后把映射后的公网ip地址广播给网络中的其他节点。 &nbsp; &nbsp; StartMapPort()中开启了一个线程进行端口映射，线程函数为net.cpp中的ThreadMapPort： #ifdef USE_UPNP static CThreadInterrupt g_upnp_interrupt; static std::thread g_upnp_thread; static void ThreadMapPort() { std::string port = strprintf(&quot;%u&quot;, GetListenPort()); const char * multicastif = nullptr; const char * minissdpdpath = nullptr; struct UPNPDev * devlist = nullptr; char lanaddr[64]; #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0); #elif MINIUPNPC_API_VERSION &lt; 14 /* miniupnpc 1.6 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, &amp;error); #else /* miniupnpc 1.9.20150730 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, 2, &amp;error); #endif struct UPNPUrls urls; struct IGDdatas data; int r; r = UPNP_GetValidIGD(devlist, &amp;urls, &amp;data, lanaddr, sizeof(lanaddr)); if (r == 1) { if (fDiscover) { char externalIPAddress[40]; r = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, externalIPAddress); if(r != UPNPCOMMAND_SUCCESS) LogPrintf(&quot;UPnP: GetExternalIPAddress() returned %d\n&quot;, r); else { if(externalIPAddress[0]) { CNetAddr resolved; if(LookupHost(externalIPAddress, resolved, false)) { LogPrintf(&quot;UPnP: ExternalIPAddress = %s\n&quot;, resolved.ToString().c_str()); AddLocal(resolved, LOCAL_UPNP); } } else LogPrintf(&quot;UPnP: GetExternalIPAddress failed.\n&quot;); } } std::string strDesc = &quot;Bitcoin &quot; + FormatFullVersion(); do { #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0); #else /* miniupnpc 1.6 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0, &quot;0&quot;); #endif if(r!=UPNPCOMMAND_SUCCESS) LogPrintf(&quot;AddPortMapping(%s, %s, %s) failed with code %d (%s)\n&quot;, port, port, lanaddr, r, strupnperror(r)); else LogPrintf(&quot;UPnP Port Mapping successful.\n&quot;); } while(g_upnp_interrupt.sleep_for(std::chrono::minutes(20))); r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), &quot;TCP&quot;, 0); LogPrintf(&quot;UPNP_DeletePortMapping() returned: %d\n&quot;, r); freeUPNPDevlist(devlist); devlist = nullptr; FreeUPNPUrls(&amp;urls); } else { LogPrintf(&quot;No valid UPnP IGDs found\n&quot;); freeUPNPDevlist(devlist); devlist = nullptr; if (r != 0) FreeUPNPUrls(&amp;urls); } } &nbsp; &nbsp; (1) 首先第一行拿到比特币系统所使用的端口号，默认为8333，之后将要映射此端口到公网ip上； &nbsp; &nbsp; (2) 调用upnpDiscover查找当前局域网中的所有upnp设备； &nbsp; &nbsp; (3) 调用UPNP_GetValidIGD，从（2）中找到的upnp设备列表中找到有效的IGD设备； &nbsp; &nbsp; (4) 如果UPNP_GetValidIGD返回1，表示有一个连接，此时调用UPNP_GetExternalIPAddress获取公网地址，然后对此公网地址进行DNS查询，将解析到的地址记录到内存中，这些公网地址之后将会被广播给P2P网络中的其他节点，一传十，十传百。 &nbsp; &nbsp; (5) 通过UPNP_AddPortMapping进行端口映射，假设内网获取的有效IGD设备的IP地址为192.168.0.1，网关出口的外网地址为192.169.1.1，采用比特币的默认端口8333，则端口映射后就是将内网中192.168.0.1：8333映射到网关出口的公有IP地址和端口：192.169.1.1:8333，之后外部节点通过此公网IP和端口，就可以与内网节点进行通信了。 4 小结 &nbsp; &nbsp; 这篇文章主要介绍了NAT以及常见的NAT穿透技术。因为建立P2P通信很重要的一步就是穿透NAT以建立起节点之间的通信通道。常见的NAT穿透技术有STUN，TURN以及UPNP，而比特币P2P组网采用的正是UPNP技术，具体实现时比特币采用了开源的miniupnp。 &nbsp; &nbsp; 最后回想一下文章开头描述的那个场景：如何让位于家中的同事和你自己的服务器建立起点对点的连接进行调试呢？本文看过了比特币的实现后，您可能已经在琢磨着如何像比特币那样，用minipunp实现一个自己的小p2p系统了。 &nbsp; &nbsp; --本文为原创作品，转载请注明出处。 &nbsp; &nbsp; 参考文章： &nbsp;&nbsp;&nbsp;&nbsp;https://blog.csdn.net/lixin88/article/details/60571846 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; 阅读更多" />
+<meta property="og:description" content="&nbsp; &nbsp; 上一篇文章分析了比特币P2P网络中，一个节点是如何发现并连接到相邻节点的。在P2P网络中，一个节点既是客户又是服务器，它还要接受其他节点的连接，为网络中其他节点提供服务。这篇文章着重分析一下比特币P2P网络中是如何通过upnp来实现端口映射的。 1 从腾讯的一道面试题说起 &nbsp; &nbsp; 笔者所在团队的总监在面试的时候必然要问面试者这样一个问题： &nbsp; &nbsp; 有两台手机同时连到了一个WIFI上，然后它们都访问了外网中某个服务器，那么网络是如何做到区分出这两台设备，把服务器的应答数据分发到合适的手机上呢？ &nbsp; &nbsp; 如果在毫无准备的情况下来回答这个问题，自己还真是答不出来。 &nbsp; &nbsp; 再想象一个场景：假设我们自己写了个小的服务器程序，然后在家里的电脑上运行，此时你想让另一个同事连接你的服务器，来验证你的服务器程序是不是能正确运行，但是明显你的网络和同事家的网络是两个不同的局域网，所以除非你去同事家或者让同事提上电脑到你家，否则无法连通。那么有什么办法做到让同事在自己家里就能点对点连上你的服务来调试么？ 2 NAT和NAT穿透 &nbsp; &nbsp; 上一节提到的两个问题，实际上都和NAT有关。要弄清楚上一节的问题，需要先了解NAT，所以这里先来补点网络课，了解一下NAT以及NAT穿透。 2.1 NAT 2.1.1 NAT是什么 &nbsp; &nbsp; NAT是个什么鬼？它的全称是Network Address Translation，翻译过来就是网络地址转换。好事的人立马就得问了：好端端的为啥要地址转换，直接用IP地址不就行了么？ &nbsp; &nbsp; 在TCP/IP协议创建的时候，他的创始人（Robert E.Kahn和Vinton G.Cerf）可能都没有预料到互联网的膨胀速度会如此之快，快到短短二三十年的时间，IPV4的地址就有要枯竭之势。随着越来越多的设备加入到互联网中，IPV4地址不够用的问题成了燃眉之急。 &nbsp; &nbsp; 解决IP地址不够用的一个办法是大家已经非常熟悉的IPV6，但是这么多年过去了，IPV6似乎还是不温不火，始终普及不起来。于是就有了NAT的解决方案，可以说正是NAT把IPV4从死亡边缘拉了回来，NAT到底是用了什么方法立下如此奇功，本节我们来简单的了解一下。 &nbsp; &nbsp; 平时我们无论是在家里，还是在公司，其实都是在一个私有的局域网，此时电脑上分配到的IP地址是私有IP地址。RFC1918规范里规定了3个保留地址段：10.0.0.0-10.255.255.255，172.16.0.0-172.31.255.255，192.168.0.0-192.168.255.255，这三个范围分别处于A、B、C类的地址段，专门用于组织或者企业内部使用，不需要进行申请。和公有IP地址相比，这些私有IP地址只在企业内部使用，不能作为全球路由地址，出了企业或组织的管理范围，这类私有地址就不在有任何意义。注意：任何一个组织都可以在内部使用这些私有地址，因此两个不同网络中存在相同IP地址的情况是很可能出现的，但是同一个网络中不允许两台主机拥有相同IP地址，否则将发生地址冲突。 &nbsp; &nbsp; 当私有网络中的主机想请求公网中服务器的服务时，需要在网络出口处部署NAT网关。NAT的作用就是在报文离开私网进入Internet的时候，把报文中的源IP地址替换为公网地址，然后等服务端的响应报文到达网关时，NAT再把目的地址替换为私网中主机的IP地址。 &nbsp; &nbsp; 听上去似乎很简单，NAT不就是替换了一下IP地址么，也没干什么，但是这里需要注意两点： &nbsp; &nbsp; (1) 有了NAT以后，内网的主机不在需要申请公网IP地址，只需要将内网主机地址和端口通过NAT映射到网络出口的公网IP即可，然后通信的两端在无感知的情况下进行通信。这也是为什么前文说NAT挽救了IPV4，因为大量的内网主机有了NAT，只需要很少的公网地址做映射就可以了，如此就可以节约出很多的IPV4地址空间。 &nbsp; &nbsp; (2) 当在私网网络出口处部署了NAT网关以后，只能由内网主机发起到外网主机的连接，外网主机无法主动发起连接到内网。这样虽然对外隔离了内网主机，但同时又限制了P2P的通信，这也是NAT带来的一大弊端，下一节介绍NAT穿透技术时会看到针对这一问题有哪些解决手段。 2.1.2 NAT的分类 &nbsp; &nbsp; (1) 一对一NAT &nbsp; &nbsp; 就是一个内网主机对应一个公有IP。这种类型的NAT对于节省IP地址没什么意义。 &nbsp; &nbsp; (2) 一对多NAT&nbsp; &nbsp; &nbsp; 内网的多个主机都映射到同一个公有IP地址上。但是这里就有前文提到的那个面试问题：当内网有多台主机都请求同一服务器时，如果仅仅是替换地址，从返回信息是无法确认该将响应转发到哪一台主机的。此时还需要NAT根据传输层信息或者上层协议区分不同的会话，把不同的会话映射到公网IP不同的传输层端口上(NAPT)。 &nbsp; &nbsp; 按照端口映射的方式分类，1对多的NAT又可以细分为4种： &nbsp; &nbsp; (1) 全锥型NAT： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向svr1发起请求，内网地址在NAT网关被映射为公网地址和端口：192.169.0.1:8080，在全锥形模式下，一旦连接成功后，外网所有主机发送到192.169.0.1:8080的数据，都将被NAT网关转发到内网192.168.0.1：80设备上。 &nbsp; &nbsp; (2) 限制锥型NAT: &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1：80成功连接了svr1，内网设备的地址和端口在NAT网关被映射为192.169.0.1：8080，在限制锥形模式下，只有内网设备向svr1发送过数据，之后从svr1的任意端口发送到192.169.0.1：8080的数据，都会被网关转发给内网设备192.168.0.1：80，但是外网其他设备（图中的svr2）发送到192.169.0.1：8080的数据将不会被转发。 &nbsp; &nbsp; (3) 端口限制锥形NAT： &nbsp; &nbsp; 与限制锥形NAT相比，端口限制锥形NAT更加严格： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向外网svr1的80端口建立连接并发送数据，其内网地址和端口在NAT网关被映射为192.169.0.1：8080，在端口限制锥形模式下，只有svr1的80端口发送到网关192.169.0.1：8080的数据才会被转发到内网设备192.168.0.1：80，svr1的其他端口或者外网其他主机发送到192.168.0.1：8080的数据均不会抓发到内网设备。 &nbsp; &nbsp; 现在回头在来看看那到面试题目：两台手机连到同一WIFI，为什么外网服务器的响应可以转发到正确的手机上来不会混乱。明白了前面描述的NAT端口映射的原理，这个问题就比较容易理解：在NAT网关，将不同设备的服务请求用NAT映射到不同端口号上就可以实现： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 因为仅仅替换IP地址无法区分出内网设备，所以需要通过端口映射将不同内网设备的请求映射到不同端口上，这样当来自同一个往外服务器的响应数据到来时，NAT网关才能够把响应转发到内网的设备上。 2.2 NAT穿透 &nbsp; &nbsp; 前文提到过，使用NAT的缺陷之一就是只能由内网主机发起连接，外网主机无法主动连接到内网。这就意味着外部节点无法和内网主机进行P2P通信，就像第一节中提到的那个场景：因为两个人在不同的局域网中，相互不知道对方的公网地址和端口，所以无法直接建立起点对点连接。解决这个问题的办法就是NAT穿透技术。下面简单介绍几种常见的NAT穿越技术。 2.2.1 STUN &nbsp; &nbsp; STUN全称为Simple Tranversal of UDP through NAT。其穿透原理参考下图： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设两个不同网络中的设备A和B想穿透NAT进行点对点通信，通过STUN进行NAT穿透的过程如上图，其中STUN SERVER是部署在公网中的STUN服务器。 &nbsp; &nbsp; (1) CLIENT A通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (2) STUN SERVER响应，并将CLIENT A经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (3) CLIENT B通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (4)&nbsp;STUN SERVER响应，并将CLIENT B经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (5) 此时CLIENT A已经知道了自己映射后对应的公网IP地址和端口号，它把这些信息打包在请求中发送给STUN SERVER，请求和B进行通信； &nbsp; &nbsp; (6) STUN SERVER查询到B注册的公网地址和端口，然后将请求通过NAT网关转发给B； &nbsp; &nbsp; (7) B从消息中知道A的公网地址和端口，于是通过此地址和端口，向A发送消息，消息中包含B映射后的公网地址和端口号，A收到消息后就知道了B的公网地址及端口，这样在A和B之间建立起了通信通道。 2.2.2 TURN &nbsp; &nbsp; STUN穿透技术的缺点在于无法穿透对称型NAT，这可以通过TURN技术进行改进。TURN的工作过程和STUN非常相似，区别在于在TURN中，公网地址和端口不由NAT网关分配，而是由TURN服务器分配。 &nbsp; &nbsp; TURN可以解决STUN无法穿透对称NAT的问题，但是由于所有的请求都需要经过TURN服务器，所以网络延迟和丢包的可能性较大，实际当中通常将STUN和TURN混合使用。 2.2.3 UPNP &nbsp; &nbsp; UPNP意为通用即插即用协议，是由微软提出的一种NAT穿透技术。使用UPNP需要内网主机、网关和应用程序都支持UPNP技术。 &nbsp; &nbsp; UPNP通过网关映射请求可以动态的为客户分配映射表项，而NAT网关只需要执行地址和端口的转换。UPNP客户端发送到公网侧的信令或者控制消息中，会包含映射之后公网IP和端口，接收端根据这些信息就可以建立起P2P连接。 &nbsp; &nbsp; UPNP穿透的过程大致如下： &nbsp; &nbsp; (1) 发送查找消息： &nbsp; &nbsp; 一个设备添加到网络以后，会多播大量发现消息来通知其嵌入式设备和服务，所有的控制点都可以监听多播地址以接收通知，标准的多播地址是239.255.255.250：1900。可以通过发送http请求查询局域网中upnp设备，消息形式如下： &nbsp; &nbsp; M-SEARCH * HTTP/1.1 \r\n &nbsp; &nbsp; HOST 239.255.255.250:1900 \r\n &nbsp; &nbsp; ST:UPnP rootdevice \r\n &nbsp; &nbsp; MAN:\&quot;ssdp:discover\&quot; \r\n &nbsp; &nbsp; MX:\r\n\r\n &nbsp; &nbsp; (2) 获得根设备描述url &nbsp; &nbsp; 如果网络中存在upnp设备，此设备会向发送了查找请求的多播通道的源IP地址和端口发送响应消息，其形式如下： &nbsp; &nbsp; HTTP/1.1 200 OK &nbsp; &nbsp; CACHE_CONTROL: max-age=100 &nbsp; &nbsp; DATE: XXXX &nbsp; &nbsp; LOCATION:http://192.168.1.1:1900/igd.xml &nbsp; &nbsp; SERVER: TP-LINK Wireness Router UPnP1.0 &nbsp; &nbsp; ST: upnp:rootdevice &nbsp; 首先通过200 OK确定成功的找到了设备。然后要从响应中找到根设备的描述URL（例如上面响应报文中的http://192.168.1.1:1900/igd.xml），通过此URL就可以找到根设备的描述信息，从根设备的描述信息中又可以得到设备的控制URL，通过控制URL就可以控制UPNP的行为。上面这个响应中表示我们在局域网中成功的找到了一台支持UPNP的无线路由器设备。 &nbsp; &nbsp; (3) 通过（2）中找到的设备描述URL的地址得到设备描述URL得到XML文档。发送HTTP请求消息： &nbsp; &nbsp; GET /igd.xml HTTP/1.1 &nbsp; &nbsp; HOST:192.168.1.1:1900 &nbsp; &nbsp; Connection: Close &nbsp; &nbsp; 然后就能得到一个设备描述文档，从中可以找到服务和UPNP控制URL。每一种设备都有对应的serviceURL和controlURL。其中和端口映射有关的服务时WANIPConnection和WANPPPConnection。 &nbsp; &nbsp; (4) 进行端口映射 &nbsp; &nbsp; 拿到设备的控制URL以后就可以发送控制信息了。每一种控制都是根据HTTP请求来发送的，请求形式如下： &nbsp; &nbsp; POST path HTTP/1.1 &nbsp; &nbsp; HOST: host:port &nbsp; &nbsp; SOAPACTION:serviceType#actionName &nbsp; &nbsp; CONTENT-TYPE: text/xml &nbsp; &nbsp; CONTENT-LENGTH: XXX &nbsp; &nbsp; .... &nbsp; &nbsp; 其中path表示控制url，host:port就是目的主机地址，actionName就是控制upnp设备执行响应的指令。UPNP支持的指令如下： actionName 描述 GetStatusInfo 查看UPNP设备状态 AddPortMapping 添加一个端口映射 DeletePortMapping 删除一个端口映射 GetExternalIPAddress 查看映射的外网地址 GetConnectionTypeInfo 查看连接状态 GetSpecificPortMappingEntry 查询指定的端口映射 GetGenericPortMappingEntry 查询端口映射表 &nbsp;&nbsp;&nbsp; 通常我们需要用到的是AddPortMapping进行端口映射，以及GetExternalIPAddress获取到映射的公网地址。 &nbsp; &nbsp; UPNP完整的协议栈比较复杂，有兴趣的读者可以自行查找资料做更加深入的学习。 3 UPNP在比特币P2P网络中的应用 &nbsp; &nbsp; 区块链是建立在P2P网络基础上的。在比特币系统中，穿透NAT建立节点之间点对点的P2P网络，采用的就是上一节所说的UPNP技术。比特币使用了开源的miniupnp，基本上就是调用miniupnp封装好的接口，实现比较简单，我们来看看源代码： &nbsp; &nbsp; 在前一篇文章比特币源码分析--P2P网络初始化中介绍中知道，比特币系统的初始化大部分都是在init.cpp中的AppInitMain中进行的，我们当时略过了端口映射的部分，在这里补上： // Map ports with UPnP if (gArgs.GetBoolArg(&quot;-upnp&quot;, DEFAULT_UPNP)) { StartMapPort(); } &nbsp; &nbsp; 从代码中可以看到，如果在启动bitcoind时开启了upnp选项，将会进行端口映射，如果想将自己的节点加入到比特币p2p网络中，让其他网络中的节点访问，可以开启此选项进行端口映射，然后把映射后的公网ip地址广播给网络中的其他节点。 &nbsp; &nbsp; StartMapPort()中开启了一个线程进行端口映射，线程函数为net.cpp中的ThreadMapPort： #ifdef USE_UPNP static CThreadInterrupt g_upnp_interrupt; static std::thread g_upnp_thread; static void ThreadMapPort() { std::string port = strprintf(&quot;%u&quot;, GetListenPort()); const char * multicastif = nullptr; const char * minissdpdpath = nullptr; struct UPNPDev * devlist = nullptr; char lanaddr[64]; #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0); #elif MINIUPNPC_API_VERSION &lt; 14 /* miniupnpc 1.6 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, &amp;error); #else /* miniupnpc 1.9.20150730 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, 2, &amp;error); #endif struct UPNPUrls urls; struct IGDdatas data; int r; r = UPNP_GetValidIGD(devlist, &amp;urls, &amp;data, lanaddr, sizeof(lanaddr)); if (r == 1) { if (fDiscover) { char externalIPAddress[40]; r = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, externalIPAddress); if(r != UPNPCOMMAND_SUCCESS) LogPrintf(&quot;UPnP: GetExternalIPAddress() returned %d\n&quot;, r); else { if(externalIPAddress[0]) { CNetAddr resolved; if(LookupHost(externalIPAddress, resolved, false)) { LogPrintf(&quot;UPnP: ExternalIPAddress = %s\n&quot;, resolved.ToString().c_str()); AddLocal(resolved, LOCAL_UPNP); } } else LogPrintf(&quot;UPnP: GetExternalIPAddress failed.\n&quot;); } } std::string strDesc = &quot;Bitcoin &quot; + FormatFullVersion(); do { #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0); #else /* miniupnpc 1.6 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0, &quot;0&quot;); #endif if(r!=UPNPCOMMAND_SUCCESS) LogPrintf(&quot;AddPortMapping(%s, %s, %s) failed with code %d (%s)\n&quot;, port, port, lanaddr, r, strupnperror(r)); else LogPrintf(&quot;UPnP Port Mapping successful.\n&quot;); } while(g_upnp_interrupt.sleep_for(std::chrono::minutes(20))); r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), &quot;TCP&quot;, 0); LogPrintf(&quot;UPNP_DeletePortMapping() returned: %d\n&quot;, r); freeUPNPDevlist(devlist); devlist = nullptr; FreeUPNPUrls(&amp;urls); } else { LogPrintf(&quot;No valid UPnP IGDs found\n&quot;); freeUPNPDevlist(devlist); devlist = nullptr; if (r != 0) FreeUPNPUrls(&amp;urls); } } &nbsp; &nbsp; (1) 首先第一行拿到比特币系统所使用的端口号，默认为8333，之后将要映射此端口到公网ip上； &nbsp; &nbsp; (2) 调用upnpDiscover查找当前局域网中的所有upnp设备； &nbsp; &nbsp; (3) 调用UPNP_GetValidIGD，从（2）中找到的upnp设备列表中找到有效的IGD设备； &nbsp; &nbsp; (4) 如果UPNP_GetValidIGD返回1，表示有一个连接，此时调用UPNP_GetExternalIPAddress获取公网地址，然后对此公网地址进行DNS查询，将解析到的地址记录到内存中，这些公网地址之后将会被广播给P2P网络中的其他节点，一传十，十传百。 &nbsp; &nbsp; (5) 通过UPNP_AddPortMapping进行端口映射，假设内网获取的有效IGD设备的IP地址为192.168.0.1，网关出口的外网地址为192.169.1.1，采用比特币的默认端口8333，则端口映射后就是将内网中192.168.0.1：8333映射到网关出口的公有IP地址和端口：192.169.1.1:8333，之后外部节点通过此公网IP和端口，就可以与内网节点进行通信了。 4 小结 &nbsp; &nbsp; 这篇文章主要介绍了NAT以及常见的NAT穿透技术。因为建立P2P通信很重要的一步就是穿透NAT以建立起节点之间的通信通道。常见的NAT穿透技术有STUN，TURN以及UPNP，而比特币P2P组网采用的正是UPNP技术，具体实现时比特币采用了开源的miniupnp。 &nbsp; &nbsp; 最后回想一下文章开头描述的那个场景：如何让位于家中的同事和你自己的服务器建立起点对点的连接进行调试呢？本文看过了比特币的实现后，您可能已经在琢磨着如何像比特币那样，用minipunp实现一个自己的小p2p系统了。 &nbsp; &nbsp; --本文为原创作品，转载请注明出处。 &nbsp; &nbsp; 参考文章： &nbsp;&nbsp;&nbsp;&nbsp;https://blog.csdn.net/lixin88/article/details/60571846 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/21/4e2ae23ecbf145c52006bb7da04ac534.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/21/4e2ae23ecbf145c52006bb7da04ac534.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-21T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"&nbsp; &nbsp; 上一篇文章分析了比特币P2P网络中，一个节点是如何发现并连接到相邻节点的。在P2P网络中，一个节点既是客户又是服务器，它还要接受其他节点的连接，为网络中其他节点提供服务。这篇文章着重分析一下比特币P2P网络中是如何通过upnp来实现端口映射的。 1 从腾讯的一道面试题说起 &nbsp; &nbsp; 笔者所在团队的总监在面试的时候必然要问面试者这样一个问题： &nbsp; &nbsp; 有两台手机同时连到了一个WIFI上，然后它们都访问了外网中某个服务器，那么网络是如何做到区分出这两台设备，把服务器的应答数据分发到合适的手机上呢？ &nbsp; &nbsp; 如果在毫无准备的情况下来回答这个问题，自己还真是答不出来。 &nbsp; &nbsp; 再想象一个场景：假设我们自己写了个小的服务器程序，然后在家里的电脑上运行，此时你想让另一个同事连接你的服务器，来验证你的服务器程序是不是能正确运行，但是明显你的网络和同事家的网络是两个不同的局域网，所以除非你去同事家或者让同事提上电脑到你家，否则无法连通。那么有什么办法做到让同事在自己家里就能点对点连上你的服务来调试么？ 2 NAT和NAT穿透 &nbsp; &nbsp; 上一节提到的两个问题，实际上都和NAT有关。要弄清楚上一节的问题，需要先了解NAT，所以这里先来补点网络课，了解一下NAT以及NAT穿透。 2.1 NAT 2.1.1 NAT是什么 &nbsp; &nbsp; NAT是个什么鬼？它的全称是Network Address Translation，翻译过来就是网络地址转换。好事的人立马就得问了：好端端的为啥要地址转换，直接用IP地址不就行了么？ &nbsp; &nbsp; 在TCP/IP协议创建的时候，他的创始人（Robert E.Kahn和Vinton G.Cerf）可能都没有预料到互联网的膨胀速度会如此之快，快到短短二三十年的时间，IPV4的地址就有要枯竭之势。随着越来越多的设备加入到互联网中，IPV4地址不够用的问题成了燃眉之急。 &nbsp; &nbsp; 解决IP地址不够用的一个办法是大家已经非常熟悉的IPV6，但是这么多年过去了，IPV6似乎还是不温不火，始终普及不起来。于是就有了NAT的解决方案，可以说正是NAT把IPV4从死亡边缘拉了回来，NAT到底是用了什么方法立下如此奇功，本节我们来简单的了解一下。 &nbsp; &nbsp; 平时我们无论是在家里，还是在公司，其实都是在一个私有的局域网，此时电脑上分配到的IP地址是私有IP地址。RFC1918规范里规定了3个保留地址段：10.0.0.0-10.255.255.255，172.16.0.0-172.31.255.255，192.168.0.0-192.168.255.255，这三个范围分别处于A、B、C类的地址段，专门用于组织或者企业内部使用，不需要进行申请。和公有IP地址相比，这些私有IP地址只在企业内部使用，不能作为全球路由地址，出了企业或组织的管理范围，这类私有地址就不在有任何意义。注意：任何一个组织都可以在内部使用这些私有地址，因此两个不同网络中存在相同IP地址的情况是很可能出现的，但是同一个网络中不允许两台主机拥有相同IP地址，否则将发生地址冲突。 &nbsp; &nbsp; 当私有网络中的主机想请求公网中服务器的服务时，需要在网络出口处部署NAT网关。NAT的作用就是在报文离开私网进入Internet的时候，把报文中的源IP地址替换为公网地址，然后等服务端的响应报文到达网关时，NAT再把目的地址替换为私网中主机的IP地址。 &nbsp; &nbsp; 听上去似乎很简单，NAT不就是替换了一下IP地址么，也没干什么，但是这里需要注意两点： &nbsp; &nbsp; (1) 有了NAT以后，内网的主机不在需要申请公网IP地址，只需要将内网主机地址和端口通过NAT映射到网络出口的公网IP即可，然后通信的两端在无感知的情况下进行通信。这也是为什么前文说NAT挽救了IPV4，因为大量的内网主机有了NAT，只需要很少的公网地址做映射就可以了，如此就可以节约出很多的IPV4地址空间。 &nbsp; &nbsp; (2) 当在私网网络出口处部署了NAT网关以后，只能由内网主机发起到外网主机的连接，外网主机无法主动发起连接到内网。这样虽然对外隔离了内网主机，但同时又限制了P2P的通信，这也是NAT带来的一大弊端，下一节介绍NAT穿透技术时会看到针对这一问题有哪些解决手段。 2.1.2 NAT的分类 &nbsp; &nbsp; (1) 一对一NAT &nbsp; &nbsp; 就是一个内网主机对应一个公有IP。这种类型的NAT对于节省IP地址没什么意义。 &nbsp; &nbsp; (2) 一对多NAT&nbsp; &nbsp; &nbsp; 内网的多个主机都映射到同一个公有IP地址上。但是这里就有前文提到的那个面试问题：当内网有多台主机都请求同一服务器时，如果仅仅是替换地址，从返回信息是无法确认该将响应转发到哪一台主机的。此时还需要NAT根据传输层信息或者上层协议区分不同的会话，把不同的会话映射到公网IP不同的传输层端口上(NAPT)。 &nbsp; &nbsp; 按照端口映射的方式分类，1对多的NAT又可以细分为4种： &nbsp; &nbsp; (1) 全锥型NAT： &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向svr1发起请求，内网地址在NAT网关被映射为公网地址和端口：192.169.0.1:8080，在全锥形模式下，一旦连接成功后，外网所有主机发送到192.169.0.1:8080的数据，都将被NAT网关转发到内网192.168.0.1：80设备上。 &nbsp; &nbsp; (2) 限制锥型NAT: &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1：80成功连接了svr1，内网设备的地址和端口在NAT网关被映射为192.169.0.1：8080，在限制锥形模式下，只有内网设备向svr1发送过数据，之后从svr1的任意端口发送到192.169.0.1：8080的数据，都会被网关转发给内网设备192.168.0.1：80，但是外网其他设备（图中的svr2）发送到192.169.0.1：8080的数据将不会被转发。 &nbsp; &nbsp; (3) 端口限制锥形NAT： &nbsp; &nbsp; 与限制锥形NAT相比，端口限制锥形NAT更加严格： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设内网设备192.168.0.1:80向外网svr1的80端口建立连接并发送数据，其内网地址和端口在NAT网关被映射为192.169.0.1：8080，在端口限制锥形模式下，只有svr1的80端口发送到网关192.169.0.1：8080的数据才会被转发到内网设备192.168.0.1：80，svr1的其他端口或者外网其他主机发送到192.168.0.1：8080的数据均不会抓发到内网设备。 &nbsp; &nbsp; 现在回头在来看看那到面试题目：两台手机连到同一WIFI，为什么外网服务器的响应可以转发到正确的手机上来不会混乱。明白了前面描述的NAT端口映射的原理，这个问题就比较容易理解：在NAT网关，将不同设备的服务请求用NAT映射到不同端口号上就可以实现： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 因为仅仅替换IP地址无法区分出内网设备，所以需要通过端口映射将不同内网设备的请求映射到不同端口上，这样当来自同一个往外服务器的响应数据到来时，NAT网关才能够把响应转发到内网的设备上。 2.2 NAT穿透 &nbsp; &nbsp; 前文提到过，使用NAT的缺陷之一就是只能由内网主机发起连接，外网主机无法主动连接到内网。这就意味着外部节点无法和内网主机进行P2P通信，就像第一节中提到的那个场景：因为两个人在不同的局域网中，相互不知道对方的公网地址和端口，所以无法直接建立起点对点连接。解决这个问题的办法就是NAT穿透技术。下面简单介绍几种常见的NAT穿越技术。 2.2.1 STUN &nbsp; &nbsp; STUN全称为Simple Tranversal of UDP through NAT。其穿透原理参考下图： &nbsp;&nbsp;&nbsp;&nbsp; &nbsp; &nbsp; 假设两个不同网络中的设备A和B想穿透NAT进行点对点通信，通过STUN进行NAT穿透的过程如上图，其中STUN SERVER是部署在公网中的STUN服务器。 &nbsp; &nbsp; (1) CLIENT A通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (2) STUN SERVER响应，并将CLIENT A经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (3) CLIENT B通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址； &nbsp; &nbsp; (4)&nbsp;STUN SERVER响应，并将CLIENT B经过转换后的公网IP地址和端口填在响应报文中； &nbsp; &nbsp; (5) 此时CLIENT A已经知道了自己映射后对应的公网IP地址和端口号，它把这些信息打包在请求中发送给STUN SERVER，请求和B进行通信； &nbsp; &nbsp; (6) STUN SERVER查询到B注册的公网地址和端口，然后将请求通过NAT网关转发给B； &nbsp; &nbsp; (7) B从消息中知道A的公网地址和端口，于是通过此地址和端口，向A发送消息，消息中包含B映射后的公网地址和端口号，A收到消息后就知道了B的公网地址及端口，这样在A和B之间建立起了通信通道。 2.2.2 TURN &nbsp; &nbsp; STUN穿透技术的缺点在于无法穿透对称型NAT，这可以通过TURN技术进行改进。TURN的工作过程和STUN非常相似，区别在于在TURN中，公网地址和端口不由NAT网关分配，而是由TURN服务器分配。 &nbsp; &nbsp; TURN可以解决STUN无法穿透对称NAT的问题，但是由于所有的请求都需要经过TURN服务器，所以网络延迟和丢包的可能性较大，实际当中通常将STUN和TURN混合使用。 2.2.3 UPNP &nbsp; &nbsp; UPNP意为通用即插即用协议，是由微软提出的一种NAT穿透技术。使用UPNP需要内网主机、网关和应用程序都支持UPNP技术。 &nbsp; &nbsp; UPNP通过网关映射请求可以动态的为客户分配映射表项，而NAT网关只需要执行地址和端口的转换。UPNP客户端发送到公网侧的信令或者控制消息中，会包含映射之后公网IP和端口，接收端根据这些信息就可以建立起P2P连接。 &nbsp; &nbsp; UPNP穿透的过程大致如下： &nbsp; &nbsp; (1) 发送查找消息： &nbsp; &nbsp; 一个设备添加到网络以后，会多播大量发现消息来通知其嵌入式设备和服务，所有的控制点都可以监听多播地址以接收通知，标准的多播地址是239.255.255.250：1900。可以通过发送http请求查询局域网中upnp设备，消息形式如下： &nbsp; &nbsp; M-SEARCH * HTTP/1.1 \\r\\n &nbsp; &nbsp; HOST 239.255.255.250:1900 \\r\\n &nbsp; &nbsp; ST:UPnP rootdevice \\r\\n &nbsp; &nbsp; MAN:\\&quot;ssdp:discover\\&quot; \\r\\n &nbsp; &nbsp; MX:\\r\\n\\r\\n &nbsp; &nbsp; (2) 获得根设备描述url &nbsp; &nbsp; 如果网络中存在upnp设备，此设备会向发送了查找请求的多播通道的源IP地址和端口发送响应消息，其形式如下： &nbsp; &nbsp; HTTP/1.1 200 OK &nbsp; &nbsp; CACHE_CONTROL: max-age=100 &nbsp; &nbsp; DATE: XXXX &nbsp; &nbsp; LOCATION:http://192.168.1.1:1900/igd.xml &nbsp; &nbsp; SERVER: TP-LINK Wireness Router UPnP1.0 &nbsp; &nbsp; ST: upnp:rootdevice &nbsp; 首先通过200 OK确定成功的找到了设备。然后要从响应中找到根设备的描述URL（例如上面响应报文中的http://192.168.1.1:1900/igd.xml），通过此URL就可以找到根设备的描述信息，从根设备的描述信息中又可以得到设备的控制URL，通过控制URL就可以控制UPNP的行为。上面这个响应中表示我们在局域网中成功的找到了一台支持UPNP的无线路由器设备。 &nbsp; &nbsp; (3) 通过（2）中找到的设备描述URL的地址得到设备描述URL得到XML文档。发送HTTP请求消息： &nbsp; &nbsp; GET /igd.xml HTTP/1.1 &nbsp; &nbsp; HOST:192.168.1.1:1900 &nbsp; &nbsp; Connection: Close &nbsp; &nbsp; 然后就能得到一个设备描述文档，从中可以找到服务和UPNP控制URL。每一种设备都有对应的serviceURL和controlURL。其中和端口映射有关的服务时WANIPConnection和WANPPPConnection。 &nbsp; &nbsp; (4) 进行端口映射 &nbsp; &nbsp; 拿到设备的控制URL以后就可以发送控制信息了。每一种控制都是根据HTTP请求来发送的，请求形式如下： &nbsp; &nbsp; POST path HTTP/1.1 &nbsp; &nbsp; HOST: host:port &nbsp; &nbsp; SOAPACTION:serviceType#actionName &nbsp; &nbsp; CONTENT-TYPE: text/xml &nbsp; &nbsp; CONTENT-LENGTH: XXX &nbsp; &nbsp; .... &nbsp; &nbsp; 其中path表示控制url，host:port就是目的主机地址，actionName就是控制upnp设备执行响应的指令。UPNP支持的指令如下： actionName 描述 GetStatusInfo 查看UPNP设备状态 AddPortMapping 添加一个端口映射 DeletePortMapping 删除一个端口映射 GetExternalIPAddress 查看映射的外网地址 GetConnectionTypeInfo 查看连接状态 GetSpecificPortMappingEntry 查询指定的端口映射 GetGenericPortMappingEntry 查询端口映射表 &nbsp;&nbsp;&nbsp; 通常我们需要用到的是AddPortMapping进行端口映射，以及GetExternalIPAddress获取到映射的公网地址。 &nbsp; &nbsp; UPNP完整的协议栈比较复杂，有兴趣的读者可以自行查找资料做更加深入的学习。 3 UPNP在比特币P2P网络中的应用 &nbsp; &nbsp; 区块链是建立在P2P网络基础上的。在比特币系统中，穿透NAT建立节点之间点对点的P2P网络，采用的就是上一节所说的UPNP技术。比特币使用了开源的miniupnp，基本上就是调用miniupnp封装好的接口，实现比较简单，我们来看看源代码： &nbsp; &nbsp; 在前一篇文章比特币源码分析--P2P网络初始化中介绍中知道，比特币系统的初始化大部分都是在init.cpp中的AppInitMain中进行的，我们当时略过了端口映射的部分，在这里补上： // Map ports with UPnP if (gArgs.GetBoolArg(&quot;-upnp&quot;, DEFAULT_UPNP)) { StartMapPort(); } &nbsp; &nbsp; 从代码中可以看到，如果在启动bitcoind时开启了upnp选项，将会进行端口映射，如果想将自己的节点加入到比特币p2p网络中，让其他网络中的节点访问，可以开启此选项进行端口映射，然后把映射后的公网ip地址广播给网络中的其他节点。 &nbsp; &nbsp; StartMapPort()中开启了一个线程进行端口映射，线程函数为net.cpp中的ThreadMapPort： #ifdef USE_UPNP static CThreadInterrupt g_upnp_interrupt; static std::thread g_upnp_thread; static void ThreadMapPort() { std::string port = strprintf(&quot;%u&quot;, GetListenPort()); const char * multicastif = nullptr; const char * minissdpdpath = nullptr; struct UPNPDev * devlist = nullptr; char lanaddr[64]; #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0); #elif MINIUPNPC_API_VERSION &lt; 14 /* miniupnpc 1.6 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, &amp;error); #else /* miniupnpc 1.9.20150730 */ int error = 0; devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, 2, &amp;error); #endif struct UPNPUrls urls; struct IGDdatas data; int r; r = UPNP_GetValidIGD(devlist, &amp;urls, &amp;data, lanaddr, sizeof(lanaddr)); if (r == 1) { if (fDiscover) { char externalIPAddress[40]; r = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, externalIPAddress); if(r != UPNPCOMMAND_SUCCESS) LogPrintf(&quot;UPnP: GetExternalIPAddress() returned %d\\n&quot;, r); else { if(externalIPAddress[0]) { CNetAddr resolved; if(LookupHost(externalIPAddress, resolved, false)) { LogPrintf(&quot;UPnP: ExternalIPAddress = %s\\n&quot;, resolved.ToString().c_str()); AddLocal(resolved, LOCAL_UPNP); } } else LogPrintf(&quot;UPnP: GetExternalIPAddress failed.\\n&quot;); } } std::string strDesc = &quot;Bitcoin &quot; + FormatFullVersion(); do { #ifndef UPNPDISCOVER_SUCCESS /* miniupnpc 1.5 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0); #else /* miniupnpc 1.6 */ r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), &quot;TCP&quot;, 0, &quot;0&quot;); #endif if(r!=UPNPCOMMAND_SUCCESS) LogPrintf(&quot;AddPortMapping(%s, %s, %s) failed with code %d (%s)\\n&quot;, port, port, lanaddr, r, strupnperror(r)); else LogPrintf(&quot;UPnP Port Mapping successful.\\n&quot;); } while(g_upnp_interrupt.sleep_for(std::chrono::minutes(20))); r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), &quot;TCP&quot;, 0); LogPrintf(&quot;UPNP_DeletePortMapping() returned: %d\\n&quot;, r); freeUPNPDevlist(devlist); devlist = nullptr; FreeUPNPUrls(&amp;urls); } else { LogPrintf(&quot;No valid UPnP IGDs found\\n&quot;); freeUPNPDevlist(devlist); devlist = nullptr; if (r != 0) FreeUPNPUrls(&amp;urls); } } &nbsp; &nbsp; (1) 首先第一行拿到比特币系统所使用的端口号，默认为8333，之后将要映射此端口到公网ip上； &nbsp; &nbsp; (2) 调用upnpDiscover查找当前局域网中的所有upnp设备； &nbsp; &nbsp; (3) 调用UPNP_GetValidIGD，从（2）中找到的upnp设备列表中找到有效的IGD设备； &nbsp; &nbsp; (4) 如果UPNP_GetValidIGD返回1，表示有一个连接，此时调用UPNP_GetExternalIPAddress获取公网地址，然后对此公网地址进行DNS查询，将解析到的地址记录到内存中，这些公网地址之后将会被广播给P2P网络中的其他节点，一传十，十传百。 &nbsp; &nbsp; (5) 通过UPNP_AddPortMapping进行端口映射，假设内网获取的有效IGD设备的IP地址为192.168.0.1，网关出口的外网地址为192.169.1.1，采用比特币的默认端口8333，则端口映射后就是将内网中192.168.0.1：8333映射到网关出口的公有IP地址和端口：192.169.1.1:8333，之后外部节点通过此公网IP和端口，就可以与内网节点进行通信了。 4 小结 &nbsp; &nbsp; 这篇文章主要介绍了NAT以及常见的NAT穿透技术。因为建立P2P通信很重要的一步就是穿透NAT以建立起节点之间的通信通道。常见的NAT穿透技术有STUN，TURN以及UPNP，而比特币P2P组网采用的正是UPNP技术，具体实现时比特币采用了开源的miniupnp。 &nbsp; &nbsp; 最后回想一下文章开头描述的那个场景：如何让位于家中的同事和你自己的服务器建立起点对点的连接进行调试呢？本文看过了比特币的实现后，您可能已经在琢磨着如何像比特币那样，用minipunp实现一个自己的小p2p系统了。 &nbsp; &nbsp; --本文为原创作品，转载请注明出处。 &nbsp; &nbsp; 参考文章： &nbsp;&nbsp;&nbsp;&nbsp;https://blog.csdn.net/lixin88/article/details/60571846 &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; &nbsp;&nbsp;&nbsp;&nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/21/4e2ae23ecbf145c52006bb7da04ac534.html","headline":"比特币源码分析–端口映射","dateModified":"2018-05-21T00:00:00+08:00","datePublished":"2018-05-21T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/21/4e2ae23ecbf145c52006bb7da04ac534.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>比特币源码分析--端口映射</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <p>&nbsp; &nbsp; 上一篇文章分析了比特币P2P网络中，一个节点是如何发现并连接到相邻节点的。在P2P网络中，一个节点既是客户又是服务器，它还要接受其他节点的连接，为网络中其他节点提供服务。这篇文章着重分析一下比特币P2P网络中是如何通过upnp来实现端口映射的。</p>
+  <h1>1 从腾讯的一道面试题说起</h1>
+  <p>&nbsp; &nbsp; 笔者所在团队的总监在面试的时候必然要问面试者这样一个问题：</p>
+  <p>&nbsp; &nbsp; 有两台手机同时连到了一个WIFI上，然后它们都访问了外网中某个服务器，那么网络是如何做到区分出这两台设备，把服务器的应答数据分发到合适的手机上呢？<br></p>
+  <p>&nbsp; &nbsp; 如果在毫无准备的情况下来回答这个问题，自己还真是答不出来。<br></p>
+  <p>&nbsp; &nbsp; 再想象一个场景：假设我们自己写了个小的服务器程序，然后在家里的电脑上运行，此时你想让另一个同事连接你的服务器，来验证你的服务器程序是不是能正确运行，但是明显你的网络和同事家的网络是两个不同的局域网，所以除非你去同事家或者让同事提上电脑到你家，否则无法连通。那么有什么办法做到让同事在自己家里就能点对点连上你的服务来调试么？<br></p>
+  <h1>2 NAT和NAT穿透</h1>
+  <p>&nbsp; &nbsp; 上一节提到的两个问题，实际上都和NAT有关。要弄清楚上一节的问题，需要先了解NAT，所以这里先来补点网络课，了解一下NAT以及NAT穿透。<br></p>
+  <h2>2.1 NAT</h2>
+  <h3>2.1.1 NAT是什么</h3>
+  <p>&nbsp; &nbsp; NAT是个什么鬼？它的全称是Network Address Translation，翻译过来就是网络地址转换。好事的人立马就得问了：好端端的为啥要地址转换，直接用IP地址不就行了么？<br></p>
+  <p>&nbsp; &nbsp; 在TCP/IP协议创建的时候，他的创始人（<span style="color:rgb(51,51,51);text-align:left;background-color:rgb(255,255,255);"><span style="color:rgb(51,51,51);text-align:left;background-color:rgb(255,255,255);"><span style="font-family:SimSun;font-size:16px;"><span style="color:rgb(51,51,51);text-align:left;background-color:rgb(255,255,255);">Robert E.Kahn</span>和<span style="color:rgb(51,51,51);text-align:left;background-color:rgb(255,255,255);">Vinton G.Cerf</span></span></span></span>）可能都没有预料到互联网的膨胀速度会如此之快，快到短短二三十年的时间，IPV4的地址就有要枯竭之势。随着越来越多的设备加入到互联网中，IPV4地址不够用的问题成了燃眉之急。</p>
+  <p>&nbsp; &nbsp; 解决IP地址不够用的一个办法是大家已经非常熟悉的IPV6，但是这么多年过去了，IPV6似乎还是不温不火，始终普及不起来。于是就有了NAT的解决方案，可以说正是NAT把IPV4从死亡边缘拉了回来，NAT到底是用了什么方法立下如此奇功，本节我们来简单的了解一下。<br></p>
+  <p>&nbsp; &nbsp; 平时我们无论是在家里，还是在公司，其实都是在一个私有的局域网，此时电脑上分配到的IP地址是私有IP地址。RFC1918规范里规定了3个保留地址段：10.0.0.0-10.255.255.255，172.16.0.0-172.31.255.255，192.168.0.0-192.168.255.255，这三个范围分别处于A、B、C类的地址段，专门用于组织或者企业内部使用，不需要进行申请。和公有IP地址相比，这些私有IP地址只在企业内部使用，不能作为全球路由地址，出了企业或组织的管理范围，这类私有地址就不在有任何意义。注意：任何一个组织都可以在内部使用这些私有地址，因此两个不同网络中存在相同IP地址的情况是很可能出现的，但是同一个网络中不允许两台主机拥有相同IP地址，否则将发生地址冲突。</p>
+  <p>&nbsp; &nbsp; 当私有网络中的主机想请求公网中服务器的服务时，需要在网络出口处部署NAT网关。NAT的作用就是在报文离开私网进入Internet的时候，把报文中的源IP地址替换为公网地址，然后等服务端的响应报文到达网关时，NAT再把目的地址替换为私网中主机的IP地址。<br></p>
+  <p>&nbsp; &nbsp; 听上去似乎很简单，NAT不就是替换了一下IP地址么，也没干什么，但是这里需要注意两点：<br></p>
+  <p>&nbsp; &nbsp; (1) 有了NAT以后，内网的主机不在需要申请公网IP地址，只需要将内网主机地址和端口通过NAT映射到网络出口的公网IP即可，然后通信的两端在无感知的情况下进行通信。这也是为什么前文说NAT挽救了IPV4，因为大量的内网主机有了NAT，只需要很少的公网地址做映射就可以了，如此就可以节约出很多的IPV4地址空间。<br></p>
+  <p>&nbsp; &nbsp; (2) 当在私网网络出口处部署了NAT网关以后，只能由内网主机发起到外网主机的连接，外网主机无法主动发起连接到内网。这样虽然对外隔离了内网主机，但同时又限制了P2P的通信，这也是NAT带来的一大弊端，下一节介绍NAT穿透技术时会看到针对这一问题有哪些解决手段。<br></p>
+  <h3>2.1.2 NAT的分类</h3>
+  <p>&nbsp; &nbsp; (1) 一对一NAT<br></p>
+  <p>&nbsp; &nbsp; 就是一个内网主机对应一个公有IP。这种类型的NAT对于节省IP地址没什么意义。<br></p>
+  <p>&nbsp; &nbsp; (2) 一对多NAT&nbsp;<br></p>
+  <p>&nbsp; &nbsp; 内网的多个主机都映射到同一个公有IP地址上。但是这里就有前文提到的那个面试问题：当内网有多台主机都请求同一服务器时，如果仅仅是替换地址，从返回信息是无法确认该将响应转发到哪一台主机的。此时还需要NAT根据传输层信息或者上层协议区分不同的会话，把不同的会话映射到公网IP不同的传输层端口上(NAPT)。<br></p>
+  <p>&nbsp; &nbsp; 按照端口映射的方式分类，1对多的NAT又可以细分为4种：<br></p>
+  <p>&nbsp; &nbsp; (1) 全锥型NAT：<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180520142853559" alt="">&nbsp;&nbsp;&nbsp;&nbsp;<br></p>
+  <p>&nbsp; &nbsp; 假设内网设备192.168.0.1:80向svr1发起请求，内网地址在NAT网关被映射为公网地址和端口：192.169.0.1:8080，在全锥形模式下，一旦连接成功后，外网所有主机发送到192.169.0.1:8080的数据，都将被NAT网关转发到内网192.168.0.1：80设备上。<br></p>
+  <p>&nbsp; &nbsp; (2) 限制锥型NAT:<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180520143522846" alt=""><br></p>
+  <p>&nbsp; &nbsp; 假设内网设备192.168.0.1：80成功连接了svr1，内网设备的地址和端口在NAT网关被映射为192.169.0.1：8080，在限制锥形模式下，只有内网设备向svr1发送过数据，之后从svr1的任意端口发送到192.169.0.1：8080的数据，都会被网关转发给内网设备192.168.0.1：80，但是外网其他设备（图中的svr2）发送到192.169.0.1：8080的数据将不会被转发。<br></p>
+  <p>&nbsp; &nbsp; (3) 端口限制锥形NAT：<br></p>
+  <p>&nbsp; &nbsp; 与限制锥形NAT相比，端口限制锥形NAT更加严格：<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180520144545773" alt=""><br></p>
+  <p>&nbsp; &nbsp; 假设内网设备192.168.0.1:80向外网svr1的80端口建立连接并发送数据，其内网地址和端口在NAT网关被映射为192.169.0.1：8080，在端口限制锥形模式下，只有svr1的80端口发送到网关192.169.0.1：8080的数据才会被转发到内网设备192.168.0.1：80，svr1的其他端口或者外网其他主机发送到192.168.0.1：8080的数据均不会抓发到内网设备。<br></p>
+  <p>&nbsp; &nbsp; 现在回头在来看看那到面试题目：两台手机连到同一WIFI，为什么外网服务器的响应可以转发到正确的手机上来不会混乱。明白了前面描述的NAT端口映射的原理，这个问题就比较容易理解：在NAT网关，将不同设备的服务请求用NAT映射到不同端口号上就可以实现：<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180520151047245" alt=""><br></p>
+  <p>&nbsp; &nbsp; 因为仅仅替换IP地址无法区分出内网设备，所以需要通过端口映射将不同内网设备的请求映射到不同端口上，这样当来自同一个往外服务器的响应数据到来时，NAT网关才能够把响应转发到内网的设备上。<br></p>
+  <h2>2.2 NAT穿透</h2>
+  <p>&nbsp; &nbsp; 前文提到过，使用NAT的缺陷之一就是只能由内网主机发起连接，外网主机无法主动连接到内网。这就意味着外部节点无法和内网主机进行P2P通信，就像第一节中提到的那个场景：因为两个人在不同的局域网中，相互不知道对方的公网地址和端口，所以无法直接建立起点对点连接。解决这个问题的办法就是NAT穿透技术。下面简单介绍几种常见的NAT穿越技术。</p>
+  <h3>2.2.1 STUN</h3>
+  <p>&nbsp; &nbsp; STUN全称为Simple Tranversal of UDP through NAT。其穿透原理参考下图：<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20180520171109120" alt=""><br></p>
+  <p>&nbsp; &nbsp; 假设两个不同网络中的设备A和B想穿透NAT进行点对点通信，通过STUN进行NAT穿透的过程如上图，其中STUN SERVER是部署在公网中的STUN服务器。<br></p>
+  <p>&nbsp; &nbsp; (1) CLIENT A通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址；<br></p>
+  <p>&nbsp; &nbsp; (2) STUN SERVER响应，并将CLIENT A经过转换后的公网IP地址和端口填在响应报文中；<br></p>
+  <p></p>
+  <p>&nbsp; &nbsp; (3) CLIENT B通过NAT网关向STUN SERVER发送STUN请求消息(UDP)，查询并注册自己经过NAT映射后的公网地址；</p>
+  <p>&nbsp; &nbsp; (4)&nbsp;STUN SERVER响应，并将CLIENT B经过转换后的公网IP地址和端口填在响应报文中；<br></p>
+  <p>&nbsp; &nbsp; (5) 此时CLIENT A已经知道了自己映射后对应的公网IP地址和端口号，它把这些信息打包在请求中发送给STUN SERVER，请求和B进行通信；<br></p>
+  <p>&nbsp; &nbsp; (6) STUN SERVER查询到B注册的公网地址和端口，然后将请求通过NAT网关转发给B；<br></p>
+  <p>&nbsp; &nbsp; (7) B从消息中知道A的公网地址和端口，于是通过此地址和端口，向A发送消息，消息中包含B映射后的公网地址和端口号，A收到消息后就知道了B的公网地址及端口，这样在A和B之间建立起了通信通道。<br></p>
+  <h3>2.2.2 TURN</h3>
+  <p>&nbsp; &nbsp; STUN穿透技术的缺点在于无法穿透对称型NAT，这可以通过TURN技术进行改进。TURN的工作过程和STUN非常相似，区别在于在TURN中，公网地址和端口不由NAT网关分配，而是由TURN服务器分配。<br></p>
+  <p>&nbsp; &nbsp; TURN可以解决STUN无法穿透对称NAT的问题，但是由于所有的请求都需要经过TURN服务器，所以网络延迟和丢包的可能性较大，实际当中通常将STUN和TURN混合使用。<br></p>
+  <h3>2.2.3 UPNP</h3>
+  <p>&nbsp; &nbsp; UPNP意为通用即插即用协议，是由微软提出的一种NAT穿透技术。使用UPNP需要内网主机、网关和应用程序都支持UPNP技术。<br></p>
+  <p>&nbsp; &nbsp; UPNP通过网关映射请求可以动态的为客户分配映射表项，而NAT网关只需要执行地址和端口的转换。UPNP客户端发送到公网侧的信令或者控制消息中，会包含映射之后公网IP和端口，接收端根据这些信息就可以建立起P2P连接。</p>
+  <p>&nbsp; &nbsp; UPNP穿透的过程大致如下：</p>
+  <p>&nbsp; &nbsp; (1) 发送查找消息：<br></p>
+  <p>&nbsp; &nbsp; 一个设备添加到网络以后，会多播大量发现消息来通知其嵌入式设备和服务，所有的控制点都可以监听多播地址以接收通知，标准的多播地址是239.255.255.250：1900。可以通过发送http请求查询局域网中upnp设备，消息形式如下：<br></p>
+  <p>&nbsp; &nbsp; M-SEARCH * HTTP/1.1 \r\n<br></p>
+  <p>&nbsp; &nbsp; HOST 239.255.255.250:1900 \r\n<br></p>
+  <p>&nbsp; &nbsp; ST:UPnP rootdevice \r\n<br></p>
+  <p>&nbsp; &nbsp; MAN:\"ssdp:discover\" \r\n<br></p>
+  <p>&nbsp; &nbsp; MX:\r\n\r\n<br></p>
+  <p>&nbsp; &nbsp; (2) 获得根设备描述url<br></p>
+  <p>&nbsp; &nbsp; 如果网络中存在upnp设备，此设备会向发送了查找请求的多播通道的源IP地址和端口发送响应消息，其形式如下：<br></p>
+  <p>&nbsp; &nbsp; HTTP/1.1 200 OK<br></p>
+  <p>&nbsp; &nbsp; CACHE_CONTROL: max-age=100<br></p>
+  <p>&nbsp; &nbsp; DATE: XXXX<br></p>
+  <p>&nbsp; &nbsp; LOCATION:http://192.168.1.1:1900/igd.xml<br></p>
+  <p>&nbsp; &nbsp; SERVER: TP-LINK Wireness Router UPnP1.0<br></p>
+  <p>&nbsp; &nbsp; ST: upnp:rootdevice<br></p>
+  <p>&nbsp; 首先通过200 OK确定成功的找到了设备。然后要从响应中找到根设备的描述URL（例如上面响应报文中的http://192.168.1.1:1900/igd.xml），通过此URL就可以找到根设备的描述信息，从根设备的描述信息中又可以得到设备的控制URL，通过控制URL就可以控制UPNP的行为。上面这个响应中表示我们在局域网中成功的找到了一台支持UPNP的无线路由器设备。<br></p>
+  <p>&nbsp; &nbsp; (3) 通过（2）中找到的设备描述URL的地址得到设备描述URL得到XML文档。发送HTTP请求消息：<br></p>
+  <p>&nbsp; &nbsp; GET /igd.xml HTTP/1.1<br></p>
+  <p>&nbsp; &nbsp; HOST:192.168.1.1:1900<br></p>
+  <p>&nbsp; &nbsp; Connection: Close<br></p>
+  <p>&nbsp; &nbsp; 然后就能得到一个设备描述文档，从中可以找到服务和UPNP控制URL。每一种设备都有对应的serviceURL和controlURL。其中和端口映射有关的服务时WANIPConnection和WANPPPConnection。<br></p>
+  <p>&nbsp; &nbsp; (4) 进行端口映射<br></p>
+  <p>&nbsp; &nbsp; 拿到设备的控制URL以后就可以发送控制信息了。每一种控制都是根据HTTP请求来发送的，请求形式如下：<br></p>
+  <p>&nbsp; &nbsp; POST <span style="color:#ff0000;">path</span> HTTP/1.1<br></p>
+  <p>&nbsp; &nbsp; HOST: <span style="color:#ff0000;">host:port</span><br></p>
+  <p>&nbsp; &nbsp; SOAPACTION:serviceType#<span style="color:#ff0000;">actionName</span><br></p>
+  <p>&nbsp; &nbsp; CONTENT-TYPE: text/xml<br></p>
+  <p>&nbsp; &nbsp; CONTENT-LENGTH: XXX</p>
+  <p>&nbsp; &nbsp; ....</p>
+  <p>&nbsp; &nbsp; 其中path表示控制url，host:port就是目的主机地址，actionName就是控制upnp设备执行响应的指令。UPNP支持的指令如下：</p>
+  <p></p>
+  <table border="1" cellspacing="1" cellpadding="1">
+   <tbody>
+    <tr>
+     <td>actionName</td>
+     <td>描述</td>
+    </tr>
+    <tr>
+     <td>GetStatusInfo</td>
+     <td>查看UPNP设备状态</td>
+    </tr>
+    <tr>
+     <td>AddPortMapping</td>
+     <td>添加一个端口映射</td>
+    </tr>
+    <tr>
+     <td>DeletePortMapping</td>
+     <td>删除一个端口映射</td>
+    </tr>
+    <tr>
+     <td>GetExternalIPAddress</td>
+     <td>查看映射的外网地址</td>
+    </tr>
+    <tr>
+     <td>GetConnectionTypeInfo</td>
+     <td>查看连接状态</td>
+    </tr>
+    <tr>
+     <td>GetSpecificPortMappingEntry</td>
+     <td>查询指定的端口映射</td>
+    </tr>
+    <tr>
+     <td>GetGenericPortMappingEntry</td>
+     <td>查询端口映射表</td>
+    </tr>
+   </tbody>
+  </table>&nbsp;&nbsp;&nbsp; 通常我们需要用到的是AddPortMapping进行端口映射，以及GetExternalIPAddress获取到映射的公网地址。
+  <br>
+  <p>&nbsp; &nbsp; UPNP完整的协议栈比较复杂，有兴趣的读者可以自行查找资料做更加深入的学习。<br></p>
+  <h1>3 UPNP在比特币P2P网络中的应用</h1>
+  <p>&nbsp; &nbsp; 区块链是建立在P2P网络基础上的。在比特币系统中，穿透NAT建立节点之间点对点的P2P网络，采用的就是上一节所说的UPNP技术。比特币使用了开源的miniupnp，基本上就是调用miniupnp封装好的接口，实现比较简单，我们来看看源代码：</p>
+  <p>&nbsp; &nbsp; 在前一篇文章比<a href="https://mp.csdn.net/postedit/80291705" rel="nofollow">特币源码分析--P2P网络初始化</a>中介绍中知道，比特币系统的初始化大部分都是在init.cpp中的AppInitMain中进行的，我们当时略过了端口映射的部分，在这里补上：<br></p>
+  <pre><code class="language-cpp">    // Map ports with UPnP
+    if (gArgs.GetBoolArg("-upnp", DEFAULT_UPNP)) {
+        StartMapPort();
+    }</code></pre>
+  <p>&nbsp; &nbsp; 从代码中可以看到，如果在启动bitcoind时开启了upnp选项，将会进行端口映射，如果想将自己的节点加入到比特币p2p网络中，让其他网络中的节点访问，可以开启此选项进行端口映射，然后把映射后的公网ip地址广播给网络中的其他节点。</p>
+  <p>&nbsp; &nbsp; StartMapPort()中开启了一个线程进行端口映射，线程函数为net.cpp中的ThreadMapPort：<br></p>
+  <pre><code class="language-cpp">#ifdef USE_UPNP
+static CThreadInterrupt g_upnp_interrupt;
+static std::thread g_upnp_thread;
+static void ThreadMapPort()
+{
+    std::string port = strprintf("%u", GetListenPort());
+    const char * multicastif = nullptr;
+    const char * minissdpdpath = nullptr;
+    struct UPNPDev * devlist = nullptr;
+    char lanaddr[64];
+
+#ifndef UPNPDISCOVER_SUCCESS
+    /* miniupnpc 1.5 */
+    devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0);
+#elif MINIUPNPC_API_VERSION &lt; 14
+    /* miniupnpc 1.6 */
+    int error = 0;
+    devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, &amp;error);
+#else
+    /* miniupnpc 1.9.20150730 */
+    int error = 0;
+    devlist = upnpDiscover(2000, multicastif, minissdpdpath, 0, 0, 2, &amp;error);
+#endif
+
+    struct UPNPUrls urls;
+    struct IGDdatas data;
+    int r;
+
+    r = UPNP_GetValidIGD(devlist, &amp;urls, &amp;data, lanaddr, sizeof(lanaddr));
+    if (r == 1)
+    {
+        if (fDiscover) {
+            char externalIPAddress[40];
+            r = UPNP_GetExternalIPAddress(urls.controlURL, data.first.servicetype, externalIPAddress);
+            if(r != UPNPCOMMAND_SUCCESS)
+                LogPrintf("UPnP: GetExternalIPAddress() returned %d\n", r);
+            else
+            {
+                if(externalIPAddress[0])
+                {
+                    CNetAddr resolved;
+                    if(LookupHost(externalIPAddress, resolved, false)) {
+                        LogPrintf("UPnP: ExternalIPAddress = %s\n", resolved.ToString().c_str());
+                        AddLocal(resolved, LOCAL_UPNP);
+                    }
+                }
+                else
+                    LogPrintf("UPnP: GetExternalIPAddress failed.\n");
+            }
+        }
+
+        std::string strDesc = "Bitcoin " + FormatFullVersion();
+
+        do {
+#ifndef UPNPDISCOVER_SUCCESS
+            /* miniupnpc 1.5 */
+            r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype,
+                                port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), "TCP", 0);
+#else
+            /* miniupnpc 1.6 */
+            r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype,
+                                port.c_str(), port.c_str(), lanaddr, strDesc.c_str(), "TCP", 0, "0");
+#endif
+
+            if(r!=UPNPCOMMAND_SUCCESS)
+                LogPrintf("AddPortMapping(%s, %s, %s) failed with code %d (%s)\n",
+                    port, port, lanaddr, r, strupnperror(r));
+            else
+                LogPrintf("UPnP Port Mapping successful.\n");
+        }
+        while(g_upnp_interrupt.sleep_for(std::chrono::minutes(20)));
+
+        r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), "TCP", 0);
+        LogPrintf("UPNP_DeletePortMapping() returned: %d\n", r);
+        freeUPNPDevlist(devlist); devlist = nullptr;
+        FreeUPNPUrls(&amp;urls);
+    } else {
+        LogPrintf("No valid UPnP IGDs found\n");
+        freeUPNPDevlist(devlist); devlist = nullptr;
+        if (r != 0)
+            FreeUPNPUrls(&amp;urls);
+    }
+}</code></pre>
+  <p>&nbsp; &nbsp; (1) 首先第一行拿到比特币系统所使用的端口号，默认为8333，之后将要映射此端口到公网ip上；</p>
+  <p>&nbsp; &nbsp; (2) 调用upnpDiscover查找当前局域网中的所有upnp设备；<br></p>
+  <p>&nbsp; &nbsp; (3) 调用UPNP_GetValidIGD，从（2）中找到的upnp设备列表中找到有效的IGD设备；<br></p>
+  <p>&nbsp; &nbsp; (4) 如果UPNP_GetValidIGD返回1，表示有一个连接，此时调用UPNP_GetExternalIPAddress获取公网地址，然后对此公网地址进行DNS查询，将解析到的地址记录到内存中，这些公网地址之后将会被广播给P2P网络中的其他节点，一传十，十传百。<br></p>
+  <p>&nbsp; &nbsp; (5) 通过UPNP_AddPortMapping进行端口映射，假设内网获取的有效IGD设备的IP地址为192.168.0.1，网关出口的外网地址为192.169.1.1，采用比特币的默认端口8333，则端口映射后就是将内网中192.168.0.1：8333映射到网关出口的公有IP地址和端口：192.169.1.1:8333，之后外部节点通过此公网IP和端口，就可以与内网节点进行通信了。<br></p>
+  <h1>4 小结</h1>
+  <p>&nbsp; &nbsp; 这篇文章主要介绍了NAT以及常见的NAT穿透技术。因为建立P2P通信很重要的一步就是穿透NAT以建立起节点之间的通信通道。常见的NAT穿透技术有STUN，TURN以及UPNP，而比特币P2P组网采用的正是UPNP技术，具体实现时比特币采用了开源的miniupnp。<br></p>
+  <p>&nbsp; &nbsp; 最后回想一下文章开头描述的那个场景：如何让位于家中的同事和你自己的服务器建立起点对点的连接进行调试呢？本文看过了比特币的实现后，您可能已经在琢磨着如何像比特币那样，用minipunp实现一个自己的小p2p系统了。<br></p>
+  <p><br></p>
+  <p>&nbsp; &nbsp; --本文为原创作品，转载请注明出处。<br></p>
+  <p><br></p>
+  <p>&nbsp; &nbsp; 参考文章：<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<a href="https://blog.csdn.net/lixin88/article/details/60571846" rel="nofollow">https://blog.csdn.net/lixin88/article/details/60571846<br></a></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<br></p>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<br></p>
+  <p></p>
+  <br>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<br></p>
+  <div>
+   <br>
+  </div>
+  <br>
+  <p>&nbsp;&nbsp;&nbsp;&nbsp;<br></p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/ztemt_sw2/article/details/80321600,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/ztemt_sw2/article/details/80321600,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

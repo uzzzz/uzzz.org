@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Spark_08 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Spark_08" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="文章目录 SparkSql案例 SparkSQL实现最受欢迎的老师 Spark SQL的Join broadcast join shuffle hash join示意图 sort-merge-join示意图 Spark shell演示 BroadcastHashJoin Spark SQL整合Hive 应用 Hive跟mysql的区别？ spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) idea开发整合 实时计算 实时计算相关技术 消息中间件 Kafka 简介 特征 Kafka的一些概念 Kafka0.8集群安装 Java代码实现kafka发送和接收消息 SparkSql案例 SparkSQL实现最受欢迎的老师 package day8 import java.net.URL import org.apache.spark.sql.{DataFrame, Dataset, SparkSession} object SQLFavTeache { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().appName(&quot;RowNumberDemo&quot;) .master(&quot;local[4]&quot;) .getOrCreate() val lines: Dataset[String] = spark.read.textFile(args(0)) import spark.implicits._ val df: DataFrame = lines.map(line =&gt; { val tIndex = line.lastIndexOf(&quot;/&quot;) + 1 val teacher = line.substring(tIndex) val host = new URL(line).getHost val sIndex = host.indexOf(&quot;.&quot;) val subject = host.substring(0, sIndex) (subject, teacher) }).toDF(&quot;subject&quot;, &quot;teacher&quot;) df.createTempView(&quot;v_sub_teacher&quot;) //该学科下的老师的访问次数 val temp1: DataFrame = spark.sql(&quot;SELECT subject, teacher, count(*) counts FROM v_sub_teacher GROUP BY subject, teacher&quot;) //求每个学科下最受欢迎的老师的topn temp1.createTempView(&quot;v_temp_sub_teacher_counts&quot;) //所有学科按照出现的次数排序 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(order by counts desc) rk FROM v_temp_sub_teacher_counts&quot;) //学课相同的老师，进行局部排序,同时进行全局配许 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts&quot;) val topN = args(1) //前n名老师 //做全局排序可能某些序列号会被删除掉 //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk, rank() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //将入选的老师进行全局排序 //val temp2 = spark.sql(s&quot;SELECT *, dense_rank() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) val temp2 = spark.sql(s&quot;SELECT *, row_number() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) temp2.show() spark.stop() } } Spark SQL的Join broadcast join 适用于小表与大表的join，其中小表小于10M，本质上是去用空间换时间， 也就是将小表发送到每个大表对应的节点上，然后依次去遍历大表中的每个关联键去和对应小表中的关联键去匹配，找到相等的进行关联，并不会走shuffle过程，因此最终的文件数取决于block的个数，每个bolck是一个逻辑上的概念， 生成的规则是在建表并落HDFS文件的时候按256M去拆分，得到最终的文件数 shuffle hash join示意图 适合于没有特别小的两个表进行关联的时候，默认设置的shuffle partition的个数 是200，也就是分了200个区，然后两张表的key值分别去基于200做hash取余然后散步在每个区域中了，这样的思想先把相近的合并在一个区内，再在每个分区内去做比较key值的等值比较，就避免了大范围的遍历比较，节省了时间和内存。 sort-merge-join示意图 特点：同一个范围内的数据shuffle到同一个分区。 这种适用于关联的两张表都特别大时，使用上述的两种方法加载到内存的时候对于内存的压力都非常大时，因此在2方法的基础上，hash取余之后还要分别对两张表的key值进行排序，这样去做等值比较的时候就不需要将某一方的全部数据都加载到内存进行计算了，只需要取一部分就能知道是否有相等的（比如按升序排列，某个值明显比它大了，后面肯定就不会有相等的，就不用继续比较了，节省了时间和内存），也就是在进行等值比较的时候即用即丢的。这个方法在前面进行排序的时候可能会消耗点时间，但相对于后面的时间来说，总体是大大节省了时间。 原文链接：https://blog.csdn.net/rms1800201760/article/details/90970932 package day8 import org.apache.spark.sql.SparkSession object JoinTest { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().master(&quot;local[*]&quot;).appName(&quot;JoinTest&quot;).getOrCreate() import spark.implicits._ val df1: DataFrame = Seq( (0, &quot;playing&quot;), (1, &quot;with&quot;), (2, &quot;join&quot;) ).toDF(&quot;id&quot;, &quot;token&quot;) val df2: DataFrame = Seq( (0, &quot;P&quot;), (1, &quot;W&quot;), (2, &quot;S&quot;) ).toDF(&quot;aid&quot;, &quot;atoken&quot;) val query: DataFrame = df1.join(df2, $&quot;id&quot; === $&quot;aid&quot;) //查看物理计划 query.explain() query.show() spark.stop() } } Spark shell演示 val df1 = Seq( | (0, “peon”), | (1, “with”), | (2, “join”) | ).toDF(“id”, “token”) val df2 = Seq( | (0, “P”), | (1, “W”), | (2, “S”) | ).toDF(“aid”, “atoken”) BroadcastHashJoin 默认使用BroadcastHashJoin Spark SQL整合Hive Hive On Spark(跟Hive没有太大的关系，就是使用了Hive的标准（HQL，元数据库，UDF，序列化，反序列化机制)) 在公司中使用hive还是特别多的。 Hive原来的执行计算模型是MR，有点慢（中间结果写入到HDFS)。 Hive On Spark 使用RDD（DataFrame）运行在Spark集群上。 Hive元数据库中不包含真正要计算的数据。 1.安装MySQL（hive的元数据库）并创建一个普通用户，并且授权 CREATE USER ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’; GRANT ALL PRIVILEGES ON hivedb.* TO ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’ WITH GRANT OPTION; FLUSH PRIVILEGES; #在spark的conf目录下创建一个hive的配置文件 2.添加一个hive-site.xml &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot; standalone=&quot;no&quot;?&gt; &lt;?xml-stylesheet type=&quot;text/xsl&quot; href=&quot;configuration.xsl&quot;?&gt; &lt;!-- Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements. See the NOTICE file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. --&gt; &lt;configuration&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionURL&lt;/name&gt; &lt;value&gt;jdbc:mysql://node-6:3306/hivedb?createDatabaseIfNotExist=true&lt;/value&gt; &lt;description&gt;JDBC connect string for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionDriverName&lt;/name&gt; &lt;value&gt;com.mysql.jdbc.Driver&lt;/value&gt; &lt;description&gt;Driver class name for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionUserName&lt;/name&gt; &lt;value&gt;xiaoniu&lt;/value&gt; &lt;description&gt;username to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionPassword&lt;/name&gt; &lt;value&gt;123568&lt;/value&gt; &lt;description&gt;password to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;/configuration&gt; 3.上传一个mysql连接驱动（sparkSubmit也要连接MySQL，获取元数据信息） ./spark-sql --master spark://node-4:7077,node-5:7077 --driver-class-path /home/xiaoniu/mysql-connector-java-5.1.7-bin.jar 4.sparkSQL会在mysql上创建一个database，需要手动改一下DBS表中的DB_LOCATION_UIR改成hdfs的地址 hdfs://ns1/user/hive/warehome 5.要在/etc/profile中配置一个环节变量(让sparkSQL知道hdfs在哪里，其实就是namenode在哪里) exprot HADOOP_CONF_DIR=/appdata/hadoop/etc/hadoop/ 6.重新启动SparkSQL的命令行 注意：真正要计算的数据保存在hdfs中，mysql这个元数据库保存的是hive表的描述信息，描述了有那些database,table,以及表有多少列，每一列是什么类型，还要描述表的数据保存在hdfs的什么位置。 应用 1.连接 /appdata/spark/bin/spark-sql --master spark://n1:7077 (不指定driver-class-path的前提是，spark/jars下导入mysql驱动的jar) 2.创建表 create table person(id int,name string,fv int) &gt; row format delimited &gt; fields terminated by ‘,’; 3.导入数据（数据源hdfs） load data inpath ‘/person.txt’ into table person; 4.查看数据 Hive跟mysql的区别？ Hive是一个数据仓库(存储数据并分析数据，分析数据仓库中的数据量很大，)， MySQL是一个关系型数据库（关系型数据的增删改查（低延迟））。 hive的元数据库中保存要计算的数据吗？ 不保存，保存hive仓库的表，字段，等描述信息。 hive的元数据库的功能？ 建立了一种映射关系，执行HQL时，先到Mysql元数据库中查找描述信息，然后根据描述信息生成任务，然后将任务发到spark集群中执行。 spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) /appdata/spark/bin/spark-sql --master spark://node1:7077 -e “select * from t_boy order by fv desc” /appdata/spark/bin/spark-sql --master spark://node1:7077 -f demo.sql idea开发整合 在idea开发整合，hive需要依赖： &lt;dependency&gt; &lt;groupId&gt;org.apache.spark&lt;/groupId&gt; &lt;artifactId&gt;spark-hive_2.11&lt;/artifactId&gt; &lt;version&gt;2.2.0&lt;/version&gt; &lt;/dependency&gt; //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(“HiveOnSpark”) .master(“local[*]”) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() package day8 import org.apache.spark.sql.SparkSession object HiveOnSpark { def main(args: Array[String]): Unit = { //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(&quot;HiveOnSpark&quot;) .master(&quot;local[*]&quot;) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() //想要使用hive的元数据库，必须指定元数据库的位置，添加一个hive-site.xml到当前程序的classpath下即可。 //有t_boy这个表或视图吗？ val result = spark.sql(&quot;SELECT * FROM t_boy ORDER BY fv DESC&quot;) result.show() spark.stop() } } 导入集群的配置文件：hdfs-site.xml,core-site.xml 实时计算 实时计算相关技术 Strom / JStrom Spark streaming() Flink 实时性高 有延迟 实时性高 吞吐量较低 吞吐量高 吞吐量高 只能实时计算 离线+实时 离线+实时 算子较少 算子丰富 算子丰富 没有 机器学习 没有 没有 机器学习 没有 使用比较少 非常火 一般 一个完整的生态时非常重要的，Spark生态比较完善。 消息中间件 消息中间件的作用：临时存储数据，很重要。 拉取数据的有点：能有控制Spark Streaming的处理速度，不会出现大量的堆积到Spark Streaming的情况。 Kafka 简介 Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。Kafka是一种高吞吐量的分布式发布订阅消息系统，它可以处理消费者在网站中的所有动作流数据。 这种动作（网页浏览，搜索和其他用户的行动）是在现代网络上的许多社会功能的一个关键因素。 这些数据通常是由于吞吐量的要求而通过处理日志和日志聚合来解决。 对于像Hadoop一样的日志数据和离线分析系统，但又要求实时处理的限制，这是一个可行的解决方案。Kafka的目的是通过Hadoop的并行加载机制来统一线上和离线的消息处理，也是为了通过集群来提供实时的消息。 特征 Kafka 是一种高吞吐量 的分布式发布订阅消息系统，有如下特性： 1.通过O的磁盘数据结构提供消息的持久化，这种结构对于即使数以TB的消息存储也能够保持长时间的稳定性能。 2.高吞吐量：即使是非常普通的硬件Kafka也可以支持每秒数百万 [2] 的消息。 3.支持通过Kafka服务器和消费机集群来分区消息。 4.支持Hadoop并行数据加载。 Kafka通过官网发布了最新版本2.0.0 Kafka的一些概念 Broker:安装了Kafka服务的那台集群就是一个broker(broker的id要全局唯一) Producer:消息的生产者，负责将数据写入broker中(push) Consumer:消息的消费者，负责从Kafka中读取数据(pull),老版本的消费者需要依赖zk,新版本的不需要。 Topic:主题，数据的一个分类，不同的topic存放不同的数据。 Consumer Group:消费者组,一个topic可以有多个消费者同时消费，多个消费者如果在一个消费者组中，那么他们不能重复消费数据。 Spark Streaming2.2.0兼容kafka0.8.21以上的版本，主要支持0.8和0.10 Kafka0.8集群安装 1.下载Kafka安装包 2.上传安装包 3.解压 4.修改配置文件 config/server.properties broker.id=0 host.name=node1 log.dirs=/data/kafka zookeeper.connect=node-1:2181,node-2:2181,node-3:2181 kafka0.10不需要指定host.name默认是主机名。 5.将配置好的kafka拷贝到其他机器上 6.修改broker.id和host.name 7.启动kafka（后台线程启动） /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-start.sh -daemon /bigdata/kafka_2.11-0.8.2.2/config/server.properties 关闭： /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-stop.sh #查看topic信息 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --list --zookeeper node-1:2181,node-2:2181 #创建topic /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --create --zookeeper node-1:2181,node-2:2181 --replication-factor 3 --partitions 3 --topic xiaoniu #往Kafka的topic中写入数据(命令行的生产者) /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-producer.sh --broker-list node-4:9092,node-5:9092,node-5:9092 --topic xiaoniu #启动消费者 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-consumer.sh --zookeeper node-1:2181,node-2:2181 --topic xiaoniu --from-beginning Java代码实现kafka发送和接收消息 发送代码 package cn.edu360.kafka; import java.util.Properties; import kafka.javaapi.producer.Producer; import kafka.producer.KeyedMessage; import kafka.producer.ProducerConfig; public class ProducerDemo { public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;metadata.broker.list&quot;, &quot;node1:9092,node2:9092,node3:9092&quot;); props.put(&quot;serializer.class&quot;, &quot;kafka.serializer.StringEncoder&quot;); ProducerConfig config = new ProducerConfig(props); Producer&lt;String, String&gt; producer = new Producer&lt;String, String&gt;(config); for (int i = 1001; i &lt;= 1100; i++) producer.send(new KeyedMessage&lt;String, String&gt;(&quot;xiaoniu&quot;, &quot;xiaoniu-msg&quot; + i)); } } 接收代码 package cn.edu360.kafka; import java.util.HashMap; import java.util.List; import java.util.Map; import java.util.Properties; import kafka.consumer.Consumer; import kafka.consumer.ConsumerConfig; import kafka.consumer.KafkaStream; import kafka.javaapi.consumer.ConsumerConnector; import kafka.message.MessageAndMetadata; public class ConsumerDemo { private static final String topic = &quot;xiaoniu&quot;; private static final Integer threads = 2;//一个消费者可以有多少个线程同时消费 public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;zookeeper.connect&quot;, &quot;node1:2181,node2:2181,node3:2181&quot;); props.put(&quot;group.id&quot;, &quot;vvvvv&quot;); //smallest重最开始消费,largest代表重消费者启动后产生的数据才消费 //--from-beginning props.put(&quot;auto.offset.reset&quot;, &quot;smallest&quot;); ConsumerConfig config = new ConsumerConfig(props); ConsumerConnector consumer =Consumer.createJavaConsumerConnector(config); Map&lt;String, Integer&gt; topicCountMap = new HashMap&lt;String, Integer&gt;(); topicCountMap.put(topic, threads); Map&lt;String, List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt;&gt; consumerMap = consumer.createMessageStreams(topicCountMap); List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt; streams = consumerMap.get(topic); for(final KafkaStream&lt;byte[], byte[]&gt; kafkaStream : streams){ new Thread(new Runnable() { public void run() { for(MessageAndMetadata&lt;byte[], byte[]&gt; mm : kafkaStream){ String msg = new String(mm.message()); System.out.println(msg); } } }).start(); } } }" />
+<meta property="og:description" content="文章目录 SparkSql案例 SparkSQL实现最受欢迎的老师 Spark SQL的Join broadcast join shuffle hash join示意图 sort-merge-join示意图 Spark shell演示 BroadcastHashJoin Spark SQL整合Hive 应用 Hive跟mysql的区别？ spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) idea开发整合 实时计算 实时计算相关技术 消息中间件 Kafka 简介 特征 Kafka的一些概念 Kafka0.8集群安装 Java代码实现kafka发送和接收消息 SparkSql案例 SparkSQL实现最受欢迎的老师 package day8 import java.net.URL import org.apache.spark.sql.{DataFrame, Dataset, SparkSession} object SQLFavTeache { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().appName(&quot;RowNumberDemo&quot;) .master(&quot;local[4]&quot;) .getOrCreate() val lines: Dataset[String] = spark.read.textFile(args(0)) import spark.implicits._ val df: DataFrame = lines.map(line =&gt; { val tIndex = line.lastIndexOf(&quot;/&quot;) + 1 val teacher = line.substring(tIndex) val host = new URL(line).getHost val sIndex = host.indexOf(&quot;.&quot;) val subject = host.substring(0, sIndex) (subject, teacher) }).toDF(&quot;subject&quot;, &quot;teacher&quot;) df.createTempView(&quot;v_sub_teacher&quot;) //该学科下的老师的访问次数 val temp1: DataFrame = spark.sql(&quot;SELECT subject, teacher, count(*) counts FROM v_sub_teacher GROUP BY subject, teacher&quot;) //求每个学科下最受欢迎的老师的topn temp1.createTempView(&quot;v_temp_sub_teacher_counts&quot;) //所有学科按照出现的次数排序 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(order by counts desc) rk FROM v_temp_sub_teacher_counts&quot;) //学课相同的老师，进行局部排序,同时进行全局配许 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts&quot;) val topN = args(1) //前n名老师 //做全局排序可能某些序列号会被删除掉 //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk, rank() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //将入选的老师进行全局排序 //val temp2 = spark.sql(s&quot;SELECT *, dense_rank() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) val temp2 = spark.sql(s&quot;SELECT *, row_number() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) temp2.show() spark.stop() } } Spark SQL的Join broadcast join 适用于小表与大表的join，其中小表小于10M，本质上是去用空间换时间， 也就是将小表发送到每个大表对应的节点上，然后依次去遍历大表中的每个关联键去和对应小表中的关联键去匹配，找到相等的进行关联，并不会走shuffle过程，因此最终的文件数取决于block的个数，每个bolck是一个逻辑上的概念， 生成的规则是在建表并落HDFS文件的时候按256M去拆分，得到最终的文件数 shuffle hash join示意图 适合于没有特别小的两个表进行关联的时候，默认设置的shuffle partition的个数 是200，也就是分了200个区，然后两张表的key值分别去基于200做hash取余然后散步在每个区域中了，这样的思想先把相近的合并在一个区内，再在每个分区内去做比较key值的等值比较，就避免了大范围的遍历比较，节省了时间和内存。 sort-merge-join示意图 特点：同一个范围内的数据shuffle到同一个分区。 这种适用于关联的两张表都特别大时，使用上述的两种方法加载到内存的时候对于内存的压力都非常大时，因此在2方法的基础上，hash取余之后还要分别对两张表的key值进行排序，这样去做等值比较的时候就不需要将某一方的全部数据都加载到内存进行计算了，只需要取一部分就能知道是否有相等的（比如按升序排列，某个值明显比它大了，后面肯定就不会有相等的，就不用继续比较了，节省了时间和内存），也就是在进行等值比较的时候即用即丢的。这个方法在前面进行排序的时候可能会消耗点时间，但相对于后面的时间来说，总体是大大节省了时间。 原文链接：https://blog.csdn.net/rms1800201760/article/details/90970932 package day8 import org.apache.spark.sql.SparkSession object JoinTest { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().master(&quot;local[*]&quot;).appName(&quot;JoinTest&quot;).getOrCreate() import spark.implicits._ val df1: DataFrame = Seq( (0, &quot;playing&quot;), (1, &quot;with&quot;), (2, &quot;join&quot;) ).toDF(&quot;id&quot;, &quot;token&quot;) val df2: DataFrame = Seq( (0, &quot;P&quot;), (1, &quot;W&quot;), (2, &quot;S&quot;) ).toDF(&quot;aid&quot;, &quot;atoken&quot;) val query: DataFrame = df1.join(df2, $&quot;id&quot; === $&quot;aid&quot;) //查看物理计划 query.explain() query.show() spark.stop() } } Spark shell演示 val df1 = Seq( | (0, “peon”), | (1, “with”), | (2, “join”) | ).toDF(“id”, “token”) val df2 = Seq( | (0, “P”), | (1, “W”), | (2, “S”) | ).toDF(“aid”, “atoken”) BroadcastHashJoin 默认使用BroadcastHashJoin Spark SQL整合Hive Hive On Spark(跟Hive没有太大的关系，就是使用了Hive的标准（HQL，元数据库，UDF，序列化，反序列化机制)) 在公司中使用hive还是特别多的。 Hive原来的执行计算模型是MR，有点慢（中间结果写入到HDFS)。 Hive On Spark 使用RDD（DataFrame）运行在Spark集群上。 Hive元数据库中不包含真正要计算的数据。 1.安装MySQL（hive的元数据库）并创建一个普通用户，并且授权 CREATE USER ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’; GRANT ALL PRIVILEGES ON hivedb.* TO ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’ WITH GRANT OPTION; FLUSH PRIVILEGES; #在spark的conf目录下创建一个hive的配置文件 2.添加一个hive-site.xml &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot; standalone=&quot;no&quot;?&gt; &lt;?xml-stylesheet type=&quot;text/xsl&quot; href=&quot;configuration.xsl&quot;?&gt; &lt;!-- Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements. See the NOTICE file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. --&gt; &lt;configuration&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionURL&lt;/name&gt; &lt;value&gt;jdbc:mysql://node-6:3306/hivedb?createDatabaseIfNotExist=true&lt;/value&gt; &lt;description&gt;JDBC connect string for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionDriverName&lt;/name&gt; &lt;value&gt;com.mysql.jdbc.Driver&lt;/value&gt; &lt;description&gt;Driver class name for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionUserName&lt;/name&gt; &lt;value&gt;xiaoniu&lt;/value&gt; &lt;description&gt;username to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionPassword&lt;/name&gt; &lt;value&gt;123568&lt;/value&gt; &lt;description&gt;password to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;/configuration&gt; 3.上传一个mysql连接驱动（sparkSubmit也要连接MySQL，获取元数据信息） ./spark-sql --master spark://node-4:7077,node-5:7077 --driver-class-path /home/xiaoniu/mysql-connector-java-5.1.7-bin.jar 4.sparkSQL会在mysql上创建一个database，需要手动改一下DBS表中的DB_LOCATION_UIR改成hdfs的地址 hdfs://ns1/user/hive/warehome 5.要在/etc/profile中配置一个环节变量(让sparkSQL知道hdfs在哪里，其实就是namenode在哪里) exprot HADOOP_CONF_DIR=/appdata/hadoop/etc/hadoop/ 6.重新启动SparkSQL的命令行 注意：真正要计算的数据保存在hdfs中，mysql这个元数据库保存的是hive表的描述信息，描述了有那些database,table,以及表有多少列，每一列是什么类型，还要描述表的数据保存在hdfs的什么位置。 应用 1.连接 /appdata/spark/bin/spark-sql --master spark://n1:7077 (不指定driver-class-path的前提是，spark/jars下导入mysql驱动的jar) 2.创建表 create table person(id int,name string,fv int) &gt; row format delimited &gt; fields terminated by ‘,’; 3.导入数据（数据源hdfs） load data inpath ‘/person.txt’ into table person; 4.查看数据 Hive跟mysql的区别？ Hive是一个数据仓库(存储数据并分析数据，分析数据仓库中的数据量很大，)， MySQL是一个关系型数据库（关系型数据的增删改查（低延迟））。 hive的元数据库中保存要计算的数据吗？ 不保存，保存hive仓库的表，字段，等描述信息。 hive的元数据库的功能？ 建立了一种映射关系，执行HQL时，先到Mysql元数据库中查找描述信息，然后根据描述信息生成任务，然后将任务发到spark集群中执行。 spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) /appdata/spark/bin/spark-sql --master spark://node1:7077 -e “select * from t_boy order by fv desc” /appdata/spark/bin/spark-sql --master spark://node1:7077 -f demo.sql idea开发整合 在idea开发整合，hive需要依赖： &lt;dependency&gt; &lt;groupId&gt;org.apache.spark&lt;/groupId&gt; &lt;artifactId&gt;spark-hive_2.11&lt;/artifactId&gt; &lt;version&gt;2.2.0&lt;/version&gt; &lt;/dependency&gt; //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(“HiveOnSpark”) .master(“local[*]”) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() package day8 import org.apache.spark.sql.SparkSession object HiveOnSpark { def main(args: Array[String]): Unit = { //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(&quot;HiveOnSpark&quot;) .master(&quot;local[*]&quot;) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() //想要使用hive的元数据库，必须指定元数据库的位置，添加一个hive-site.xml到当前程序的classpath下即可。 //有t_boy这个表或视图吗？ val result = spark.sql(&quot;SELECT * FROM t_boy ORDER BY fv DESC&quot;) result.show() spark.stop() } } 导入集群的配置文件：hdfs-site.xml,core-site.xml 实时计算 实时计算相关技术 Strom / JStrom Spark streaming() Flink 实时性高 有延迟 实时性高 吞吐量较低 吞吐量高 吞吐量高 只能实时计算 离线+实时 离线+实时 算子较少 算子丰富 算子丰富 没有 机器学习 没有 没有 机器学习 没有 使用比较少 非常火 一般 一个完整的生态时非常重要的，Spark生态比较完善。 消息中间件 消息中间件的作用：临时存储数据，很重要。 拉取数据的有点：能有控制Spark Streaming的处理速度，不会出现大量的堆积到Spark Streaming的情况。 Kafka 简介 Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。Kafka是一种高吞吐量的分布式发布订阅消息系统，它可以处理消费者在网站中的所有动作流数据。 这种动作（网页浏览，搜索和其他用户的行动）是在现代网络上的许多社会功能的一个关键因素。 这些数据通常是由于吞吐量的要求而通过处理日志和日志聚合来解决。 对于像Hadoop一样的日志数据和离线分析系统，但又要求实时处理的限制，这是一个可行的解决方案。Kafka的目的是通过Hadoop的并行加载机制来统一线上和离线的消息处理，也是为了通过集群来提供实时的消息。 特征 Kafka 是一种高吞吐量 的分布式发布订阅消息系统，有如下特性： 1.通过O的磁盘数据结构提供消息的持久化，这种结构对于即使数以TB的消息存储也能够保持长时间的稳定性能。 2.高吞吐量：即使是非常普通的硬件Kafka也可以支持每秒数百万 [2] 的消息。 3.支持通过Kafka服务器和消费机集群来分区消息。 4.支持Hadoop并行数据加载。 Kafka通过官网发布了最新版本2.0.0 Kafka的一些概念 Broker:安装了Kafka服务的那台集群就是一个broker(broker的id要全局唯一) Producer:消息的生产者，负责将数据写入broker中(push) Consumer:消息的消费者，负责从Kafka中读取数据(pull),老版本的消费者需要依赖zk,新版本的不需要。 Topic:主题，数据的一个分类，不同的topic存放不同的数据。 Consumer Group:消费者组,一个topic可以有多个消费者同时消费，多个消费者如果在一个消费者组中，那么他们不能重复消费数据。 Spark Streaming2.2.0兼容kafka0.8.21以上的版本，主要支持0.8和0.10 Kafka0.8集群安装 1.下载Kafka安装包 2.上传安装包 3.解压 4.修改配置文件 config/server.properties broker.id=0 host.name=node1 log.dirs=/data/kafka zookeeper.connect=node-1:2181,node-2:2181,node-3:2181 kafka0.10不需要指定host.name默认是主机名。 5.将配置好的kafka拷贝到其他机器上 6.修改broker.id和host.name 7.启动kafka（后台线程启动） /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-start.sh -daemon /bigdata/kafka_2.11-0.8.2.2/config/server.properties 关闭： /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-stop.sh #查看topic信息 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --list --zookeeper node-1:2181,node-2:2181 #创建topic /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --create --zookeeper node-1:2181,node-2:2181 --replication-factor 3 --partitions 3 --topic xiaoniu #往Kafka的topic中写入数据(命令行的生产者) /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-producer.sh --broker-list node-4:9092,node-5:9092,node-5:9092 --topic xiaoniu #启动消费者 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-consumer.sh --zookeeper node-1:2181,node-2:2181 --topic xiaoniu --from-beginning Java代码实现kafka发送和接收消息 发送代码 package cn.edu360.kafka; import java.util.Properties; import kafka.javaapi.producer.Producer; import kafka.producer.KeyedMessage; import kafka.producer.ProducerConfig; public class ProducerDemo { public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;metadata.broker.list&quot;, &quot;node1:9092,node2:9092,node3:9092&quot;); props.put(&quot;serializer.class&quot;, &quot;kafka.serializer.StringEncoder&quot;); ProducerConfig config = new ProducerConfig(props); Producer&lt;String, String&gt; producer = new Producer&lt;String, String&gt;(config); for (int i = 1001; i &lt;= 1100; i++) producer.send(new KeyedMessage&lt;String, String&gt;(&quot;xiaoniu&quot;, &quot;xiaoniu-msg&quot; + i)); } } 接收代码 package cn.edu360.kafka; import java.util.HashMap; import java.util.List; import java.util.Map; import java.util.Properties; import kafka.consumer.Consumer; import kafka.consumer.ConsumerConfig; import kafka.consumer.KafkaStream; import kafka.javaapi.consumer.ConsumerConnector; import kafka.message.MessageAndMetadata; public class ConsumerDemo { private static final String topic = &quot;xiaoniu&quot;; private static final Integer threads = 2;//一个消费者可以有多少个线程同时消费 public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;zookeeper.connect&quot;, &quot;node1:2181,node2:2181,node3:2181&quot;); props.put(&quot;group.id&quot;, &quot;vvvvv&quot;); //smallest重最开始消费,largest代表重消费者启动后产生的数据才消费 //--from-beginning props.put(&quot;auto.offset.reset&quot;, &quot;smallest&quot;); ConsumerConfig config = new ConsumerConfig(props); ConsumerConnector consumer =Consumer.createJavaConsumerConnector(config); Map&lt;String, Integer&gt; topicCountMap = new HashMap&lt;String, Integer&gt;(); topicCountMap.put(topic, threads); Map&lt;String, List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt;&gt; consumerMap = consumer.createMessageStreams(topicCountMap); List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt; streams = consumerMap.get(topic); for(final KafkaStream&lt;byte[], byte[]&gt; kafkaStream : streams){ new Thread(new Runnable() { public void run() { for(MessageAndMetadata&lt;byte[], byte[]&gt; mm : kafkaStream){ String msg = new String(mm.message()); System.out.println(msg); } } }).start(); } } }" />
+<link rel="canonical" href="https://uzzz.org/2019/08/10/793224.html" />
+<meta property="og:url" content="https://uzzz.org/2019/08/10/793224.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-08-10T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"文章目录 SparkSql案例 SparkSQL实现最受欢迎的老师 Spark SQL的Join broadcast join shuffle hash join示意图 sort-merge-join示意图 Spark shell演示 BroadcastHashJoin Spark SQL整合Hive 应用 Hive跟mysql的区别？ spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) idea开发整合 实时计算 实时计算相关技术 消息中间件 Kafka 简介 特征 Kafka的一些概念 Kafka0.8集群安装 Java代码实现kafka发送和接收消息 SparkSql案例 SparkSQL实现最受欢迎的老师 package day8 import java.net.URL import org.apache.spark.sql.{DataFrame, Dataset, SparkSession} object SQLFavTeache { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().appName(&quot;RowNumberDemo&quot;) .master(&quot;local[4]&quot;) .getOrCreate() val lines: Dataset[String] = spark.read.textFile(args(0)) import spark.implicits._ val df: DataFrame = lines.map(line =&gt; { val tIndex = line.lastIndexOf(&quot;/&quot;) + 1 val teacher = line.substring(tIndex) val host = new URL(line).getHost val sIndex = host.indexOf(&quot;.&quot;) val subject = host.substring(0, sIndex) (subject, teacher) }).toDF(&quot;subject&quot;, &quot;teacher&quot;) df.createTempView(&quot;v_sub_teacher&quot;) //该学科下的老师的访问次数 val temp1: DataFrame = spark.sql(&quot;SELECT subject, teacher, count(*) counts FROM v_sub_teacher GROUP BY subject, teacher&quot;) //求每个学科下最受欢迎的老师的topn temp1.createTempView(&quot;v_temp_sub_teacher_counts&quot;) //所有学科按照出现的次数排序 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(order by counts desc) rk FROM v_temp_sub_teacher_counts&quot;) //学课相同的老师，进行局部排序,同时进行全局配许 //val temp2 = spark.sql(&quot;SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts&quot;) val topN = args(1) //前n名老师 //做全局排序可能某些序列号会被删除掉 //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //val temp2 = spark.sql(s&quot;SELECT * FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk, rank() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) //将入选的老师进行全局排序 //val temp2 = spark.sql(s&quot;SELECT *, dense_rank() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) val temp2 = spark.sql(s&quot;SELECT *, row_number() over(order by counts desc) g_rk FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN&quot;) temp2.show() spark.stop() } } Spark SQL的Join broadcast join 适用于小表与大表的join，其中小表小于10M，本质上是去用空间换时间， 也就是将小表发送到每个大表对应的节点上，然后依次去遍历大表中的每个关联键去和对应小表中的关联键去匹配，找到相等的进行关联，并不会走shuffle过程，因此最终的文件数取决于block的个数，每个bolck是一个逻辑上的概念， 生成的规则是在建表并落HDFS文件的时候按256M去拆分，得到最终的文件数 shuffle hash join示意图 适合于没有特别小的两个表进行关联的时候，默认设置的shuffle partition的个数 是200，也就是分了200个区，然后两张表的key值分别去基于200做hash取余然后散步在每个区域中了，这样的思想先把相近的合并在一个区内，再在每个分区内去做比较key值的等值比较，就避免了大范围的遍历比较，节省了时间和内存。 sort-merge-join示意图 特点：同一个范围内的数据shuffle到同一个分区。 这种适用于关联的两张表都特别大时，使用上述的两种方法加载到内存的时候对于内存的压力都非常大时，因此在2方法的基础上，hash取余之后还要分别对两张表的key值进行排序，这样去做等值比较的时候就不需要将某一方的全部数据都加载到内存进行计算了，只需要取一部分就能知道是否有相等的（比如按升序排列，某个值明显比它大了，后面肯定就不会有相等的，就不用继续比较了，节省了时间和内存），也就是在进行等值比较的时候即用即丢的。这个方法在前面进行排序的时候可能会消耗点时间，但相对于后面的时间来说，总体是大大节省了时间。 原文链接：https://blog.csdn.net/rms1800201760/article/details/90970932 package day8 import org.apache.spark.sql.SparkSession object JoinTest { def main(args: Array[String]): Unit = { val spark = SparkSession.builder().master(&quot;local[*]&quot;).appName(&quot;JoinTest&quot;).getOrCreate() import spark.implicits._ val df1: DataFrame = Seq( (0, &quot;playing&quot;), (1, &quot;with&quot;), (2, &quot;join&quot;) ).toDF(&quot;id&quot;, &quot;token&quot;) val df2: DataFrame = Seq( (0, &quot;P&quot;), (1, &quot;W&quot;), (2, &quot;S&quot;) ).toDF(&quot;aid&quot;, &quot;atoken&quot;) val query: DataFrame = df1.join(df2, $&quot;id&quot; === $&quot;aid&quot;) //查看物理计划 query.explain() query.show() spark.stop() } } Spark shell演示 val df1 = Seq( | (0, “peon”), | (1, “with”), | (2, “join”) | ).toDF(“id”, “token”) val df2 = Seq( | (0, “P”), | (1, “W”), | (2, “S”) | ).toDF(“aid”, “atoken”) BroadcastHashJoin 默认使用BroadcastHashJoin Spark SQL整合Hive Hive On Spark(跟Hive没有太大的关系，就是使用了Hive的标准（HQL，元数据库，UDF，序列化，反序列化机制)) 在公司中使用hive还是特别多的。 Hive原来的执行计算模型是MR，有点慢（中间结果写入到HDFS)。 Hive On Spark 使用RDD（DataFrame）运行在Spark集群上。 Hive元数据库中不包含真正要计算的数据。 1.安装MySQL（hive的元数据库）并创建一个普通用户，并且授权 CREATE USER ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’; GRANT ALL PRIVILEGES ON hivedb.* TO ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’ WITH GRANT OPTION; FLUSH PRIVILEGES; #在spark的conf目录下创建一个hive的配置文件 2.添加一个hive-site.xml &lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot; standalone=&quot;no&quot;?&gt; &lt;?xml-stylesheet type=&quot;text/xsl&quot; href=&quot;configuration.xsl&quot;?&gt; &lt;!-- Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements. See the NOTICE file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. --&gt; &lt;configuration&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionURL&lt;/name&gt; &lt;value&gt;jdbc:mysql://node-6:3306/hivedb?createDatabaseIfNotExist=true&lt;/value&gt; &lt;description&gt;JDBC connect string for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionDriverName&lt;/name&gt; &lt;value&gt;com.mysql.jdbc.Driver&lt;/value&gt; &lt;description&gt;Driver class name for a JDBC metastore&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionUserName&lt;/name&gt; &lt;value&gt;xiaoniu&lt;/value&gt; &lt;description&gt;username to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;property&gt; &lt;name&gt;javax.jdo.option.ConnectionPassword&lt;/name&gt; &lt;value&gt;123568&lt;/value&gt; &lt;description&gt;password to use against metastore database&lt;/description&gt; &lt;/property&gt; &lt;/configuration&gt; 3.上传一个mysql连接驱动（sparkSubmit也要连接MySQL，获取元数据信息） ./spark-sql --master spark://node-4:7077,node-5:7077 --driver-class-path /home/xiaoniu/mysql-connector-java-5.1.7-bin.jar 4.sparkSQL会在mysql上创建一个database，需要手动改一下DBS表中的DB_LOCATION_UIR改成hdfs的地址 hdfs://ns1/user/hive/warehome 5.要在/etc/profile中配置一个环节变量(让sparkSQL知道hdfs在哪里，其实就是namenode在哪里) exprot HADOOP_CONF_DIR=/appdata/hadoop/etc/hadoop/ 6.重新启动SparkSQL的命令行 注意：真正要计算的数据保存在hdfs中，mysql这个元数据库保存的是hive表的描述信息，描述了有那些database,table,以及表有多少列，每一列是什么类型，还要描述表的数据保存在hdfs的什么位置。 应用 1.连接 /appdata/spark/bin/spark-sql --master spark://n1:7077 (不指定driver-class-path的前提是，spark/jars下导入mysql驱动的jar) 2.创建表 create table person(id int,name string,fv int) &gt; row format delimited &gt; fields terminated by ‘,’; 3.导入数据（数据源hdfs） load data inpath ‘/person.txt’ into table person; 4.查看数据 Hive跟mysql的区别？ Hive是一个数据仓库(存储数据并分析数据，分析数据仓库中的数据量很大，)， MySQL是一个关系型数据库（关系型数据的增删改查（低延迟））。 hive的元数据库中保存要计算的数据吗？ 不保存，保存hive仓库的表，字段，等描述信息。 hive的元数据库的功能？ 建立了一种映射关系，执行HQL时，先到Mysql元数据库中查找描述信息，然后根据描述信息生成任务，然后将任务发到spark集群中执行。 spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数) /appdata/spark/bin/spark-sql --master spark://node1:7077 -e “select * from t_boy order by fv desc” /appdata/spark/bin/spark-sql --master spark://node1:7077 -f demo.sql idea开发整合 在idea开发整合，hive需要依赖： &lt;dependency&gt; &lt;groupId&gt;org.apache.spark&lt;/groupId&gt; &lt;artifactId&gt;spark-hive_2.11&lt;/artifactId&gt; &lt;version&gt;2.2.0&lt;/version&gt; &lt;/dependency&gt; //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(“HiveOnSpark”) .master(“local[*]”) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() package day8 import org.apache.spark.sql.SparkSession object HiveOnSpark { def main(args: Array[String]): Unit = { //如果想让hive运行在spark上，一定要开启spark对hive的支持。 val spark = SparkSession.builder() .appName(&quot;HiveOnSpark&quot;) .master(&quot;local[*]&quot;) .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了） .getOrCreate() //想要使用hive的元数据库，必须指定元数据库的位置，添加一个hive-site.xml到当前程序的classpath下即可。 //有t_boy这个表或视图吗？ val result = spark.sql(&quot;SELECT * FROM t_boy ORDER BY fv DESC&quot;) result.show() spark.stop() } } 导入集群的配置文件：hdfs-site.xml,core-site.xml 实时计算 实时计算相关技术 Strom / JStrom Spark streaming() Flink 实时性高 有延迟 实时性高 吞吐量较低 吞吐量高 吞吐量高 只能实时计算 离线+实时 离线+实时 算子较少 算子丰富 算子丰富 没有 机器学习 没有 没有 机器学习 没有 使用比较少 非常火 一般 一个完整的生态时非常重要的，Spark生态比较完善。 消息中间件 消息中间件的作用：临时存储数据，很重要。 拉取数据的有点：能有控制Spark Streaming的处理速度，不会出现大量的堆积到Spark Streaming的情况。 Kafka 简介 Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。Kafka是一种高吞吐量的分布式发布订阅消息系统，它可以处理消费者在网站中的所有动作流数据。 这种动作（网页浏览，搜索和其他用户的行动）是在现代网络上的许多社会功能的一个关键因素。 这些数据通常是由于吞吐量的要求而通过处理日志和日志聚合来解决。 对于像Hadoop一样的日志数据和离线分析系统，但又要求实时处理的限制，这是一个可行的解决方案。Kafka的目的是通过Hadoop的并行加载机制来统一线上和离线的消息处理，也是为了通过集群来提供实时的消息。 特征 Kafka 是一种高吞吐量 的分布式发布订阅消息系统，有如下特性： 1.通过O的磁盘数据结构提供消息的持久化，这种结构对于即使数以TB的消息存储也能够保持长时间的稳定性能。 2.高吞吐量：即使是非常普通的硬件Kafka也可以支持每秒数百万 [2] 的消息。 3.支持通过Kafka服务器和消费机集群来分区消息。 4.支持Hadoop并行数据加载。 Kafka通过官网发布了最新版本2.0.0 Kafka的一些概念 Broker:安装了Kafka服务的那台集群就是一个broker(broker的id要全局唯一) Producer:消息的生产者，负责将数据写入broker中(push) Consumer:消息的消费者，负责从Kafka中读取数据(pull),老版本的消费者需要依赖zk,新版本的不需要。 Topic:主题，数据的一个分类，不同的topic存放不同的数据。 Consumer Group:消费者组,一个topic可以有多个消费者同时消费，多个消费者如果在一个消费者组中，那么他们不能重复消费数据。 Spark Streaming2.2.0兼容kafka0.8.21以上的版本，主要支持0.8和0.10 Kafka0.8集群安装 1.下载Kafka安装包 2.上传安装包 3.解压 4.修改配置文件 config/server.properties broker.id=0 host.name=node1 log.dirs=/data/kafka zookeeper.connect=node-1:2181,node-2:2181,node-3:2181 kafka0.10不需要指定host.name默认是主机名。 5.将配置好的kafka拷贝到其他机器上 6.修改broker.id和host.name 7.启动kafka（后台线程启动） /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-start.sh -daemon /bigdata/kafka_2.11-0.8.2.2/config/server.properties 关闭： /bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-stop.sh #查看topic信息 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --list --zookeeper node-1:2181,node-2:2181 #创建topic /bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --create --zookeeper node-1:2181,node-2:2181 --replication-factor 3 --partitions 3 --topic xiaoniu #往Kafka的topic中写入数据(命令行的生产者) /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-producer.sh --broker-list node-4:9092,node-5:9092,node-5:9092 --topic xiaoniu #启动消费者 /bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-consumer.sh --zookeeper node-1:2181,node-2:2181 --topic xiaoniu --from-beginning Java代码实现kafka发送和接收消息 发送代码 package cn.edu360.kafka; import java.util.Properties; import kafka.javaapi.producer.Producer; import kafka.producer.KeyedMessage; import kafka.producer.ProducerConfig; public class ProducerDemo { public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;metadata.broker.list&quot;, &quot;node1:9092,node2:9092,node3:9092&quot;); props.put(&quot;serializer.class&quot;, &quot;kafka.serializer.StringEncoder&quot;); ProducerConfig config = new ProducerConfig(props); Producer&lt;String, String&gt; producer = new Producer&lt;String, String&gt;(config); for (int i = 1001; i &lt;= 1100; i++) producer.send(new KeyedMessage&lt;String, String&gt;(&quot;xiaoniu&quot;, &quot;xiaoniu-msg&quot; + i)); } } 接收代码 package cn.edu360.kafka; import java.util.HashMap; import java.util.List; import java.util.Map; import java.util.Properties; import kafka.consumer.Consumer; import kafka.consumer.ConsumerConfig; import kafka.consumer.KafkaStream; import kafka.javaapi.consumer.ConsumerConnector; import kafka.message.MessageAndMetadata; public class ConsumerDemo { private static final String topic = &quot;xiaoniu&quot;; private static final Integer threads = 2;//一个消费者可以有多少个线程同时消费 public static void main(String[] args) { Properties props = new Properties(); props.put(&quot;zookeeper.connect&quot;, &quot;node1:2181,node2:2181,node3:2181&quot;); props.put(&quot;group.id&quot;, &quot;vvvvv&quot;); //smallest重最开始消费,largest代表重消费者启动后产生的数据才消费 //--from-beginning props.put(&quot;auto.offset.reset&quot;, &quot;smallest&quot;); ConsumerConfig config = new ConsumerConfig(props); ConsumerConnector consumer =Consumer.createJavaConsumerConnector(config); Map&lt;String, Integer&gt; topicCountMap = new HashMap&lt;String, Integer&gt;(); topicCountMap.put(topic, threads); Map&lt;String, List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt;&gt; consumerMap = consumer.createMessageStreams(topicCountMap); List&lt;KafkaStream&lt;byte[], byte[]&gt;&gt; streams = consumerMap.get(topic); for(final KafkaStream&lt;byte[], byte[]&gt; kafkaStream : streams){ new Thread(new Runnable() { public void run() { for(MessageAndMetadata&lt;byte[], byte[]&gt; mm : kafkaStream){ String msg = new String(mm.message()); System.out.println(msg); } } }).start(); } } }","@type":"BlogPosting","url":"https://uzzz.org/2019/08/10/793224.html","headline":"Spark_08","dateModified":"2019-08-10T00:00:00+08:00","datePublished":"2019-08-10T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/08/10/793224.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Spark_08</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-3019150162.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;"> 
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path> 
+  </svg> 
+  <p></p>
+  <div class="toc">
+   <h3>文章目录</h3>
+   <ul>
+    <ul>
+     <li><a href="#SparkSql_1" rel="nofollow" data-token="fe4b1848236da7ac6ed23e79e2f66097">SparkSql案例</a></li>
+     <ul>
+      <ul>
+       <li><a href="#SparkSQL_2" rel="nofollow" data-token="8f695c800684c9d8254e9e7957b82b80">SparkSQL实现最受欢迎的老师</a></li>
+      </ul>
+     </ul>
+     <li><a href="#Spark_SQLJoin_59" rel="nofollow" data-token="765516af3e8512297610817075e4080f">Spark SQL的Join</a></li>
+     <ul>
+      <ul>
+       <li><a href="#broadcast_join_60" rel="nofollow" data-token="915747f3d10bb05d8868330f8a012c3c">broadcast join</a></li>
+       <li><a href="#shuffle_hash_join_65" rel="nofollow" data-token="ff4024ad488e021bfa53b2f47f7c29d1">shuffle hash join示意图</a></li>
+       <li><a href="#sortmergejoin_69" rel="nofollow" data-token="ddb0756f953f619d0c8f66c5c306a2eb">sort-merge-join示意图</a></li>
+      </ul>
+      <li><a href="#Spark_shell_106" rel="nofollow" data-token="85f8af59926dc5abdc9382126df462ef">Spark shell演示</a></li>
+      <ul>
+       <li><a href="#BroadcastHashJoin_119" rel="nofollow" data-token="79b491e0bc382d54ae0a6a88749669bd">BroadcastHashJoin</a></li>
+      </ul>
+     </ul>
+     <li><a href="#Spark_SQLHive_124" rel="nofollow" data-token="bcff696d6395404caa46cc671544f9fd">Spark SQL整合Hive</a></li>
+     <ul>
+      <ul>
+       <li><a href="#_198" rel="nofollow" data-token="93da389dfac7af3001bb792f7329ce7a">应用</a></li>
+       <li><a href="#Hivemysql_211" rel="nofollow" data-token="d2aa6695c0a30b6e2af4f8a994fe3650">Hive跟mysql的区别？</a></li>
+       <ul>
+        <li><a href="#spark_sqlHivehivesqlf_221" rel="nofollow" data-token="609bc7258843ae0af74fba05f625388b">spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数)</a></li>
+       </ul>
+       <li><a href="#idea_225" rel="nofollow" data-token="5651e49eeb88c837e9911c79040f0b71">idea开发整合</a></li>
+      </ul>
+     </ul>
+    </ul>
+    <li><a href="#_268" rel="nofollow" data-token="8e1f205bbf19de0e8dbf2c1fb93cc96d">实时计算</a></li>
+    <ul>
+     <ul>
+      <ul>
+       <li><a href="#_269" rel="nofollow" data-token="b641d06b513ecc3e401c022f2970d34b">实时计算相关技术</a></li>
+      </ul>
+     </ul>
+    </ul>
+    <li><a href="#_282" rel="nofollow" data-token="78a27f4032eb56e540d3e110266221c1">消息中间件</a></li>
+    <ul>
+     <li><a href="#Kafka_287" rel="nofollow" data-token="f543637461f05ee9cdd364778c3ca23b">Kafka</a></li>
+     <ul>
+      <ul>
+       <li><a href="#_288" rel="nofollow" data-token="50e9dde25fef4cd309f64162ff353498">简介</a></li>
+       <li><a href="#_290" rel="nofollow" data-token="3c7cd0e77b7d3a1337a028eeabcc3cdd">特征</a></li>
+       <li><a href="#Kafka_298" rel="nofollow" data-token="c67cf7eb4bcdd9c8a0d550b3210e73c8">Kafka的一些概念</a></li>
+      </ul>
+      <li><a href="#Kafka08_307" rel="nofollow" data-token="feb188a5d0850057b85782868dd18b14">Kafka0.8集群安装</a></li>
+      <li><a href="#Javakafka_337" rel="nofollow" data-token="ed114fa17406c1fde5378c0f4dd510d9">Java代码实现kafka发送和接收消息</a></li>
+     </ul>
+    </ul>
+   </ul>
+  </div>
+  <p></p> 
+  <h2><a id="SparkSql_1"></a>SparkSql案例</h2> 
+  <h4><a id="SparkSQL_2"></a>SparkSQL实现最受欢迎的老师</h4> 
+  <pre><code class="prism language-scala">package day8
+import java.net.URL
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
+
+object SQLFavTeache {
+
+  def main(args: Array[String]): Unit = {
+
+    val spark = SparkSession.builder().appName("RowNumberDemo")
+      .master("local[4]")
+      .getOrCreate()
+
+    val lines: Dataset[String] = spark.read.textFile(args(0))
+
+    import spark.implicits._
+    val df: DataFrame = lines.map(line =&gt; {
+      val tIndex = line.lastIndexOf("/") + 1
+      val teacher = line.substring(tIndex)
+      val host = new URL(line).getHost
+      val sIndex = host.indexOf(".")
+      val subject = host.substring(0, sIndex)
+      (subject, teacher)
+    }).toDF("subject", "teacher")
+
+    df.createTempView("v_sub_teacher")
+
+    //该学科下的老师的访问次数
+    val temp1: DataFrame = spark.sql("SELECT subject, teacher, count(*) counts FROM v_sub_teacher GROUP BY subject, teacher")
+
+    //求每个学科下最受欢迎的老师的topn
+    temp1.createTempView("v_temp_sub_teacher_counts")
+
+    //所有学科按照出现的次数排序
+    //val temp2 = spark.sql("SELECT subject, teacher, counts, row_number() over(order by counts desc) rk FROM v_temp_sub_teacher_counts")
+
+    //学课相同的老师，进行局部排序,同时进行全局配许
+    //val temp2 = spark.sql("SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts")
+
+    val topN = args(1)
+    //前n名老师
+    //做全局排序可能某些序列号会被删除掉
+    //val temp2 = spark.sql(s"SELECT *  FROM (SELECT subject, teacher, counts, row_number() over(partition by subject order by counts desc) sub_rk, row_number() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN")
+    
+    //val temp2 = spark.sql(s"SELECT *  FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk, rank() over(order by counts desc) g_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN")
+
+    //将入选的老师进行全局排序
+    
+    //val temp2 = spark.sql(s"SELECT *, dense_rank() over(order by counts desc) g_rk  FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN")
+    val temp2 = spark.sql(s"SELECT *, row_number() over(order by counts desc) g_rk  FROM (SELECT subject, teacher, counts, rank() over(partition by subject order by counts desc) sub_rk FROM v_temp_sub_teacher_counts) WHERE sub_rk &lt;= $topN")
+
+    temp2.show()
+    spark.stop()
+  }
+}
+</code></pre> 
+  <h2><a id="Spark_SQLJoin_59"></a>Spark SQL的Join</h2> 
+  <h4><a id="broadcast_join_60"></a>broadcast join</h4> 
+  <p>适用于小表与大表的join，其中小表小于10M，本质上是去用空间换时间，<br> 也就是将小表发送到每个大表对应的节点上，然后依次去遍历大表中的每个关联键去和对应小表中的关联键去匹配，找到相等的进行关联，并不会走shuffle过程，因此最终的文件数取决于block的个数，每个bolck是一个逻辑上的概念，<br> 生成的规则是在建表并落HDFS文件的时候按256M去拆分，得到最终的文件数<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190809150446417.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <h4><a id="shuffle_hash_join_65"></a>shuffle hash join示意图</h4> 
+  <p>适合于没有特别小的两个表进行关联的时候，默认设置的shuffle partition的个数<br> 是200，也就是分了200个区，然后两张表的key值分别去基于200做hash取余然后散步在每个区域中了，这样的思想先把相近的合并在一个区内，再在每个分区内去做比较key值的等值比较，就避免了大范围的遍历比较，节省了时间和内存。<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/201906051644314.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <h4><a id="sortmergejoin_69"></a>sort-merge-join示意图</h4> 
+  <p>特点：同一个范围内的数据shuffle到同一个分区。<br> 这种适用于关联的两张表都特别大时，使用上述的两种方法加载到内存的时候对于内存的压力都非常大时，因此在2方法的基础上，hash取余之后还要分别对两张表的key值进行排序，这样去做等值比较的时候就不需要将某一方的全部数据都加载到内存进行计算了，只需要取一部分就能知道是否有相等的（比如按升序排列，某个值明显比它大了，后面肯定就不会有相等的，就不用继续比较了，节省了时间和内存），也就是在进行等值比较的时候即用即丢的。这个方法在前面进行排序的时候可能会消耗点时间，但相对于后面的时间来说，总体是大大节省了时间。</p> 
+  <p>原文链接：<a href="https://blog.csdn.net/rms1800201760/article/details/90970932" rel="nofollow" data-token="b37e573e79ab28183b37a8af6adf9be5">https://blog.csdn.net/rms1800201760/article/details/90970932</a><br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/2019060516553444.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <pre><code class="prism language-scala">package day8
+import org.apache.spark.sql.SparkSession
+object JoinTest {
+
+  def main(args: Array[String]): Unit = {
+
+    val spark = SparkSession.builder().master("local[*]").appName("JoinTest").getOrCreate()
+
+    import spark.implicits._
+    val df1: DataFrame = Seq(
+      (0, "playing"),
+      (1, "with"),
+      (2, "join")
+    ).toDF("id", "token")
+
+    val df2: DataFrame = Seq(
+      (0, "P"),
+      (1, "W"),
+      (2, "S")
+    ).toDF("aid", "atoken")
+
+    val query: DataFrame = df1.join(df2, $"id" === $"aid")
+
+    //查看物理计划
+    query.explain()
+    query.show()
+    spark.stop()
+  }
+}
+</code></pre> 
+  <h3><a id="Spark_shell_106"></a>Spark shell演示</h3> 
+  <p>val df1 = Seq(<br> | (0, “peon”),<br> | (1, “with”),<br> | (2, “join”)<br> | ).toDF(“id”, “token”)<br> val df2 = Seq(<br> | (0, “P”),<br> | (1, “W”),<br> | (2, “S”)<br> | ).toDF(“aid”, “atoken”)</p> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190809152612790.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <h4><a id="BroadcastHashJoin_119"></a>BroadcastHashJoin</h4> 
+  <p>默认使用BroadcastHashJoin<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190809152714871.png" alt="在这里插入图片描述"><br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190809152757919.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <h2><a id="Spark_SQLHive_124"></a>Spark SQL整合Hive</h2> 
+  <p>Hive On Spark(跟Hive没有太大的关系，就是使用了Hive的标准（HQL，元数据库，UDF，序列化，反序列化机制))<br> 在公司中使用hive还是特别多的。</p> 
+  <p>Hive原来的执行计算模型是MR，有点慢（中间结果写入到HDFS)。</p> 
+  <p>Hive On Spark 使用RDD（DataFrame）运行在Spark集群上。<br> Hive元数据库中不包含真正要计算的数据。</p> 
+  <p>1.安装MySQL（hive的元数据库）并创建一个普通用户，并且授权<br> CREATE USER ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’;<br> GRANT ALL PRIVILEGES ON hivedb.* TO ‘xiaoniu’@’%’ IDENTIFIED BY ‘123568’ WITH GRANT OPTION;<br> FLUSH PRIVILEGES;</p> 
+  <p>#在spark的conf目录下创建一个hive的配置文件<br> 2.添加一个hive-site.xml</p> 
+  <pre><code class="prism language-xml"><span class="token prolog">&lt;?xml version="1.0" encoding="UTF-8" standalone="no"?&gt;</span>
+<span class="token prolog">&lt;?xml-stylesheet type="text/xsl" href="configuration.xsl"?&gt;</span>
+<span class="token comment">&lt;!-- Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements. See the NOTICE file distributed with this work for additional information regarding copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. --&gt;</span>
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>configuration</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>property</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>javax.jdo.option.ConnectionURL<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>value</span><span class="token punctuation">&gt;</span></span>jdbc:mysql://node-6:3306/hivedb?createDatabaseIfNotExist=true<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>value</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>description</span><span class="token punctuation">&gt;</span></span>JDBC connect string for a JDBC metastore<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>description</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>property</span><span class="token punctuation">&gt;</span></span>
+
+   <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>property</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>javax.jdo.option.ConnectionDriverName<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>value</span><span class="token punctuation">&gt;</span></span>com.mysql.jdbc.Driver<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>value</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>description</span><span class="token punctuation">&gt;</span></span>Driver class name for a JDBC metastore<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>description</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>property</span><span class="token punctuation">&gt;</span></span>
+
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>property</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>javax.jdo.option.ConnectionUserName<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>value</span><span class="token punctuation">&gt;</span></span>xiaoniu<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>value</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>description</span><span class="token punctuation">&gt;</span></span>username to use against metastore database<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>description</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>property</span><span class="token punctuation">&gt;</span></span>
+
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>property</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>name</span><span class="token punctuation">&gt;</span></span>javax.jdo.option.ConnectionPassword<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>name</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>value</span><span class="token punctuation">&gt;</span></span>123568<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>value</span><span class="token punctuation">&gt;</span></span>
+    <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;</span>description</span><span class="token punctuation">&gt;</span></span>password to use against metastore database<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>description</span><span class="token punctuation">&gt;</span></span>
+  <span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>property</span><span class="token punctuation">&gt;</span></span>
+
+<span class="token tag"><span class="token tag"><span class="token punctuation">&lt;/</span>configuration</span><span class="token punctuation">&gt;</span></span>
+</code></pre> 
+  <p>3.上传一个mysql连接驱动（sparkSubmit也要连接MySQL，获取元数据信息）<br> ./spark-sql --master spark://node-4:7077,node-5:7077 --driver-class-path /home/xiaoniu/mysql-connector-java-5.1.7-bin.jar</p> 
+  <p>4.sparkSQL会在mysql上创建一个database，需要手动改一下DBS表中的DB_LOCATION_UIR改成hdfs的地址<br> hdfs://ns1/user/hive/warehome</p> 
+  <p>5.要在/etc/profile中配置一个环节变量(让sparkSQL知道hdfs在哪里，其实就是namenode在哪里)<br> exprot HADOOP_CONF_DIR=/appdata/hadoop/etc/hadoop/</p> 
+  <p>6.重新启动SparkSQL的命令行</p> 
+  <p><strong>注意</strong>：真正要计算的数据保存在hdfs中，mysql这个元数据库保存的是hive表的描述信息，描述了有那些database,table,以及表有多少列，每一列是什么类型，还要描述表的数据保存在hdfs的什么位置。</p> 
+  <h4><a id="_198"></a>应用</h4> 
+  <p>1.连接<br> /appdata/spark/bin/spark-sql --master spark://n1:7077 (不指定driver-class-path的前提是，spark/jars下导入mysql驱动的jar)<br> 2.创建表<br> create table person(id int,name string,fv int)<br> &gt; row format delimited<br> &gt; fields terminated by ‘,’;</p> 
+  <p>3.导入数据（数据源hdfs）<br> load data inpath ‘/person.txt’ into table person;<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/2019080916485083.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 4.查看数据<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190809164735434.png" alt="在这里插入图片描述"></p> 
+  <h4><a id="Hivemysql_211"></a>Hive跟mysql的区别？</h4> 
+  <p>Hive是一个数据仓库(存储数据并分析数据，分析数据仓库中的数据量很大，)，<br> MySQL是一个关系型数据库（关系型数据的增删改查（低延迟））。</p> 
+  <p>hive的元数据库中保存要计算的数据吗？<br> 不保存，保存hive仓库的表，字段，等描述信息。</p> 
+  <p>hive的元数据库的功能？<br> 建立了一种映射关系，执行HQL时，先到Mysql元数据库中查找描述信息，然后根据描述信息生成任务，然后将任务发到spark集群中执行。</p> 
+  <h5><a id="spark_sqlHivehivesqlf_221"></a>spark sql整合Hive，将hive的sql写在一个文件中执行（用-f这个参数)</h5> 
+  <p>/appdata/spark/bin/spark-sql --master spark://node1:7077 -e “select * from t_boy order by fv desc”<br> /appdata/spark/bin/spark-sql --master spark://node1:7077 -f demo.sql</p> 
+  <h4><a id="idea_225"></a>idea开发整合</h4> 
+  <p><strong>在idea开发整合，hive需要依赖：</strong></p> 
+  <!--spark&#22914;&#26524;&#24819;&#25972;&#21512;Hive,&#38656;&#35201;&#21152;&#20837;hive&#30340;&#25903;&#25345;--> 
+  <pre><code>    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.spark&lt;/groupId&gt;
+        &lt;artifactId&gt;spark-hive_2.11&lt;/artifactId&gt;
+        &lt;version&gt;2.2.0&lt;/version&gt;
+    &lt;/dependency&gt;
+</code></pre> 
+  <p>//如果想让hive运行在spark上，一定要开启spark对hive的支持。<br> val spark = SparkSession.builder()<br> .appName(“HiveOnSpark”)<br> .master(“local[*]”)<br> .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了）<br> .getOrCreate()</p> 
+  <pre><code class="prism language-scala">package day8
+
+import org.apache.spark.sql.SparkSession
+
+object HiveOnSpark {
+
+  def main(args: Array[String]): Unit = {
+
+    //如果想让hive运行在spark上，一定要开启spark对hive的支持。
+    val spark = SparkSession.builder()
+      .appName("HiveOnSpark")
+      .master("local[*]")
+      .enableHiveSupport()//启用spark对hive的支持(可以兼容hive的句法了）
+      .getOrCreate()
+
+    //想要使用hive的元数据库，必须指定元数据库的位置，添加一个hive-site.xml到当前程序的classpath下即可。
+   
+    //有t_boy这个表或视图吗？
+    val result = spark.sql("SELECT * FROM t_boy ORDER BY fv DESC")
+
+    result.show()
+    spark.stop()
+  }
+}
+</code></pre> 
+  <p>导入集群的配置文件：hdfs-site.xml,core-site.xml<br> <img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190606210054207.png" alt="在这里插入图片描述"></p> 
+  <h1><a id="_268"></a>实时计算</h1> 
+  <h4><a id="_269"></a>实时计算相关技术</h4> 
+  <table> 
+   <thead> 
+    <tr> 
+     <th>Strom / JStrom</th> 
+     <th>Spark streaming()</th> 
+     <th>Flink</th> 
+    </tr> 
+   </thead> 
+   <tbody> 
+    <tr> 
+     <td>实时性高</td> 
+     <td>有延迟</td> 
+     <td>实时性高</td> 
+    </tr> 
+    <tr> 
+     <td>吞吐量较低</td> 
+     <td>吞吐量高</td> 
+     <td>吞吐量高</td> 
+    </tr> 
+    <tr> 
+     <td>只能实时计算</td> 
+     <td>离线+实时</td> 
+     <td>离线+实时</td> 
+    </tr> 
+    <tr> 
+     <td>算子较少</td> 
+     <td>算子丰富</td> 
+     <td>算子丰富</td> 
+    </tr> 
+    <tr> 
+     <td>没有</td> 
+     <td>机器学习</td> 
+     <td>没有</td> 
+    </tr> 
+    <tr> 
+     <td>没有</td> 
+     <td>机器学习</td> 
+     <td>没有</td> 
+    </tr> 
+    <tr> 
+     <td>使用比较少</td> 
+     <td>非常火</td> 
+     <td>一般</td> 
+    </tr> 
+   </tbody> 
+  </table>
+  <p>一个完整的生态时非常重要的，Spark生态比较完善。</p> 
+  <h1><a id="_282"></a>消息中间件</h1> 
+  <p><img src="https://uzshare.com/_p?https://img-blog.csdnimg.cn/20190606215201398.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3dlaXhpbl80MjU4MTgyMQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"><br> 消息中间件的作用：临时存储数据，很重要。<br> 拉取数据的有点：能有控制Spark Streaming的处理速度，不会出现大量的堆积到Spark Streaming的情况。</p> 
+  <h2><a id="Kafka_287"></a>Kafka</h2> 
+  <h4><a id="_288"></a>简介</h4> 
+  <p>Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。Kafka是一种高吞吐量的分布式发布订阅消息系统，它可以处理消费者在网站中的所有动作流数据。 这种动作（网页浏览，搜索和其他用户的行动）是在现代网络上的许多社会功能的一个关键因素。 这些数据通常是由于吞吐量的要求而通过处理日志和日志聚合来解决。 对于像Hadoop一样的日志数据和离线分析系统，但又要求实时处理的限制，这是一个可行的解决方案。Kafka的目的是通过Hadoop的并行加载机制来统一线上和离线的消息处理，也是为了通过集群来提供实时的消息。</p> 
+  <h4><a id="_290"></a>特征</h4> 
+  <p>Kafka 是一种高吞吐量 的分布式发布订阅消息系统，有如下特性：<br> 1.通过O的磁盘数据结构提供消息的持久化，这种结构对于即使数以TB的消息存储也能够保持长时间的稳定性能。<br> 2.高吞吐量：即使是非常普通的硬件Kafka也可以支持每秒数百万 [2] 的消息。<br> 3.支持通过Kafka服务器和消费机集群来分区消息。<br> 4.支持Hadoop并行数据加载。<br> Kafka通过官网发布了最新版本2.0.0</p> 
+  <h4><a id="Kafka_298"></a>Kafka的一些概念</h4> 
+  <pre><code>Broker:安装了Kafka服务的那台集群就是一个broker(broker的id要全局唯一)
+Producer:消息的生产者，负责将数据写入broker中(push)
+Consumer:消息的消费者，负责从Kafka中读取数据(pull),老版本的消费者需要依赖zk,新版本的不需要。
+Topic:主题，数据的一个分类，不同的topic存放不同的数据。
+Consumer Group:消费者组,一个topic可以有多个消费者同时消费，多个消费者如果在一个消费者组中，那么他们不能重复消费数据。
+</code></pre> 
+  <p>Spark Streaming2.2.0兼容kafka0.8.21以上的版本，主要支持0.8和0.10</p> 
+  <h3><a id="Kafka08_307"></a>Kafka0.8集群安装</h3> 
+  <pre><code>1.下载Kafka安装包
+2.上传安装包
+3.解压
+4.修改配置文件 config/server.properties
+	broker.id=0
+	host.name=node1
+	log.dirs=/data/kafka
+	zookeeper.connect=node-1:2181,node-2:2181,node-3:2181
+kafka0.10不需要指定host.name默认是主机名。
+5.将配置好的kafka拷贝到其他机器上
+6.修改broker.id和host.name
+7.启动kafka（后台线程启动）
+	/bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-start.sh -daemon /bigdata/kafka_2.11-0.8.2.2/config/server.properties 
+
+	关闭：
+	/bigdata/kafka_2.11-0.8.2.2/bin/kafka-server-stop.sh
+
+#查看topic信息
+/bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --list --zookeeper node-1:2181,node-2:2181
+
+#创建topic
+/bigdata/kafka_2.11-0.8.2.2/bin/kafka-topics.sh --create --zookeeper node-1:2181,node-2:2181 --replication-factor 3 --partitions 3 --topic xiaoniu
+
+#往Kafka的topic中写入数据(命令行的生产者)
+/bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-producer.sh --broker-list node-4:9092,node-5:9092,node-5:9092 --topic xiaoniu
+
+#启动消费者
+/bigdata/kafka_2.11-0.8.2.2/bin/kafka-console-consumer.sh --zookeeper node-1:2181,node-2:2181 --topic xiaoniu --from-beginning
+</code></pre> 
+  <h3><a id="Javakafka_337"></a>Java代码实现kafka发送和接收消息</h3> 
+  <p>发送代码</p> 
+  <pre><code class="prism language-java"><span class="token keyword">package</span> cn<span class="token punctuation">.</span>edu360<span class="token punctuation">.</span>kafka<span class="token punctuation">;</span>
+<span class="token keyword">import</span> java<span class="token punctuation">.</span>util<span class="token punctuation">.</span>Properties<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>javaapi<span class="token punctuation">.</span>producer<span class="token punctuation">.</span>Producer<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>producer<span class="token punctuation">.</span>KeyedMessage<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>producer<span class="token punctuation">.</span>ProducerConfig<span class="token punctuation">;</span>
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ProducerDemo</span> <span class="token punctuation">{</span>
+
+	<span class="token keyword">public</span> <span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">main</span><span class="token punctuation">(</span>String<span class="token punctuation">[</span><span class="token punctuation">]</span> args<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+		Properties props <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Properties</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		props<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span><span class="token string">"metadata.broker.list"</span><span class="token punctuation">,</span> <span class="token string">"node1:9092,node2:9092,node3:9092"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		props<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span><span class="token string">"serializer.class"</span><span class="token punctuation">,</span> <span class="token string">"kafka.serializer.StringEncoder"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		ProducerConfig config <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ProducerConfig</span><span class="token punctuation">(</span>props<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		Producer<span class="token generics function"><span class="token punctuation">&lt;</span>String<span class="token punctuation">,</span> String<span class="token punctuation">&gt;</span></span> producer <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Producer</span><span class="token generics function"><span class="token punctuation">&lt;</span>String<span class="token punctuation">,</span> String<span class="token punctuation">&gt;</span></span><span class="token punctuation">(</span>config<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">for</span> <span class="token punctuation">(</span><span class="token keyword">int</span> i <span class="token operator">=</span> <span class="token number">1001</span><span class="token punctuation">;</span> i <span class="token operator">&lt;=</span> <span class="token number">1100</span><span class="token punctuation">;</span> i<span class="token operator">++</span><span class="token punctuation">)</span>
+			producer<span class="token punctuation">.</span><span class="token function">send</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">KeyedMessage</span><span class="token generics function"><span class="token punctuation">&lt;</span>String<span class="token punctuation">,</span> String<span class="token punctuation">&gt;</span></span><span class="token punctuation">(</span><span class="token string">"xiaoniu"</span><span class="token punctuation">,</span> <span class="token string">"xiaoniu-msg"</span> <span class="token operator">+</span> i<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+  <p>接收代码</p> 
+  <pre><code class="prism language-java"><span class="token keyword">package</span> cn<span class="token punctuation">.</span>edu360<span class="token punctuation">.</span>kafka<span class="token punctuation">;</span>
+<span class="token keyword">import</span> java<span class="token punctuation">.</span>util<span class="token punctuation">.</span>HashMap<span class="token punctuation">;</span>
+<span class="token keyword">import</span> java<span class="token punctuation">.</span>util<span class="token punctuation">.</span>List<span class="token punctuation">;</span>
+<span class="token keyword">import</span> java<span class="token punctuation">.</span>util<span class="token punctuation">.</span>Map<span class="token punctuation">;</span>
+<span class="token keyword">import</span> java<span class="token punctuation">.</span>util<span class="token punctuation">.</span>Properties<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>consumer<span class="token punctuation">.</span>Consumer<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>consumer<span class="token punctuation">.</span>ConsumerConfig<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>consumer<span class="token punctuation">.</span>KafkaStream<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>javaapi<span class="token punctuation">.</span>consumer<span class="token punctuation">.</span>ConsumerConnector<span class="token punctuation">;</span>
+<span class="token keyword">import</span> kafka<span class="token punctuation">.</span>message<span class="token punctuation">.</span>MessageAndMetadata<span class="token punctuation">;</span>
+
+<span class="token keyword">public</span> <span class="token keyword">class</span> <span class="token class-name">ConsumerDemo</span> <span class="token punctuation">{</span>
+	<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> String topic <span class="token operator">=</span> <span class="token string">"xiaoniu"</span><span class="token punctuation">;</span>
+	<span class="token keyword">private</span> <span class="token keyword">static</span> <span class="token keyword">final</span> Integer threads <span class="token operator">=</span> <span class="token number">2</span><span class="token punctuation">;</span><span class="token comment">//一个消费者可以有多少个线程同时消费</span>
+
+	<span class="token keyword">public</span> <span class="token keyword">static</span> <span class="token keyword">void</span> <span class="token function">main</span><span class="token punctuation">(</span>String<span class="token punctuation">[</span><span class="token punctuation">]</span> args<span class="token punctuation">)</span> <span class="token punctuation">{</span>
+		
+		Properties props <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">Properties</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		props<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span><span class="token string">"zookeeper.connect"</span><span class="token punctuation">,</span> <span class="token string">"node1:2181,node2:2181,node3:2181"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		props<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span><span class="token string">"group.id"</span><span class="token punctuation">,</span> <span class="token string">"vvvvv"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//smallest重最开始消费,largest代表重消费者启动后产生的数据才消费</span>
+		<span class="token comment">//--from-beginning</span>
+		props<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span><span class="token string">"auto.offset.reset"</span><span class="token punctuation">,</span> <span class="token string">"smallest"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+
+		ConsumerConfig config <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">ConsumerConfig</span><span class="token punctuation">(</span>props<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		ConsumerConnector consumer <span class="token operator">=</span>Consumer<span class="token punctuation">.</span><span class="token function">createJavaConsumerConnector</span><span class="token punctuation">(</span>config<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		Map<span class="token generics function"><span class="token punctuation">&lt;</span>String<span class="token punctuation">,</span> Integer<span class="token punctuation">&gt;</span></span> topicCountMap <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">HashMap</span><span class="token generics function"><span class="token punctuation">&lt;</span>String<span class="token punctuation">,</span> Integer<span class="token punctuation">&gt;</span></span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		topicCountMap<span class="token punctuation">.</span><span class="token function">put</span><span class="token punctuation">(</span>topic<span class="token punctuation">,</span> threads<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		Map<span class="token operator">&lt;</span>String<span class="token punctuation">,</span> List<span class="token operator">&lt;</span>KafkaStream<span class="token operator">&lt;</span><span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">&gt;&gt;&gt;</span> consumerMap <span class="token operator">=</span> consumer<span class="token punctuation">.</span><span class="token function">createMessageStreams</span><span class="token punctuation">(</span>topicCountMap<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		List<span class="token operator">&lt;</span>KafkaStream<span class="token operator">&lt;</span><span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">&gt;&gt;</span> streams <span class="token operator">=</span> consumerMap<span class="token punctuation">.</span><span class="token function">get</span><span class="token punctuation">(</span>topic<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		
+		<span class="token keyword">for</span><span class="token punctuation">(</span><span class="token keyword">final</span> KafkaStream<span class="token operator">&lt;</span><span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">&gt;</span> kafkaStream <span class="token operator">:</span> streams<span class="token punctuation">)</span><span class="token punctuation">{</span>
+			<span class="token keyword">new</span> <span class="token class-name">Thread</span><span class="token punctuation">(</span><span class="token keyword">new</span> <span class="token class-name">Runnable</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+				<span class="token keyword">public</span> <span class="token keyword">void</span> <span class="token function">run</span><span class="token punctuation">(</span><span class="token punctuation">)</span> <span class="token punctuation">{</span>
+					<span class="token keyword">for</span><span class="token punctuation">(</span>MessageAndMetadata<span class="token operator">&lt;</span><span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token keyword">byte</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token operator">&gt;</span> mm <span class="token operator">:</span> kafkaStream<span class="token punctuation">)</span><span class="token punctuation">{</span>
+						String msg <span class="token operator">=</span> <span class="token keyword">new</span> <span class="token class-name">String</span><span class="token punctuation">(</span>mm<span class="token punctuation">.</span><span class="token function">message</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+						System<span class="token punctuation">.</span>out<span class="token punctuation">.</span><span class="token function">println</span><span class="token punctuation">(</span>msg<span class="token punctuation">)</span><span class="token punctuation">;</span>
+					<span class="token punctuation">}</span>
+				<span class="token punctuation">}</span>
+			<span class="token punctuation">}</span><span class="token punctuation">)</span><span class="token punctuation">.</span><span class="token function">start</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token punctuation">}</span>
+	<span class="token punctuation">}</span>
+<span class="token punctuation">}</span>
+</code></pre> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-e44c3c0e64.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

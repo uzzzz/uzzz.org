@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码之『账户管理钱包分析』 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码之『账户管理钱包分析』" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="如何实现通过geth生成以太坊地址？ personal.newAccount(password) // 创建一个新的账号 func accountCreate(ctx *cli.Context) error { // 获取geth配置 cfg := gethConfig{Node: defaultNodeConfig()} // 加载配置文件 if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } // 设置节点相关协议配置 utils.SetNodeConfig(ctx, &amp;cfg.Node) // 获取账号配置 scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // 解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // 通过密码获取一个新的地址，存储到keystore目录 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\n&quot;, address) return nil } accounts源码分析： 在accounts包中，主要实现了以太坊客户端的钱包管理和账户管理，提供了两种钱包，分别是keystore,usb。同时以太坊合约代码的ABI也在accounts中实现。 key.go中 // 生成新的key结构 func newKey(rand io.Reader) (*Key, error) { // 通过ecdsa生成一对公私钥对 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // 通过ecdsa公钥生成key结构 return newKeyFromECDSA(privateKeyECDSA), nil } // 生成地址，存储 func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 通过给定的随机数生成新的key结构 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } // 封装生成address a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} // 存储私钥 if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } keystore_passphrase.go accounts.go package accounts import ( &quot;math/big&quot; ethereum &quot;github.com/ethereum/go-ethereum&quot; &quot;github.com/ethereum/go-ethereum/common&quot; &quot;github.com/ethereum/go-ethereum/core/types&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 以太坊地址类型结构 type Account struct { // 20字节的数据 Address common.Address `json:&quot;address&quot;` // Ethereum account address derived from the key URL URL `json:&quot;url&quot;` // Optional resource locator within a backend } // 钱包接口 type Wallet interface { // 获取该钱包可以访问的规范路径 URL() URL // 钱包状态 Status() (string, error) // 初始化对钱包实例的访问 Open(passphrase string) error // 释放open方法占用的资源 Close() error // 账号列表 Accounts() []Account // 查询指定账户是否属于该钱包 Contains(account Account) bool // 专门给确定性钱包使用的 Derive(path DerivationPath, pin bool) (Account, error) // 设置一个账户导出路径 SelfDerive(base DerivationPath, chain ethereum.ChainStateReader) // 请求钱包为传入的哈希进行签名 SignHash(account Account, hash []byte) ([]byte, error) // 请求钱包为传入的交易进行签名 SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) // 请求钱包使用指定 的passphrase为传入的哈希进行签名 SignHashWithPassphrase(account Account, passphrase string, hash []byte) ([]byte, error) // 请求钱包使用指定 的passphrase为传入的交易进行签名 SignTxWithPassphrase(account Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) } // 钱包的后端实现(服务)，主要实现keystore钱包以及USB硬件钱包 type Backend interface { // 获取钱包列表 Wallets() []Wallet // 订阅钱包相关事件 Subscribe(sink chan&lt;- WalletEvent) event.Subscription } // 钱包事件的类型 type WalletEventType int const ( // 在通过USB或者密码文件检测到新钱包的时候 ，会触发该事件 WalletArrived WalletEventType = iota // 开户钱包所触发的事件 WalletOpened WalletDropped ) // 在检测到钱包账户发生改变时所触发的事件 type WalletEvent struct { Wallet Wallet Kind WalletEventType } 以太坊钱包管理器manager分析： manager.go： package accounts import ( &quot;reflect&quot; &quot;sort&quot; &quot;sync&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 账户管理工具，可以和所有的backends进行通信来签名交易 type Manager struct { // 已注册的后台服务 backends map[reflect.Type][]Backend // 钱包管理相关事件 updaters []event.Subscription updates chan WalletEvent // 已经注册过的钱包缓存 wallets []Wallet feed event.Feed quit chan chan error lock sync.RWMutex } // 新建管理器对象 func NewManager(backends ...Backend) *Manager { var wallets []Wallet for _, backend := range backends { // 调用所有backend的wallet方法，合并成完整的钱包列表 wallets = merge(wallets, backend.Wallets()...) } updates := make(chan WalletEvent, 4*len(backends)) subs := make([]event.Subscription, len(backends)) for i, backend := range backends { // 注册update channel到后端服务中 subs[i] = backend.Subscribe(updates) } // 封装 am := &amp;Manager{ backends: make(map[reflect.Type][]Backend), updaters: subs, updates: updates, wallets: wallets, quit: make(chan chan error), } for _, backend := range backends { kind := reflect.TypeOf(backend) am.backends[kind] = append(am.backends[kind], backend) } // 另起协程，监听钱包事件 go am.update() return am } // 关闭账号管理器 func (am *Manager) Close() error { errc := make(chan error) am.quit &lt;- errc return &lt;-errc } // 钱包事件 func (am *Manager) update() { defer func() { am.lock.Lock() for _, sub := range am.updaters { sub.Unsubscribe() } am.updaters = nil am.lock.Unlock() }() // 循环监听钱包相关事件 for { select { case event := &lt;-am.updates: am.lock.Lock() switch event.Kind { // 判断事件类型 case WalletArrived: am.wallets = merge(am.wallets, event.Wallet) case WalletDropped: am.wallets = drop(am.wallets, event.Wallet) } am.lock.Unlock() am.feed.Send(event) // 接收退出 case errc := &lt;-am.quit: errc &lt;- nil return } } } // 返回指定的服务列表 func (am *Manager) Backends(kind reflect.Type) []Backend { return am.backends[kind] } // 返回该账号管理器下的所有签名账户 func (am *Manager) Wallets() []Wallet { am.lock.RLock() defer am.lock.RUnlock() cpy := make([]Wallet, len(am.wallets)) copy(cpy, am.wallets) return cpy } // 通过URL查找指定的钱包 func (am *Manager) Wallet(url string) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() parsed, err := parseURL(url) if err != nil { return nil, err } for _, wallet := range am.Wallets() { if wallet.URL() == parsed { return wallet, nil } } return nil, ErrUnknownWallet } // 通过指定的ACCOUNT查找钱包 func (am *Manager) Find(account Account) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() for _, wallet := range am.wallets { if wallet.Contains(account) { return wallet, nil } } return nil, ErrUnknownAccount } // 订阅事件 func (am *Manager) Subscribe(sink chan&lt;- WalletEvent) event.Subscription { return am.feed.Subscribe(sink) } // 在指定的位置插入钱包，保证原来列表的顺序 func merge(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { slice = append(slice, wallet) continue } slice = append(slice[:n], append([]Wallet{wallet}, slice[n:]...)...) } return slice } // 删除钱包列表中指定的钱包 func drop(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { continue } slice = append(slice[:n], slice[n+1:]...) } return slice } 钱包列表获取与事件流程： 通过架构图，可以看到一个wallet中可以包含多个account,每个account中包含一个address结构(address, URL) accounts中核心接口： Backend接口：钱包后端，目前实现了keystore钱包和USB硬件钱包 Wallet接口：单个钱包，包含了一些打开 ，关闭，签名相关的接口函数 type KeyStore struct { // keyStore接口，用于访问账户关联的私钥 storage keyStore // Storage backend, might be cleartext or encrypted cache *accountCache // In-memory account cache over the filesystem storage changes chan struct{} // Channel receiving change notifications from the cache unlocked map[common.Address]*unlocked // Currently unlocked account (decrypted private keys) // 所有钱包的集合， wallets []accounts.Wallet // Wallet wrappers around the individual key files updateFeed event.Feed // Event feed to notify wallet additions/removals updateScope event.SubscriptionScope // Subscription scope tracking current live listeners updating bool // Whether the event notification loop is running mu sync.RWMutex } type unlocked struct { *Key abort chan struct{} } // 概念指定的目录创建一个keystore func NewKeyStore(keydir string, scryptN, scryptP int) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePassphrase{keydir, scryptN, scryptP}} ks.init(keydir) return ks } func NewPlaintextKeyStore(keydir string) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePlain{keydir}} ks.init(keydir) return ks } func (ks *KeyStore) init(keydir string) { ks.mu.Lock() defer ks.mu.Unlock() ks.unlocked = make(map[common.Address]*unlocked) // 创建一个accountCache实例 ks.cache, ks.changes = newAccountCache(keydir) runtime.SetFinalizer(ks, func(m *KeyStore) { m.cache.close() }) // 获取当前的账号列表 accs := ks.cache.accounts() ks.wallets = make([]accounts.Wallet, len(accs)) for i := 0; i &lt; len(accs); i++ { // 将keyStore填充到钱包中去 ks.wallets[i] = &amp;keystoreWallet{account: accs[i], keystore: ks} } } // 通过keystore获取wallet列表 func (ks *KeyStore) Wallets() []accounts.Wallet { ks.refreshWallets() ks.mu.RLock() defer ks.mu.RUnlock() cpy := make([]accounts.Wallet, len(ks.wallets)) copy(cpy, ks.wallets) return cpy } config.go // 创建一个账号管理器 func makeAccountManager(conf *Config) (*accounts.Manager, string, error) { // 获取配送配置以及私钥存储的目录 scryptN, scryptP, keydir, err := conf.AccountConfig() var ephemeral string if keydir == &quot;&quot; { keydir, err = ioutil.TempDir(&quot;&quot;, &quot;go-ethereum-keystore&quot;) ephemeral = keydir } if err != nil { return nil, &quot;&quot;, err } // 以700权限创建keystore目录，默认为datadir/keystore if err := os.MkdirAll(keydir, 0700); err != nil { return nil, &quot;&quot;, err } // 初始化backend列表,创建keyStore实例 backends := []accounts.Backend{ keystore.NewKeyStore(keydir, scryptN, scryptP), } if !conf.NoUSB { if ledgerhub, err := usbwallet.NewLedgerHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Ledger hub, disabling: %v&quot;, err)) } else { backends = append(backends, ledgerhub) } if trezorhub, err := usbwallet.NewTrezorHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Trezor hub, disabling: %v&quot;, err)) } else { backends = append(backends, trezorhub) } } // 在账户的列表初始化完成之后，通过NewManager函数创建一个账号管理器 return accounts.NewManager(backends...), ephemeral, nil } 钱包事件： Manager中：updates字段，channel类型，主要用于接收钱包相关的事件。Manage需要调用backend的subscribe函数注册channel Keystore:后端的事件，把注册请求转发给feed实例 Feed把channel记录下来 Manager可以能过该接口取消订阅 &nbsp; 阅读更多" />
+<meta property="og:description" content="如何实现通过geth生成以太坊地址？ personal.newAccount(password) // 创建一个新的账号 func accountCreate(ctx *cli.Context) error { // 获取geth配置 cfg := gethConfig{Node: defaultNodeConfig()} // 加载配置文件 if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } // 设置节点相关协议配置 utils.SetNodeConfig(ctx, &amp;cfg.Node) // 获取账号配置 scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // 解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // 通过密码获取一个新的地址，存储到keystore目录 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\n&quot;, address) return nil } accounts源码分析： 在accounts包中，主要实现了以太坊客户端的钱包管理和账户管理，提供了两种钱包，分别是keystore,usb。同时以太坊合约代码的ABI也在accounts中实现。 key.go中 // 生成新的key结构 func newKey(rand io.Reader) (*Key, error) { // 通过ecdsa生成一对公私钥对 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // 通过ecdsa公钥生成key结构 return newKeyFromECDSA(privateKeyECDSA), nil } // 生成地址，存储 func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 通过给定的随机数生成新的key结构 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } // 封装生成address a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} // 存储私钥 if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } keystore_passphrase.go accounts.go package accounts import ( &quot;math/big&quot; ethereum &quot;github.com/ethereum/go-ethereum&quot; &quot;github.com/ethereum/go-ethereum/common&quot; &quot;github.com/ethereum/go-ethereum/core/types&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 以太坊地址类型结构 type Account struct { // 20字节的数据 Address common.Address `json:&quot;address&quot;` // Ethereum account address derived from the key URL URL `json:&quot;url&quot;` // Optional resource locator within a backend } // 钱包接口 type Wallet interface { // 获取该钱包可以访问的规范路径 URL() URL // 钱包状态 Status() (string, error) // 初始化对钱包实例的访问 Open(passphrase string) error // 释放open方法占用的资源 Close() error // 账号列表 Accounts() []Account // 查询指定账户是否属于该钱包 Contains(account Account) bool // 专门给确定性钱包使用的 Derive(path DerivationPath, pin bool) (Account, error) // 设置一个账户导出路径 SelfDerive(base DerivationPath, chain ethereum.ChainStateReader) // 请求钱包为传入的哈希进行签名 SignHash(account Account, hash []byte) ([]byte, error) // 请求钱包为传入的交易进行签名 SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) // 请求钱包使用指定 的passphrase为传入的哈希进行签名 SignHashWithPassphrase(account Account, passphrase string, hash []byte) ([]byte, error) // 请求钱包使用指定 的passphrase为传入的交易进行签名 SignTxWithPassphrase(account Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) } // 钱包的后端实现(服务)，主要实现keystore钱包以及USB硬件钱包 type Backend interface { // 获取钱包列表 Wallets() []Wallet // 订阅钱包相关事件 Subscribe(sink chan&lt;- WalletEvent) event.Subscription } // 钱包事件的类型 type WalletEventType int const ( // 在通过USB或者密码文件检测到新钱包的时候 ，会触发该事件 WalletArrived WalletEventType = iota // 开户钱包所触发的事件 WalletOpened WalletDropped ) // 在检测到钱包账户发生改变时所触发的事件 type WalletEvent struct { Wallet Wallet Kind WalletEventType } 以太坊钱包管理器manager分析： manager.go： package accounts import ( &quot;reflect&quot; &quot;sort&quot; &quot;sync&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 账户管理工具，可以和所有的backends进行通信来签名交易 type Manager struct { // 已注册的后台服务 backends map[reflect.Type][]Backend // 钱包管理相关事件 updaters []event.Subscription updates chan WalletEvent // 已经注册过的钱包缓存 wallets []Wallet feed event.Feed quit chan chan error lock sync.RWMutex } // 新建管理器对象 func NewManager(backends ...Backend) *Manager { var wallets []Wallet for _, backend := range backends { // 调用所有backend的wallet方法，合并成完整的钱包列表 wallets = merge(wallets, backend.Wallets()...) } updates := make(chan WalletEvent, 4*len(backends)) subs := make([]event.Subscription, len(backends)) for i, backend := range backends { // 注册update channel到后端服务中 subs[i] = backend.Subscribe(updates) } // 封装 am := &amp;Manager{ backends: make(map[reflect.Type][]Backend), updaters: subs, updates: updates, wallets: wallets, quit: make(chan chan error), } for _, backend := range backends { kind := reflect.TypeOf(backend) am.backends[kind] = append(am.backends[kind], backend) } // 另起协程，监听钱包事件 go am.update() return am } // 关闭账号管理器 func (am *Manager) Close() error { errc := make(chan error) am.quit &lt;- errc return &lt;-errc } // 钱包事件 func (am *Manager) update() { defer func() { am.lock.Lock() for _, sub := range am.updaters { sub.Unsubscribe() } am.updaters = nil am.lock.Unlock() }() // 循环监听钱包相关事件 for { select { case event := &lt;-am.updates: am.lock.Lock() switch event.Kind { // 判断事件类型 case WalletArrived: am.wallets = merge(am.wallets, event.Wallet) case WalletDropped: am.wallets = drop(am.wallets, event.Wallet) } am.lock.Unlock() am.feed.Send(event) // 接收退出 case errc := &lt;-am.quit: errc &lt;- nil return } } } // 返回指定的服务列表 func (am *Manager) Backends(kind reflect.Type) []Backend { return am.backends[kind] } // 返回该账号管理器下的所有签名账户 func (am *Manager) Wallets() []Wallet { am.lock.RLock() defer am.lock.RUnlock() cpy := make([]Wallet, len(am.wallets)) copy(cpy, am.wallets) return cpy } // 通过URL查找指定的钱包 func (am *Manager) Wallet(url string) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() parsed, err := parseURL(url) if err != nil { return nil, err } for _, wallet := range am.Wallets() { if wallet.URL() == parsed { return wallet, nil } } return nil, ErrUnknownWallet } // 通过指定的ACCOUNT查找钱包 func (am *Manager) Find(account Account) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() for _, wallet := range am.wallets { if wallet.Contains(account) { return wallet, nil } } return nil, ErrUnknownAccount } // 订阅事件 func (am *Manager) Subscribe(sink chan&lt;- WalletEvent) event.Subscription { return am.feed.Subscribe(sink) } // 在指定的位置插入钱包，保证原来列表的顺序 func merge(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { slice = append(slice, wallet) continue } slice = append(slice[:n], append([]Wallet{wallet}, slice[n:]...)...) } return slice } // 删除钱包列表中指定的钱包 func drop(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { continue } slice = append(slice[:n], slice[n+1:]...) } return slice } 钱包列表获取与事件流程： 通过架构图，可以看到一个wallet中可以包含多个account,每个account中包含一个address结构(address, URL) accounts中核心接口： Backend接口：钱包后端，目前实现了keystore钱包和USB硬件钱包 Wallet接口：单个钱包，包含了一些打开 ，关闭，签名相关的接口函数 type KeyStore struct { // keyStore接口，用于访问账户关联的私钥 storage keyStore // Storage backend, might be cleartext or encrypted cache *accountCache // In-memory account cache over the filesystem storage changes chan struct{} // Channel receiving change notifications from the cache unlocked map[common.Address]*unlocked // Currently unlocked account (decrypted private keys) // 所有钱包的集合， wallets []accounts.Wallet // Wallet wrappers around the individual key files updateFeed event.Feed // Event feed to notify wallet additions/removals updateScope event.SubscriptionScope // Subscription scope tracking current live listeners updating bool // Whether the event notification loop is running mu sync.RWMutex } type unlocked struct { *Key abort chan struct{} } // 概念指定的目录创建一个keystore func NewKeyStore(keydir string, scryptN, scryptP int) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePassphrase{keydir, scryptN, scryptP}} ks.init(keydir) return ks } func NewPlaintextKeyStore(keydir string) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePlain{keydir}} ks.init(keydir) return ks } func (ks *KeyStore) init(keydir string) { ks.mu.Lock() defer ks.mu.Unlock() ks.unlocked = make(map[common.Address]*unlocked) // 创建一个accountCache实例 ks.cache, ks.changes = newAccountCache(keydir) runtime.SetFinalizer(ks, func(m *KeyStore) { m.cache.close() }) // 获取当前的账号列表 accs := ks.cache.accounts() ks.wallets = make([]accounts.Wallet, len(accs)) for i := 0; i &lt; len(accs); i++ { // 将keyStore填充到钱包中去 ks.wallets[i] = &amp;keystoreWallet{account: accs[i], keystore: ks} } } // 通过keystore获取wallet列表 func (ks *KeyStore) Wallets() []accounts.Wallet { ks.refreshWallets() ks.mu.RLock() defer ks.mu.RUnlock() cpy := make([]accounts.Wallet, len(ks.wallets)) copy(cpy, ks.wallets) return cpy } config.go // 创建一个账号管理器 func makeAccountManager(conf *Config) (*accounts.Manager, string, error) { // 获取配送配置以及私钥存储的目录 scryptN, scryptP, keydir, err := conf.AccountConfig() var ephemeral string if keydir == &quot;&quot; { keydir, err = ioutil.TempDir(&quot;&quot;, &quot;go-ethereum-keystore&quot;) ephemeral = keydir } if err != nil { return nil, &quot;&quot;, err } // 以700权限创建keystore目录，默认为datadir/keystore if err := os.MkdirAll(keydir, 0700); err != nil { return nil, &quot;&quot;, err } // 初始化backend列表,创建keyStore实例 backends := []accounts.Backend{ keystore.NewKeyStore(keydir, scryptN, scryptP), } if !conf.NoUSB { if ledgerhub, err := usbwallet.NewLedgerHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Ledger hub, disabling: %v&quot;, err)) } else { backends = append(backends, ledgerhub) } if trezorhub, err := usbwallet.NewTrezorHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Trezor hub, disabling: %v&quot;, err)) } else { backends = append(backends, trezorhub) } } // 在账户的列表初始化完成之后，通过NewManager函数创建一个账号管理器 return accounts.NewManager(backends...), ephemeral, nil } 钱包事件： Manager中：updates字段，channel类型，主要用于接收钱包相关的事件。Manage需要调用backend的subscribe函数注册channel Keystore:后端的事件，把注册请求转发给feed实例 Feed把channel记录下来 Manager可以能过该接口取消订阅 &nbsp; 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/10/30/2297796a9cccb7e2b46312a81585dfa4.html" />
+<meta property="og:url" content="https://uzzz.org/2018/10/30/2297796a9cccb7e2b46312a81585dfa4.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-10-30T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"如何实现通过geth生成以太坊地址？ personal.newAccount(password) // 创建一个新的账号 func accountCreate(ctx *cli.Context) error { // 获取geth配置 cfg := gethConfig{Node: defaultNodeConfig()} // 加载配置文件 if file := ctx.GlobalString(configFileFlag.Name); file != &quot;&quot; { if err := loadConfig(file, &amp;cfg); err != nil { utils.Fatalf(&quot;%v&quot;, err) } } // 设置节点相关协议配置 utils.SetNodeConfig(ctx, &amp;cfg.Node) // 获取账号配置 scryptN, scryptP, keydir, err := cfg.Node.AccountConfig() if err != nil { utils.Fatalf(&quot;Failed to read configuration: %v&quot;, err) } // 解析用户密码 password := getPassPhrase(&quot;Your new account is locked with a password. Please give a password. Do not forget this password.&quot;, true, 0, utils.MakePasswordList(ctx)) // 通过密码获取一个新的地址，存储到keystore目录 address, err := keystore.StoreKey(keydir, password, scryptN, scryptP) if err != nil { utils.Fatalf(&quot;Failed to create account: %v&quot;, err) } fmt.Printf(&quot;Address: {%x}\\n&quot;, address) return nil } accounts源码分析： 在accounts包中，主要实现了以太坊客户端的钱包管理和账户管理，提供了两种钱包，分别是keystore,usb。同时以太坊合约代码的ABI也在accounts中实现。 key.go中 // 生成新的key结构 func newKey(rand io.Reader) (*Key, error) { // 通过ecdsa生成一对公私钥对 privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand) if err != nil { return nil, err } // 通过ecdsa公钥生成key结构 return newKeyFromECDSA(privateKeyECDSA), nil } // 生成地址，存储 func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) { // 通过给定的随机数生成新的key结构 key, err := newKey(rand) if err != nil { return nil, accounts.Account{}, err } // 封装生成address a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}} // 存储私钥 if err := ks.StoreKey(a.URL.Path, key, auth); err != nil { zeroKey(key.PrivateKey) return nil, a, err } return key, a, err } keystore_passphrase.go accounts.go package accounts import ( &quot;math/big&quot; ethereum &quot;github.com/ethereum/go-ethereum&quot; &quot;github.com/ethereum/go-ethereum/common&quot; &quot;github.com/ethereum/go-ethereum/core/types&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 以太坊地址类型结构 type Account struct { // 20字节的数据 Address common.Address `json:&quot;address&quot;` // Ethereum account address derived from the key URL URL `json:&quot;url&quot;` // Optional resource locator within a backend } // 钱包接口 type Wallet interface { // 获取该钱包可以访问的规范路径 URL() URL // 钱包状态 Status() (string, error) // 初始化对钱包实例的访问 Open(passphrase string) error // 释放open方法占用的资源 Close() error // 账号列表 Accounts() []Account // 查询指定账户是否属于该钱包 Contains(account Account) bool // 专门给确定性钱包使用的 Derive(path DerivationPath, pin bool) (Account, error) // 设置一个账户导出路径 SelfDerive(base DerivationPath, chain ethereum.ChainStateReader) // 请求钱包为传入的哈希进行签名 SignHash(account Account, hash []byte) ([]byte, error) // 请求钱包为传入的交易进行签名 SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) // 请求钱包使用指定 的passphrase为传入的哈希进行签名 SignHashWithPassphrase(account Account, passphrase string, hash []byte) ([]byte, error) // 请求钱包使用指定 的passphrase为传入的交易进行签名 SignTxWithPassphrase(account Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) } // 钱包的后端实现(服务)，主要实现keystore钱包以及USB硬件钱包 type Backend interface { // 获取钱包列表 Wallets() []Wallet // 订阅钱包相关事件 Subscribe(sink chan&lt;- WalletEvent) event.Subscription } // 钱包事件的类型 type WalletEventType int const ( // 在通过USB或者密码文件检测到新钱包的时候 ，会触发该事件 WalletArrived WalletEventType = iota // 开户钱包所触发的事件 WalletOpened WalletDropped ) // 在检测到钱包账户发生改变时所触发的事件 type WalletEvent struct { Wallet Wallet Kind WalletEventType } 以太坊钱包管理器manager分析： manager.go： package accounts import ( &quot;reflect&quot; &quot;sort&quot; &quot;sync&quot; &quot;github.com/ethereum/go-ethereum/event&quot; ) // 账户管理工具，可以和所有的backends进行通信来签名交易 type Manager struct { // 已注册的后台服务 backends map[reflect.Type][]Backend // 钱包管理相关事件 updaters []event.Subscription updates chan WalletEvent // 已经注册过的钱包缓存 wallets []Wallet feed event.Feed quit chan chan error lock sync.RWMutex } // 新建管理器对象 func NewManager(backends ...Backend) *Manager { var wallets []Wallet for _, backend := range backends { // 调用所有backend的wallet方法，合并成完整的钱包列表 wallets = merge(wallets, backend.Wallets()...) } updates := make(chan WalletEvent, 4*len(backends)) subs := make([]event.Subscription, len(backends)) for i, backend := range backends { // 注册update channel到后端服务中 subs[i] = backend.Subscribe(updates) } // 封装 am := &amp;Manager{ backends: make(map[reflect.Type][]Backend), updaters: subs, updates: updates, wallets: wallets, quit: make(chan chan error), } for _, backend := range backends { kind := reflect.TypeOf(backend) am.backends[kind] = append(am.backends[kind], backend) } // 另起协程，监听钱包事件 go am.update() return am } // 关闭账号管理器 func (am *Manager) Close() error { errc := make(chan error) am.quit &lt;- errc return &lt;-errc } // 钱包事件 func (am *Manager) update() { defer func() { am.lock.Lock() for _, sub := range am.updaters { sub.Unsubscribe() } am.updaters = nil am.lock.Unlock() }() // 循环监听钱包相关事件 for { select { case event := &lt;-am.updates: am.lock.Lock() switch event.Kind { // 判断事件类型 case WalletArrived: am.wallets = merge(am.wallets, event.Wallet) case WalletDropped: am.wallets = drop(am.wallets, event.Wallet) } am.lock.Unlock() am.feed.Send(event) // 接收退出 case errc := &lt;-am.quit: errc &lt;- nil return } } } // 返回指定的服务列表 func (am *Manager) Backends(kind reflect.Type) []Backend { return am.backends[kind] } // 返回该账号管理器下的所有签名账户 func (am *Manager) Wallets() []Wallet { am.lock.RLock() defer am.lock.RUnlock() cpy := make([]Wallet, len(am.wallets)) copy(cpy, am.wallets) return cpy } // 通过URL查找指定的钱包 func (am *Manager) Wallet(url string) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() parsed, err := parseURL(url) if err != nil { return nil, err } for _, wallet := range am.Wallets() { if wallet.URL() == parsed { return wallet, nil } } return nil, ErrUnknownWallet } // 通过指定的ACCOUNT查找钱包 func (am *Manager) Find(account Account) (Wallet, error) { am.lock.RLock() defer am.lock.RUnlock() for _, wallet := range am.wallets { if wallet.Contains(account) { return wallet, nil } } return nil, ErrUnknownAccount } // 订阅事件 func (am *Manager) Subscribe(sink chan&lt;- WalletEvent) event.Subscription { return am.feed.Subscribe(sink) } // 在指定的位置插入钱包，保证原来列表的顺序 func merge(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { slice = append(slice, wallet) continue } slice = append(slice[:n], append([]Wallet{wallet}, slice[n:]...)...) } return slice } // 删除钱包列表中指定的钱包 func drop(slice []Wallet, wallets ...Wallet) []Wallet { for _, wallet := range wallets { n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 }) if n == len(slice) { continue } slice = append(slice[:n], slice[n+1:]...) } return slice } 钱包列表获取与事件流程： 通过架构图，可以看到一个wallet中可以包含多个account,每个account中包含一个address结构(address, URL) accounts中核心接口： Backend接口：钱包后端，目前实现了keystore钱包和USB硬件钱包 Wallet接口：单个钱包，包含了一些打开 ，关闭，签名相关的接口函数 type KeyStore struct { // keyStore接口，用于访问账户关联的私钥 storage keyStore // Storage backend, might be cleartext or encrypted cache *accountCache // In-memory account cache over the filesystem storage changes chan struct{} // Channel receiving change notifications from the cache unlocked map[common.Address]*unlocked // Currently unlocked account (decrypted private keys) // 所有钱包的集合， wallets []accounts.Wallet // Wallet wrappers around the individual key files updateFeed event.Feed // Event feed to notify wallet additions/removals updateScope event.SubscriptionScope // Subscription scope tracking current live listeners updating bool // Whether the event notification loop is running mu sync.RWMutex } type unlocked struct { *Key abort chan struct{} } // 概念指定的目录创建一个keystore func NewKeyStore(keydir string, scryptN, scryptP int) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePassphrase{keydir, scryptN, scryptP}} ks.init(keydir) return ks } func NewPlaintextKeyStore(keydir string) *KeyStore { keydir, _ = filepath.Abs(keydir) ks := &amp;KeyStore{storage: &amp;keyStorePlain{keydir}} ks.init(keydir) return ks } func (ks *KeyStore) init(keydir string) { ks.mu.Lock() defer ks.mu.Unlock() ks.unlocked = make(map[common.Address]*unlocked) // 创建一个accountCache实例 ks.cache, ks.changes = newAccountCache(keydir) runtime.SetFinalizer(ks, func(m *KeyStore) { m.cache.close() }) // 获取当前的账号列表 accs := ks.cache.accounts() ks.wallets = make([]accounts.Wallet, len(accs)) for i := 0; i &lt; len(accs); i++ { // 将keyStore填充到钱包中去 ks.wallets[i] = &amp;keystoreWallet{account: accs[i], keystore: ks} } } // 通过keystore获取wallet列表 func (ks *KeyStore) Wallets() []accounts.Wallet { ks.refreshWallets() ks.mu.RLock() defer ks.mu.RUnlock() cpy := make([]accounts.Wallet, len(ks.wallets)) copy(cpy, ks.wallets) return cpy } config.go // 创建一个账号管理器 func makeAccountManager(conf *Config) (*accounts.Manager, string, error) { // 获取配送配置以及私钥存储的目录 scryptN, scryptP, keydir, err := conf.AccountConfig() var ephemeral string if keydir == &quot;&quot; { keydir, err = ioutil.TempDir(&quot;&quot;, &quot;go-ethereum-keystore&quot;) ephemeral = keydir } if err != nil { return nil, &quot;&quot;, err } // 以700权限创建keystore目录，默认为datadir/keystore if err := os.MkdirAll(keydir, 0700); err != nil { return nil, &quot;&quot;, err } // 初始化backend列表,创建keyStore实例 backends := []accounts.Backend{ keystore.NewKeyStore(keydir, scryptN, scryptP), } if !conf.NoUSB { if ledgerhub, err := usbwallet.NewLedgerHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Ledger hub, disabling: %v&quot;, err)) } else { backends = append(backends, ledgerhub) } if trezorhub, err := usbwallet.NewTrezorHub(); err != nil { log.Warn(fmt.Sprintf(&quot;Failed to start Trezor hub, disabling: %v&quot;, err)) } else { backends = append(backends, trezorhub) } } // 在账户的列表初始化完成之后，通过NewManager函数创建一个账号管理器 return accounts.NewManager(backends...), ephemeral, nil } 钱包事件： Manager中：updates字段，channel类型，主要用于接收钱包相关的事件。Manage需要调用backend的subscribe函数注册channel Keystore:后端的事件，把注册请求转发给feed实例 Feed把channel记录下来 Manager可以能过该接口取消订阅 &nbsp; 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/10/30/2297796a9cccb7e2b46312a81585dfa4.html","headline":"以太坊源码之『账户管理钱包分析』","dateModified":"2018-10-30T00:00:00+08:00","datePublished":"2018-10-30T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/10/30/2297796a9cccb7e2b46312a81585dfa4.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码之『账户管理钱包分析』</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-2c6a5211c9.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <h2>如何实现通过geth生成以太坊地址？</h2> 
+  <p style="margin-left:0pt;"><span style="color:#f33b45;">personal.newAccount(password)</span></p> 
+  <pre class="has">
+<code class="language-Go">// 创建一个新的账号
+func accountCreate(ctx *cli.Context) error {
+	// 获取geth配置
+	cfg := gethConfig{Node: defaultNodeConfig()}
+	// 加载配置文件
+	if file := ctx.GlobalString(configFileFlag.Name); file != "" {
+		if err := loadConfig(file, &amp;cfg); err != nil {
+			utils.Fatalf("%v", err)
+		}
+	}
+	// 设置节点相关协议配置
+	utils.SetNodeConfig(ctx, &amp;cfg.Node)
+	// 获取账号配置
+	scryptN, scryptP, keydir, err := cfg.Node.AccountConfig()
+
+	if err != nil {
+		utils.Fatalf("Failed to read configuration: %v", err)
+	}
+	// 解析用户密码
+	password := getPassPhrase("Your new account is locked with a password. Please give a password. Do not forget this password.", true, 0, utils.MakePasswordList(ctx))
+	// 通过密码获取一个新的地址，存储到keystore目录
+	address, err := keystore.StoreKey(keydir, password, scryptN, scryptP)
+
+	if err != nil {
+		utils.Fatalf("Failed to create account: %v", err)
+	}
+	fmt.Printf("Address: {%x}\n", address)
+	return nil
+}
+</code></pre> 
+  <h2 style="margin-left:0pt;">accounts源码分析：</h2> 
+  <p>在accounts包中，主要实现了以太坊客户端的钱包管理和账户管理，提供了两种钱包，分别是keystore,usb。同时以太坊合约代码的ABI也在accounts中实现。</p> 
+  <blockquote> 
+   <p>key.go中</p> 
+  </blockquote> 
+  <p style="text-align:center;"><img alt="" class="has" height="199" src="https://img-blog.csdnimg.cn/20181030142950833.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="559"></p> 
+  <pre class="has">
+<code class="language-Go">// 生成新的key结构
+func newKey(rand io.Reader) (*Key, error) {
+	// 通过ecdsa生成一对公私钥对
+	privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand)
+	if err != nil {
+		return nil, err
+	}
+	// 通过ecdsa公钥生成key结构
+	return newKeyFromECDSA(privateKeyECDSA), nil
+}
+// 生成地址，存储
+func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) {
+	// 通过给定的随机数生成新的key结构
+	key, err := newKey(rand)
+	if err != nil {
+		return nil, accounts.Account{}, err
+	}
+	// 封装生成address
+	a := accounts.Account{Address: key.Address, URL: accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))}}
+	// 存储私钥
+	if err := ks.StoreKey(a.URL.Path, key, auth); err != nil {
+		zeroKey(key.PrivateKey)
+		return nil, a, err
+	}
+	return key, a, err
+}</code></pre> 
+  <blockquote> 
+   <p>keystore_passphrase.go</p> 
+  </blockquote> 
+  <p style="text-align:center;"><img alt="" class="has" height="196" src="https://img-blog.csdnimg.cn/20181030143127423.jpeg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="695"></p> 
+  <blockquote> 
+   <p>accounts.go</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="language-Go">
+package accounts
+
+import (
+	"math/big"
+
+	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/event"
+)
+
+// 以太坊地址类型结构
+type Account struct {
+	// 20字节的数据
+	Address common.Address `json:"address"` // Ethereum account address derived from the key
+	URL     URL            `json:"url"`     // Optional resource locator within a backend
+}
+
+// 钱包接口
+type Wallet interface {
+	// 获取该钱包可以访问的规范路径
+	URL() URL
+	// 钱包状态
+	Status() (string, error)
+	// 初始化对钱包实例的访问
+	Open(passphrase string) error
+	// 释放open方法占用的资源
+	Close() error
+	// 账号列表
+	Accounts() []Account
+	// 查询指定账户是否属于该钱包
+	Contains(account Account) bool
+	// 专门给确定性钱包使用的
+	Derive(path DerivationPath, pin bool) (Account, error)
+	// 设置一个账户导出路径
+	SelfDerive(base DerivationPath, chain ethereum.ChainStateReader)
+	// 请求钱包为传入的哈希进行签名
+	SignHash(account Account, hash []byte) ([]byte, error)
+	// 请求钱包为传入的交易进行签名
+	SignTx(account Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error)
+	// 请求钱包使用指定 的passphrase为传入的哈希进行签名
+	SignHashWithPassphrase(account Account, passphrase string, hash []byte) ([]byte, error)
+	// 请求钱包使用指定 的passphrase为传入的交易进行签名
+	SignTxWithPassphrase(account Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error)
+}
+
+// 钱包的后端实现(服务)，主要实现keystore钱包以及USB硬件钱包
+type Backend interface {
+	// 获取钱包列表
+	Wallets() []Wallet
+	// 订阅钱包相关事件
+	Subscribe(sink chan&lt;- WalletEvent) event.Subscription
+}
+// 钱包事件的类型
+type WalletEventType int
+
+const (
+	// 在通过USB或者密码文件检测到新钱包的时候 ，会触发该事件
+	WalletArrived WalletEventType = iota
+	// 开户钱包所触发的事件
+	WalletOpened
+	WalletDropped
+)
+// 在检测到钱包账户发生改变时所触发的事件
+type WalletEvent struct {
+	Wallet Wallet          
+	Kind   WalletEventType 
+}
+</code></pre> 
+  <hr>
+  <h2>以太坊钱包管理器manager分析：</h2> 
+  <blockquote> 
+   <p>manager.go：</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="language-Go">
+
+package accounts
+
+import (
+	"reflect"
+	"sort"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/event"
+)
+// 账户管理工具，可以和所有的backends进行通信来签名交易
+type Manager struct {
+	// 已注册的后台服务
+	backends map[reflect.Type][]Backend
+	// 钱包管理相关事件
+	updaters []event.Subscription
+	updates  chan WalletEvent
+	// 已经注册过的钱包缓存
+	wallets  []Wallet
+
+	feed event.Feed
+
+	quit chan chan error
+	lock sync.RWMutex
+}
+// 新建管理器对象
+func NewManager(backends ...Backend) *Manager {
+	var wallets []Wallet
+	for _, backend := range backends {
+		// 调用所有backend的wallet方法，合并成完整的钱包列表
+		wallets = merge(wallets, backend.Wallets()...)
+	}
+	updates := make(chan WalletEvent, 4*len(backends))
+
+	subs := make([]event.Subscription, len(backends))
+	for i, backend := range backends {
+		// 注册update channel到后端服务中
+		subs[i] = backend.Subscribe(updates)
+	}
+	// 封装
+	am := &amp;Manager{
+		backends: make(map[reflect.Type][]Backend),
+		updaters: subs,
+		updates:  updates,
+		wallets:  wallets,
+		quit:     make(chan chan error),
+	}
+	for _, backend := range backends {
+		kind := reflect.TypeOf(backend)
+		am.backends[kind] = append(am.backends[kind], backend)
+	}
+
+	// 另起协程，监听钱包事件
+	go am.update()
+
+	return am
+}
+// 关闭账号管理器
+func (am *Manager) Close() error {
+	errc := make(chan error)
+	am.quit &lt;- errc
+	return &lt;-errc
+}
+// 钱包事件
+func (am *Manager) update() {
+	defer func() {
+		am.lock.Lock()
+		for _, sub := range am.updaters {
+			sub.Unsubscribe()
+		}
+		am.updaters = nil
+		am.lock.Unlock()
+	}()
+	// 循环监听钱包相关事件
+	for {
+		select {
+		case event := &lt;-am.updates:
+			am.lock.Lock()
+			switch event.Kind {
+			// 判断事件类型
+			case WalletArrived:
+				am.wallets = merge(am.wallets, event.Wallet)
+			case WalletDropped:
+				am.wallets = drop(am.wallets, event.Wallet)
+			}
+			am.lock.Unlock()
+
+			am.feed.Send(event)
+		// 接收退出
+		case errc := &lt;-am.quit:
+			errc &lt;- nil
+			return
+		}
+	}
+}
+
+// 返回指定的服务列表
+func (am *Manager) Backends(kind reflect.Type) []Backend {
+	return am.backends[kind]
+}
+
+// 返回该账号管理器下的所有签名账户
+func (am *Manager) Wallets() []Wallet {
+	am.lock.RLock()
+	defer am.lock.RUnlock()
+
+	cpy := make([]Wallet, len(am.wallets))
+	copy(cpy, am.wallets)
+	return cpy
+}
+
+// 通过URL查找指定的钱包
+func (am *Manager) Wallet(url string) (Wallet, error) {
+	am.lock.RLock()
+	defer am.lock.RUnlock()
+
+	parsed, err := parseURL(url)
+	if err != nil {
+		return nil, err
+	}
+	for _, wallet := range am.Wallets() {
+		if wallet.URL() == parsed {
+			return wallet, nil
+		}
+	}
+	return nil, ErrUnknownWallet
+}
+// 通过指定的ACCOUNT查找钱包
+func (am *Manager) Find(account Account) (Wallet, error) {
+	am.lock.RLock()
+	defer am.lock.RUnlock()
+
+	for _, wallet := range am.wallets {
+		if wallet.Contains(account) {
+			return wallet, nil
+		}
+	}
+	return nil, ErrUnknownAccount
+}
+// 订阅事件
+func (am *Manager) Subscribe(sink chan&lt;- WalletEvent) event.Subscription {
+	return am.feed.Subscribe(sink)
+}
+// 在指定的位置插入钱包，保证原来列表的顺序
+func merge(slice []Wallet, wallets ...Wallet) []Wallet {
+	for _, wallet := range wallets {
+		n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 })
+		if n == len(slice) {
+			slice = append(slice, wallet)
+			continue
+		}
+		slice = append(slice[:n], append([]Wallet{wallet}, slice[n:]...)...)
+	}
+	return slice
+}
+// 删除钱包列表中指定的钱包
+func drop(slice []Wallet, wallets ...Wallet) []Wallet {
+	for _, wallet := range wallets {
+		n := sort.Search(len(slice), func(i int) bool { return slice[i].URL().Cmp(wallet.URL()) &gt;= 0 })
+		if n == len(slice) {
+			continue
+		}
+		slice = append(slice[:n], slice[n+1:]...)
+	}
+	return slice
+}
+</code></pre> 
+  <h2>钱包列表获取与事件流程：</h2> 
+  <p>通过架构图，可以看到一个wallet中可以包含多个account,每个account中包含一个address结构(address, URL)</p> 
+  <p style="text-align:center;"><img alt="" class="has" height="443" src="https://img-blog.csdnimg.cn/20181030144916285.jpg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="716"></p> 
+  <h2>accounts中核心接口：</h2> 
+  <ul>
+   <li>Backend接口：钱包后端，目前实现了keystore钱包和USB硬件钱包</li> 
+   <li>Wallet接口：单个钱包，包含了一些打开 ，关闭，签名相关的接口函数</li> 
+  </ul>
+  <pre class="has">
+<code class="language-Go">type KeyStore struct {
+	// keyStore接口，用于访问账户关联的私钥
+	storage  keyStore                     // Storage backend, might be cleartext or encrypted
+	cache    *accountCache                // In-memory account cache over the filesystem storage
+	changes  chan struct{}                // Channel receiving change notifications from the cache
+	unlocked map[common.Address]*unlocked // Currently unlocked account (decrypted private keys)
+
+	// 所有钱包的集合，
+	wallets     []accounts.Wallet       // Wallet wrappers around the individual key files
+	updateFeed  event.Feed              // Event feed to notify wallet additions/removals
+	updateScope event.SubscriptionScope // Subscription scope tracking current live listeners
+	updating    bool                    // Whether the event notification loop is running
+
+	mu sync.RWMutex
+}
+
+type unlocked struct {
+	*Key
+	abort chan struct{}
+}
+// 概念指定的目录创建一个keystore
+func NewKeyStore(keydir string, scryptN, scryptP int) *KeyStore {
+	keydir, _ = filepath.Abs(keydir)
+	ks := &amp;KeyStore{storage: &amp;keyStorePassphrase{keydir, scryptN, scryptP}}
+	ks.init(keydir)
+	return ks
+}
+func NewPlaintextKeyStore(keydir string) *KeyStore {
+	keydir, _ = filepath.Abs(keydir)
+	ks := &amp;KeyStore{storage: &amp;keyStorePlain{keydir}}
+	ks.init(keydir)
+	return ks
+}
+
+func (ks *KeyStore) init(keydir string) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	ks.unlocked = make(map[common.Address]*unlocked)
+	// 创建一个accountCache实例
+	ks.cache, ks.changes = newAccountCache(keydir)
+	runtime.SetFinalizer(ks, func(m *KeyStore) {
+		m.cache.close()
+	})
+	// 获取当前的账号列表
+	accs := ks.cache.accounts()
+	ks.wallets = make([]accounts.Wallet, len(accs))
+	for i := 0; i &lt; len(accs); i++ {
+		// 将keyStore填充到钱包中去
+		ks.wallets[i] = &amp;keystoreWallet{account: accs[i], keystore: ks}
+	}
+}
+// 通过keystore获取wallet列表
+func (ks *KeyStore) Wallets() []accounts.Wallet {
+	ks.refreshWallets()
+
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+
+	cpy := make([]accounts.Wallet, len(ks.wallets))
+	copy(cpy, ks.wallets)
+	return cpy
+}</code></pre> 
+  <blockquote> 
+   <p>config.go</p> 
+  </blockquote> 
+  <pre class="has">
+<code class="language-Go">
+// 创建一个账号管理器
+func makeAccountManager(conf *Config) (*accounts.Manager, string, error) {
+	// 获取配送配置以及私钥存储的目录
+	scryptN, scryptP, keydir, err := conf.AccountConfig()
+	var ephemeral string
+	if keydir == "" {
+		keydir, err = ioutil.TempDir("", "go-ethereum-keystore")
+		ephemeral = keydir
+	}
+
+	if err != nil {
+		return nil, "", err
+	}
+	// 以700权限创建keystore目录，默认为datadir/keystore
+	if err := os.MkdirAll(keydir, 0700); err != nil {
+		return nil, "", err
+	}
+	// 初始化backend列表,创建keyStore实例
+	backends := []accounts.Backend{
+		keystore.NewKeyStore(keydir, scryptN, scryptP),
+	}
+	if !conf.NoUSB {
+		if ledgerhub, err := usbwallet.NewLedgerHub(); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start Ledger hub, disabling: %v", err))
+		} else {
+			backends = append(backends, ledgerhub)
+		}
+		if trezorhub, err := usbwallet.NewTrezorHub(); err != nil {
+			log.Warn(fmt.Sprintf("Failed to start Trezor hub, disabling: %v", err))
+		} else {
+			backends = append(backends, trezorhub)
+		}
+	}
+	// 在账户的列表初始化完成之后，通过NewManager函数创建一个账号管理器
+	return accounts.NewManager(backends...), ephemeral, nil
+}
+</code></pre> 
+  <h2>钱包事件：</h2> 
+  <p style="text-align:center;"><img alt="" class="has" height="496" src="https://img-blog.csdnimg.cn/20181030145939204.jpg?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3N1cGVyX2xpeGlhbmc=,size_16,color_FFFFFF,t_70" width="762"></p> 
+  <ul>
+   <li>Manager中：updates字段，channel类型，主要用于接收钱包相关的事件。Manage需要调用backend的subscribe函数注册channel</li> 
+   <li>Keystore:后端的事件，把注册请求转发给feed实例</li> 
+   <li>Feed把channel记录下来</li> 
+   <li>Manager可以能过该接口取消订阅</li> 
+  </ul>
+  <p>&nbsp;</p> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/super_lixiang/article/details/83541134,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/super_lixiang/article/details/83541134,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

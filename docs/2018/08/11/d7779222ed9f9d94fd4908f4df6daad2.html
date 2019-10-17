@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>geth源码修改：取消调用智能合约的gas费用 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="geth源码修改：取消调用智能合约的gas费用" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="1 问题的提出 在联盟链里，有需求是普通的转账ether可以收取交易gas，发布或调用智能合约不需要gas费用。在私链环境下，如果智能合约调用是私链官方者的行为，则希望智能合约不收取gas费用。所谓的普通转账，就是在web3里面通过eth.sendTransaction({from:a,to:b,value:c)这种方式发起的交易。 2 虚拟机EVM中对交易处理及收取gas的机制 在源码 core/state_transition.go中，执行交易的函数是 func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 这个函数首先通过NewStateTransaction函数新建一个StateTransaction对象，然后再通过这个对象来执行TransactionDb()函数来真正处理交易。首先看NewStateTransaction函数，根据传递进来的EVM对象evm和Message对象msg来初始化一个StateTransaction对象。EVM对象就是虚拟机本身，交易包含的额外信息都存在Message对象中。 / NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 再来看TransactionDb()交易执行函数： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 首先是进行交易的preCheck()函数，preCheck()函数先检查Nonce，然后再通过buyGas购买gas。 func (st *StateTransition) preCheck() error { // Make sure this transaction&#39;s nonce is correct. if st.msg.CheckNonce() { nonce := st.state.GetNonce(st.msg.From()) if nonce &lt; st.msg.Nonce() { return ErrNonceTooHigh } else if nonce &gt; st.msg.Nonce() { return ErrNonceTooLow } } return st.buyGas() } 进入到buyGas内部： func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里先根据gasPrice和数量gas计算gas费用，mgVal=gasPrice*gas，（注意这里的gas就是给交易设置的gasLimit，而不是真正用到的gas数量gasUsed。以太坊普通的以太坊转账需要消耗的gasUsed一般是21000。而gasLimit是你为交易设定的gas上限。）。然后判断当前转出方st.msg.From()的账户余额和mgVal，如果余额不足则会抛出&nbsp;errInsufficientBalanceForGas错误。然后从转出账户扣除数量为mgval的费用。注意，mgval比实际真实消耗的gas费用要高，这里扣除多了，到时候会补偿回来。st.gas += st.msg.Gas()，此时st.gas=gasLimit 再回到TransitionDb()函数，执行完preChek(),做了一些变量赋值。如果是发布合约，msg.To()就会为nil。 msg := st.msg &nbsp;&nbsp; &nbsp;sender := vm.AccountRef(msg.From()) &nbsp;&nbsp; &nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp; &nbsp;contractCreation := msg.To() == nil 然后通过IntrinsicGas来计算交易要消耗的真实gas数量gasUsed。IntrinsicGas根据交易code的字节数多少来计算，合约越复杂，携带的数据量越多，需要的gas数量越多。然后再经过过st.useGas函数从st.gas扣除gasUsed，此时st.gas=gasLimit-gasUsed。 接着真正在虚拟机内执行交易了。 if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } 如果是创建合约，则调用evm.Create，否则走evm.Call路径。这里有个问题，调用合约的交易和普通以太坊转账交易也会走evm.call路径，那么如何区别这俩种情况？evm.Call总有代码段 if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { // Calling a non existing account, don&#39;t do antything, but ping the tracer if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) evm.vmConfig.Tracer.CaptureEnd(ret, 0, 0, nil) } return nil, gas, nil } evm.StateDB.CreateAccount(addr) } 可以通过判断交易的目的地址st.to()执行evm.StateDB.Exist(addr)来判断，如果是合约地址，则evm.StateDB.Exist(addr)返回true,如果是用户账户地址，则返回false，这个时候需要为普通以太坊转账交易临时新建一个账户。 继续回到TransitionDb()，在evm中执行完交易后，最后还剩3行代码 st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err st.refundGas()给发起者补偿gas，前面说过了，from账户在buyGas阶段被扣除了gasLimit*gasPrice的gas，而实际上交易消耗的真实gas是gasUsed*gasPrice，所以需要将(gasLimit-gasUsed)*gasPrice的多扣部分返还给from账户。 交易的真实gas消耗是gasUsed*gasPrice,这部分通过st.AddBalance给了evm.Coinbase,即区块记账账户。 3 如何取消智能合约手续费 上一节中解读了交易的gas扣除与奖励机制，源码绕了一大圈，感觉有点懵。其实想取消gas费用，直接操作gasPrice就行了。由于gasPrice对交易的过滤机制是在交易处理ApplyMessage函数之前就完成了，所以在这里可以取巧。可以在NewStateTransition中传递gasPrice时将之设为0即可。改造后的NewSateTransaction函数： // NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { gasPrice:= msg.GasPrice() var addr = common.Address{} if msg.To() != nil{ addr = *msg.To() } if msg.To() == nil || evm.StateDB.Exist(addr){ log.Info(&quot;contract create or call&quot;) gasPrice = big.NewInt(0) } return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: gasPrice,//msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 这里判断交易目的地址msg.To()，如果目的地址为空，说明是合约发布的交易。如果msg.To()存在evm.StateDB中，则说明是调用智能合约的交易，这俩种情况都将gasPrice设置为0。 4 实验验证 新建一条私有链，里面新建3个账户。eth.accounts[0]是矿工，先用eth.accounts[0]往eth.accounts[1]转100 ether，查询eth.accounts[1]余额： &gt; eth.sendTransaction({from:eth.coinbase,to:eth.accounts[1],value:web3.toWei(100,&quot;ether&quot;)}) INFO [08-11|16:08:47.447] Submitted transaction fullhash=0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe recipient=0xC004Fdeb4daC9827c695C672dAa2aFB0Ed2D0779 &quot;0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe&quot; &gt; miner.start() INFO [08-11|16:09:01.725] Updated mining threads threads=0 INFO [08-11|16:09:01.725] Transaction pool price threshold updated price=12000000000000 null INFO [08-11|16:09:01.725] Starting mining operation &gt; INFO [08-11|16:09:01.726] Commit new mining work number=1 txs=1 uncles=0 elapsed=898.694µs &gt; miner.stopINFO [08-11|16:09:04.990] Successfully sealed new block number=1 hash=15e49e…f61ead INFO [08-11|16:09:04.991] 阅读更多" />
+<meta property="og:description" content="1 问题的提出 在联盟链里，有需求是普通的转账ether可以收取交易gas，发布或调用智能合约不需要gas费用。在私链环境下，如果智能合约调用是私链官方者的行为，则希望智能合约不收取gas费用。所谓的普通转账，就是在web3里面通过eth.sendTransaction({from:a,to:b,value:c)这种方式发起的交易。 2 虚拟机EVM中对交易处理及收取gas的机制 在源码 core/state_transition.go中，执行交易的函数是 func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 这个函数首先通过NewStateTransaction函数新建一个StateTransaction对象，然后再通过这个对象来执行TransactionDb()函数来真正处理交易。首先看NewStateTransaction函数，根据传递进来的EVM对象evm和Message对象msg来初始化一个StateTransaction对象。EVM对象就是虚拟机本身，交易包含的额外信息都存在Message对象中。 / NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 再来看TransactionDb()交易执行函数： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 首先是进行交易的preCheck()函数，preCheck()函数先检查Nonce，然后再通过buyGas购买gas。 func (st *StateTransition) preCheck() error { // Make sure this transaction&#39;s nonce is correct. if st.msg.CheckNonce() { nonce := st.state.GetNonce(st.msg.From()) if nonce &lt; st.msg.Nonce() { return ErrNonceTooHigh } else if nonce &gt; st.msg.Nonce() { return ErrNonceTooLow } } return st.buyGas() } 进入到buyGas内部： func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里先根据gasPrice和数量gas计算gas费用，mgVal=gasPrice*gas，（注意这里的gas就是给交易设置的gasLimit，而不是真正用到的gas数量gasUsed。以太坊普通的以太坊转账需要消耗的gasUsed一般是21000。而gasLimit是你为交易设定的gas上限。）。然后判断当前转出方st.msg.From()的账户余额和mgVal，如果余额不足则会抛出&nbsp;errInsufficientBalanceForGas错误。然后从转出账户扣除数量为mgval的费用。注意，mgval比实际真实消耗的gas费用要高，这里扣除多了，到时候会补偿回来。st.gas += st.msg.Gas()，此时st.gas=gasLimit 再回到TransitionDb()函数，执行完preChek(),做了一些变量赋值。如果是发布合约，msg.To()就会为nil。 msg := st.msg &nbsp;&nbsp; &nbsp;sender := vm.AccountRef(msg.From()) &nbsp;&nbsp; &nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp; &nbsp;contractCreation := msg.To() == nil 然后通过IntrinsicGas来计算交易要消耗的真实gas数量gasUsed。IntrinsicGas根据交易code的字节数多少来计算，合约越复杂，携带的数据量越多，需要的gas数量越多。然后再经过过st.useGas函数从st.gas扣除gasUsed，此时st.gas=gasLimit-gasUsed。 接着真正在虚拟机内执行交易了。 if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } 如果是创建合约，则调用evm.Create，否则走evm.Call路径。这里有个问题，调用合约的交易和普通以太坊转账交易也会走evm.call路径，那么如何区别这俩种情况？evm.Call总有代码段 if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { // Calling a non existing account, don&#39;t do antything, but ping the tracer if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) evm.vmConfig.Tracer.CaptureEnd(ret, 0, 0, nil) } return nil, gas, nil } evm.StateDB.CreateAccount(addr) } 可以通过判断交易的目的地址st.to()执行evm.StateDB.Exist(addr)来判断，如果是合约地址，则evm.StateDB.Exist(addr)返回true,如果是用户账户地址，则返回false，这个时候需要为普通以太坊转账交易临时新建一个账户。 继续回到TransitionDb()，在evm中执行完交易后，最后还剩3行代码 st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err st.refundGas()给发起者补偿gas，前面说过了，from账户在buyGas阶段被扣除了gasLimit*gasPrice的gas，而实际上交易消耗的真实gas是gasUsed*gasPrice，所以需要将(gasLimit-gasUsed)*gasPrice的多扣部分返还给from账户。 交易的真实gas消耗是gasUsed*gasPrice,这部分通过st.AddBalance给了evm.Coinbase,即区块记账账户。 3 如何取消智能合约手续费 上一节中解读了交易的gas扣除与奖励机制，源码绕了一大圈，感觉有点懵。其实想取消gas费用，直接操作gasPrice就行了。由于gasPrice对交易的过滤机制是在交易处理ApplyMessage函数之前就完成了，所以在这里可以取巧。可以在NewStateTransition中传递gasPrice时将之设为0即可。改造后的NewSateTransaction函数： // NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { gasPrice:= msg.GasPrice() var addr = common.Address{} if msg.To() != nil{ addr = *msg.To() } if msg.To() == nil || evm.StateDB.Exist(addr){ log.Info(&quot;contract create or call&quot;) gasPrice = big.NewInt(0) } return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: gasPrice,//msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 这里判断交易目的地址msg.To()，如果目的地址为空，说明是合约发布的交易。如果msg.To()存在evm.StateDB中，则说明是调用智能合约的交易，这俩种情况都将gasPrice设置为0。 4 实验验证 新建一条私有链，里面新建3个账户。eth.accounts[0]是矿工，先用eth.accounts[0]往eth.accounts[1]转100 ether，查询eth.accounts[1]余额： &gt; eth.sendTransaction({from:eth.coinbase,to:eth.accounts[1],value:web3.toWei(100,&quot;ether&quot;)}) INFO [08-11|16:08:47.447] Submitted transaction fullhash=0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe recipient=0xC004Fdeb4daC9827c695C672dAa2aFB0Ed2D0779 &quot;0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe&quot; &gt; miner.start() INFO [08-11|16:09:01.725] Updated mining threads threads=0 INFO [08-11|16:09:01.725] Transaction pool price threshold updated price=12000000000000 null INFO [08-11|16:09:01.725] Starting mining operation &gt; INFO [08-11|16:09:01.726] Commit new mining work number=1 txs=1 uncles=0 elapsed=898.694µs &gt; miner.stopINFO [08-11|16:09:04.990] Successfully sealed new block number=1 hash=15e49e…f61ead INFO [08-11|16:09:04.991] 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/08/11/d7779222ed9f9d94fd4908f4df6daad2.html" />
+<meta property="og:url" content="https://uzzz.org/2018/08/11/d7779222ed9f9d94fd4908f4df6daad2.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-08-11T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"1 问题的提出 在联盟链里，有需求是普通的转账ether可以收取交易gas，发布或调用智能合约不需要gas费用。在私链环境下，如果智能合约调用是私链官方者的行为，则希望智能合约不收取gas费用。所谓的普通转账，就是在web3里面通过eth.sendTransaction({from:a,to:b,value:c)这种方式发起的交易。 2 虚拟机EVM中对交易处理及收取gas的机制 在源码 core/state_transition.go中，执行交易的函数是 func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 这个函数首先通过NewStateTransaction函数新建一个StateTransaction对象，然后再通过这个对象来执行TransactionDb()函数来真正处理交易。首先看NewStateTransaction函数，根据传递进来的EVM对象evm和Message对象msg来初始化一个StateTransaction对象。EVM对象就是虚拟机本身，交易包含的额外信息都存在Message对象中。 / NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 再来看TransactionDb()交易执行函数： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := vm.AccountRef(msg.From()) homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err } 首先是进行交易的preCheck()函数，preCheck()函数先检查Nonce，然后再通过buyGas购买gas。 func (st *StateTransition) preCheck() error { // Make sure this transaction&#39;s nonce is correct. if st.msg.CheckNonce() { nonce := st.state.GetNonce(st.msg.From()) if nonce &lt; st.msg.Nonce() { return ErrNonceTooHigh } else if nonce &gt; st.msg.Nonce() { return ErrNonceTooLow } } return st.buyGas() } 进入到buyGas内部： func (st *StateTransition) buyGas() error { mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice) if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 { return errInsufficientBalanceForGas } if err := st.gp.SubGas(st.msg.Gas()); err != nil { return err } st.gas += st.msg.Gas() st.initialGas = st.msg.Gas() st.state.SubBalance(st.msg.From(), mgval) return nil } 这里先根据gasPrice和数量gas计算gas费用，mgVal=gasPrice*gas，（注意这里的gas就是给交易设置的gasLimit，而不是真正用到的gas数量gasUsed。以太坊普通的以太坊转账需要消耗的gasUsed一般是21000。而gasLimit是你为交易设定的gas上限。）。然后判断当前转出方st.msg.From()的账户余额和mgVal，如果余额不足则会抛出&nbsp;errInsufficientBalanceForGas错误。然后从转出账户扣除数量为mgval的费用。注意，mgval比实际真实消耗的gas费用要高，这里扣除多了，到时候会补偿回来。st.gas += st.msg.Gas()，此时st.gas=gasLimit 再回到TransitionDb()函数，执行完preChek(),做了一些变量赋值。如果是发布合约，msg.To()就会为nil。 msg := st.msg &nbsp;&nbsp; &nbsp;sender := vm.AccountRef(msg.From()) &nbsp;&nbsp; &nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) &nbsp;&nbsp; &nbsp;contractCreation := msg.To() == nil 然后通过IntrinsicGas来计算交易要消耗的真实gas数量gasUsed。IntrinsicGas根据交易code的字节数多少来计算，合约越复杂，携带的数据量越多，需要的gas数量越多。然后再经过过st.useGas函数从st.gas扣除gasUsed，此时st.gas=gasLimit-gasUsed。 接着真正在虚拟机内执行交易了。 if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } 如果是创建合约，则调用evm.Create，否则走evm.Call路径。这里有个问题，调用合约的交易和普通以太坊转账交易也会走evm.call路径，那么如何区别这俩种情况？evm.Call总有代码段 if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { // Calling a non existing account, don&#39;t do antything, but ping the tracer if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) evm.vmConfig.Tracer.CaptureEnd(ret, 0, 0, nil) } return nil, gas, nil } evm.StateDB.CreateAccount(addr) } 可以通过判断交易的目的地址st.to()执行evm.StateDB.Exist(addr)来判断，如果是合约地址，则evm.StateDB.Exist(addr)返回true,如果是用户账户地址，则返回false，这个时候需要为普通以太坊转账交易临时新建一个账户。 继续回到TransitionDb()，在evm中执行完交易后，最后还剩3行代码 st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err st.refundGas()给发起者补偿gas，前面说过了，from账户在buyGas阶段被扣除了gasLimit*gasPrice的gas，而实际上交易消耗的真实gas是gasUsed*gasPrice，所以需要将(gasLimit-gasUsed)*gasPrice的多扣部分返还给from账户。 交易的真实gas消耗是gasUsed*gasPrice,这部分通过st.AddBalance给了evm.Coinbase,即区块记账账户。 3 如何取消智能合约手续费 上一节中解读了交易的gas扣除与奖励机制，源码绕了一大圈，感觉有点懵。其实想取消gas费用，直接操作gasPrice就行了。由于gasPrice对交易的过滤机制是在交易处理ApplyMessage函数之前就完成了，所以在这里可以取巧。可以在NewStateTransition中传递gasPrice时将之设为0即可。改造后的NewSateTransaction函数： // NewStateTransition initialises and returns a new state transition object. func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition { gasPrice:= msg.GasPrice() var addr = common.Address{} if msg.To() != nil{ addr = *msg.To() } if msg.To() == nil || evm.StateDB.Exist(addr){ log.Info(&quot;contract create or call&quot;) gasPrice = big.NewInt(0) } return &amp;StateTransition{ gp: gp, evm: evm, msg: msg, gasPrice: gasPrice,//msg.GasPrice(), value: msg.Value(), data: msg.Data(), state: evm.StateDB, } } 这里判断交易目的地址msg.To()，如果目的地址为空，说明是合约发布的交易。如果msg.To()存在evm.StateDB中，则说明是调用智能合约的交易，这俩种情况都将gasPrice设置为0。 4 实验验证 新建一条私有链，里面新建3个账户。eth.accounts[0]是矿工，先用eth.accounts[0]往eth.accounts[1]转100 ether，查询eth.accounts[1]余额： &gt; eth.sendTransaction({from:eth.coinbase,to:eth.accounts[1],value:web3.toWei(100,&quot;ether&quot;)}) INFO [08-11|16:08:47.447] Submitted transaction fullhash=0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe recipient=0xC004Fdeb4daC9827c695C672dAa2aFB0Ed2D0779 &quot;0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe&quot; &gt; miner.start() INFO [08-11|16:09:01.725] Updated mining threads threads=0 INFO [08-11|16:09:01.725] Transaction pool price threshold updated price=12000000000000 null INFO [08-11|16:09:01.725] Starting mining operation &gt; INFO [08-11|16:09:01.726] Commit new mining work number=1 txs=1 uncles=0 elapsed=898.694µs &gt; miner.stopINFO [08-11|16:09:04.990] Successfully sealed new block number=1 hash=15e49e…f61ead INFO [08-11|16:09:04.991] 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/08/11/d7779222ed9f9d94fd4908f4df6daad2.html","headline":"geth源码修改：取消调用智能合约的gas费用","dateModified":"2018-08-11T00:00:00+08:00","datePublished":"2018-08-11T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/08/11/d7779222ed9f9d94fd4908f4df6daad2.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>geth源码修改：取消调用智能合约的gas费用</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <h3>1 问题的提出</h3> 
+  <p>在联盟链里，有需求是普通的转账ether可以收取交易gas，发布或调用智能合约不需要gas费用。在私链环境下，如果智能合约调用是私链官方者的行为，则希望智能合约不收取gas费用。所谓的普通转账，就是在web3里面通过eth.sendTransaction({from:a,to:b,value:c)这种方式发起的交易。</p> 
+  <h3>2 虚拟机EVM中对交易处理及收取gas的机制</h3> 
+  <p>在源码 core/state_transition.go中，执行交易的函数是</p> 
+  <pre class="has">
+<code>func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) {
+	return NewStateTransition(evm, msg, gp).TransitionDb()
+}</code></pre> 
+  <p>这个函数首先通过NewStateTransaction函数新建一个StateTransaction对象，然后再通过这个对象来执行TransactionDb()函数来真正处理交易。首先看NewStateTransaction函数，根据传递进来的EVM对象evm和Message对象msg来初始化一个StateTransaction对象。EVM对象就是虚拟机本身，交易包含的额外信息都存在Message对象中。</p> 
+  <pre class="has">
+<code>/ NewStateTransition initialises and returns a new state transition object.
+func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition {
+	return &amp;StateTransition{
+		gp:       gp,
+		evm:      evm,
+		msg:      msg,
+		gasPrice: msg.GasPrice(),
+		value:    msg.Value(),
+		data:     msg.Data(),
+		state:    evm.StateDB,
+	}
+}</code></pre> 
+  <p>再来看TransactionDb()交易执行函数：</p> 
+  <pre class="has">
+<code>func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) {
+	if err = st.preCheck(); err != nil {
+		return
+	}
+	msg := st.msg
+	sender := vm.AccountRef(msg.From())
+	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+	contractCreation := msg.To() == nil
+
+	// Pay intrinsic gas
+	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if err = st.useGas(gas); err != nil {
+		return nil, 0, false, err
+	}
+
+	var (
+		evm = st.evm
+		// vm errors do not effect consensus and are therefor
+		// not assigned to err, except for insufficient balance
+		// error.
+		vmerr error
+	)
+	if contractCreation {
+		ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+	} else {
+		// Increment the nonce for the next transaction
+		st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
+		ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value)
+	}
+	if vmerr != nil {
+		log.Debug("VM returned with error", "err", vmerr)
+		// The only possible consensus-error would be if there wasn't
+		// sufficient balance to make the transfer happen. The first
+		// balance transfer may never fail.
+		if vmerr == vm.ErrInsufficientBalance {
+			return nil, 0, false, vmerr
+		}
+	}
+	st.refundGas()
+	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+	return ret, st.gasUsed(), vmerr != nil, err
+}
+</code></pre> 
+  <p>首先是进行交易的preCheck()函数，preCheck()函数先检查Nonce，然后再通过buyGas购买gas。</p> 
+  <pre class="has">
+<code>func (st *StateTransition) preCheck() error {
+	// Make sure this transaction's nonce is correct.
+	if st.msg.CheckNonce() {
+		nonce := st.state.GetNonce(st.msg.From())
+		if nonce &lt; st.msg.Nonce() {
+			return ErrNonceTooHigh
+		} else if nonce &gt; st.msg.Nonce() {
+			return ErrNonceTooLow
+		}
+	}
+	return st.buyGas()
+}</code></pre> 
+  <p>进入到buyGas内部：</p> 
+  <pre class="has">
+<code>func (st *StateTransition) buyGas() error {
+	mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice)
+	if st.state.GetBalance(st.msg.From()).Cmp(mgval) &lt; 0 {
+		return errInsufficientBalanceForGas
+	}
+	if err := st.gp.SubGas(st.msg.Gas()); err != nil {
+		return err
+	}
+	st.gas += st.msg.Gas()
+
+	st.initialGas = st.msg.Gas()
+	st.state.SubBalance(st.msg.From(), mgval)
+	return nil
+}</code></pre> 
+  <p>这里先根据gasPrice和数量gas计算gas费用，mgVal=gasPrice*gas，（注意这里的gas就是给交易设置的gasLimit，而不是真正用到的gas数量gasUsed。以太坊普通的以太坊转账需要消耗的gasUsed一般是21000。而gasLimit是你为交易设定的gas上限。）。然后判断当前转出方st.msg.From()的账户余额和mgVal，如果余额不足则会抛出&nbsp;errInsufficientBalanceForGas错误。然后从转出账户扣除数量为mgval的费用。注意，mgval比实际真实消耗的gas费用要高，这里扣除多了，到时候会补偿回来。st.gas += st.msg.Gas()，此时st.gas=gasLimit</p> 
+  <p>再回到TransitionDb()函数，执行完preChek(),做了一些变量赋值。如果是发布合约，msg.To()就会为nil。</p> 
+  <pre class="has">
+<code>    msg := st.msg
+&nbsp;&nbsp; &nbsp;sender := vm.AccountRef(msg.From())
+&nbsp;&nbsp; &nbsp;homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+&nbsp;&nbsp; &nbsp;contractCreation := msg.To() == nil</code></pre> 
+  <p>然后通过IntrinsicGas来计算交易要消耗的真实gas数量gasUsed。IntrinsicGas根据交易code的字节数多少来计算，合约越复杂，携带的数据量越多，需要的gas数量越多。然后再经过过st.useGas函数从st.gas扣除gasUsed，此时st.gas=gasLimit-gasUsed。</p> 
+  <p>接着真正在虚拟机内执行交易了。</p> 
+  <pre class="has">
+<code>    if contractCreation {
+		ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+	} else {
+		// Increment the nonce for the next transaction
+		st.state.SetNonce(msg.From(), st.state.GetNonce(sender.Address())+1)
+		ret, st.gas, vmerr = evm.Call(sender, st.to(), st.data, st.gas, st.value)
+	}
+	if vmerr != nil {
+		log.Debug("VM returned with error", "err", vmerr)
+		// The only possible consensus-error would be if there wasn't
+		// sufficient balance to make the transfer happen. The first
+		// balance transfer may never fail.
+		if vmerr == vm.ErrInsufficientBalance {
+			return nil, 0, false, vmerr
+		}
+	}</code></pre> 
+  <p>如果是创建合约，则调用evm.Create，否则走evm.Call路径。这里有个问题，调用合约的交易和普通以太坊转账交易也会走evm.call路径，那么如何区别这俩种情况？evm.Call总有代码段</p> 
+  <pre class="has">
+<code>    if !evm.StateDB.Exist(addr) {
+		precompiles := PrecompiledContractsHomestead
+		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
+			precompiles = PrecompiledContractsByzantium
+		}
+		if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 {
+			// Calling a non existing account, don't do antything, but ping the tracer
+			if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+				evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value)
+				evm.vmConfig.Tracer.CaptureEnd(ret, 0, 0, nil)
+			}
+			return nil, gas, nil
+		}
+		evm.StateDB.CreateAccount(addr)
+	}</code></pre> 
+  <p>可以通过判断交易的目的地址st.to()执行evm.StateDB.Exist(addr)来判断，如果是合约地址，则evm.StateDB.Exist(addr)返回true,如果是用户账户地址，则返回false，这个时候需要为普通以太坊转账交易临时新建一个账户。</p> 
+  <p>继续回到TransitionDb()，在evm中执行完交易后，最后还剩3行代码</p> 
+  <pre class="has">
+<code>        st.refundGas()
+	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+	return ret, st.gasUsed(), vmerr != nil, err</code></pre> 
+  <p>st.refundGas()给发起者补偿gas，前面说过了，from账户在buyGas阶段被扣除了gasLimit*gasPrice的gas，而实际上交易消耗的真实gas是gasUsed*gasPrice，所以需要将(gasLimit-gasUsed)*gasPrice的多扣部分返还给from账户。</p> 
+  <p>交易的真实gas消耗是gasUsed*gasPrice,这部分通过st.AddBalance给了evm.Coinbase,即区块记账账户。</p> 
+  <h3>3 如何取消智能合约手续费</h3> 
+  <p>上一节中解读了交易的gas扣除与奖励机制，源码绕了一大圈，感觉有点懵。其实想取消gas费用，直接操作gasPrice就行了。由于gasPrice对交易的过滤机制是在交易处理ApplyMessage函数之前就完成了，所以在这里可以取巧。可以在NewStateTransition中传递gasPrice时将之设为0即可。改造后的NewSateTransaction函数：</p> 
+  <pre class="has">
+<code>// NewStateTransition initialises and returns a new state transition object.
+func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool) *StateTransition {
+	gasPrice:= msg.GasPrice()
+	var addr = common.Address{}
+	if msg.To() != nil{
+		addr = *msg.To()
+	}
+	if  msg.To() == nil || evm.StateDB.Exist(addr){
+		log.Info("contract create or call")
+		gasPrice = big.NewInt(0)
+	}
+	return &amp;StateTransition{
+		gp:       gp,
+		evm:      evm,
+		msg:      msg,
+		gasPrice: gasPrice,//msg.GasPrice(),
+		value:    msg.Value(),
+		data:     msg.Data(),
+		state:    evm.StateDB,
+	}
+}</code></pre> 
+  <p>这里判断交易目的地址msg.To()，如果目的地址为空，说明是合约发布的交易。如果msg.To()存在evm.StateDB中，则说明是调用智能合约的交易，这俩种情况都将gasPrice设置为0。</p> 
+  <h3>4 实验验证</h3> 
+  <p>新建一条私有链，里面新建3个账户。eth.accounts[0]是矿工，先用eth.accounts[0]往eth.accounts[1]转100 ether，查询eth.accounts[1]余额：</p> 
+  <pre class="has">
+<code>&gt; eth.sendTransaction({from:eth.coinbase,to:eth.accounts[1],value:web3.toWei(100,"ether")})
+INFO [08-11|16:08:47.447] Submitted transaction                    fullhash=0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe recipient=0xC004Fdeb4daC9827c695C672dAa2aFB0Ed2D0779
+"0x94d130d04050b9368e4c124c97728ab539a6ff084eae5b761b148ddbaf478afe"
+&gt; miner.start()
+INFO [08-11|16:09:01.725] Updated mining threads                   threads=0
+INFO [08-11|16:09:01.725] Transaction pool price threshold updated price=12000000000000
+null
+INFO [08-11|16:09:01.725] Starting mining operation 
+&gt; INFO [08-11|16:09:01.726] Commit new mining work                   number=1 txs=1 uncles=0 elapsed=898.694µs
+&gt; miner.stopINFO [08-11|16:09:04.990] Successfully sealed new block            number=1 hash=15e49e…f61ead
+INFO [08-11|16:09:04.991] </code></pre> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liuzhijun301/article/details/81585047,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/liuzhijun301/article/details/81585047,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

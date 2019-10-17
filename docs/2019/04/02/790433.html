@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>spark实现逻辑回归和集群环境运行 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="spark实现逻辑回归和集群环境运行" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="原文链接： https://juejin.im/post/5ca35b24518825440b3b0a30 spark mllib 机器学习 scala代码： package Classification /** * LogisticRegression Algorithm For Hive * 逻辑回归测试环境连hive部署自动化 * Created by wy on 2019/04/01 */ import java.io.File import org.apache.log4j.{Level, Logger} import org.apache.spark.{SparkConf, SparkContext} import org.apache.spark.sql.hive.HiveContext import org.apache.spark.mllib.linalg.Vectors import org.apache.spark.mllib.regression.LabeledPoint import org.apache.spark.rdd.RDD import org.apache.spark.mllib.classification.LogisticRegressionWithSGD import org.apache.spark.mllib.classification.LogisticRegressionModel import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics import org.apache.spark.mllib.feature.StandardScaler import org.apache.spark.mllib.optimization.{L1Updater, SimpleUpdater, SquaredL2Updater, Updater} import org.apache.spark.mllib.classification.ClassificationModel import org.apache.spark.sql.Row import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType} object LrForHive { //屏蔽不必要的日志显示在终端上 Logger.getLogger(&quot;org.apache.spark&quot;).setLevel(Level.WARN) Logger.getLogger(&quot;org.apache.eclipse.jetty.server&quot;).setLevel(Level.OFF) def main(args: Array[String]): Unit = { //程序入口初始化 val conf = new SparkConf().setAppName(&quot;LrForHive&quot;) conf.set(&quot;set hive.cli.print.header&quot;,&quot;false&quot;) //去除hive表列名 val sc = new SparkContext(conf) val sqlContext = new HiveContext(sc) //hive读数据 val Data = sqlContext.sql(&quot;select * from sospdm.sosp_ml_supervip_big_order_mem&quot;).rdd val data = Data.map(x =&gt; x(0).toString).map{ line =&gt; { val arr = line.split(&quot;#&quot;) val label = arr(1).toDouble val features = arr(0).split(&quot;,&quot;).map(_.toDouble) LabeledPoint(label,Vectors.dense(features)) //创建一个稠密向量 } } data.cache() //缓存 //特征标准化 val vectors = data.map(x =&gt; x.features) val scalar = new StandardScaler(withMean = true, withStd = true).fit(vectors) //将向量传到转换函数 val scaledData = data.map(x =&gt; LabeledPoint(x.label, scalar.transform(x.features))) scaledData.cache() /** 模型参数调优MLlib线性模型优化技术：SGD和L-BFGS(只在逻辑回归中使用LogisticRegressionWithLBFGS)*/ //线性模型 //定义训练调参辅助函数，根据给定输入训练模型 (输入， 则正则化参数， 迭代次数， 正则化形式， 步长) def trainWithParams(input: RDD[LabeledPoint], regParam: Double, numIterations: Int, updater: Updater, stepSize: Double) = { val lr =new LogisticRegressionWithSGD //逻辑回归也可以用LogisticRegressionWithLBFGS lr.optimizer .setNumIterations(numIterations) //迭代次数 .setStepSize(stepSize) //步长 .setRegParam(regParam) //则正则化参数 .setUpdater(updater) //正则化形式 lr.run(input) //输入训练数据RDD } //定义第二个辅助函数,label为需要调试的参数，data:输入预测的数据，model训练的模型 def createMetrics(label: Double, data: RDD[LabeledPoint], model: ClassificationModel) = { val scoreAndLabels = data.map { point =&gt; (model.predict(point.features),point.label) //(predicts,label) } val metrics = new BinaryClassificationMetrics(scoreAndLabels) (label, metrics.areaUnderROC()) //计算AUC } //1迭代次数 val iterateResults = Seq(1, 5, 10, 50, 100).map { param =&gt; //训练 val model = trainWithParams(scaledData, 0.0, param, new SimpleUpdater, 1.0) //拟合，计算AUC createMetrics(param, scaledData, model) } iterateResults.foreach { case (param, auc) =&gt; println(f&quot;$param iterations, AUC = ${auc * 100}%2.2f%%&quot;)} var maxIterateAuc = 0.0 var bestIterateParam = 0 for(x &lt;- iterateResults){ if(x._2 &gt; maxIterateAuc){ maxIterateAuc = x._2 bestIterateParam = x._1.toInt } } println(&quot;max auc: &quot; + maxIterateAuc + &quot; best numIterations param: &quot; + bestIterateParam) //2步长 大步长收敛快，太大可能导致收敛到局部最优解 val stepResults = Seq(0.001, 0.01, 0.1, 1.0, 10.0).map { param =&gt; val model = trainWithParams(scaledData, 0.0, bestIterateParam, new SimpleUpdater, param) createMetrics(param, scaledData, model) } stepResults.foreach { case (param, auc) =&gt; println(f&quot;$param stepSize, AUC = ${auc * 100}%2.2f%%&quot;)} var maxStepAuc = 0.0 var bestStepParam = 0.0 for(x &lt;- stepResults){ if(x._2 &gt; maxStepAuc){ maxStepAuc = x._2 bestStepParam = x._1 } } println(&quot;max auc: &quot; + maxStepAuc + &quot; best stepSize param: &quot; + bestStepParam) //3.1正则化参数，默认值为0.0，L1正则new L1Updater val regL1Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new L1Updater, bestStepParam) createMetrics(param, scaledData, model) } regL1Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L1, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL1Auc = 0.0 var bestRegL1Param = 0.0 for(x &lt;- regL1Results){ if(x._2 &gt; maxRegL1Auc){ maxRegL1Auc = x._2 bestRegL1Param = x._1 } } println(&quot;max auc: &quot; + maxRegL1Auc + &quot; best L1regParam: &quot; + bestRegL1Param) //3.2正则化参数：默认值为0.0，L2正则new SquaredL2Updater val regL2Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new SquaredL2Updater, bestStepParam) createMetrics(param, scaledData, model) } regL2Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L2, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL2Auc = 0.0 var bestRegL2Param = 0.0 for(x &lt;- regL2Results){ if(x._2 &gt; maxRegL2Auc){ maxRegL2Auc = x._2 bestRegL2Param = x._1 } } println(&quot;max auc: &quot; + maxRegL2Auc + &quot; best L2regParam: &quot; + bestRegL2Param) //4正则化形式：默认为new SimpleUpdater 正则化系数无效，前两个参数调参后最优AUC为maxStepAuc //则，3.1和3.2的最优AUC与maxStepAuc比较，较大的则为最优正则化形式 var bestRegParam = 0.0 var bestUpdaterID = 0 if(maxStepAuc &gt;= maxRegL1Auc ){ if(maxStepAuc &gt;= maxRegL2Auc){ bestUpdaterID = 0 bestRegParam = 0.0 } else { bestUpdaterID = 2 bestRegParam = bestRegL2Param } } else { if(maxRegL2Auc &gt;= maxRegL1Auc){ bestUpdaterID = 2 bestRegParam = bestRegL2Param } else { bestUpdaterID = 1 bestRegParam = bestRegL1Param } } val Updaters = Seq(new SimpleUpdater, new L1Updater, new SquaredL2Updater) val bestUpdater = Updaters(bestUpdaterID) //最优参数: println(&quot;------------------更新模型训练参数---------------------&quot;) println(f&quot;best numIterations param: $bestIterateParam\n&quot; + f&quot;best stepSize param: $bestStepParam\n&quot; + f&quot;best regParam: $bestRegParam\n&quot; + f&quot;best regUpdater: $bestUpdater\n&quot; ) val upDateLrModel = trainWithParams(scaledData, bestRegParam, bestIterateParam, bestUpdater, bestStepParam) /** //删除模型目录和文件 def dirDel(path: File) { if (!path.exists()) return else if (path.isFile) { path.delete() return } val file: Array[File] = path.listFiles() for (d &lt;- file) { dirDel(d) } path.delete() } val path: File = new File(&quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) dirDel(path) //删除原模型保存的文件，不删除新模型保存会报错 // 保存和加载模型 upDateLrModel.save(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) val loadLrModel = LogisticRegressionModel.load(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) */ //打印模型权重值 val newRes = upDateLrModel.weights.toArray val rdd1 = sc.parallelize(Seq(newRes)) //转换成RDD //通过StructType直接指定每个字段的schema val schema = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true), StructField(&quot;feature02&quot;, DoubleType, nullable = true), StructField(&quot;feature03&quot;, DoubleType, nullable = true), StructField(&quot;feature04&quot;, DoubleType, nullable = true), StructField(&quot;feature05&quot;, DoubleType, nullable = true), StructField(&quot;feature06&quot;, DoubleType, nullable = true), StructField(&quot;feature07&quot;, DoubleType, nullable = true), StructField(&quot;feature08&quot;, DoubleType, nullable = true), StructField(&quot;feature09&quot;, DoubleType, nullable = true), StructField(&quot;feature10&quot;, DoubleType, nullable = true), StructField(&quot;feature11&quot;, DoubleType, nullable = true), StructField(&quot;feature12&quot;, DoubleType, nullable = true), StructField(&quot;feature13&quot;, DoubleType, nullable = true), StructField(&quot;feature14&quot;, DoubleType, nullable = true) ) ) //将RDD1映射到rowRDD,19个特征权重值 val resRDD = rdd1.map(f =&gt; (f(0),f(1),f(2),f(3),f(4),f(5),f(6),f(7),f(8),f(9),f(10) ,f(11),f(12),f(13))) val rowRDD = resRDD.map(x =&gt; Row(x._1.toDouble,x._2.toDouble,x._3.toDouble, x._4.toDouble,x._5.toDouble,x._6.toDouble,x._7.toDouble,x._8.toDouble,x._9.toDouble, x._10.toDouble,x._11.toDouble,x._12.toDouble,x._13.toDouble,x._14.toDouble)) //转换成DF，并放入表item_sim val df = sqlContext.createDataFrame(rowRDD, schema) df.createOrReplaceTempView(&quot;item_sim_c01&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features as select * from item_sim_c01&quot;) //方法2 val rdd2 = sc.parallelize(newRes) val rowRdd2 = rdd2.map(p =&gt; Row(p)) val schema2 = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true) ) ) val df2 = sqlContext.createDataFrame(rowRdd2, schema2) df2.createOrReplaceTempView(&quot;item_sim_c02&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features_02&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features_02 as select * from item_sim_c02&quot;) sc.stop() } } 复制代码 hive查询结果： hive&gt; select * from sosp_ml_supervip_big_order_features; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.01072063206632886 -0.05246889909683635 0.0167997584085957 Time taken: 0.118 seconds, Fetched: 1 row(s) hive&gt; select * from sosp_ml_supervip_big_order_features_02; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.010720632066328865 -0.05246889909683635 0.0167997584085957 Time taken: 0.095 seconds, Fetched: 14 row(s) 复制代码" />
+<meta property="og:description" content="原文链接： https://juejin.im/post/5ca35b24518825440b3b0a30 spark mllib 机器学习 scala代码： package Classification /** * LogisticRegression Algorithm For Hive * 逻辑回归测试环境连hive部署自动化 * Created by wy on 2019/04/01 */ import java.io.File import org.apache.log4j.{Level, Logger} import org.apache.spark.{SparkConf, SparkContext} import org.apache.spark.sql.hive.HiveContext import org.apache.spark.mllib.linalg.Vectors import org.apache.spark.mllib.regression.LabeledPoint import org.apache.spark.rdd.RDD import org.apache.spark.mllib.classification.LogisticRegressionWithSGD import org.apache.spark.mllib.classification.LogisticRegressionModel import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics import org.apache.spark.mllib.feature.StandardScaler import org.apache.spark.mllib.optimization.{L1Updater, SimpleUpdater, SquaredL2Updater, Updater} import org.apache.spark.mllib.classification.ClassificationModel import org.apache.spark.sql.Row import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType} object LrForHive { //屏蔽不必要的日志显示在终端上 Logger.getLogger(&quot;org.apache.spark&quot;).setLevel(Level.WARN) Logger.getLogger(&quot;org.apache.eclipse.jetty.server&quot;).setLevel(Level.OFF) def main(args: Array[String]): Unit = { //程序入口初始化 val conf = new SparkConf().setAppName(&quot;LrForHive&quot;) conf.set(&quot;set hive.cli.print.header&quot;,&quot;false&quot;) //去除hive表列名 val sc = new SparkContext(conf) val sqlContext = new HiveContext(sc) //hive读数据 val Data = sqlContext.sql(&quot;select * from sospdm.sosp_ml_supervip_big_order_mem&quot;).rdd val data = Data.map(x =&gt; x(0).toString).map{ line =&gt; { val arr = line.split(&quot;#&quot;) val label = arr(1).toDouble val features = arr(0).split(&quot;,&quot;).map(_.toDouble) LabeledPoint(label,Vectors.dense(features)) //创建一个稠密向量 } } data.cache() //缓存 //特征标准化 val vectors = data.map(x =&gt; x.features) val scalar = new StandardScaler(withMean = true, withStd = true).fit(vectors) //将向量传到转换函数 val scaledData = data.map(x =&gt; LabeledPoint(x.label, scalar.transform(x.features))) scaledData.cache() /** 模型参数调优MLlib线性模型优化技术：SGD和L-BFGS(只在逻辑回归中使用LogisticRegressionWithLBFGS)*/ //线性模型 //定义训练调参辅助函数，根据给定输入训练模型 (输入， 则正则化参数， 迭代次数， 正则化形式， 步长) def trainWithParams(input: RDD[LabeledPoint], regParam: Double, numIterations: Int, updater: Updater, stepSize: Double) = { val lr =new LogisticRegressionWithSGD //逻辑回归也可以用LogisticRegressionWithLBFGS lr.optimizer .setNumIterations(numIterations) //迭代次数 .setStepSize(stepSize) //步长 .setRegParam(regParam) //则正则化参数 .setUpdater(updater) //正则化形式 lr.run(input) //输入训练数据RDD } //定义第二个辅助函数,label为需要调试的参数，data:输入预测的数据，model训练的模型 def createMetrics(label: Double, data: RDD[LabeledPoint], model: ClassificationModel) = { val scoreAndLabels = data.map { point =&gt; (model.predict(point.features),point.label) //(predicts,label) } val metrics = new BinaryClassificationMetrics(scoreAndLabels) (label, metrics.areaUnderROC()) //计算AUC } //1迭代次数 val iterateResults = Seq(1, 5, 10, 50, 100).map { param =&gt; //训练 val model = trainWithParams(scaledData, 0.0, param, new SimpleUpdater, 1.0) //拟合，计算AUC createMetrics(param, scaledData, model) } iterateResults.foreach { case (param, auc) =&gt; println(f&quot;$param iterations, AUC = ${auc * 100}%2.2f%%&quot;)} var maxIterateAuc = 0.0 var bestIterateParam = 0 for(x &lt;- iterateResults){ if(x._2 &gt; maxIterateAuc){ maxIterateAuc = x._2 bestIterateParam = x._1.toInt } } println(&quot;max auc: &quot; + maxIterateAuc + &quot; best numIterations param: &quot; + bestIterateParam) //2步长 大步长收敛快，太大可能导致收敛到局部最优解 val stepResults = Seq(0.001, 0.01, 0.1, 1.0, 10.0).map { param =&gt; val model = trainWithParams(scaledData, 0.0, bestIterateParam, new SimpleUpdater, param) createMetrics(param, scaledData, model) } stepResults.foreach { case (param, auc) =&gt; println(f&quot;$param stepSize, AUC = ${auc * 100}%2.2f%%&quot;)} var maxStepAuc = 0.0 var bestStepParam = 0.0 for(x &lt;- stepResults){ if(x._2 &gt; maxStepAuc){ maxStepAuc = x._2 bestStepParam = x._1 } } println(&quot;max auc: &quot; + maxStepAuc + &quot; best stepSize param: &quot; + bestStepParam) //3.1正则化参数，默认值为0.0，L1正则new L1Updater val regL1Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new L1Updater, bestStepParam) createMetrics(param, scaledData, model) } regL1Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L1, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL1Auc = 0.0 var bestRegL1Param = 0.0 for(x &lt;- regL1Results){ if(x._2 &gt; maxRegL1Auc){ maxRegL1Auc = x._2 bestRegL1Param = x._1 } } println(&quot;max auc: &quot; + maxRegL1Auc + &quot; best L1regParam: &quot; + bestRegL1Param) //3.2正则化参数：默认值为0.0，L2正则new SquaredL2Updater val regL2Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new SquaredL2Updater, bestStepParam) createMetrics(param, scaledData, model) } regL2Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L2, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL2Auc = 0.0 var bestRegL2Param = 0.0 for(x &lt;- regL2Results){ if(x._2 &gt; maxRegL2Auc){ maxRegL2Auc = x._2 bestRegL2Param = x._1 } } println(&quot;max auc: &quot; + maxRegL2Auc + &quot; best L2regParam: &quot; + bestRegL2Param) //4正则化形式：默认为new SimpleUpdater 正则化系数无效，前两个参数调参后最优AUC为maxStepAuc //则，3.1和3.2的最优AUC与maxStepAuc比较，较大的则为最优正则化形式 var bestRegParam = 0.0 var bestUpdaterID = 0 if(maxStepAuc &gt;= maxRegL1Auc ){ if(maxStepAuc &gt;= maxRegL2Auc){ bestUpdaterID = 0 bestRegParam = 0.0 } else { bestUpdaterID = 2 bestRegParam = bestRegL2Param } } else { if(maxRegL2Auc &gt;= maxRegL1Auc){ bestUpdaterID = 2 bestRegParam = bestRegL2Param } else { bestUpdaterID = 1 bestRegParam = bestRegL1Param } } val Updaters = Seq(new SimpleUpdater, new L1Updater, new SquaredL2Updater) val bestUpdater = Updaters(bestUpdaterID) //最优参数: println(&quot;------------------更新模型训练参数---------------------&quot;) println(f&quot;best numIterations param: $bestIterateParam\n&quot; + f&quot;best stepSize param: $bestStepParam\n&quot; + f&quot;best regParam: $bestRegParam\n&quot; + f&quot;best regUpdater: $bestUpdater\n&quot; ) val upDateLrModel = trainWithParams(scaledData, bestRegParam, bestIterateParam, bestUpdater, bestStepParam) /** //删除模型目录和文件 def dirDel(path: File) { if (!path.exists()) return else if (path.isFile) { path.delete() return } val file: Array[File] = path.listFiles() for (d &lt;- file) { dirDel(d) } path.delete() } val path: File = new File(&quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) dirDel(path) //删除原模型保存的文件，不删除新模型保存会报错 // 保存和加载模型 upDateLrModel.save(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) val loadLrModel = LogisticRegressionModel.load(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) */ //打印模型权重值 val newRes = upDateLrModel.weights.toArray val rdd1 = sc.parallelize(Seq(newRes)) //转换成RDD //通过StructType直接指定每个字段的schema val schema = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true), StructField(&quot;feature02&quot;, DoubleType, nullable = true), StructField(&quot;feature03&quot;, DoubleType, nullable = true), StructField(&quot;feature04&quot;, DoubleType, nullable = true), StructField(&quot;feature05&quot;, DoubleType, nullable = true), StructField(&quot;feature06&quot;, DoubleType, nullable = true), StructField(&quot;feature07&quot;, DoubleType, nullable = true), StructField(&quot;feature08&quot;, DoubleType, nullable = true), StructField(&quot;feature09&quot;, DoubleType, nullable = true), StructField(&quot;feature10&quot;, DoubleType, nullable = true), StructField(&quot;feature11&quot;, DoubleType, nullable = true), StructField(&quot;feature12&quot;, DoubleType, nullable = true), StructField(&quot;feature13&quot;, DoubleType, nullable = true), StructField(&quot;feature14&quot;, DoubleType, nullable = true) ) ) //将RDD1映射到rowRDD,19个特征权重值 val resRDD = rdd1.map(f =&gt; (f(0),f(1),f(2),f(3),f(4),f(5),f(6),f(7),f(8),f(9),f(10) ,f(11),f(12),f(13))) val rowRDD = resRDD.map(x =&gt; Row(x._1.toDouble,x._2.toDouble,x._3.toDouble, x._4.toDouble,x._5.toDouble,x._6.toDouble,x._7.toDouble,x._8.toDouble,x._9.toDouble, x._10.toDouble,x._11.toDouble,x._12.toDouble,x._13.toDouble,x._14.toDouble)) //转换成DF，并放入表item_sim val df = sqlContext.createDataFrame(rowRDD, schema) df.createOrReplaceTempView(&quot;item_sim_c01&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features as select * from item_sim_c01&quot;) //方法2 val rdd2 = sc.parallelize(newRes) val rowRdd2 = rdd2.map(p =&gt; Row(p)) val schema2 = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true) ) ) val df2 = sqlContext.createDataFrame(rowRdd2, schema2) df2.createOrReplaceTempView(&quot;item_sim_c02&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features_02&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features_02 as select * from item_sim_c02&quot;) sc.stop() } } 复制代码 hive查询结果： hive&gt; select * from sosp_ml_supervip_big_order_features; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.01072063206632886 -0.05246889909683635 0.0167997584085957 Time taken: 0.118 seconds, Fetched: 1 row(s) hive&gt; select * from sosp_ml_supervip_big_order_features_02; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.010720632066328865 -0.05246889909683635 0.0167997584085957 Time taken: 0.095 seconds, Fetched: 14 row(s) 复制代码" />
+<link rel="canonical" href="https://uzzz.org/2019/04/02/790433.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/02/790433.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-02T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"原文链接： https://juejin.im/post/5ca35b24518825440b3b0a30 spark mllib 机器学习 scala代码： package Classification /** * LogisticRegression Algorithm For Hive * 逻辑回归测试环境连hive部署自动化 * Created by wy on 2019/04/01 */ import java.io.File import org.apache.log4j.{Level, Logger} import org.apache.spark.{SparkConf, SparkContext} import org.apache.spark.sql.hive.HiveContext import org.apache.spark.mllib.linalg.Vectors import org.apache.spark.mllib.regression.LabeledPoint import org.apache.spark.rdd.RDD import org.apache.spark.mllib.classification.LogisticRegressionWithSGD import org.apache.spark.mllib.classification.LogisticRegressionModel import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics import org.apache.spark.mllib.feature.StandardScaler import org.apache.spark.mllib.optimization.{L1Updater, SimpleUpdater, SquaredL2Updater, Updater} import org.apache.spark.mllib.classification.ClassificationModel import org.apache.spark.sql.Row import org.apache.spark.sql.types.{DoubleType, StringType, StructField, StructType} object LrForHive { //屏蔽不必要的日志显示在终端上 Logger.getLogger(&quot;org.apache.spark&quot;).setLevel(Level.WARN) Logger.getLogger(&quot;org.apache.eclipse.jetty.server&quot;).setLevel(Level.OFF) def main(args: Array[String]): Unit = { //程序入口初始化 val conf = new SparkConf().setAppName(&quot;LrForHive&quot;) conf.set(&quot;set hive.cli.print.header&quot;,&quot;false&quot;) //去除hive表列名 val sc = new SparkContext(conf) val sqlContext = new HiveContext(sc) //hive读数据 val Data = sqlContext.sql(&quot;select * from sospdm.sosp_ml_supervip_big_order_mem&quot;).rdd val data = Data.map(x =&gt; x(0).toString).map{ line =&gt; { val arr = line.split(&quot;#&quot;) val label = arr(1).toDouble val features = arr(0).split(&quot;,&quot;).map(_.toDouble) LabeledPoint(label,Vectors.dense(features)) //创建一个稠密向量 } } data.cache() //缓存 //特征标准化 val vectors = data.map(x =&gt; x.features) val scalar = new StandardScaler(withMean = true, withStd = true).fit(vectors) //将向量传到转换函数 val scaledData = data.map(x =&gt; LabeledPoint(x.label, scalar.transform(x.features))) scaledData.cache() /** 模型参数调优MLlib线性模型优化技术：SGD和L-BFGS(只在逻辑回归中使用LogisticRegressionWithLBFGS)*/ //线性模型 //定义训练调参辅助函数，根据给定输入训练模型 (输入， 则正则化参数， 迭代次数， 正则化形式， 步长) def trainWithParams(input: RDD[LabeledPoint], regParam: Double, numIterations: Int, updater: Updater, stepSize: Double) = { val lr =new LogisticRegressionWithSGD //逻辑回归也可以用LogisticRegressionWithLBFGS lr.optimizer .setNumIterations(numIterations) //迭代次数 .setStepSize(stepSize) //步长 .setRegParam(regParam) //则正则化参数 .setUpdater(updater) //正则化形式 lr.run(input) //输入训练数据RDD } //定义第二个辅助函数,label为需要调试的参数，data:输入预测的数据，model训练的模型 def createMetrics(label: Double, data: RDD[LabeledPoint], model: ClassificationModel) = { val scoreAndLabels = data.map { point =&gt; (model.predict(point.features),point.label) //(predicts,label) } val metrics = new BinaryClassificationMetrics(scoreAndLabels) (label, metrics.areaUnderROC()) //计算AUC } //1迭代次数 val iterateResults = Seq(1, 5, 10, 50, 100).map { param =&gt; //训练 val model = trainWithParams(scaledData, 0.0, param, new SimpleUpdater, 1.0) //拟合，计算AUC createMetrics(param, scaledData, model) } iterateResults.foreach { case (param, auc) =&gt; println(f&quot;$param iterations, AUC = ${auc * 100}%2.2f%%&quot;)} var maxIterateAuc = 0.0 var bestIterateParam = 0 for(x &lt;- iterateResults){ if(x._2 &gt; maxIterateAuc){ maxIterateAuc = x._2 bestIterateParam = x._1.toInt } } println(&quot;max auc: &quot; + maxIterateAuc + &quot; best numIterations param: &quot; + bestIterateParam) //2步长 大步长收敛快，太大可能导致收敛到局部最优解 val stepResults = Seq(0.001, 0.01, 0.1, 1.0, 10.0).map { param =&gt; val model = trainWithParams(scaledData, 0.0, bestIterateParam, new SimpleUpdater, param) createMetrics(param, scaledData, model) } stepResults.foreach { case (param, auc) =&gt; println(f&quot;$param stepSize, AUC = ${auc * 100}%2.2f%%&quot;)} var maxStepAuc = 0.0 var bestStepParam = 0.0 for(x &lt;- stepResults){ if(x._2 &gt; maxStepAuc){ maxStepAuc = x._2 bestStepParam = x._1 } } println(&quot;max auc: &quot; + maxStepAuc + &quot; best stepSize param: &quot; + bestStepParam) //3.1正则化参数，默认值为0.0，L1正则new L1Updater val regL1Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new L1Updater, bestStepParam) createMetrics(param, scaledData, model) } regL1Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L1, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL1Auc = 0.0 var bestRegL1Param = 0.0 for(x &lt;- regL1Results){ if(x._2 &gt; maxRegL1Auc){ maxRegL1Auc = x._2 bestRegL1Param = x._1 } } println(&quot;max auc: &quot; + maxRegL1Auc + &quot; best L1regParam: &quot; + bestRegL1Param) //3.2正则化参数：默认值为0.0，L2正则new SquaredL2Updater val regL2Results = Seq(0.0, 0.001, 0.01, 0.1, 1.0, 10.0).map{ param =&gt; val model = trainWithParams(scaledData, param, bestIterateParam, new SquaredL2Updater, bestStepParam) createMetrics(param, scaledData, model) } regL2Results.foreach{ case (param,auc) =&gt; println(f&quot;$param regParam L2, AUC = ${auc * 100}%2.2f%%&quot;)} var maxRegL2Auc = 0.0 var bestRegL2Param = 0.0 for(x &lt;- regL2Results){ if(x._2 &gt; maxRegL2Auc){ maxRegL2Auc = x._2 bestRegL2Param = x._1 } } println(&quot;max auc: &quot; + maxRegL2Auc + &quot; best L2regParam: &quot; + bestRegL2Param) //4正则化形式：默认为new SimpleUpdater 正则化系数无效，前两个参数调参后最优AUC为maxStepAuc //则，3.1和3.2的最优AUC与maxStepAuc比较，较大的则为最优正则化形式 var bestRegParam = 0.0 var bestUpdaterID = 0 if(maxStepAuc &gt;= maxRegL1Auc ){ if(maxStepAuc &gt;= maxRegL2Auc){ bestUpdaterID = 0 bestRegParam = 0.0 } else { bestUpdaterID = 2 bestRegParam = bestRegL2Param } } else { if(maxRegL2Auc &gt;= maxRegL1Auc){ bestUpdaterID = 2 bestRegParam = bestRegL2Param } else { bestUpdaterID = 1 bestRegParam = bestRegL1Param } } val Updaters = Seq(new SimpleUpdater, new L1Updater, new SquaredL2Updater) val bestUpdater = Updaters(bestUpdaterID) //最优参数: println(&quot;------------------更新模型训练参数---------------------&quot;) println(f&quot;best numIterations param: $bestIterateParam\\n&quot; + f&quot;best stepSize param: $bestStepParam\\n&quot; + f&quot;best regParam: $bestRegParam\\n&quot; + f&quot;best regUpdater: $bestUpdater\\n&quot; ) val upDateLrModel = trainWithParams(scaledData, bestRegParam, bestIterateParam, bestUpdater, bestStepParam) /** //删除模型目录和文件 def dirDel(path: File) { if (!path.exists()) return else if (path.isFile) { path.delete() return } val file: Array[File] = path.listFiles() for (d &lt;- file) { dirDel(d) } path.delete() } val path: File = new File(&quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) dirDel(path) //删除原模型保存的文件，不删除新模型保存会报错 // 保存和加载模型 upDateLrModel.save(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) val loadLrModel = LogisticRegressionModel.load(sc, &quot;/data/home/sospdm/tmp_wy/Model/upDateLrModel.model&quot;) */ //打印模型权重值 val newRes = upDateLrModel.weights.toArray val rdd1 = sc.parallelize(Seq(newRes)) //转换成RDD //通过StructType直接指定每个字段的schema val schema = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true), StructField(&quot;feature02&quot;, DoubleType, nullable = true), StructField(&quot;feature03&quot;, DoubleType, nullable = true), StructField(&quot;feature04&quot;, DoubleType, nullable = true), StructField(&quot;feature05&quot;, DoubleType, nullable = true), StructField(&quot;feature06&quot;, DoubleType, nullable = true), StructField(&quot;feature07&quot;, DoubleType, nullable = true), StructField(&quot;feature08&quot;, DoubleType, nullable = true), StructField(&quot;feature09&quot;, DoubleType, nullable = true), StructField(&quot;feature10&quot;, DoubleType, nullable = true), StructField(&quot;feature11&quot;, DoubleType, nullable = true), StructField(&quot;feature12&quot;, DoubleType, nullable = true), StructField(&quot;feature13&quot;, DoubleType, nullable = true), StructField(&quot;feature14&quot;, DoubleType, nullable = true) ) ) //将RDD1映射到rowRDD,19个特征权重值 val resRDD = rdd1.map(f =&gt; (f(0),f(1),f(2),f(3),f(4),f(5),f(6),f(7),f(8),f(9),f(10) ,f(11),f(12),f(13))) val rowRDD = resRDD.map(x =&gt; Row(x._1.toDouble,x._2.toDouble,x._3.toDouble, x._4.toDouble,x._5.toDouble,x._6.toDouble,x._7.toDouble,x._8.toDouble,x._9.toDouble, x._10.toDouble,x._11.toDouble,x._12.toDouble,x._13.toDouble,x._14.toDouble)) //转换成DF，并放入表item_sim val df = sqlContext.createDataFrame(rowRDD, schema) df.createOrReplaceTempView(&quot;item_sim_c01&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features as select * from item_sim_c01&quot;) //方法2 val rdd2 = sc.parallelize(newRes) val rowRdd2 = rdd2.map(p =&gt; Row(p)) val schema2 = StructType( List( StructField(&quot;feature01&quot;, DoubleType, nullable = true) ) ) val df2 = sqlContext.createDataFrame(rowRdd2, schema2) df2.createOrReplaceTempView(&quot;item_sim_c02&quot;) //结果写入hive sqlContext.sql(&quot;drop table if exists sospdm.sosp_ml_supervip_big_order_features_02&quot;) sqlContext.sql(&quot;create table if not exists &quot; + &quot;sospdm.sosp_ml_supervip_big_order_features_02 as select * from item_sim_c02&quot;) sc.stop() } } 复制代码 hive查询结果： hive&gt; select * from sosp_ml_supervip_big_order_features; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.01072063206632886 -0.05246889909683635 0.0167997584085957 Time taken: 0.118 seconds, Fetched: 1 row(s) hive&gt; select * from sosp_ml_supervip_big_order_features_02; OK 0.6663199754057857 -0.010171216293572719 0.0023033400349458714 0.038338481430094495 -0.01642462221720575 0.024300063006121263 0.010833461995473337 0.7449827421313793 -0.028370767756329837 -0.01679050770672618 -0.004508776927906877 -0.010720632066328865 -0.05246889909683635 0.0167997584085957 Time taken: 0.095 seconds, Fetched: 14 row(s) 复制代码","@type":"BlogPosting","url":"https://uzzz.org/2019/04/02/790433.html","headline":"spark实现逻辑回归和集群环境运行","dateModified":"2019-04-02T00:00:00+08:00","datePublished":"2019-04-02T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/02/790433.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>spark实现逻辑回归和集群环境运行</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix" data-track-view="{&quot;mod&quot;:&quot;popu_307&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_33912453/article/details/91397115,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_307&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/weixin_33912453/article/details/91397115&quot;}"> 
+ <div class="article-source-link">
+   原文链接：
+  <a href="" target="_blank">https://juejin.im/post/5ca35b24518825440b3b0a30</a> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-cd6c485e8b.css"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-cd6c485e8b.css"> 
+ <div class="htmledit_views" id="content_views"> 
+  <div class="article-content">
+   <p><code>spark mllib</code> <code>机器学习</code></p> 
+   <h2 class="heading">scala代码：</h2> 
+   <pre><code class="hljs scala copyable"><span class="hljs-keyword">package</span> <span class="hljs-type">Classification</span>
+
+<span class="hljs-comment">/** * LogisticRegression Algorithm For Hive * 逻辑回归测试环境连hive部署自动化 * Created by wy on 2019/04/01 */</span>
+<span class="hljs-keyword">import</span> java.io.<span class="hljs-type">File</span>
+
+<span class="hljs-keyword">import</span> org.apache.log4j.{<span class="hljs-type">Level</span>, <span class="hljs-type">Logger</span>}
+<span class="hljs-keyword">import</span> org.apache.spark.{<span class="hljs-type">SparkConf</span>, <span class="hljs-type">SparkContext</span>}
+<span class="hljs-keyword">import</span> org.apache.spark.sql.hive.<span class="hljs-type">HiveContext</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.linalg.<span class="hljs-type">Vectors</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.regression.<span class="hljs-type">LabeledPoint</span>
+<span class="hljs-keyword">import</span> org.apache.spark.rdd.<span class="hljs-type">RDD</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.classification.<span class="hljs-type">LogisticRegressionWithSGD</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.classification.<span class="hljs-type">LogisticRegressionModel</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.evaluation.<span class="hljs-type">BinaryClassificationMetrics</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.feature.<span class="hljs-type">StandardScaler</span>
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.optimization.{<span class="hljs-type">L1Updater</span>, <span class="hljs-type">SimpleUpdater</span>, <span class="hljs-type">SquaredL2Updater</span>, <span class="hljs-type">Updater</span>}
+<span class="hljs-keyword">import</span> org.apache.spark.mllib.classification.<span class="hljs-type">ClassificationModel</span>
+<span class="hljs-keyword">import</span> org.apache.spark.sql.<span class="hljs-type">Row</span>
+<span class="hljs-keyword">import</span> org.apache.spark.sql.types.{<span class="hljs-type">DoubleType</span>, <span class="hljs-type">StringType</span>, <span class="hljs-type">StructField</span>, <span class="hljs-type">StructType</span>}
+
+<span class="hljs-class"><span class="hljs-keyword">object</span> <span class="hljs-title">LrForHive</span> </span>{
+  <span class="hljs-comment">//屏蔽不必要的日志显示在终端上</span>
+  <span class="hljs-type">Logger</span>.getLogger(<span class="hljs-string">"org.apache.spark"</span>).setLevel(<span class="hljs-type">Level</span>.<span class="hljs-type">WARN</span>)
+  <span class="hljs-type">Logger</span>.getLogger(<span class="hljs-string">"org.apache.eclipse.jetty.server"</span>).setLevel(<span class="hljs-type">Level</span>.<span class="hljs-type">OFF</span>)
+
+  <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">main</span></span>(args: <span class="hljs-type">Array</span>[<span class="hljs-type">String</span>]): <span class="hljs-type">Unit</span> = {
+    <span class="hljs-comment">//程序入口初始化</span>
+    <span class="hljs-keyword">val</span> conf = <span class="hljs-keyword">new</span> <span class="hljs-type">SparkConf</span>().setAppName(<span class="hljs-string">"LrForHive"</span>)
+    conf.set(<span class="hljs-string">"set hive.cli.print.header"</span>,<span class="hljs-string">"false"</span>)   <span class="hljs-comment">//去除hive表列名</span>
+
+    <span class="hljs-keyword">val</span> sc = <span class="hljs-keyword">new</span> <span class="hljs-type">SparkContext</span>(conf)
+    <span class="hljs-keyword">val</span> sqlContext = <span class="hljs-keyword">new</span> <span class="hljs-type">HiveContext</span>(sc)
+    <span class="hljs-comment">//hive读数据</span>
+    <span class="hljs-keyword">val</span> <span class="hljs-type">Data</span> = sqlContext.sql(<span class="hljs-string">"select * from sospdm.sosp_ml_supervip_big_order_mem"</span>).rdd
+
+    <span class="hljs-keyword">val</span> data = <span class="hljs-type">Data</span>.map(x =&gt; x(<span class="hljs-number">0</span>).toString).map{
+      line =&gt; {
+        <span class="hljs-keyword">val</span> arr = line.split(<span class="hljs-string">"#"</span>)
+        <span class="hljs-keyword">val</span> label = arr(<span class="hljs-number">1</span>).toDouble
+        <span class="hljs-keyword">val</span> features = arr(<span class="hljs-number">0</span>).split(<span class="hljs-string">","</span>).map(_.toDouble)
+        <span class="hljs-type">LabeledPoint</span>(label,<span class="hljs-type">Vectors</span>.dense(features))  <span class="hljs-comment">//创建一个稠密向量</span>
+      }
+    }
+
+    data.cache()  <span class="hljs-comment">//缓存</span>
+
+    <span class="hljs-comment">//特征标准化</span>
+    <span class="hljs-keyword">val</span> vectors = data.map(x =&gt; x.features)
+    <span class="hljs-keyword">val</span> scalar = <span class="hljs-keyword">new</span> <span class="hljs-type">StandardScaler</span>(withMean = <span class="hljs-literal">true</span>, withStd = <span class="hljs-literal">true</span>).fit(vectors) <span class="hljs-comment">//将向量传到转换函数</span>
+    <span class="hljs-keyword">val</span> scaledData = data.map(x =&gt; <span class="hljs-type">LabeledPoint</span>(x.label, scalar.transform(x.features)))
+    scaledData.cache()
+
+    <span class="hljs-comment">/** 模型参数调优MLlib线性模型优化技术：SGD和L-BFGS(只在逻辑回归中使用LogisticRegressionWithLBFGS)*/</span>
+    <span class="hljs-comment">//线性模型</span>
+    <span class="hljs-comment">//定义训练调参辅助函数，根据给定输入训练模型 (输入， 则正则化参数， 迭代次数， 正则化形式， 步长)</span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">trainWithParams</span></span>(input: <span class="hljs-type">RDD</span>[<span class="hljs-type">LabeledPoint</span>], regParam: <span class="hljs-type">Double</span>, numIterations: <span class="hljs-type">Int</span>,
+                        updater: <span class="hljs-type">Updater</span>, stepSize: <span class="hljs-type">Double</span>) = {
+      <span class="hljs-keyword">val</span> lr =<span class="hljs-keyword">new</span> <span class="hljs-type">LogisticRegressionWithSGD</span>  <span class="hljs-comment">//逻辑回归也可以用LogisticRegressionWithLBFGS</span>
+      lr.optimizer
+        .setNumIterations(numIterations)  <span class="hljs-comment">//迭代次数</span>
+        .setStepSize(stepSize)            <span class="hljs-comment">//步长</span>
+        .setRegParam(regParam)            <span class="hljs-comment">//则正则化参数</span>
+        .setUpdater(updater)              <span class="hljs-comment">//正则化形式</span>
+      lr.run(input)                       <span class="hljs-comment">//输入训练数据RDD</span>
+    }
+
+    <span class="hljs-comment">//定义第二个辅助函数,label为需要调试的参数，data:输入预测的数据，model训练的模型</span>
+    <span class="hljs-function"><span class="hljs-keyword">def</span> <span class="hljs-title">createMetrics</span></span>(label: <span class="hljs-type">Double</span>, data: <span class="hljs-type">RDD</span>[<span class="hljs-type">LabeledPoint</span>], model: <span class="hljs-type">ClassificationModel</span>) = {
+      <span class="hljs-keyword">val</span> scoreAndLabels = data.map { point =&gt;
+        (model.predict(point.features),point.label)  <span class="hljs-comment">//(predicts,label)</span>
+      }
+      <span class="hljs-keyword">val</span> metrics = <span class="hljs-keyword">new</span> <span class="hljs-type">BinaryClassificationMetrics</span>(scoreAndLabels)
+      (label, metrics.areaUnderROC())  <span class="hljs-comment">//计算AUC</span>
+    }
+
+    <span class="hljs-comment">//1迭代次数</span>
+    <span class="hljs-keyword">val</span> iterateResults = <span class="hljs-type">Seq</span>(<span class="hljs-number">1</span>, <span class="hljs-number">5</span>, <span class="hljs-number">10</span>, <span class="hljs-number">50</span>, <span class="hljs-number">100</span>).map { param =&gt;
+      <span class="hljs-comment">//训练</span>
+      <span class="hljs-keyword">val</span> model = trainWithParams(scaledData, <span class="hljs-number">0.0</span>, param, <span class="hljs-keyword">new</span> <span class="hljs-type">SimpleUpdater</span>, <span class="hljs-number">1.0</span>)
+      <span class="hljs-comment">//拟合，计算AUC</span>
+      createMetrics(param, scaledData, model)
+    }
+    iterateResults.foreach { <span class="hljs-keyword">case</span> (param, auc) =&gt; println(<span class="hljs-string">f"<span class="hljs-subst">$param</span> iterations, AUC = <span class="hljs-subst">${auc * 100}</span>%2.2f%%"</span>)}
+    <span class="hljs-keyword">var</span> maxIterateAuc = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">var</span> bestIterateParam = <span class="hljs-number">0</span>
+    <span class="hljs-keyword">for</span>(x &lt;- iterateResults){
+      <span class="hljs-keyword">if</span>(x._2 &gt; maxIterateAuc){
+        maxIterateAuc = x._2
+        bestIterateParam = x._1.toInt
+      }
+    }
+    println(<span class="hljs-string">"max auc: "</span> + maxIterateAuc + <span class="hljs-string">" best numIterations param: "</span> + bestIterateParam)
+
+    <span class="hljs-comment">//2步长 大步长收敛快，太大可能导致收敛到局部最优解</span>
+    <span class="hljs-keyword">val</span> stepResults = <span class="hljs-type">Seq</span>(<span class="hljs-number">0.001</span>, <span class="hljs-number">0.01</span>, <span class="hljs-number">0.1</span>, <span class="hljs-number">1.0</span>, <span class="hljs-number">10.0</span>).map { param =&gt;
+      <span class="hljs-keyword">val</span> model = trainWithParams(scaledData, <span class="hljs-number">0.0</span>, bestIterateParam, <span class="hljs-keyword">new</span> <span class="hljs-type">SimpleUpdater</span>, param)
+      createMetrics(param, scaledData, model)
+    }
+    stepResults.foreach { <span class="hljs-keyword">case</span> (param, auc) =&gt; println(<span class="hljs-string">f"<span class="hljs-subst">$param</span> stepSize, AUC = <span class="hljs-subst">${auc * 100}</span>%2.2f%%"</span>)}
+    <span class="hljs-keyword">var</span> maxStepAuc = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">var</span> bestStepParam = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">for</span>(x &lt;- stepResults){
+      <span class="hljs-keyword">if</span>(x._2 &gt; maxStepAuc){
+        maxStepAuc = x._2
+        bestStepParam = x._1
+      }
+    }
+    println(<span class="hljs-string">"max auc: "</span> + maxStepAuc + <span class="hljs-string">" best stepSize param: "</span> + bestStepParam)
+
+    <span class="hljs-comment">//3.1正则化参数，默认值为0.0，L1正则new L1Updater</span>
+    <span class="hljs-keyword">val</span> regL1Results = <span class="hljs-type">Seq</span>(<span class="hljs-number">0.0</span>, <span class="hljs-number">0.001</span>, <span class="hljs-number">0.01</span>, <span class="hljs-number">0.1</span>, <span class="hljs-number">1.0</span>, <span class="hljs-number">10.0</span>).map{ param =&gt;
+      <span class="hljs-keyword">val</span> model = trainWithParams(scaledData, param, bestIterateParam, <span class="hljs-keyword">new</span> <span class="hljs-type">L1Updater</span>, bestStepParam)
+      createMetrics(param, scaledData, model)
+    }
+    regL1Results.foreach{ <span class="hljs-keyword">case</span> (param,auc) =&gt; println(<span class="hljs-string">f"<span class="hljs-subst">$param</span> regParam L1, AUC = <span class="hljs-subst">${auc * 100}</span>%2.2f%%"</span>)}
+    <span class="hljs-keyword">var</span> maxRegL1Auc = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">var</span> bestRegL1Param = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">for</span>(x &lt;- regL1Results){
+      <span class="hljs-keyword">if</span>(x._2 &gt; maxRegL1Auc){
+        maxRegL1Auc = x._2
+        bestRegL1Param = x._1
+      }
+    }
+    println(<span class="hljs-string">"max auc: "</span> + maxRegL1Auc + <span class="hljs-string">" best L1regParam: "</span> + bestRegL1Param)
+
+    <span class="hljs-comment">//3.2正则化参数：默认值为0.0，L2正则new SquaredL2Updater</span>
+    <span class="hljs-keyword">val</span> regL2Results = <span class="hljs-type">Seq</span>(<span class="hljs-number">0.0</span>, <span class="hljs-number">0.001</span>, <span class="hljs-number">0.01</span>, <span class="hljs-number">0.1</span>, <span class="hljs-number">1.0</span>, <span class="hljs-number">10.0</span>).map{ param =&gt;
+      <span class="hljs-keyword">val</span> model = trainWithParams(scaledData, param, bestIterateParam, <span class="hljs-keyword">new</span> <span class="hljs-type">SquaredL2Updater</span>, bestStepParam)
+      createMetrics(param, scaledData, model)
+    }
+    regL2Results.foreach{ <span class="hljs-keyword">case</span> (param,auc) =&gt; println(<span class="hljs-string">f"<span class="hljs-subst">$param</span> regParam L2, AUC = <span class="hljs-subst">${auc * 100}</span>%2.2f%%"</span>)}
+    <span class="hljs-keyword">var</span> maxRegL2Auc = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">var</span> bestRegL2Param = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">for</span>(x &lt;- regL2Results){
+      <span class="hljs-keyword">if</span>(x._2 &gt; maxRegL2Auc){
+        maxRegL2Auc = x._2
+        bestRegL2Param = x._1
+      }
+    }
+    println(<span class="hljs-string">"max auc: "</span> + maxRegL2Auc + <span class="hljs-string">" best L2regParam: "</span> + bestRegL2Param)
+    <span class="hljs-comment">//4正则化形式：默认为new SimpleUpdater 正则化系数无效，前两个参数调参后最优AUC为maxStepAuc</span>
+    <span class="hljs-comment">//则，3.1和3.2的最优AUC与maxStepAuc比较，较大的则为最优正则化形式</span>
+    <span class="hljs-keyword">var</span> bestRegParam = <span class="hljs-number">0.0</span>
+    <span class="hljs-keyword">var</span> bestUpdaterID = <span class="hljs-number">0</span>
+    <span class="hljs-keyword">if</span>(maxStepAuc &gt;= maxRegL1Auc ){
+      <span class="hljs-keyword">if</span>(maxStepAuc &gt;= maxRegL2Auc){
+        bestUpdaterID = <span class="hljs-number">0</span>
+        bestRegParam = <span class="hljs-number">0.0</span>
+      }
+      <span class="hljs-keyword">else</span> {
+        bestUpdaterID = <span class="hljs-number">2</span>
+        bestRegParam = bestRegL2Param
+      }
+    }
+    <span class="hljs-keyword">else</span> {
+      <span class="hljs-keyword">if</span>(maxRegL2Auc &gt;= maxRegL1Auc){
+        bestUpdaterID = <span class="hljs-number">2</span>
+        bestRegParam = bestRegL2Param
+      }
+      <span class="hljs-keyword">else</span> {
+        bestUpdaterID = <span class="hljs-number">1</span>
+        bestRegParam = bestRegL1Param
+      }
+    }
+    <span class="hljs-keyword">val</span> <span class="hljs-type">Updaters</span> = <span class="hljs-type">Seq</span>(<span class="hljs-keyword">new</span> <span class="hljs-type">SimpleUpdater</span>, <span class="hljs-keyword">new</span> <span class="hljs-type">L1Updater</span>, <span class="hljs-keyword">new</span> <span class="hljs-type">SquaredL2Updater</span>)
+    <span class="hljs-keyword">val</span> bestUpdater = <span class="hljs-type">Updaters</span>(bestUpdaterID)
+    <span class="hljs-comment">//最优参数:</span>
+    println(<span class="hljs-string">"------------------更新模型训练参数---------------------"</span>)
+    println(<span class="hljs-string">f"best numIterations param: <span class="hljs-subst">$bestIterateParam</span>\n"</span> +
+      <span class="hljs-string">f"best stepSize param: <span class="hljs-subst">$bestStepParam</span>\n"</span> +
+      <span class="hljs-string">f"best regParam: <span class="hljs-subst">$bestRegParam</span>\n"</span> +
+      <span class="hljs-string">f"best regUpdater: <span class="hljs-subst">$bestUpdater</span>\n"</span>
+    )
+
+    <span class="hljs-keyword">val</span> upDateLrModel = trainWithParams(scaledData, bestRegParam, bestIterateParam, bestUpdater, bestStepParam)
+
+    <span class="hljs-comment">/** //删除模型目录和文件 def dirDel(path: File) { if (!path.exists()) return else if (path.isFile) { path.delete() return } val file: Array[File] = path.listFiles() for (d &lt;- file) { dirDel(d) } path.delete() } val path: File = new File("/data/home/sospdm/tmp_wy/Model/upDateLrModel.model") dirDel(path) //删除原模型保存的文件，不删除新模型保存会报错 // 保存和加载模型 upDateLrModel.save(sc, "/data/home/sospdm/tmp_wy/Model/upDateLrModel.model") val loadLrModel = LogisticRegressionModel.load(sc, "/data/home/sospdm/tmp_wy/Model/upDateLrModel.model") */</span>
+
+    <span class="hljs-comment">//打印模型权重值</span>
+    <span class="hljs-keyword">val</span> newRes = upDateLrModel.weights.toArray
+
+    <span class="hljs-keyword">val</span> rdd1 = sc.parallelize(<span class="hljs-type">Seq</span>(newRes)) <span class="hljs-comment">//转换成RDD</span>
+
+
+    <span class="hljs-comment">//通过StructType直接指定每个字段的schema</span>
+    <span class="hljs-keyword">val</span> schema = <span class="hljs-type">StructType</span>(
+      <span class="hljs-type">List</span>(
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature01"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature02"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature03"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature04"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature05"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature06"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature07"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature08"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature09"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature10"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature11"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature12"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature13"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>),
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature14"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>)
+      )
+    )
+
+    <span class="hljs-comment">//将RDD1映射到rowRDD,19个特征权重值</span>
+    <span class="hljs-keyword">val</span> resRDD = rdd1.map(f =&gt; (f(<span class="hljs-number">0</span>),f(<span class="hljs-number">1</span>),f(<span class="hljs-number">2</span>),f(<span class="hljs-number">3</span>),f(<span class="hljs-number">4</span>),f(<span class="hljs-number">5</span>),f(<span class="hljs-number">6</span>),f(<span class="hljs-number">7</span>),f(<span class="hljs-number">8</span>),f(<span class="hljs-number">9</span>),f(<span class="hljs-number">10</span>)
+      ,f(<span class="hljs-number">11</span>),f(<span class="hljs-number">12</span>),f(<span class="hljs-number">13</span>)))
+
+    <span class="hljs-keyword">val</span> rowRDD = resRDD.map(x =&gt; <span class="hljs-type">Row</span>(x._1.toDouble,x._2.toDouble,x._3.toDouble,
+      x._4.toDouble,x._5.toDouble,x._6.toDouble,x._7.toDouble,x._8.toDouble,x._9.toDouble,
+      x._10.toDouble,x._11.toDouble,x._12.toDouble,x._13.toDouble,x._14.toDouble))
+    <span class="hljs-comment">//转换成DF，并放入表item_sim</span>
+    <span class="hljs-keyword">val</span> df = sqlContext.createDataFrame(rowRDD, schema)
+
+    df.createOrReplaceTempView(<span class="hljs-string">"item_sim_c01"</span>)
+
+    <span class="hljs-comment">//结果写入hive</span>
+    sqlContext.sql(<span class="hljs-string">"drop table if exists sospdm.sosp_ml_supervip_big_order_features"</span>)
+    sqlContext.sql(<span class="hljs-string">"create table if not exists "</span> +
+      <span class="hljs-string">"sospdm.sosp_ml_supervip_big_order_features as select * from item_sim_c01"</span>)
+
+    <span class="hljs-comment">//方法2</span>
+    <span class="hljs-keyword">val</span> rdd2 = sc.parallelize(newRes)
+    <span class="hljs-keyword">val</span> rowRdd2 = rdd2.map(p =&gt; <span class="hljs-type">Row</span>(p))
+    <span class="hljs-keyword">val</span> schema2 = <span class="hljs-type">StructType</span>(
+      <span class="hljs-type">List</span>(
+        <span class="hljs-type">StructField</span>(<span class="hljs-string">"feature01"</span>, <span class="hljs-type">DoubleType</span>, nullable = <span class="hljs-literal">true</span>)
+      )
+    )
+    <span class="hljs-keyword">val</span> df2 = sqlContext.createDataFrame(rowRdd2, schema2)
+    df2.createOrReplaceTempView(<span class="hljs-string">"item_sim_c02"</span>)
+    <span class="hljs-comment">//结果写入hive</span>
+    sqlContext.sql(<span class="hljs-string">"drop table if exists sospdm.sosp_ml_supervip_big_order_features_02"</span>)
+    sqlContext.sql(<span class="hljs-string">"create table if not exists "</span> +
+      <span class="hljs-string">"sospdm.sosp_ml_supervip_big_order_features_02 as select * from item_sim_c02"</span>)
+
+    sc.stop()
+  }
+}
+<span class="copy-code-btn">复制代码</span></code></pre>
+   <h2 class="heading">hive查询结果：</h2> 
+   <pre><code class="hljs scala copyable">hive&gt; select * from sosp_ml_supervip_big_order_features;
+<span class="hljs-type">OK</span>
+<span class="hljs-number">0.6663199754057857</span>      <span class="hljs-number">-0.010171216293572719</span>   <span class="hljs-number">0.0023033400349458714</span>   <span class="hljs-number">0.038338481430094495</span>
+<span class="hljs-number">-0.01642462221720575</span>     <span class="hljs-number">0.024300063006121263</span>    <span class="hljs-number">0.010833461995473337</span>    <span class="hljs-number">0.7449827421313793</span>  
+<span class="hljs-number">-0.028370767756329837</span>    <span class="hljs-number">-0.01679050770672618</span>    <span class="hljs-number">-0.004508776927906877</span>   <span class="hljs-number">-0.01072063206632886</span>
+<span class="hljs-number">-0.05246889909683635</span>     <span class="hljs-number">0.0167997584085957</span>
+<span class="hljs-type">Time</span> taken: <span class="hljs-number">0.118</span> seconds, <span class="hljs-type">Fetched</span>: <span class="hljs-number">1</span> row(s)
+hive&gt; select * from sosp_ml_supervip_big_order_features_02;
+<span class="hljs-type">OK</span>
+<span class="hljs-number">0.6663199754057857</span>
+<span class="hljs-number">-0.010171216293572719</span>
+<span class="hljs-number">0.0023033400349458714</span>
+<span class="hljs-number">0.038338481430094495</span>
+<span class="hljs-number">-0.01642462221720575</span>
+<span class="hljs-number">0.024300063006121263</span>
+<span class="hljs-number">0.010833461995473337</span>
+<span class="hljs-number">0.7449827421313793</span>
+<span class="hljs-number">-0.028370767756329837</span>
+<span class="hljs-number">-0.01679050770672618</span>
+<span class="hljs-number">-0.004508776927906877</span>
+<span class="hljs-number">-0.010720632066328865</span>
+<span class="hljs-number">-0.05246889909683635</span>
+<span class="hljs-number">0.0167997584085957</span>
+<span class="hljs-type">Time</span> taken: <span class="hljs-number">0.095</span> seconds, <span class="hljs-type">Fetched</span>: <span class="hljs-number">14</span> row(s)
+<span class="copy-code-btn">复制代码</span></code></pre>
+  </div> 
+ </div> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

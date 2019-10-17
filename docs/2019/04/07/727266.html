@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>生死看淡，不服就GAN(八)—-WGAN的改进版本WGAN-GP | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="生死看淡，不服就GAN(八)—-WGAN的改进版本WGAN-GP" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：转载请注明出处（作者：Ephemeroptera） https://blog.csdn.net/Ephemeroptera/article/details/89074498 WGAN-GP是针对WGAN的存在的问题提出来的，WGAN在真实的实验过程中依旧存在着训练困难、收敛速度慢的 问题，相比较传统GAN在实验上提升不是很明显。WGAN-GP在文章中指出了WGAN存在问题的原因，那就是WGAN在处理Lipschitz限制条件时直接采用了 weight clipping。相关讲解请参考 WGAN-GP的介绍 同往期一样，依然以生成cifar数据集中马的彩色图片为例，关于cifar数据集的读取和生成器模型的验证请参考第6期： 用DCGAN生成马的彩色图片 下面给出WGAN-GP框架 &quot;&quot;&quot; -------------------------------------------------------生死看淡，不服就GAN------------------------------------------------------------------------- PROJECT: CIFAR10_WGAN-GP Author: Ephemeroptera Date:2019-3-19 QQ:605686962 &quot;&quot;&quot; &quot;&quot;&quot; WGAN说明：相比较WGAN，WGAN-GP提出以下改进： （1）用对判别器梯度惩罚取代WGAN的判决器权值区间截断 （2）判别器取消BN操作 （3）优化器使用ADAM &quot;&quot;&quot; # 导入包 import numpy as np import tensorflow as tf import pickle import TFRecordTools import time ############################################### 设置参数 #################################################################################### real_shape = [-1,32,32,3] # 真实样本尺寸 data_total = 5000 # 真实样本个数 batch_size = 64 # 批大小 noise_size = 128 # 噪声维度 max_iters = 50000 #的最大迭代次数 learning_rate = 5e-5 # 学习率 beta1 = 0.5# ADAM参数1 beta2 = 0.9# ADAM参数2 CRITIC_NUM = 5 # 每次迭代判别器训练次数 lam = 10 #梯度惩罚权重 ############################################# 定义生成器和判别器 ############################################################################# # 定义生成器（32x32图片） def Generator_DC_32x32(z, channel, is_train=True): &quot;&quot;&quot; :param z: 噪声信号，tensor类型 :param channnel: 生成图片的通道数 :param is_train: 是否为训练状态，该参数主要用于作为batch_normalization方法中的参数使用(训练时候开启) &quot;&quot;&quot; # 训练时生成器不允许复用 with tf.variable_scope(&quot;generator&quot;, reuse=(not is_train)): # layer1: noise_dim --&gt; 4*4*512 --&gt; 4x4x512 --&gt;BN+relu layer1 = tf.layers.dense(z, 4 * 4 * 512) layer1 = tf.reshape(layer1, [-1, 4, 4, 512]) layer1 = tf.layers.batch_normalization(layer1, training=is_train,) layer1 = tf.nn.relu(layer1) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8)# dropout # layer2: deconv(ks=3x3,s=2,padding=same):4x4x512 --&gt; 8x8x256 --&gt; BN+relu layer2 = tf.layers.conv2d_transpose(layer1, 256, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer2 = tf.layers.batch_normalization(layer2, training=is_train) layer2 = tf.nn.relu(layer2) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8)# dropout # layer3: deconv(ks=3x3,s=2,padding=same):8x8x256 --&gt; 16x16x128 --&gt; BN+relu layer3 = tf.layers.conv2d_transpose(layer2, 128, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer3 = tf.layers.batch_normalization(layer3, training=is_train) layer3 = tf.nn.relu(layer3) # layer3 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # layer4: deconv(ks=3x3,s=2,padding=same):16x16x128 --&gt; 32x32x64--&gt; BN+relu layer4 = tf.layers.conv2d_transpose(layer3, 64, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer4 = tf.layers.batch_normalization(layer4, training=is_train) layer4 = tf.nn.relu(layer4) # layer4 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # logits: deconv(ks=3x3,s=2,padding=same):32x32x64 --&gt; 32x32x3 logits = tf.layers.conv2d_transpose(layer4, channel, 3, strides=1, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) # outputs outputs = tf.tanh(logits) return logits,outputs # 定义判别器（32x32） def Discriminator_DC_32x32(inputs_img, reuse=False, GAN = False,GP= False,alpha=0.2): &quot;&quot;&quot; @param inputs_img: 输入图片，tensor类型 @param reuse:判别器复用 @param GP: 使用WGAN-GP时关闭BN @param alpha: Leaky ReLU系数 &quot;&quot;&quot; with tf.variable_scope(&quot;discriminator&quot;, reuse=reuse): # layer1: conv(ks=3x3,s=2,padding=same)+lrelu --&gt;32x32x3 to 16x16x128 layer1 = tf.layers.conv2d(inputs_img, 128, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer1 = tf.layers.batch_normalization(layer1, training=True) layer1 = tf.nn.leaky_relu(layer1,alpha=alpha) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8) # layer2: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;16x16x128 to 8x8x256 layer2 = tf.layers.conv2d(layer1, 256, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer2 = tf.layers.batch_normalization(layer2, training=True) layer2 = tf.nn.leaky_relu(layer2, alpha=alpha) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8) # layer3: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;8x8x256 to 4x4x512 layer3 = tf.layers.conv2d(layer2, 512, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer3 = tf.layers.batch_normalization(layer3, training=True) layer3 = tf.nn.leaky_relu(layer3, alpha=alpha) layer3 = tf.reshape(layer3, [-1, 4*4* 512]) # layer3 = tf.nn.dropout(layer2, keep_prob=0.8) # logits,output: logits = tf.layers.dense(layer3, 1) &quot;WGAN:去除sigmoid&quot; if GAN: outputs = None else: outputs = tf.sigmoid(logits) return logits, outputs ############################################## 定义计算图（网络） ####################################################### #----------------------输入---------------- inputs_real = tf.placeholder(tf.float32, [None, real_shape[1], real_shape[2], real_shape[3]], name=&#39;inputs_real&#39;) # 真实样本输入 inputs_noise = tf.placeholder(tf.float32, [None, noise_size], name=&#39;inputs_noise&#39;) # 生成样本输入 #-------------------生成和判别-------------- # 生成样本 _,g_outputs = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=True) # 训练生成器 _,g_test = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=False) # 测试生成器 # 判别样本 &#39;WGAN-GP:判别器废除批归一化&#39; d_logits_real, _ = Discriminator_DC_32x32(inputs_real,GAN=True,GP=True) #识别真样本 d_logits_fake, _ = Discriminator_DC_32x32(g_outputs,GAN=True,GP=True,reuse=True) #识别假样本 #------------定义原始GAN的损失函数-------------- &quot;WGAN:损失函数去log，采用Wasserstein距离形式&quot; # 生成器 g_loss = tf.reduce_mean(-d_logits_fake) # 判别器 d_loss = tf.reduce_mean(d_logits_fake - d_logits_real) &#39;WGAN-GP:加入判别器梯度惩罚项&#39; # 判别器梯度惩罚项 alpha_dist = tf.contrib.distributions.Uniform(low=0., high=1.)#获取[0,1]之间正态分布 alpha = alpha_dist.sample((batch_size, 1, 1, 1)) interpolated = inputs_real + alpha*(g_outputs-inputs_real)# 对真实样本和生成样本之间插值 inte_logit,_ = Discriminator_DC_32x32(interpolated, GAN=True,GP=True,reuse=True) gradients = tf.gradients(inte_logit, [interpolated,])[0]# 求得判别器梯度 grad_l2 = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3])) gradient_penalty = tf.reduce_mean((grad_l2-1)**2) # 定义惩罚项 # 加入d_loss d_loss+=gradient_penalty*lam #-------------------训练模型----------------- # 分别获取生成器和判别器的变量空间 train_vars = tf.trainable_variables() g_vars = [var for var in train_vars if var.name.startswith(&quot;generator&quot;)] d_vars = [var for var in train_vars if var.name.startswith(&quot;discriminator&quot;)] # Optimizer with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):# 保证分布白化先完成 g_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(g_loss, var_list=g_vars) d_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(d_loss, var_list=d_vars) ############################################# 调用TFRecord读取数据 ##################################################### # 读取TFR,不打乱文件顺序，指定数据类型，开启多线程 [data,label] = TFRecordTools.ReadFromTFRecord(sameName= r&#39;.\TFR\class7-*&#39;,isShuffle= False,datatype= tf.float64, labeltype= tf.int32,isMultithreading= True) # 批量处理，送入队列数据，指定数据大小，打乱数据项，设置批次大小64 [data_batch,label_batch] = TFRecordTools.DataBatch(data,label,dataSize= 32*32*3,labelSize= 1, isShuffle= True,batchSize= 64) ############################################### 迭代 ################################################################### # 存储训练过程中生成日志 GenLog = [] # 存储loss losses = [] # 保存生成器变量(仅保存生成器模型，保存最近5个) saver = tf.train.Saver(var_list=[var for var in tf.trainable_variables() if var.name.startswith(&quot;generator&quot;)],max_to_keep=5) # 定义批预处理 def batch_preprocess(data_batch): # 提取批数据 batch = sess.run(data_batch) # 整理成RGB（Nx32x32x3） batch_images = np.reshape(batch, [-1, 3, 32, 32]).transpose((0, 2, 3, 1)) # (-1,32,32,3) # scale to -1, 1 batch_images = batch_images * 2 - 1 return batch_images # 生成相关目录保存生成信息 def GEN_DIR(): import os if not os.path.isdir(&#39;ckpt&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;ckpt&#39;) if not os.path.isdir(&#39;trainLog&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;trainLog&#39;) # 开启会话 with tf.Session() as sess: # 生成相关目录 GEN_DIR() # 初始化变量 init = (tf.global_variables_initializer(), tf.local_variables_initializer()) sess.run(init) # 开启协调器 coord = tf.train.Coordinator() # 启动线程 threads = tf.train.start_queue_runners(sess=sess, coord=coord) time_start = time.time() # 开始计时 for steps in range(max_iters): steps += 1 # 判别器重复训练设置 if steps &lt; 25 or steps % 500 == 0: critic_num = 100 else: critic_num = CRITIC_NUM # 重复训练判别器 for i in range(CRITIC_NUM): batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(d_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 训练生成器 batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(g_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 记录训练信息 if steps % 5 == 1: # （1）记录损失函数 train_loss_d = d_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) train_loss_g = g_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) losses.append([train_loss_d, train_loss_g,steps]) # （2）记录生成样本 batch_noise = np.random.normal(size=(batch_size, noise_size)) gen_samples = sess.run(g_test, feed_dict={inputs_noise: batch_noise}) genLog = (gen_samples[0:11] + 1) / 2 # 恢复颜色空间(取10张) GenLog.append(genLog) # (3)打印信息 print(&#39;step {}...&#39;.format(steps), &quot;Discriminator Loss: {:.4f}...&quot;.format(train_loss_d), &quot;Generator Loss: {:.4f}...&quot;.format(train_loss_g)) # （4）保存生成模型 if steps % 300 ==0: saver.save(sess, &#39;./ckpt/generator.ckpt&#39;, global_step=steps) # 关闭线程 coord.request_stop() coord.join(threads) #计时结束： time_end = time.time() print(&#39;迭代结束，耗时：%.2f秒&#39;%(time_end-time_start)) # 保存信息 # 保存loss记录 with open(&#39;./trainLog/loss_variation.loss&#39;, &#39;wb&#39;) as l: losses = np.array(losses) pickle.dump(losses,l) print(&#39;保存loss信息..&#39;) # 保存生成日志 with open(&#39;./trainLog/GenLog.log&#39;, &#39;wb&#39;) as g: pickle.dump(GenLog, g) print(&#39;保存GenLog信息..&#39;) 结果展示 最后一次生成样本 训练期间生成日志 损失函数 验证生成器" />
+<meta property="og:description" content="版权声明：转载请注明出处（作者：Ephemeroptera） https://blog.csdn.net/Ephemeroptera/article/details/89074498 WGAN-GP是针对WGAN的存在的问题提出来的，WGAN在真实的实验过程中依旧存在着训练困难、收敛速度慢的 问题，相比较传统GAN在实验上提升不是很明显。WGAN-GP在文章中指出了WGAN存在问题的原因，那就是WGAN在处理Lipschitz限制条件时直接采用了 weight clipping。相关讲解请参考 WGAN-GP的介绍 同往期一样，依然以生成cifar数据集中马的彩色图片为例，关于cifar数据集的读取和生成器模型的验证请参考第6期： 用DCGAN生成马的彩色图片 下面给出WGAN-GP框架 &quot;&quot;&quot; -------------------------------------------------------生死看淡，不服就GAN------------------------------------------------------------------------- PROJECT: CIFAR10_WGAN-GP Author: Ephemeroptera Date:2019-3-19 QQ:605686962 &quot;&quot;&quot; &quot;&quot;&quot; WGAN说明：相比较WGAN，WGAN-GP提出以下改进： （1）用对判别器梯度惩罚取代WGAN的判决器权值区间截断 （2）判别器取消BN操作 （3）优化器使用ADAM &quot;&quot;&quot; # 导入包 import numpy as np import tensorflow as tf import pickle import TFRecordTools import time ############################################### 设置参数 #################################################################################### real_shape = [-1,32,32,3] # 真实样本尺寸 data_total = 5000 # 真实样本个数 batch_size = 64 # 批大小 noise_size = 128 # 噪声维度 max_iters = 50000 #的最大迭代次数 learning_rate = 5e-5 # 学习率 beta1 = 0.5# ADAM参数1 beta2 = 0.9# ADAM参数2 CRITIC_NUM = 5 # 每次迭代判别器训练次数 lam = 10 #梯度惩罚权重 ############################################# 定义生成器和判别器 ############################################################################# # 定义生成器（32x32图片） def Generator_DC_32x32(z, channel, is_train=True): &quot;&quot;&quot; :param z: 噪声信号，tensor类型 :param channnel: 生成图片的通道数 :param is_train: 是否为训练状态，该参数主要用于作为batch_normalization方法中的参数使用(训练时候开启) &quot;&quot;&quot; # 训练时生成器不允许复用 with tf.variable_scope(&quot;generator&quot;, reuse=(not is_train)): # layer1: noise_dim --&gt; 4*4*512 --&gt; 4x4x512 --&gt;BN+relu layer1 = tf.layers.dense(z, 4 * 4 * 512) layer1 = tf.reshape(layer1, [-1, 4, 4, 512]) layer1 = tf.layers.batch_normalization(layer1, training=is_train,) layer1 = tf.nn.relu(layer1) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8)# dropout # layer2: deconv(ks=3x3,s=2,padding=same):4x4x512 --&gt; 8x8x256 --&gt; BN+relu layer2 = tf.layers.conv2d_transpose(layer1, 256, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer2 = tf.layers.batch_normalization(layer2, training=is_train) layer2 = tf.nn.relu(layer2) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8)# dropout # layer3: deconv(ks=3x3,s=2,padding=same):8x8x256 --&gt; 16x16x128 --&gt; BN+relu layer3 = tf.layers.conv2d_transpose(layer2, 128, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer3 = tf.layers.batch_normalization(layer3, training=is_train) layer3 = tf.nn.relu(layer3) # layer3 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # layer4: deconv(ks=3x3,s=2,padding=same):16x16x128 --&gt; 32x32x64--&gt; BN+relu layer4 = tf.layers.conv2d_transpose(layer3, 64, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer4 = tf.layers.batch_normalization(layer4, training=is_train) layer4 = tf.nn.relu(layer4) # layer4 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # logits: deconv(ks=3x3,s=2,padding=same):32x32x64 --&gt; 32x32x3 logits = tf.layers.conv2d_transpose(layer4, channel, 3, strides=1, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) # outputs outputs = tf.tanh(logits) return logits,outputs # 定义判别器（32x32） def Discriminator_DC_32x32(inputs_img, reuse=False, GAN = False,GP= False,alpha=0.2): &quot;&quot;&quot; @param inputs_img: 输入图片，tensor类型 @param reuse:判别器复用 @param GP: 使用WGAN-GP时关闭BN @param alpha: Leaky ReLU系数 &quot;&quot;&quot; with tf.variable_scope(&quot;discriminator&quot;, reuse=reuse): # layer1: conv(ks=3x3,s=2,padding=same)+lrelu --&gt;32x32x3 to 16x16x128 layer1 = tf.layers.conv2d(inputs_img, 128, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer1 = tf.layers.batch_normalization(layer1, training=True) layer1 = tf.nn.leaky_relu(layer1,alpha=alpha) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8) # layer2: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;16x16x128 to 8x8x256 layer2 = tf.layers.conv2d(layer1, 256, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer2 = tf.layers.batch_normalization(layer2, training=True) layer2 = tf.nn.leaky_relu(layer2, alpha=alpha) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8) # layer3: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;8x8x256 to 4x4x512 layer3 = tf.layers.conv2d(layer2, 512, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer3 = tf.layers.batch_normalization(layer3, training=True) layer3 = tf.nn.leaky_relu(layer3, alpha=alpha) layer3 = tf.reshape(layer3, [-1, 4*4* 512]) # layer3 = tf.nn.dropout(layer2, keep_prob=0.8) # logits,output: logits = tf.layers.dense(layer3, 1) &quot;WGAN:去除sigmoid&quot; if GAN: outputs = None else: outputs = tf.sigmoid(logits) return logits, outputs ############################################## 定义计算图（网络） ####################################################### #----------------------输入---------------- inputs_real = tf.placeholder(tf.float32, [None, real_shape[1], real_shape[2], real_shape[3]], name=&#39;inputs_real&#39;) # 真实样本输入 inputs_noise = tf.placeholder(tf.float32, [None, noise_size], name=&#39;inputs_noise&#39;) # 生成样本输入 #-------------------生成和判别-------------- # 生成样本 _,g_outputs = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=True) # 训练生成器 _,g_test = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=False) # 测试生成器 # 判别样本 &#39;WGAN-GP:判别器废除批归一化&#39; d_logits_real, _ = Discriminator_DC_32x32(inputs_real,GAN=True,GP=True) #识别真样本 d_logits_fake, _ = Discriminator_DC_32x32(g_outputs,GAN=True,GP=True,reuse=True) #识别假样本 #------------定义原始GAN的损失函数-------------- &quot;WGAN:损失函数去log，采用Wasserstein距离形式&quot; # 生成器 g_loss = tf.reduce_mean(-d_logits_fake) # 判别器 d_loss = tf.reduce_mean(d_logits_fake - d_logits_real) &#39;WGAN-GP:加入判别器梯度惩罚项&#39; # 判别器梯度惩罚项 alpha_dist = tf.contrib.distributions.Uniform(low=0., high=1.)#获取[0,1]之间正态分布 alpha = alpha_dist.sample((batch_size, 1, 1, 1)) interpolated = inputs_real + alpha*(g_outputs-inputs_real)# 对真实样本和生成样本之间插值 inte_logit,_ = Discriminator_DC_32x32(interpolated, GAN=True,GP=True,reuse=True) gradients = tf.gradients(inte_logit, [interpolated,])[0]# 求得判别器梯度 grad_l2 = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3])) gradient_penalty = tf.reduce_mean((grad_l2-1)**2) # 定义惩罚项 # 加入d_loss d_loss+=gradient_penalty*lam #-------------------训练模型----------------- # 分别获取生成器和判别器的变量空间 train_vars = tf.trainable_variables() g_vars = [var for var in train_vars if var.name.startswith(&quot;generator&quot;)] d_vars = [var for var in train_vars if var.name.startswith(&quot;discriminator&quot;)] # Optimizer with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):# 保证分布白化先完成 g_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(g_loss, var_list=g_vars) d_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(d_loss, var_list=d_vars) ############################################# 调用TFRecord读取数据 ##################################################### # 读取TFR,不打乱文件顺序，指定数据类型，开启多线程 [data,label] = TFRecordTools.ReadFromTFRecord(sameName= r&#39;.\TFR\class7-*&#39;,isShuffle= False,datatype= tf.float64, labeltype= tf.int32,isMultithreading= True) # 批量处理，送入队列数据，指定数据大小，打乱数据项，设置批次大小64 [data_batch,label_batch] = TFRecordTools.DataBatch(data,label,dataSize= 32*32*3,labelSize= 1, isShuffle= True,batchSize= 64) ############################################### 迭代 ################################################################### # 存储训练过程中生成日志 GenLog = [] # 存储loss losses = [] # 保存生成器变量(仅保存生成器模型，保存最近5个) saver = tf.train.Saver(var_list=[var for var in tf.trainable_variables() if var.name.startswith(&quot;generator&quot;)],max_to_keep=5) # 定义批预处理 def batch_preprocess(data_batch): # 提取批数据 batch = sess.run(data_batch) # 整理成RGB（Nx32x32x3） batch_images = np.reshape(batch, [-1, 3, 32, 32]).transpose((0, 2, 3, 1)) # (-1,32,32,3) # scale to -1, 1 batch_images = batch_images * 2 - 1 return batch_images # 生成相关目录保存生成信息 def GEN_DIR(): import os if not os.path.isdir(&#39;ckpt&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;ckpt&#39;) if not os.path.isdir(&#39;trainLog&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;trainLog&#39;) # 开启会话 with tf.Session() as sess: # 生成相关目录 GEN_DIR() # 初始化变量 init = (tf.global_variables_initializer(), tf.local_variables_initializer()) sess.run(init) # 开启协调器 coord = tf.train.Coordinator() # 启动线程 threads = tf.train.start_queue_runners(sess=sess, coord=coord) time_start = time.time() # 开始计时 for steps in range(max_iters): steps += 1 # 判别器重复训练设置 if steps &lt; 25 or steps % 500 == 0: critic_num = 100 else: critic_num = CRITIC_NUM # 重复训练判别器 for i in range(CRITIC_NUM): batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(d_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 训练生成器 batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(g_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 记录训练信息 if steps % 5 == 1: # （1）记录损失函数 train_loss_d = d_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) train_loss_g = g_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) losses.append([train_loss_d, train_loss_g,steps]) # （2）记录生成样本 batch_noise = np.random.normal(size=(batch_size, noise_size)) gen_samples = sess.run(g_test, feed_dict={inputs_noise: batch_noise}) genLog = (gen_samples[0:11] + 1) / 2 # 恢复颜色空间(取10张) GenLog.append(genLog) # (3)打印信息 print(&#39;step {}...&#39;.format(steps), &quot;Discriminator Loss: {:.4f}...&quot;.format(train_loss_d), &quot;Generator Loss: {:.4f}...&quot;.format(train_loss_g)) # （4）保存生成模型 if steps % 300 ==0: saver.save(sess, &#39;./ckpt/generator.ckpt&#39;, global_step=steps) # 关闭线程 coord.request_stop() coord.join(threads) #计时结束： time_end = time.time() print(&#39;迭代结束，耗时：%.2f秒&#39;%(time_end-time_start)) # 保存信息 # 保存loss记录 with open(&#39;./trainLog/loss_variation.loss&#39;, &#39;wb&#39;) as l: losses = np.array(losses) pickle.dump(losses,l) print(&#39;保存loss信息..&#39;) # 保存生成日志 with open(&#39;./trainLog/GenLog.log&#39;, &#39;wb&#39;) as g: pickle.dump(GenLog, g) print(&#39;保存GenLog信息..&#39;) 结果展示 最后一次生成样本 训练期间生成日志 损失函数 验证生成器" />
+<link rel="canonical" href="https://uzzz.org/2019/04/07/727266.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/07/727266.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-07T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：转载请注明出处（作者：Ephemeroptera） https://blog.csdn.net/Ephemeroptera/article/details/89074498 WGAN-GP是针对WGAN的存在的问题提出来的，WGAN在真实的实验过程中依旧存在着训练困难、收敛速度慢的 问题，相比较传统GAN在实验上提升不是很明显。WGAN-GP在文章中指出了WGAN存在问题的原因，那就是WGAN在处理Lipschitz限制条件时直接采用了 weight clipping。相关讲解请参考 WGAN-GP的介绍 同往期一样，依然以生成cifar数据集中马的彩色图片为例，关于cifar数据集的读取和生成器模型的验证请参考第6期： 用DCGAN生成马的彩色图片 下面给出WGAN-GP框架 &quot;&quot;&quot; -------------------------------------------------------生死看淡，不服就GAN------------------------------------------------------------------------- PROJECT: CIFAR10_WGAN-GP Author: Ephemeroptera Date:2019-3-19 QQ:605686962 &quot;&quot;&quot; &quot;&quot;&quot; WGAN说明：相比较WGAN，WGAN-GP提出以下改进： （1）用对判别器梯度惩罚取代WGAN的判决器权值区间截断 （2）判别器取消BN操作 （3）优化器使用ADAM &quot;&quot;&quot; # 导入包 import numpy as np import tensorflow as tf import pickle import TFRecordTools import time ############################################### 设置参数 #################################################################################### real_shape = [-1,32,32,3] # 真实样本尺寸 data_total = 5000 # 真实样本个数 batch_size = 64 # 批大小 noise_size = 128 # 噪声维度 max_iters = 50000 #的最大迭代次数 learning_rate = 5e-5 # 学习率 beta1 = 0.5# ADAM参数1 beta2 = 0.9# ADAM参数2 CRITIC_NUM = 5 # 每次迭代判别器训练次数 lam = 10 #梯度惩罚权重 ############################################# 定义生成器和判别器 ############################################################################# # 定义生成器（32x32图片） def Generator_DC_32x32(z, channel, is_train=True): &quot;&quot;&quot; :param z: 噪声信号，tensor类型 :param channnel: 生成图片的通道数 :param is_train: 是否为训练状态，该参数主要用于作为batch_normalization方法中的参数使用(训练时候开启) &quot;&quot;&quot; # 训练时生成器不允许复用 with tf.variable_scope(&quot;generator&quot;, reuse=(not is_train)): # layer1: noise_dim --&gt; 4*4*512 --&gt; 4x4x512 --&gt;BN+relu layer1 = tf.layers.dense(z, 4 * 4 * 512) layer1 = tf.reshape(layer1, [-1, 4, 4, 512]) layer1 = tf.layers.batch_normalization(layer1, training=is_train,) layer1 = tf.nn.relu(layer1) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8)# dropout # layer2: deconv(ks=3x3,s=2,padding=same):4x4x512 --&gt; 8x8x256 --&gt; BN+relu layer2 = tf.layers.conv2d_transpose(layer1, 256, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer2 = tf.layers.batch_normalization(layer2, training=is_train) layer2 = tf.nn.relu(layer2) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8)# dropout # layer3: deconv(ks=3x3,s=2,padding=same):8x8x256 --&gt; 16x16x128 --&gt; BN+relu layer3 = tf.layers.conv2d_transpose(layer2, 128, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer3 = tf.layers.batch_normalization(layer3, training=is_train) layer3 = tf.nn.relu(layer3) # layer3 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # layer4: deconv(ks=3x3,s=2,padding=same):16x16x128 --&gt; 32x32x64--&gt; BN+relu layer4 = tf.layers.conv2d_transpose(layer3, 64, 3, strides=2, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) layer4 = tf.layers.batch_normalization(layer4, training=is_train) layer4 = tf.nn.relu(layer4) # layer4 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout # logits: deconv(ks=3x3,s=2,padding=same):32x32x64 --&gt; 32x32x3 logits = tf.layers.conv2d_transpose(layer4, channel, 3, strides=1, padding=&#39;same&#39;, kernel_initializer=tf.random_normal_initializer(0, 0.02), bias_initializer=tf.random_normal_initializer(0, 0.02)) # outputs outputs = tf.tanh(logits) return logits,outputs # 定义判别器（32x32） def Discriminator_DC_32x32(inputs_img, reuse=False, GAN = False,GP= False,alpha=0.2): &quot;&quot;&quot; @param inputs_img: 输入图片，tensor类型 @param reuse:判别器复用 @param GP: 使用WGAN-GP时关闭BN @param alpha: Leaky ReLU系数 &quot;&quot;&quot; with tf.variable_scope(&quot;discriminator&quot;, reuse=reuse): # layer1: conv(ks=3x3,s=2,padding=same)+lrelu --&gt;32x32x3 to 16x16x128 layer1 = tf.layers.conv2d(inputs_img, 128, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer1 = tf.layers.batch_normalization(layer1, training=True) layer1 = tf.nn.leaky_relu(layer1,alpha=alpha) # layer1 = tf.nn.dropout(layer1, keep_prob=0.8) # layer2: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;16x16x128 to 8x8x256 layer2 = tf.layers.conv2d(layer1, 256, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer2 = tf.layers.batch_normalization(layer2, training=True) layer2 = tf.nn.leaky_relu(layer2, alpha=alpha) # layer2 = tf.nn.dropout(layer2, keep_prob=0.8) # layer3: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;8x8x256 to 4x4x512 layer3 = tf.layers.conv2d(layer2, 512, 3, strides=2, padding=&#39;same&#39;) if GP is False: layer3 = tf.layers.batch_normalization(layer3, training=True) layer3 = tf.nn.leaky_relu(layer3, alpha=alpha) layer3 = tf.reshape(layer3, [-1, 4*4* 512]) # layer3 = tf.nn.dropout(layer2, keep_prob=0.8) # logits,output: logits = tf.layers.dense(layer3, 1) &quot;WGAN:去除sigmoid&quot; if GAN: outputs = None else: outputs = tf.sigmoid(logits) return logits, outputs ############################################## 定义计算图（网络） ####################################################### #----------------------输入---------------- inputs_real = tf.placeholder(tf.float32, [None, real_shape[1], real_shape[2], real_shape[3]], name=&#39;inputs_real&#39;) # 真实样本输入 inputs_noise = tf.placeholder(tf.float32, [None, noise_size], name=&#39;inputs_noise&#39;) # 生成样本输入 #-------------------生成和判别-------------- # 生成样本 _,g_outputs = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=True) # 训练生成器 _,g_test = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=False) # 测试生成器 # 判别样本 &#39;WGAN-GP:判别器废除批归一化&#39; d_logits_real, _ = Discriminator_DC_32x32(inputs_real,GAN=True,GP=True) #识别真样本 d_logits_fake, _ = Discriminator_DC_32x32(g_outputs,GAN=True,GP=True,reuse=True) #识别假样本 #------------定义原始GAN的损失函数-------------- &quot;WGAN:损失函数去log，采用Wasserstein距离形式&quot; # 生成器 g_loss = tf.reduce_mean(-d_logits_fake) # 判别器 d_loss = tf.reduce_mean(d_logits_fake - d_logits_real) &#39;WGAN-GP:加入判别器梯度惩罚项&#39; # 判别器梯度惩罚项 alpha_dist = tf.contrib.distributions.Uniform(low=0., high=1.)#获取[0,1]之间正态分布 alpha = alpha_dist.sample((batch_size, 1, 1, 1)) interpolated = inputs_real + alpha*(g_outputs-inputs_real)# 对真实样本和生成样本之间插值 inte_logit,_ = Discriminator_DC_32x32(interpolated, GAN=True,GP=True,reuse=True) gradients = tf.gradients(inte_logit, [interpolated,])[0]# 求得判别器梯度 grad_l2 = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3])) gradient_penalty = tf.reduce_mean((grad_l2-1)**2) # 定义惩罚项 # 加入d_loss d_loss+=gradient_penalty*lam #-------------------训练模型----------------- # 分别获取生成器和判别器的变量空间 train_vars = tf.trainable_variables() g_vars = [var for var in train_vars if var.name.startswith(&quot;generator&quot;)] d_vars = [var for var in train_vars if var.name.startswith(&quot;discriminator&quot;)] # Optimizer with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):# 保证分布白化先完成 g_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(g_loss, var_list=g_vars) d_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(d_loss, var_list=d_vars) ############################################# 调用TFRecord读取数据 ##################################################### # 读取TFR,不打乱文件顺序，指定数据类型，开启多线程 [data,label] = TFRecordTools.ReadFromTFRecord(sameName= r&#39;.\\TFR\\class7-*&#39;,isShuffle= False,datatype= tf.float64, labeltype= tf.int32,isMultithreading= True) # 批量处理，送入队列数据，指定数据大小，打乱数据项，设置批次大小64 [data_batch,label_batch] = TFRecordTools.DataBatch(data,label,dataSize= 32*32*3,labelSize= 1, isShuffle= True,batchSize= 64) ############################################### 迭代 ################################################################### # 存储训练过程中生成日志 GenLog = [] # 存储loss losses = [] # 保存生成器变量(仅保存生成器模型，保存最近5个) saver = tf.train.Saver(var_list=[var for var in tf.trainable_variables() if var.name.startswith(&quot;generator&quot;)],max_to_keep=5) # 定义批预处理 def batch_preprocess(data_batch): # 提取批数据 batch = sess.run(data_batch) # 整理成RGB（Nx32x32x3） batch_images = np.reshape(batch, [-1, 3, 32, 32]).transpose((0, 2, 3, 1)) # (-1,32,32,3) # scale to -1, 1 batch_images = batch_images * 2 - 1 return batch_images # 生成相关目录保存生成信息 def GEN_DIR(): import os if not os.path.isdir(&#39;ckpt&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;ckpt&#39;) if not os.path.isdir(&#39;trainLog&#39;): print(&#39;文件夹ckpt未创建，现在在当前目录下创建..&#39;) os.mkdir(&#39;trainLog&#39;) # 开启会话 with tf.Session() as sess: # 生成相关目录 GEN_DIR() # 初始化变量 init = (tf.global_variables_initializer(), tf.local_variables_initializer()) sess.run(init) # 开启协调器 coord = tf.train.Coordinator() # 启动线程 threads = tf.train.start_queue_runners(sess=sess, coord=coord) time_start = time.time() # 开始计时 for steps in range(max_iters): steps += 1 # 判别器重复训练设置 if steps &lt; 25 or steps % 500 == 0: critic_num = 100 else: critic_num = CRITIC_NUM # 重复训练判别器 for i in range(CRITIC_NUM): batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(d_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 训练生成器 batch_images = batch_preprocess(data_batch) # images batch_noise = np.random.normal(size=(batch_size, noise_size)) # noise(normal) _ = sess.run(g_train_opt, feed_dict={inputs_real: batch_images, inputs_noise: batch_noise}) # 记录训练信息 if steps % 5 == 1: # （1）记录损失函数 train_loss_d = d_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) train_loss_g = g_loss.eval({inputs_real: batch_images, inputs_noise: batch_noise}) losses.append([train_loss_d, train_loss_g,steps]) # （2）记录生成样本 batch_noise = np.random.normal(size=(batch_size, noise_size)) gen_samples = sess.run(g_test, feed_dict={inputs_noise: batch_noise}) genLog = (gen_samples[0:11] + 1) / 2 # 恢复颜色空间(取10张) GenLog.append(genLog) # (3)打印信息 print(&#39;step {}...&#39;.format(steps), &quot;Discriminator Loss: {:.4f}...&quot;.format(train_loss_d), &quot;Generator Loss: {:.4f}...&quot;.format(train_loss_g)) # （4）保存生成模型 if steps % 300 ==0: saver.save(sess, &#39;./ckpt/generator.ckpt&#39;, global_step=steps) # 关闭线程 coord.request_stop() coord.join(threads) #计时结束： time_end = time.time() print(&#39;迭代结束，耗时：%.2f秒&#39;%(time_end-time_start)) # 保存信息 # 保存loss记录 with open(&#39;./trainLog/loss_variation.loss&#39;, &#39;wb&#39;) as l: losses = np.array(losses) pickle.dump(losses,l) print(&#39;保存loss信息..&#39;) # 保存生成日志 with open(&#39;./trainLog/GenLog.log&#39;, &#39;wb&#39;) as g: pickle.dump(GenLog, g) print(&#39;保存GenLog信息..&#39;) 结果展示 最后一次生成样本 训练期间生成日志 损失函数 验证生成器","@type":"BlogPosting","url":"https://uzzz.org/2019/04/07/727266.html","headline":"生死看淡，不服就GAN(八)—-WGAN的改进版本WGAN-GP","dateModified":"2019-04-07T00:00:00+08:00","datePublished":"2019-04-07T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/07/727266.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>生死看淡，不服就GAN(八)----WGAN的改进版本WGAN-GP</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：转载请注明出处（作者：Ephemeroptera） https://blog.csdn.net/Ephemeroptera/article/details/89074498 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-tomorrow-night-eighties"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h4><a id="WGANGPWGANWGAN_GANWGANGPWGANWGANLipschitz_weight_clipping_0"></a>WGAN-GP是针对WGAN的存在的问题提出来的，WGAN在真实的实验过程中依旧存在着训练困难、收敛速度慢的 问题，相比较传统GAN在实验上提升不是很明显。WGAN-GP在文章中指出了WGAN存在问题的原因，那就是WGAN在处理Lipschitz限制条件时直接采用了 weight clipping。相关讲解请参考</h4> 
+  <p><a href="https://blog.csdn.net/weixin_41036461/article/details/82385334" rel="nofollow">WGAN-GP的介绍</a></p> 
+  <h4><a id="cifarcifar6_3"></a>同往期一样，依然以生成cifar数据集中马的彩色图片为例，关于cifar数据集的读取和生成器模型的验证请参考第6期：</h4> 
+  <p><a href="https://blog.csdn.net/Ephemeroptera/article/details/89019873" rel="nofollow">用DCGAN生成马的彩色图片</a></p> 
+  <h4><a id="WGANGP_6"></a>下面给出WGAN-GP框架</h4> 
+  <pre><code>"""
+-------------------------------------------------------生死看淡，不服就GAN-------------------------------------------------------------------------
+PROJECT: CIFAR10_WGAN-GP
+Author: Ephemeroptera
+Date:2019-3-19
+QQ:605686962
+
+"""
+"""
+WGAN说明：相比较WGAN，WGAN-GP提出以下改进：
+                                        （1）用对判别器梯度惩罚取代WGAN的判决器权值区间截断
+                                        （2）判别器取消BN操作
+                                        （3）优化器使用ADAM
+"""
+# 导入包
+import numpy as np
+import tensorflow as tf
+import pickle
+import TFRecordTools
+import time
+
+############################################### 设置参数 ####################################################################################
+
+real_shape = [-1,32,32,3] # 真实样本尺寸
+data_total = 5000 # 真实样本个数
+batch_size = 64 # 批大小
+noise_size = 128 # 噪声维度
+max_iters = 50000 #的最大迭代次数
+learning_rate = 5e-5 # 学习率
+beta1 = 0.5# ADAM参数1
+beta2 = 0.9# ADAM参数2
+CRITIC_NUM = 5 # 每次迭代判别器训练次数
+lam = 10 #梯度惩罚权重
+
+############################################# 定义生成器和判别器 #############################################################################
+
+# 定义生成器（32x32图片）
+def Generator_DC_32x32(z, channel, is_train=True):
+    """
+    :param z: 噪声信号，tensor类型
+    :param channnel: 生成图片的通道数
+    :param is_train: 是否为训练状态，该参数主要用于作为batch_normalization方法中的参数使用(训练时候开启)
+    """
+    # 训练时生成器不允许复用
+    with tf.variable_scope("generator", reuse=(not is_train)):
+
+        # layer1: noise_dim --&gt; 4*4*512 --&gt; 4x4x512 --&gt;BN+relu
+        layer1 = tf.layers.dense(z, 4 * 4 * 512)
+        layer1 = tf.reshape(layer1, [-1, 4, 4, 512])
+        layer1 = tf.layers.batch_normalization(layer1, training=is_train,)
+        layer1 = tf.nn.relu(layer1)
+        # layer1 = tf.nn.dropout(layer1, keep_prob=0.8)# dropout
+
+        # layer2: deconv(ks=3x3,s=2,padding=same):4x4x512 --&gt; 8x8x256 --&gt; BN+relu
+        layer2 = tf.layers.conv2d_transpose(layer1, 256, 3, strides=2, padding='same',
+                                            kernel_initializer=tf.random_normal_initializer(0, 0.02),
+                                            bias_initializer=tf.random_normal_initializer(0, 0.02))
+        layer2 = tf.layers.batch_normalization(layer2, training=is_train)
+        layer2 = tf.nn.relu(layer2)
+        # layer2 = tf.nn.dropout(layer2, keep_prob=0.8)# dropout
+
+        # layer3: deconv(ks=3x3,s=2,padding=same):8x8x256 --&gt; 16x16x128 --&gt; BN+relu
+        layer3 = tf.layers.conv2d_transpose(layer2, 128, 3, strides=2, padding='same',
+                                            kernel_initializer=tf.random_normal_initializer(0, 0.02),
+                                            bias_initializer=tf.random_normal_initializer(0, 0.02))
+        layer3 = tf.layers.batch_normalization(layer3, training=is_train)
+        layer3 = tf.nn.relu(layer3)
+        # layer3 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout
+
+        # layer4: deconv(ks=3x3,s=2,padding=same):16x16x128 --&gt; 32x32x64--&gt; BN+relu
+        layer4 = tf.layers.conv2d_transpose(layer3, 64, 3, strides=2, padding='same',
+                                            kernel_initializer=tf.random_normal_initializer(0, 0.02),
+                                            bias_initializer=tf.random_normal_initializer(0, 0.02))
+        layer4 = tf.layers.batch_normalization(layer4, training=is_train)
+        layer4 = tf.nn.relu(layer4)
+        # layer4 = tf.nn.dropout(layer3, keep_prob=0.8)# dropout
+
+        # logits: deconv(ks=3x3,s=2,padding=same):32x32x64 --&gt; 32x32x3
+        logits = tf.layers.conv2d_transpose(layer4, channel, 3, strides=1, padding='same',
+                                            kernel_initializer=tf.random_normal_initializer(0, 0.02),
+                                            bias_initializer=tf.random_normal_initializer(0, 0.02))
+        # outputs
+        outputs = tf.tanh(logits)
+
+        return logits,outputs
+
+# 定义判别器（32x32）
+def Discriminator_DC_32x32(inputs_img, reuse=False, GAN = False,GP= False,alpha=0.2):
+    """
+    @param inputs_img: 输入图片，tensor类型
+    @param reuse:判别器复用
+    @param GP: 使用WGAN-GP时关闭BN
+    @param alpha: Leaky ReLU系数
+    """
+
+    with tf.variable_scope("discriminator", reuse=reuse):
+
+        # layer1: conv(ks=3x3,s=2,padding=same)+lrelu --&gt;32x32x3 to 16x16x128
+        layer1 = tf.layers.conv2d(inputs_img, 128, 3, strides=2, padding='same')
+        if GP is False:
+            layer1 = tf.layers.batch_normalization(layer1, training=True)
+        layer1 = tf.nn.leaky_relu(layer1,alpha=alpha)
+        # layer1 = tf.nn.dropout(layer1, keep_prob=0.8)
+
+        # layer2: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;16x16x128 to 8x8x256
+        layer2 = tf.layers.conv2d(layer1, 256, 3, strides=2, padding='same')
+        if GP is False:
+            layer2 = tf.layers.batch_normalization(layer2, training=True)
+        layer2 = tf.nn.leaky_relu(layer2, alpha=alpha)
+        # layer2 = tf.nn.dropout(layer2, keep_prob=0.8)
+
+        # layer3: conv(ks=3x3,s=2,padding=same)+BN+lrelu --&gt;8x8x256 to 4x4x512
+        layer3 = tf.layers.conv2d(layer2, 512, 3, strides=2, padding='same')
+        if GP is False:
+            layer3 = tf.layers.batch_normalization(layer3, training=True)
+        layer3 = tf.nn.leaky_relu(layer3, alpha=alpha)
+        layer3 = tf.reshape(layer3, [-1, 4*4* 512])
+        # layer3 = tf.nn.dropout(layer2, keep_prob=0.8)
+
+        # logits,output:
+        logits = tf.layers.dense(layer3, 1)
+        "WGAN:去除sigmoid"
+        if GAN:
+            outputs = None
+        else:
+            outputs = tf.sigmoid(logits)
+
+        return logits, outputs
+
+############################################## 定义计算图（网络） #######################################################
+
+#----------------------输入----------------
+
+inputs_real = tf.placeholder(tf.float32, [None, real_shape[1], real_shape[2], real_shape[3]], name='inputs_real') # 真实样本输入
+inputs_noise = tf.placeholder(tf.float32, [None, noise_size], name='inputs_noise') # 生成样本输入
+
+#-------------------生成和判别--------------
+# 生成样本
+_,g_outputs = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=True) # 训练生成器
+_,g_test = Generator_DC_32x32(inputs_noise, real_shape[3], is_train=False) # 测试生成器
+# 判别样本
+'WGAN-GP:判别器废除批归一化'
+d_logits_real, _ = Discriminator_DC_32x32(inputs_real,GAN=True,GP=True) #识别真样本
+d_logits_fake, _ = Discriminator_DC_32x32(g_outputs,GAN=True,GP=True,reuse=True) #识别假样本
+
+#------------定义原始GAN的损失函数--------------
+"WGAN:损失函数去log，采用Wasserstein距离形式"
+# 生成器
+g_loss = tf.reduce_mean(-d_logits_fake)
+# 判别器
+d_loss = tf.reduce_mean(d_logits_fake - d_logits_real)
+'WGAN-GP:加入判别器梯度惩罚项'
+# 判别器梯度惩罚项
+alpha_dist = tf.contrib.distributions.Uniform(low=0., high=1.)#获取[0,1]之间正态分布
+alpha = alpha_dist.sample((batch_size, 1, 1, 1))
+interpolated = inputs_real + alpha*(g_outputs-inputs_real)# 对真实样本和生成样本之间插值
+inte_logit,_ = Discriminator_DC_32x32(interpolated, GAN=True,GP=True,reuse=True)
+gradients = tf.gradients(inte_logit, [interpolated,])[0]# 求得判别器梯度
+grad_l2 = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=[1,2,3]))
+gradient_penalty = tf.reduce_mean((grad_l2-1)**2) # 定义惩罚项
+# 加入d_loss
+d_loss+=gradient_penalty*lam
+#-------------------训练模型-----------------
+# 分别获取生成器和判别器的变量空间
+train_vars = tf.trainable_variables()
+g_vars = [var for var in train_vars if var.name.startswith("generator")]
+d_vars = [var for var in train_vars if var.name.startswith("discriminator")]
+
+# Optimizer
+with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):# 保证分布白化先完成
+    g_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(g_loss, var_list=g_vars)
+    d_train_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=beta1, beta2=beta2).minimize(d_loss, var_list=d_vars)
+############################################# 调用TFRecord读取数据 #####################################################
+
+# 读取TFR,不打乱文件顺序，指定数据类型，开启多线程
+[data,label] = TFRecordTools.ReadFromTFRecord(sameName= r'.\TFR\class7-*',isShuffle= False,datatype= tf.float64,
+                                labeltype= tf.int32,isMultithreading= True)
+# 批量处理，送入队列数据，指定数据大小，打乱数据项，设置批次大小64
+[data_batch,label_batch] = TFRecordTools.DataBatch(data,label,dataSize= 32*32*3,labelSize= 1,
+                                                   isShuffle= True,batchSize= 64)
+
+############################################### 迭代 ###################################################################
+
+# 存储训练过程中生成日志
+GenLog = []
+# 存储loss
+losses = []
+# 保存生成器变量(仅保存生成器模型，保存最近5个)
+saver = tf.train.Saver(var_list=[var for var in tf.trainable_variables()
+                                 if var.name.startswith("generator")],max_to_keep=5)
+# 定义批预处理
+def batch_preprocess(data_batch):
+    # 提取批数据
+    batch = sess.run(data_batch)
+    # 整理成RGB（Nx32x32x3）
+    batch_images = np.reshape(batch, [-1, 3, 32, 32]).transpose((0, 2, 3, 1))  # (-1,32,32,3)
+    # scale to -1, 1
+    batch_images = batch_images * 2 - 1
+    return  batch_images
+
+# 生成相关目录保存生成信息
+def GEN_DIR():
+    import os
+    if not os.path.isdir('ckpt'):
+        print('文件夹ckpt未创建，现在在当前目录下创建..')
+        os.mkdir('ckpt')
+    if not os.path.isdir('trainLog'):
+        print('文件夹ckpt未创建，现在在当前目录下创建..')
+        os.mkdir('trainLog')
+
+# 开启会话
+with tf.Session() as sess:
+    # 生成相关目录
+    GEN_DIR()
+
+    # 初始化变量
+    init = (tf.global_variables_initializer(), tf.local_variables_initializer())
+    sess.run(init)
+
+    # 开启协调器
+    coord = tf.train.Coordinator()
+    # 启动线程
+    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
+    time_start = time.time() # 开始计时
+    for steps in range(max_iters):
+        steps += 1
+
+        # 判别器重复训练设置
+        if steps &lt; 25 or steps % 500 == 0:
+            critic_num = 100
+        else:
+            critic_num = CRITIC_NUM
+
+        # 重复训练判别器
+        for i in range(CRITIC_NUM):
+            batch_images = batch_preprocess(data_batch)  # images
+            batch_noise = np.random.normal(size=(batch_size, noise_size))  # noise(normal)
+            _ = sess.run(d_train_opt, feed_dict={inputs_real: batch_images,
+                                                 inputs_noise: batch_noise})
+
+        # 训练生成器
+        batch_images = batch_preprocess(data_batch)  # images
+        batch_noise = np.random.normal(size=(batch_size, noise_size))  # noise(normal)
+        _ = sess.run(g_train_opt, feed_dict={inputs_real: batch_images,
+                                             inputs_noise: batch_noise})
+
+        #  记录训练信息
+        if steps % 5 == 1:
+            # （1）记录损失函数
+            train_loss_d = d_loss.eval({inputs_real: batch_images,
+                                        inputs_noise: batch_noise})
+            train_loss_g = g_loss.eval({inputs_real: batch_images,
+                                        inputs_noise: batch_noise})
+            losses.append([train_loss_d, train_loss_g,steps])
+
+            # （2）记录生成样本
+            batch_noise = np.random.normal(size=(batch_size, noise_size))
+            gen_samples = sess.run(g_test, feed_dict={inputs_noise: batch_noise})
+            genLog = (gen_samples[0:11] + 1) / 2  # 恢复颜色空间(取10张)
+            GenLog.append(genLog)
+
+            # (3)打印信息
+            print('step {}...'.format(steps),
+                  "Discriminator Loss: {:.4f}...".format(train_loss_d),
+                  "Generator Loss: {:.4f}...".format(train_loss_g))
+
+        # （4）保存生成模型
+        if steps % 300 ==0:
+            saver.save(sess, './ckpt/generator.ckpt', global_step=steps)
+
+    # 关闭线程
+    coord.request_stop()
+    coord.join(threads)
+
+#计时结束：
+time_end = time.time()
+print('迭代结束，耗时：%.2f秒'%(time_end-time_start))
+
+# 保存信息
+#  保存loss记录
+with open('./trainLog/loss_variation.loss', 'wb') as l:
+    losses = np.array(losses)
+    pickle.dump(losses,l)
+    print('保存loss信息..')
+
+# 保存生成日志
+with open('./trainLog/GenLog.log', 'wb') as g:
+    pickle.dump(GenLog, g)
+    print('保存GenLog信息..')
+
+
+
+
+</code></pre> 
+  <h4><a id="_304"></a>结果展示</h4> 
+  <h4><a id="_305"></a>最后一次生成样本</h4> 
+  <p><img src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190407202655285.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0VwaGVtZXJvcHRlcmE=,size_16,color_FFFFFF,t_70" alt=""></p> 
+  <h4><a id="_307"></a>训练期间生成日志</h4> 
+  <p><img src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190407202744977.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0VwaGVtZXJvcHRlcmE=,size_16,color_FFFFFF,t_70" alt=""></p> 
+  <h4><a id="_309"></a>损失函数</h4> 
+  <p><img src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190407202838373.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0VwaGVtZXJvcHRlcmE=,size_16,color_FFFFFF,t_70" alt=""></p> 
+  <h4><a id="_311"></a>验证生成器</h4> 
+  <p><img src="https://blog.uzzz.org.cn/_p?https://img-blog.csdnimg.cn/20190407202906915.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0VwaGVtZXJvcHRlcmE=,size_16,color_FFFFFF,t_70" alt=""></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

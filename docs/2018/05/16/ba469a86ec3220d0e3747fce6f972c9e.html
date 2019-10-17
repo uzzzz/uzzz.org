@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>以太坊源码深入分析（9）– 以太坊通过EVM执行交易过程分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="以太坊源码深入分析（9）– 以太坊通过EVM执行交易过程分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="上一节分析了同步一个新的区块准备插入本地BlockChain之前需要重放并执行新区块的所有交易，并产生交易收据和日志。以太坊是如何执行这些交易呢？这就要请出大名鼎鼎的以太坊虚拟机。 以太坊虚拟机在执行交易分为两个部分，第一部分是创建EVM，计算交易金额，设置交易对象，计算交易gas花销；第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。 一，创建EVM，通过EVM执行交易流程 上一节分析BlockChain调用processor.Process（）遍历block的所有交易，然后调用： receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)。 执行交易并返回收据数据 func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // Create a new context to be used in the EVM environment context := NewEVMContext(msg, header, bc, author) // Create a new environment which holds all relevant information // about the transaction and calling mechanisms. vmenv := vm.NewEVM(context, statedb, config, cfg) // Apply the transaction to the current state (included in the env) _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // Update the state with pending changes var root []byte if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } *usedGas += gas // Create a new receipt for the transaction, storing the intermediate root and gas used by the tx // based on the eip phase, we&#39;re passing wether the root touch-delete accounts. receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // if the transaction created a contract, store the creation address in the receipt. if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err }1，首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。 2，调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。 3，调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。 重点看看ApplyMessage()方法的实现： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 创建stateTransition对象，执行TransitionDb（）方法： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := st.from() // err checked in preCheck homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err }3.1，调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。 3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { // Depth check execution. Fail if we&#39;re trying to execute above the // limit. if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } // Ensure there&#39;s no existing contract already at the designated address nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) contractAddr = crypto.CreateAddress(caller.Address(), nonce) contractHash := evm.StateDB.GetCodeHash(contractAddr) if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } // Create a new account on the state snapshot := evm.StateDB.Snapshot() evm.StateDB.CreateAccount(contractAddr) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(contractAddr, 1) } evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) // initialise a new contract and set the code that is to be used by the // E The contract is a scoped evmironment for this execution context // only. contract := NewContract(caller, AccountRef(contractAddr), value, gas) contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, contractAddr, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), contractAddr, true, code, gas, value) } start := time.Now() ret, err = run(evm, contract, nil) // check whether the max code size has been exceeded maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // if the contract creation ran successfully and no errors were returned // calculate the gas required to store the code. If the code could not // be stored due to not enough gas set an error and let it be handled // by the error checking condition below. if err == nil &amp;&amp; !maxCodeSizeExceeded { createDataGas := uint64(len(ret)) * params.CreateDataGas if contract.UseGas(createDataGas) { evm.StateDB.SetCode(contractAddr, ret) } else { err = ErrCodeStoreOutOfGas } } // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // Assign err if contract code size exceeds the max while the err is still empty. if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } return ret, contractAddr, contract.Gas, err }3.2.1，evm执行栈深度不能超过1024，发送方持有的以太坊数量大于此次合约交易金额。 3.2.2，对该发送方地址的nonce值+1，通过地址和nonce值生成合约地址，通过合约地址得到合约hash值。 3.2.3，记录一个状态快照，用来后见失败回滚。 3.2.4，为这个合约地址创建一个合约账户，并为这个合约账户设置nonce值为1 3.2.5，产生以太坊资产转移，发送方地址账户金额减value值，合约账户的金额加value值。 3.2.6，根据发送方地址和合约地址，以及金额value 值和gas，合约代码和代码hash值，创建一个合约对象 3.2.7，run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。 3.2.8，如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。 3.3，如果不是新创建的合约，则调用evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)方法，同时更新发送方地址nonce值+1. func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, gas, nil } // Fail if we&#39;re trying to execute above the call depth limit if evm.depth &gt; int(params.CallCreateDepth) { return nil, gas, ErrDepth } // Fail if we&#39;re trying to transfer more than the available balance if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, gas, ErrInsufficientBalance } var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) // Initialise a new contract and set the code that is to be used by the EVM. // The contract is a scoped environment for this execution context only. contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) start := time.Now() // Capture the tracer start/end events in debug mode if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) defer func() { // Lazy evaluation of the parameters evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) }() } ret, err = run(evm, contract, input) // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err }evm.call方法和evm.create方法大致相同，我们来说说不一样的地方。 3.3.1，call方法调用的是一个存在的合约地址的合约，所以不用创建合约账户。如果call方法发现本地没有合约接收方的账户，则需要创建一个接收方的账户，并更新本地状态数据库。 3.3.2，create方法的资金transfer转移是在创建合约用户账户和这个合约账户之间发生，而call方法的资金转移是在合约的发送方和合约的接收方之间产生。 3.4，TransitionDb（）方法执行完合约，调用st.refundGas()方法计算合约退税，调用evm SSTORE指令 或者evm SUICIDE指令销毁合约十都会产生退税。 3.5，计算合约产生的gas总数，加入到矿工账户，作为矿工收入。 4，回到最开始的ApplyTransaction()方法，根据EVM的执行结果，拼接交易receipt数据，其中receipt.Logs日志数据是EVM执行指令代码的时候产生的，receipt.Bloom根据日志数据建立bloom过滤器。 二，EVM 的虚拟机解析器通过运行合约指令，执行智能合约代码 我们从 3.2.7 执行合约的run()方法入手，它调用了evm.interpreter.Run(contract, input)方法 func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err error) { // Increment the call depth which is restricted to 1024 in.evm.depth++ defer func() { in.evm.depth-- }() // Reset the previous call&#39;s return data. It&#39;s unimportant to preserve the old buffer // as every returning call will return new data anyway. in.returnData = nil // Don&#39;t bother with the execution if there&#39;s no code. if len(contract.Code) == 0 { return nil, nil } var ( op OpCode // current opcode mem = NewMemory() // bound memory stack = newstack() // local stack // For optimisation reason we&#39;re using uint64 as the program counter. // It&#39;s theoretically possible to go above 2^64. The YP defines the PC // to be uint256. Practically much less so feasible. pc = uint64(0) // program counter cost uint64 // copies used by tracer pcCopy uint64 // needed for the deferred Tracer gasCopy uint64 // for Tracer to log gas remaining before execution logged bool // deferred Tracer should ignore already logged steps ) contract.Input = input if in.cfg.Debug { defer func() { if err != nil { if !logged { in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } else { in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } } }() } // The Interpreter main run loop (contextual). This loop runs until either an // explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during // the execution of one of the operations or until the done flag is set by the // parent context. for atomic.LoadInt32(&amp;in.evm.abort) == 0 { if in.cfg.Debug { // Capture pre-execution values for tracing. logged, pcCopy, gasCopy = false, pc, contract.Gas } // Get the operation from the jump table and validate the stack to ensure there are // enough stack items available to perform the operation. op = contract.GetOp(pc) operation := in.cfg.JumpTable[op] if !operation.valid { return nil, fmt.Errorf(&quot;invalid opcode 0x%x&quot;, int(op)) } if err := operation.validateStack(stack); err != nil { return nil, err } // If the operation is valid, enforce and write restrictions if err := in.enforceRestrictions(op, operation, stack); err != nil { return nil, err } var memorySize uint64 // calculate the new memory size and expand the memory to fit // the operation if operation.memorySize != nil { memSize, overflow := bigUint64(operation.memorySize(stack)) if overflow { return nil, errGasUintOverflow } // memory is expanded in words of 32 bytes. Gas // is also calculated in words. if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow { return nil, errGasUintOverflow } } if !in.cfg.DisableGasMetering { // consume the gas and return an error if not enough gas is available. // cost is explicitly set so that the capture state defer method cas get the proper cost cost, err = operation.gasCost(in.gasTable, in.evm, contract, stack, mem, memorySize) if err != nil || !contract.UseGas(cost) { return nil, ErrOutOfGas } } if memorySize &gt; 0 { mem.Resize(memorySize) } if in.cfg.Debug { in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) logged = true } // execute the operation res, err := operation.execute(&amp;pc, in.evm, contract, mem, stack) // verifyPool is a build flag. Pool verification makes sure the integrity // of the integer pool by comparing values to a default value. if verifyPool { verifyIntegerPool(in.intPool) } // if the operation clears the return data (e.g. it has returning data) // set the last return to the result of the operation. if operation.returns { in.returnData = res } switch { case err != nil: return nil, err case operation.reverts: return res, errExecutionReverted case operation.halts: return res, nil case !operation.jumps: pc++ } } return nil, nil }我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。 1，首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。 2，从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是 SHA3: { execute: opSha3, gasCost: gasSha3, validateStack: makeStackFunc(2, 1), memorySize: memorySha3, valid: true, }execute表示指令对应的执行方法 gasCost表示执行这个指令需要消耗的gas validateStack计算是不是解析器栈溢出 memorySize用于计算operation的占用内存大小 3，如果operation可用，解析器栈不超过1024，且读写不冲突 4，计算operation的memorysize，不能大于64位。 5，根据不同的指令，指令的memorysize等，调用operation.gasCost()方法计算执行operation指令需要消耗的gas。 6，调用operation.execute(&amp;pc, in.evm, contract, mem, stack)执行指令对应的方法。 7，operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。 8，operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。 总结EVM是以太坊的核心功能，得益于EVM，以太坊把区块链带入了2.0时代，这是一个非常伟大的进步。客观的说以太坊的EVM还不是很完善，存在一些诟病，比如支持address类型数据导致栈容易溢出，缺少标准库，智能合约一旦创建很难修改，不支持浮点数等等问题，但这些问题都不足以击溃以太坊EVM的前进步伐。相信这些问题都会在以太坊不断的迭代更新中加以完善改进。 阅读更多" />
+<meta property="og:description" content="上一节分析了同步一个新的区块准备插入本地BlockChain之前需要重放并执行新区块的所有交易，并产生交易收据和日志。以太坊是如何执行这些交易呢？这就要请出大名鼎鼎的以太坊虚拟机。 以太坊虚拟机在执行交易分为两个部分，第一部分是创建EVM，计算交易金额，设置交易对象，计算交易gas花销；第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。 一，创建EVM，通过EVM执行交易流程 上一节分析BlockChain调用processor.Process（）遍历block的所有交易，然后调用： receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)。 执行交易并返回收据数据 func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // Create a new context to be used in the EVM environment context := NewEVMContext(msg, header, bc, author) // Create a new environment which holds all relevant information // about the transaction and calling mechanisms. vmenv := vm.NewEVM(context, statedb, config, cfg) // Apply the transaction to the current state (included in the env) _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // Update the state with pending changes var root []byte if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } *usedGas += gas // Create a new receipt for the transaction, storing the intermediate root and gas used by the tx // based on the eip phase, we&#39;re passing wether the root touch-delete accounts. receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // if the transaction created a contract, store the creation address in the receipt. if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err }1，首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。 2，调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。 3，调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。 重点看看ApplyMessage()方法的实现： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 创建stateTransition对象，执行TransitionDb（）方法： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := st.from() // err checked in preCheck homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err }3.1，调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。 3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { // Depth check execution. Fail if we&#39;re trying to execute above the // limit. if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } // Ensure there&#39;s no existing contract already at the designated address nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) contractAddr = crypto.CreateAddress(caller.Address(), nonce) contractHash := evm.StateDB.GetCodeHash(contractAddr) if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } // Create a new account on the state snapshot := evm.StateDB.Snapshot() evm.StateDB.CreateAccount(contractAddr) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(contractAddr, 1) } evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) // initialise a new contract and set the code that is to be used by the // E The contract is a scoped evmironment for this execution context // only. contract := NewContract(caller, AccountRef(contractAddr), value, gas) contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, contractAddr, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), contractAddr, true, code, gas, value) } start := time.Now() ret, err = run(evm, contract, nil) // check whether the max code size has been exceeded maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // if the contract creation ran successfully and no errors were returned // calculate the gas required to store the code. If the code could not // be stored due to not enough gas set an error and let it be handled // by the error checking condition below. if err == nil &amp;&amp; !maxCodeSizeExceeded { createDataGas := uint64(len(ret)) * params.CreateDataGas if contract.UseGas(createDataGas) { evm.StateDB.SetCode(contractAddr, ret) } else { err = ErrCodeStoreOutOfGas } } // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // Assign err if contract code size exceeds the max while the err is still empty. if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } return ret, contractAddr, contract.Gas, err }3.2.1，evm执行栈深度不能超过1024，发送方持有的以太坊数量大于此次合约交易金额。 3.2.2，对该发送方地址的nonce值+1，通过地址和nonce值生成合约地址，通过合约地址得到合约hash值。 3.2.3，记录一个状态快照，用来后见失败回滚。 3.2.4，为这个合约地址创建一个合约账户，并为这个合约账户设置nonce值为1 3.2.5，产生以太坊资产转移，发送方地址账户金额减value值，合约账户的金额加value值。 3.2.6，根据发送方地址和合约地址，以及金额value 值和gas，合约代码和代码hash值，创建一个合约对象 3.2.7，run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。 3.2.8，如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。 3.3，如果不是新创建的合约，则调用evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)方法，同时更新发送方地址nonce值+1. func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, gas, nil } // Fail if we&#39;re trying to execute above the call depth limit if evm.depth &gt; int(params.CallCreateDepth) { return nil, gas, ErrDepth } // Fail if we&#39;re trying to transfer more than the available balance if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, gas, ErrInsufficientBalance } var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) // Initialise a new contract and set the code that is to be used by the EVM. // The contract is a scoped environment for this execution context only. contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) start := time.Now() // Capture the tracer start/end events in debug mode if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) defer func() { // Lazy evaluation of the parameters evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) }() } ret, err = run(evm, contract, input) // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err }evm.call方法和evm.create方法大致相同，我们来说说不一样的地方。 3.3.1，call方法调用的是一个存在的合约地址的合约，所以不用创建合约账户。如果call方法发现本地没有合约接收方的账户，则需要创建一个接收方的账户，并更新本地状态数据库。 3.3.2，create方法的资金transfer转移是在创建合约用户账户和这个合约账户之间发生，而call方法的资金转移是在合约的发送方和合约的接收方之间产生。 3.4，TransitionDb（）方法执行完合约，调用st.refundGas()方法计算合约退税，调用evm SSTORE指令 或者evm SUICIDE指令销毁合约十都会产生退税。 3.5，计算合约产生的gas总数，加入到矿工账户，作为矿工收入。 4，回到最开始的ApplyTransaction()方法，根据EVM的执行结果，拼接交易receipt数据，其中receipt.Logs日志数据是EVM执行指令代码的时候产生的，receipt.Bloom根据日志数据建立bloom过滤器。 二，EVM 的虚拟机解析器通过运行合约指令，执行智能合约代码 我们从 3.2.7 执行合约的run()方法入手，它调用了evm.interpreter.Run(contract, input)方法 func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err error) { // Increment the call depth which is restricted to 1024 in.evm.depth++ defer func() { in.evm.depth-- }() // Reset the previous call&#39;s return data. It&#39;s unimportant to preserve the old buffer // as every returning call will return new data anyway. in.returnData = nil // Don&#39;t bother with the execution if there&#39;s no code. if len(contract.Code) == 0 { return nil, nil } var ( op OpCode // current opcode mem = NewMemory() // bound memory stack = newstack() // local stack // For optimisation reason we&#39;re using uint64 as the program counter. // It&#39;s theoretically possible to go above 2^64. The YP defines the PC // to be uint256. Practically much less so feasible. pc = uint64(0) // program counter cost uint64 // copies used by tracer pcCopy uint64 // needed for the deferred Tracer gasCopy uint64 // for Tracer to log gas remaining before execution logged bool // deferred Tracer should ignore already logged steps ) contract.Input = input if in.cfg.Debug { defer func() { if err != nil { if !logged { in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } else { in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } } }() } // The Interpreter main run loop (contextual). This loop runs until either an // explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during // the execution of one of the operations or until the done flag is set by the // parent context. for atomic.LoadInt32(&amp;in.evm.abort) == 0 { if in.cfg.Debug { // Capture pre-execution values for tracing. logged, pcCopy, gasCopy = false, pc, contract.Gas } // Get the operation from the jump table and validate the stack to ensure there are // enough stack items available to perform the operation. op = contract.GetOp(pc) operation := in.cfg.JumpTable[op] if !operation.valid { return nil, fmt.Errorf(&quot;invalid opcode 0x%x&quot;, int(op)) } if err := operation.validateStack(stack); err != nil { return nil, err } // If the operation is valid, enforce and write restrictions if err := in.enforceRestrictions(op, operation, stack); err != nil { return nil, err } var memorySize uint64 // calculate the new memory size and expand the memory to fit // the operation if operation.memorySize != nil { memSize, overflow := bigUint64(operation.memorySize(stack)) if overflow { return nil, errGasUintOverflow } // memory is expanded in words of 32 bytes. Gas // is also calculated in words. if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow { return nil, errGasUintOverflow } } if !in.cfg.DisableGasMetering { // consume the gas and return an error if not enough gas is available. // cost is explicitly set so that the capture state defer method cas get the proper cost cost, err = operation.gasCost(in.gasTable, in.evm, contract, stack, mem, memorySize) if err != nil || !contract.UseGas(cost) { return nil, ErrOutOfGas } } if memorySize &gt; 0 { mem.Resize(memorySize) } if in.cfg.Debug { in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) logged = true } // execute the operation res, err := operation.execute(&amp;pc, in.evm, contract, mem, stack) // verifyPool is a build flag. Pool verification makes sure the integrity // of the integer pool by comparing values to a default value. if verifyPool { verifyIntegerPool(in.intPool) } // if the operation clears the return data (e.g. it has returning data) // set the last return to the result of the operation. if operation.returns { in.returnData = res } switch { case err != nil: return nil, err case operation.reverts: return res, errExecutionReverted case operation.halts: return res, nil case !operation.jumps: pc++ } } return nil, nil }我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。 1，首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。 2，从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是 SHA3: { execute: opSha3, gasCost: gasSha3, validateStack: makeStackFunc(2, 1), memorySize: memorySha3, valid: true, }execute表示指令对应的执行方法 gasCost表示执行这个指令需要消耗的gas validateStack计算是不是解析器栈溢出 memorySize用于计算operation的占用内存大小 3，如果operation可用，解析器栈不超过1024，且读写不冲突 4，计算operation的memorysize，不能大于64位。 5，根据不同的指令，指令的memorysize等，调用operation.gasCost()方法计算执行operation指令需要消耗的gas。 6，调用operation.execute(&amp;pc, in.evm, contract, mem, stack)执行指令对应的方法。 7，operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。 8，operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。 总结EVM是以太坊的核心功能，得益于EVM，以太坊把区块链带入了2.0时代，这是一个非常伟大的进步。客观的说以太坊的EVM还不是很完善，存在一些诟病，比如支持address类型数据导致栈容易溢出，缺少标准库，智能合约一旦创建很难修改，不支持浮点数等等问题，但这些问题都不足以击溃以太坊EVM的前进步伐。相信这些问题都会在以太坊不断的迭代更新中加以完善改进。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/16/ba469a86ec3220d0e3747fce6f972c9e.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/16/ba469a86ec3220d0e3747fce6f972c9e.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"上一节分析了同步一个新的区块准备插入本地BlockChain之前需要重放并执行新区块的所有交易，并产生交易收据和日志。以太坊是如何执行这些交易呢？这就要请出大名鼎鼎的以太坊虚拟机。 以太坊虚拟机在执行交易分为两个部分，第一部分是创建EVM，计算交易金额，设置交易对象，计算交易gas花销；第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。 一，创建EVM，通过EVM执行交易流程 上一节分析BlockChain调用processor.Process（）遍历block的所有交易，然后调用： receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)。 执行交易并返回收据数据 func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) { msg, err := tx.AsMessage(types.MakeSigner(config, header.Number)) if err != nil { return nil, 0, err } // Create a new context to be used in the EVM environment context := NewEVMContext(msg, header, bc, author) // Create a new environment which holds all relevant information // about the transaction and calling mechanisms. vmenv := vm.NewEVM(context, statedb, config, cfg) // Apply the transaction to the current state (included in the env) _, gas, failed, err := ApplyMessage(vmenv, msg, gp) if err != nil { return nil, 0, err } // Update the state with pending changes var root []byte if config.IsByzantium(header.Number) { statedb.Finalise(true) } else { root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes() } *usedGas += gas // Create a new receipt for the transaction, storing the intermediate root and gas used by the tx // based on the eip phase, we&#39;re passing wether the root touch-delete accounts. receipt := types.NewReceipt(root, failed, *usedGas) receipt.TxHash = tx.Hash() receipt.GasUsed = gas // if the transaction created a contract, store the creation address in the receipt. if msg.To() == nil { receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce()) } // Set the receipt logs and create a bloom for filtering receipt.Logs = statedb.GetLogs(tx.Hash()) receipt.Bloom = types.CreateBloom(types.Receipts{receipt}) return receipt, gas, err }1，首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。 2，调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。 3，调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。 重点看看ApplyMessage()方法的实现： func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) { return NewStateTransition(evm, msg, gp).TransitionDb() } 创建stateTransition对象，执行TransitionDb（）方法： func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) { if err = st.preCheck(); err != nil { return } msg := st.msg sender := st.from() // err checked in preCheck homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber) contractCreation := msg.To() == nil // Pay intrinsic gas gas, err := IntrinsicGas(st.data, contractCreation, homestead) if err != nil { return nil, 0, false, err } if err = st.useGas(gas); err != nil { return nil, 0, false, err } var ( evm = st.evm // vm errors do not effect consensus and are therefor // not assigned to err, except for insufficient balance // error. vmerr error ) if contractCreation { ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value) } else { // Increment the nonce for the next transaction st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1) ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value) } if vmerr != nil { log.Debug(&quot;VM returned with error&quot;, &quot;err&quot;, vmerr) // The only possible consensus-error would be if there wasn&#39;t // sufficient balance to make the transfer happen. The first // balance transfer may never fail. if vmerr == vm.ErrInsufficientBalance { return nil, 0, false, vmerr } } st.refundGas() st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice)) return ret, st.gasUsed(), vmerr != nil, err }3.1，调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。 3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) { // Depth check execution. Fail if we&#39;re trying to execute above the // limit. if evm.depth &gt; int(params.CallCreateDepth) { return nil, common.Address{}, gas, ErrDepth } if !evm.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, common.Address{}, gas, ErrInsufficientBalance } // Ensure there&#39;s no existing contract already at the designated address nonce := evm.StateDB.GetNonce(caller.Address()) evm.StateDB.SetNonce(caller.Address(), nonce+1) contractAddr = crypto.CreateAddress(caller.Address(), nonce) contractHash := evm.StateDB.GetCodeHash(contractAddr) if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) { return nil, common.Address{}, 0, ErrContractAddressCollision } // Create a new account on the state snapshot := evm.StateDB.Snapshot() evm.StateDB.CreateAccount(contractAddr) if evm.ChainConfig().IsEIP158(evm.BlockNumber) { evm.StateDB.SetNonce(contractAddr, 1) } evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) // initialise a new contract and set the code that is to be used by the // E The contract is a scoped evmironment for this execution context // only. contract := NewContract(caller, AccountRef(contractAddr), value, gas) contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code) if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, contractAddr, gas, nil } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), contractAddr, true, code, gas, value) } start := time.Now() ret, err = run(evm, contract, nil) // check whether the max code size has been exceeded maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize // if the contract creation ran successfully and no errors were returned // calculate the gas required to store the code. If the code could not // be stored due to not enough gas set an error and let it be handled // by the error checking condition below. if err == nil &amp;&amp; !maxCodeSizeExceeded { createDataGas := uint64(len(ret)) * params.CreateDataGas if contract.UseGas(createDataGas) { evm.StateDB.SetCode(contractAddr, ret) } else { err = ErrCodeStoreOutOfGas } } // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } // Assign err if contract code size exceeds the max while the err is still empty. if maxCodeSizeExceeded &amp;&amp; err == nil { err = errMaxCodeSizeExceeded } if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) } return ret, contractAddr, contract.Gas, err }3.2.1，evm执行栈深度不能超过1024，发送方持有的以太坊数量大于此次合约交易金额。 3.2.2，对该发送方地址的nonce值+1，通过地址和nonce值生成合约地址，通过合约地址得到合约hash值。 3.2.3，记录一个状态快照，用来后见失败回滚。 3.2.4，为这个合约地址创建一个合约账户，并为这个合约账户设置nonce值为1 3.2.5，产生以太坊资产转移，发送方地址账户金额减value值，合约账户的金额加value值。 3.2.6，根据发送方地址和合约地址，以及金额value 值和gas，合约代码和代码hash值，创建一个合约对象 3.2.7，run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。 3.2.8，如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。 3.3，如果不是新创建的合约，则调用evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)方法，同时更新发送方地址nonce值+1. func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) { if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 { return nil, gas, nil } // Fail if we&#39;re trying to execute above the call depth limit if evm.depth &gt; int(params.CallCreateDepth) { return nil, gas, ErrDepth } // Fail if we&#39;re trying to transfer more than the available balance if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) { return nil, gas, ErrInsufficientBalance } var ( to = AccountRef(addr) snapshot = evm.StateDB.Snapshot() ) if !evm.StateDB.Exist(addr) { precompiles := PrecompiledContractsHomestead if evm.ChainConfig().IsByzantium(evm.BlockNumber) { precompiles = PrecompiledContractsByzantium } if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 { return nil, gas, nil } evm.StateDB.CreateAccount(addr) } evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) // Initialise a new contract and set the code that is to be used by the EVM. // The contract is a scoped environment for this execution context only. contract := NewContract(caller, to, value, gas) contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr)) start := time.Now() // Capture the tracer start/end events in debug mode if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 { evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value) defer func() { // Lazy evaluation of the parameters evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err) }() } ret, err = run(evm, contract, input) // When an error was returned by the EVM or when setting the creation code // above we revert to the snapshot and consume any gas remaining. Additionally // when we&#39;re in homestead this also counts for code storage gas errors. if err != nil { evm.StateDB.RevertToSnapshot(snapshot) if err != errExecutionReverted { contract.UseGas(contract.Gas) } } return ret, contract.Gas, err }evm.call方法和evm.create方法大致相同，我们来说说不一样的地方。 3.3.1，call方法调用的是一个存在的合约地址的合约，所以不用创建合约账户。如果call方法发现本地没有合约接收方的账户，则需要创建一个接收方的账户，并更新本地状态数据库。 3.3.2，create方法的资金transfer转移是在创建合约用户账户和这个合约账户之间发生，而call方法的资金转移是在合约的发送方和合约的接收方之间产生。 3.4，TransitionDb（）方法执行完合约，调用st.refundGas()方法计算合约退税，调用evm SSTORE指令 或者evm SUICIDE指令销毁合约十都会产生退税。 3.5，计算合约产生的gas总数，加入到矿工账户，作为矿工收入。 4，回到最开始的ApplyTransaction()方法，根据EVM的执行结果，拼接交易receipt数据，其中receipt.Logs日志数据是EVM执行指令代码的时候产生的，receipt.Bloom根据日志数据建立bloom过滤器。 二，EVM 的虚拟机解析器通过运行合约指令，执行智能合约代码 我们从 3.2.7 执行合约的run()方法入手，它调用了evm.interpreter.Run(contract, input)方法 func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err error) { // Increment the call depth which is restricted to 1024 in.evm.depth++ defer func() { in.evm.depth-- }() // Reset the previous call&#39;s return data. It&#39;s unimportant to preserve the old buffer // as every returning call will return new data anyway. in.returnData = nil // Don&#39;t bother with the execution if there&#39;s no code. if len(contract.Code) == 0 { return nil, nil } var ( op OpCode // current opcode mem = NewMemory() // bound memory stack = newstack() // local stack // For optimisation reason we&#39;re using uint64 as the program counter. // It&#39;s theoretically possible to go above 2^64. The YP defines the PC // to be uint256. Practically much less so feasible. pc = uint64(0) // program counter cost uint64 // copies used by tracer pcCopy uint64 // needed for the deferred Tracer gasCopy uint64 // for Tracer to log gas remaining before execution logged bool // deferred Tracer should ignore already logged steps ) contract.Input = input if in.cfg.Debug { defer func() { if err != nil { if !logged { in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } else { in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) } } }() } // The Interpreter main run loop (contextual). This loop runs until either an // explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during // the execution of one of the operations or until the done flag is set by the // parent context. for atomic.LoadInt32(&amp;in.evm.abort) == 0 { if in.cfg.Debug { // Capture pre-execution values for tracing. logged, pcCopy, gasCopy = false, pc, contract.Gas } // Get the operation from the jump table and validate the stack to ensure there are // enough stack items available to perform the operation. op = contract.GetOp(pc) operation := in.cfg.JumpTable[op] if !operation.valid { return nil, fmt.Errorf(&quot;invalid opcode 0x%x&quot;, int(op)) } if err := operation.validateStack(stack); err != nil { return nil, err } // If the operation is valid, enforce and write restrictions if err := in.enforceRestrictions(op, operation, stack); err != nil { return nil, err } var memorySize uint64 // calculate the new memory size and expand the memory to fit // the operation if operation.memorySize != nil { memSize, overflow := bigUint64(operation.memorySize(stack)) if overflow { return nil, errGasUintOverflow } // memory is expanded in words of 32 bytes. Gas // is also calculated in words. if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow { return nil, errGasUintOverflow } } if !in.cfg.DisableGasMetering { // consume the gas and return an error if not enough gas is available. // cost is explicitly set so that the capture state defer method cas get the proper cost cost, err = operation.gasCost(in.gasTable, in.evm, contract, stack, mem, memorySize) if err != nil || !contract.UseGas(cost) { return nil, ErrOutOfGas } } if memorySize &gt; 0 { mem.Resize(memorySize) } if in.cfg.Debug { in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err) logged = true } // execute the operation res, err := operation.execute(&amp;pc, in.evm, contract, mem, stack) // verifyPool is a build flag. Pool verification makes sure the integrity // of the integer pool by comparing values to a default value. if verifyPool { verifyIntegerPool(in.intPool) } // if the operation clears the return data (e.g. it has returning data) // set the last return to the result of the operation. if operation.returns { in.returnData = res } switch { case err != nil: return nil, err case operation.reverts: return res, errExecutionReverted case operation.halts: return res, nil case !operation.jumps: pc++ } } return nil, nil }我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。 1，首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。 2，从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是 SHA3: { execute: opSha3, gasCost: gasSha3, validateStack: makeStackFunc(2, 1), memorySize: memorySha3, valid: true, }execute表示指令对应的执行方法 gasCost表示执行这个指令需要消耗的gas validateStack计算是不是解析器栈溢出 memorySize用于计算operation的占用内存大小 3，如果operation可用，解析器栈不超过1024，且读写不冲突 4，计算operation的memorysize，不能大于64位。 5，根据不同的指令，指令的memorysize等，调用operation.gasCost()方法计算执行operation指令需要消耗的gas。 6，调用operation.execute(&amp;pc, in.evm, contract, mem, stack)执行指令对应的方法。 7，operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。 8，operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。 总结EVM是以太坊的核心功能，得益于EVM，以太坊把区块链带入了2.0时代，这是一个非常伟大的进步。客观的说以太坊的EVM还不是很完善，存在一些诟病，比如支持address类型数据导致栈容易溢出，缺少标准库，智能合约一旦创建很难修改，不支持浮点数等等问题，但这些问题都不足以击溃以太坊EVM的前进步伐。相信这些问题都会在以太坊不断的迭代更新中加以完善改进。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/16/ba469a86ec3220d0e3747fce6f972c9e.html","headline":"以太坊源码深入分析（9）– 以太坊通过EVM执行交易过程分析","dateModified":"2018-05-16T00:00:00+08:00","datePublished":"2018-05-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/16/ba469a86ec3220d0e3747fce6f972c9e.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>以太坊源码深入分析（9）-- 以太坊通过EVM执行交易过程分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e4c7a3727d.css"> 
+ <div class="htmledit_views">
+   上一节分析了同步一个新的区块准备插入本地BlockChain之前需要重放并执行新区块的所有交易，并产生交易收据和日志。以太坊是如何执行这些交易呢？这就要请出大名鼎鼎的以太坊虚拟机。
+  <br>以太坊虚拟机在执行交易分为两个部分，第一部分是创建EVM，计算交易金额，设置交易对象，计算交易gas花销；第二部分是EVM 的虚拟机解析器通过合约指令，执行智能合约代码，具体来看看源码。
+  <br>
+  <br>
+  <h2>一，创建EVM，通过EVM执行交易流程</h2>
+  <p>上一节分析BlockChain调用processor.Process（）遍历block的所有交易，然后调用：</p>
+  <pre><code class="language-plain">receipt, _, err := ApplyTransaction(p.config, p.bc, nil, gp, statedb, header, tx, usedGas, cfg)。</code></pre>
+  <p>执行交易并返回收据数据</p>
+  <pre><code class="language-plain">func ApplyTransaction(config *params.ChainConfig, bc *BlockChain, author *common.Address, gp *GasPool, statedb *state.StateDB, header *types.Header, tx *types.Transaction, usedGas *uint64, cfg vm.Config) (*types.Receipt, uint64, error) {
+	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
+	if err != nil {
+		return nil, 0, err
+	}
+	// Create a new context to be used in the EVM environment
+	context := NewEVMContext(msg, header, bc, author)
+	// Create a new environment which holds all relevant information
+	// about the transaction and calling mechanisms.
+	vmenv := vm.NewEVM(context, statedb, config, cfg)
+	// Apply the transaction to the current state (included in the env)
+	_, gas, failed, err := ApplyMessage(vmenv, msg, gp)
+	if err != nil {
+		return nil, 0, err
+	}
+	// Update the state with pending changes
+	var root []byte
+	if config.IsByzantium(header.Number) {
+		statedb.Finalise(true)
+	} else {
+		root = statedb.IntermediateRoot(config.IsEIP158(header.Number)).Bytes()
+	}
+	*usedGas += gas
+
+
+	// Create a new receipt for the transaction, storing the intermediate root and gas used by the tx
+	// based on the eip phase, we're passing wether the root touch-delete accounts.
+	receipt := types.NewReceipt(root, failed, *usedGas)
+	receipt.TxHash = tx.Hash()
+	receipt.GasUsed = gas
+	// if the transaction created a contract, store the creation address in the receipt.
+	if msg.To() == nil {
+		receipt.ContractAddress = crypto.CreateAddress(vmenv.Context.Origin, tx.Nonce())
+	}
+	// Set the receipt logs and create a bloom for filtering
+	receipt.Logs = statedb.GetLogs(tx.Hash())
+	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+
+
+	return receipt, gas, err
+}</code></pre>1，首先调用tx.Message()方法产生交易Message。这个方法通过txdata数据来拼接Message对象，并通过签名方法signer.Sender(tx)，对txdata 的V、R 、S三个数进行解密得到这个交易的签名公钥（也是就是发送方的地址）。发送方的地址在交易数据中是没有的，这主要是为了防止交易数据被篡改，任何交易数据的变化后通过signer.Sender方法都不能得到正确的地址。
+  <br>2，调用 NewEVMContext(msg, header, bc, author)创建EVM的上下文环境，调用vm.NewEVM(context, statedb, config, cfg)创建EVM对象，并在内部创建一个evm.interpreter（虚拟机解析器）。
+  <br>3，调用ApplyMessage(vmenv, msg, gp)方法通过EVM对象来执行Message。
+  <br>
+  <p>重点看看ApplyMessage()方法的实现：</p>
+  <pre><code class="language-plain">func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool) ([]byte, uint64, bool, error) {
+	return NewStateTransition(evm, msg, gp).TransitionDb()
+}</code></pre>
+  <p>创建stateTransition对象，执行TransitionDb（）方法：</p>
+  <pre><code class="language-plain">func (st *StateTransition) TransitionDb() (ret []byte, usedGas uint64, failed bool, err error) {
+	if err = st.preCheck(); err != nil {
+		return
+	}
+	msg := st.msg
+	sender := st.from() // err checked in preCheck
+
+
+	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+	contractCreation := msg.To() == nil
+
+
+	// Pay intrinsic gas
+	gas, err := IntrinsicGas(st.data, contractCreation, homestead)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if err = st.useGas(gas); err != nil {
+		return nil, 0, false, err
+	}
+
+
+	var (
+		evm = st.evm
+		// vm errors do not effect consensus and are therefor
+		// not assigned to err, except for insufficient balance
+		// error.
+		vmerr error
+	)
+	if contractCreation {
+		ret, _, st.gas, vmerr = evm.Create(sender, st.data, st.gas, st.value)
+	} else {
+		// Increment the nonce for the next transaction
+		st.state.SetNonce(sender.Address(), st.state.GetNonce(sender.Address())+1)
+		ret, st.gas, vmerr = evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)
+	}
+	if vmerr != nil {
+		log.Debug("VM returned with error", "err", vmerr)
+		// The only possible consensus-error would be if there wasn't
+		// sufficient balance to make the transfer happen. The first
+		// balance transfer may never fail.
+		if vmerr == vm.ErrInsufficientBalance {
+			return nil, 0, false, vmerr
+		}
+	}
+	st.refundGas()
+	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
+
+
+	return ret, st.gasUsed(), vmerr != nil, err
+}</code></pre>3.1，调用IntrinsicGas()方法，通过计算消息的大小以及是否是合约创建交易，来计算此次交易需消耗的gas。
+  <br>
+  <p>3.2，如果是合约创建交易，调用evm.Create(sender, st.data, st.gas, st.value)来执行message</p>
+  <pre><code class="language-plain">func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+
+
+	// Depth check execution. Fail if we're trying to execute above the
+	// limit.
+	if evm.depth &gt; int(params.CallCreateDepth) {
+		return nil, common.Address{}, gas, ErrDepth
+	}
+	if !evm.CanTransfer(evm.StateDB, caller.Address(), value) {
+		return nil, common.Address{}, gas, ErrInsufficientBalance
+	}
+	// Ensure there's no existing contract already at the designated address
+	nonce := evm.StateDB.GetNonce(caller.Address())
+	evm.StateDB.SetNonce(caller.Address(), nonce+1)
+
+
+	contractAddr = crypto.CreateAddress(caller.Address(), nonce)
+	contractHash := evm.StateDB.GetCodeHash(contractAddr)
+	if evm.StateDB.GetNonce(contractAddr) != 0 || (contractHash != (common.Hash{}) &amp;&amp; contractHash != emptyCodeHash) {
+		return nil, common.Address{}, 0, ErrContractAddressCollision
+	}
+	// Create a new account on the state
+	snapshot := evm.StateDB.Snapshot()
+	evm.StateDB.CreateAccount(contractAddr)
+	if evm.ChainConfig().IsEIP158(evm.BlockNumber) {
+		evm.StateDB.SetNonce(contractAddr, 1)
+	}
+	evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value)
+
+
+	// initialise a new contract and set the code that is to be used by the
+	// E The contract is a scoped evmironment for this execution context
+	// only.
+	contract := NewContract(caller, AccountRef(contractAddr), value, gas)
+	contract.SetCallCode(&amp;contractAddr, crypto.Keccak256Hash(code), code)
+
+
+	if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+		return nil, contractAddr, gas, nil
+	}
+
+
+	if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+		evm.vmConfig.Tracer.CaptureStart(caller.Address(), contractAddr, true, code, gas, value)
+	}
+	start := time.Now()
+
+
+	ret, err = run(evm, contract, nil)
+
+
+	// check whether the max code size has been exceeded
+	maxCodeSizeExceeded := evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; len(ret) &gt; params.MaxCodeSize
+	// if the contract creation ran successfully and no errors were returned
+	// calculate the gas required to store the code. If the code could not
+	// be stored due to not enough gas set an error and let it be handled
+	// by the error checking condition below.
+	if err == nil &amp;&amp; !maxCodeSizeExceeded {
+		createDataGas := uint64(len(ret)) * params.CreateDataGas
+		if contract.UseGas(createDataGas) {
+			evm.StateDB.SetCode(contractAddr, ret)
+		} else {
+			err = ErrCodeStoreOutOfGas
+		}
+	}
+
+
+	// When an error was returned by the EVM or when setting the creation code
+	// above we revert to the snapshot and consume any gas remaining. Additionally
+	// when we're in homestead this also counts for code storage gas errors.
+	if maxCodeSizeExceeded || (err != nil &amp;&amp; (evm.ChainConfig().IsHomestead(evm.BlockNumber) || err != ErrCodeStoreOutOfGas)) {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		if err != errExecutionReverted {
+			contract.UseGas(contract.Gas)
+		}
+	}
+	// Assign err if contract code size exceeds the max while the err is still empty.
+	if maxCodeSizeExceeded &amp;&amp; err == nil {
+		err = errMaxCodeSizeExceeded
+	}
+	if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+		evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err)
+	}
+	return ret, contractAddr, contract.Gas, err
+}</code></pre>3.2.1，evm执行栈深度不能超过1024，发送方持有的以太坊数量大于此次合约交易金额。
+  <br>3.2.2，对该发送方地址的nonce值+1，通过地址和nonce值生成合约地址，通过合约地址得到合约hash值。
+  <br>3.2.3，记录一个状态快照，用来后见失败回滚。
+  <br>3.2.4，为这个合约地址创建一个合约账户，并为这个合约账户设置nonce值为1
+  <br>3.2.5，产生以太坊资产转移，发送方地址账户金额减value值，合约账户的金额加value值。
+  <br>3.2.6，根据发送方地址和合约地址，以及金额value 值和gas，合约代码和代码hash值，创建一个合约对象
+  <br>3.2.7，run方法来执行合约，内部调用evm的解析器来执行合约指令，如果是预编译好的合约，则预编译执行合约就行。
+  <br>3.2.8，如果执行ok，setcode更新这个合约地址状态，设置usegas为创建合约的gas。如果执行出错，则回滚到之前快照状态，设置usegas为传入的合约gas。
+  <br>
+  <br>
+  <p>3.3，如果不是新创建的合约，则调用evm.Call(sender, st.to().Address(), st.data, st.gas, st.value)方法，同时更新发送方地址nonce值+1.</p>
+  <pre><code class="language-plain">func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
+	if evm.vmConfig.NoRecursion &amp;&amp; evm.depth &gt; 0 {
+		return nil, gas, nil
+	}
+
+
+	// Fail if we're trying to execute above the call depth limit
+	if evm.depth &gt; int(params.CallCreateDepth) {
+		return nil, gas, ErrDepth
+	}
+	// Fail if we're trying to transfer more than the available balance
+	if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		return nil, gas, ErrInsufficientBalance
+	}
+
+
+	var (
+		to       = AccountRef(addr)
+		snapshot = evm.StateDB.Snapshot()
+	)
+	if !evm.StateDB.Exist(addr) {
+		precompiles := PrecompiledContractsHomestead
+		if evm.ChainConfig().IsByzantium(evm.BlockNumber) {
+			precompiles = PrecompiledContractsByzantium
+		}
+		if precompiles[addr] == nil &amp;&amp; evm.ChainConfig().IsEIP158(evm.BlockNumber) &amp;&amp; value.Sign() == 0 {
+			return nil, gas, nil
+		}
+		evm.StateDB.CreateAccount(addr)
+	}
+	evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value)
+
+
+	// Initialise a new contract and set the code that is to be used by the EVM.
+	// The contract is a scoped environment for this execution context only.
+	contract := NewContract(caller, to, value, gas)
+	contract.SetCallCode(&amp;addr, evm.StateDB.GetCodeHash(addr), evm.StateDB.GetCode(addr))
+
+
+	start := time.Now()
+
+
+	// Capture the tracer start/end events in debug mode
+	if evm.vmConfig.Debug &amp;&amp; evm.depth == 0 {
+		evm.vmConfig.Tracer.CaptureStart(caller.Address(), addr, false, input, gas, value)
+
+
+		defer func() { // Lazy evaluation of the parameters
+			evm.vmConfig.Tracer.CaptureEnd(ret, gas-contract.Gas, time.Since(start), err)
+		}()
+	}
+	ret, err = run(evm, contract, input)
+
+
+	// When an error was returned by the EVM or when setting the creation code
+	// above we revert to the snapshot and consume any gas remaining. Additionally
+	// when we're in homestead this also counts for code storage gas errors.
+	if err != nil {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		if err != errExecutionReverted {
+			contract.UseGas(contract.Gas)
+		}
+	}
+	return ret, contract.Gas, err
+}</code></pre>evm.call方法和evm.create方法大致相同，我们来说说不一样的地方。
+  <br>3.3.1，call方法调用的是一个存在的合约地址的合约，所以不用创建合约账户。如果call方法发现本地没有合约接收方的账户，则需要创建一个接收方的账户，并更新本地状态数据库。
+  <br>3.3.2，create方法的资金transfer转移是在创建合约用户账户和这个合约账户之间发生，而call方法的资金转移是在合约的发送方和合约的接收方之间产生。
+  <br>
+  <br>3.4，TransitionDb（）方法执行完合约，调用st.refundGas()方法计算合约退税，调用evm SSTORE指令 或者evm SUICIDE指令销毁合约十都会产生退税。
+  <br>3.5，计算合约产生的gas总数，加入到矿工账户，作为矿工收入。
+  <br>
+  <br>4，回到最开始的ApplyTransaction()方法，根据EVM的执行结果，拼接交易receipt数据，其中receipt.Logs日志数据是EVM执行指令代码的时候产生的，receipt.Bloom根据日志数据建立bloom过滤器。
+  <br>
+  <br>
+  <br>
+  <h2>二，EVM 的虚拟机解析器通过运行合约指令，执行智能合约代码</h2>
+  <p>我们从 3.2.7 执行合约的run()方法入手，它调用了evm.interpreter.Run(contract, input)方法</p>
+  <pre><code class="language-plain">func (in *Interpreter) Run(contract *Contract, input []byte) (ret []byte, err error) {
+	// Increment the call depth which is restricted to 1024
+	in.evm.depth++
+	defer func() { in.evm.depth-- }()
+
+
+	// Reset the previous call's return data. It's unimportant to preserve the old buffer
+	// as every returning call will return new data anyway.
+	in.returnData = nil
+
+
+	// Don't bother with the execution if there's no code.
+	if len(contract.Code) == 0 {
+		return nil, nil
+	}
+
+
+	var (
+		op    OpCode        // current opcode
+		mem   = NewMemory() // bound memory
+		stack = newstack()  // local stack
+		// For optimisation reason we're using uint64 as the program counter.
+		// It's theoretically possible to go above 2^64. The YP defines the PC
+		// to be uint256. Practically much less so feasible.
+		pc   = uint64(0) // program counter
+		cost uint64
+		// copies used by tracer
+		pcCopy  uint64 // needed for the deferred Tracer
+		gasCopy uint64 // for Tracer to log gas remaining before execution
+		logged  bool   // deferred Tracer should ignore already logged steps
+	)
+	contract.Input = input
+
+
+	if in.cfg.Debug {
+		defer func() {
+			if err != nil {
+				if !logged {
+					in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err)
+				} else {
+					in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err)
+				}
+			}
+		}()
+	}
+	// The Interpreter main run loop (contextual). This loop runs until either an
+	// explicit STOP, RETURN or SELFDESTRUCT is executed, an error occurred during
+	// the execution of one of the operations or until the done flag is set by the
+	// parent context.
+	for atomic.LoadInt32(&amp;in.evm.abort) == 0 {
+		if in.cfg.Debug {
+			// Capture pre-execution values for tracing.
+			logged, pcCopy, gasCopy = false, pc, contract.Gas
+		}
+
+
+		// Get the operation from the jump table and validate the stack to ensure there are
+		// enough stack items available to perform the operation.
+		op = contract.GetOp(pc)
+		operation := in.cfg.JumpTable[op]
+		if !operation.valid {
+			return nil, fmt.Errorf("invalid opcode 0x%x", int(op))
+		}
+		if err := operation.validateStack(stack); err != nil {
+			return nil, err
+		}
+		// If the operation is valid, enforce and write restrictions
+		if err := in.enforceRestrictions(op, operation, stack); err != nil {
+			return nil, err
+		}
+
+
+		var memorySize uint64
+		// calculate the new memory size and expand the memory to fit
+		// the operation
+		if operation.memorySize != nil {
+			memSize, overflow := bigUint64(operation.memorySize(stack))
+			if overflow {
+				return nil, errGasUintOverflow
+			}
+			// memory is expanded in words of 32 bytes. Gas
+			// is also calculated in words.
+			if memorySize, overflow = math.SafeMul(toWordSize(memSize), 32); overflow {
+				return nil, errGasUintOverflow
+			}
+		}
+
+
+		if !in.cfg.DisableGasMetering {
+			// consume the gas and return an error if not enough gas is available.
+			// cost is explicitly set so that the capture state defer method cas get the proper cost
+			cost, err = operation.gasCost(in.gasTable, in.evm, contract, stack, mem, memorySize)
+			if err != nil || !contract.UseGas(cost) {
+				return nil, ErrOutOfGas
+			}
+		}
+		if memorySize &gt; 0 {
+			mem.Resize(memorySize)
+		}
+
+
+		if in.cfg.Debug {
+			in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, stack, contract, in.evm.depth, err)
+			logged = true
+		}
+
+
+		// execute the operation
+		res, err := operation.execute(&amp;pc, in.evm, contract, mem, stack)
+		// verifyPool is a build flag. Pool verification makes sure the integrity
+		// of the integer pool by comparing values to a default value.
+		if verifyPool {
+			verifyIntegerPool(in.intPool)
+		}
+		// if the operation clears the return data (e.g. it has returning data)
+		// set the last return to the result of the operation.
+		if operation.returns {
+			in.returnData = res
+		}
+
+
+		switch {
+		case err != nil:
+			return nil, err
+		case operation.reverts:
+			return res, errExecutionReverted
+		case operation.halts:
+			return res, nil
+		case !operation.jumps:
+			pc++
+		}
+	}
+	return nil, nil
+}</code></pre>我们直接看解析器处理的主循环，之前的代码都是在初始化一些临时变量。
+  <br>1，首先调用contract.GetOp(pc)从和约二进制数据里取得第pc个opcode，opcode是以太坊虚拟机指令，一共不超过256个，正好一个byte大小能装下。
+  <br>
+  <p>2，从解析器的JumpTable表中查到op对应的operation。比如opcode是SHA3（0x20），取到的operation就是</p>
+  <pre><code class="language-plain">    SHA3: {
+			execute:       opSha3,
+			gasCost:       gasSha3,
+			validateStack: makeStackFunc(2, 1),
+			memorySize:    memorySha3,
+			valid:         true,
+		}</code></pre>execute表示指令对应的执行方法
+  <br>gasCost表示执行这个指令需要消耗的gas
+  <br>validateStack计算是不是解析器栈溢出
+  <br>memorySize用于计算operation的占用内存大小
+  <br>
+  <br>3，如果operation可用，解析器栈不超过1024，且读写不冲突
+  <br>4，计算operation的memorysize，不能大于64位。
+  <br>5，根据不同的指令，指令的memorysize等，调用operation.gasCost()方法计算执行operation指令需要消耗的gas。
+  <br>6，调用operation.execute(&amp;pc, in.evm, contract, mem, stack)执行指令对应的方法。
+  <br>7，operation.reverts值是true或者operation.halts值是true的指令，会跳出主循环，否则继续遍历下个op。
+  <br>8，operation指令集里面有4个特殊的指令LOG0，LOG1，LOG2，LOG3，它们的指令执行方法makeLog()会产生日志数据，这些日志数据会写入到tx的Receipt的logs里面，并存入本地ldb数据库。
+  <br>
+  <br>
+  <h4>总结</h4>EVM是以太坊的核心功能，得益于EVM，以太坊把区块链带入了2.0时代，这是一个非常伟大的进步。客观的说以太坊的EVM还不是很完善，存在一些诟病，比如支持address类型数据导致栈容易溢出，缺少标准库，智能合约一旦创建很难修改，不支持浮点数等等问题，但这些问题都不足以击溃以太坊EVM的前进步伐。相信这些问题都会在以太坊不断的迭代更新中加以完善改进。 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80343004,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/cj2094/article/details/80343004,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

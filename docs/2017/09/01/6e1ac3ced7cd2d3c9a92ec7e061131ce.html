@@ -1,0 +1,1291 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>STM32移植LWIP网线热插入网络不通的解决办法 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="STM32移植LWIP网线热插入网络不通的解决办法" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="开发背景： 1、主芯片—STM32F207VCT6； 2、TCP/IP协议栈—LWIP，依托ST例程移植； 3、操作系统—无（裸机）； 异常现象： 1、网线不插入的情况下先给设备上电，之后再插入网线无法ping通；（如果上电前网线插入，网络正常）； 2、网络已经正常的情况下，电脑PC端修改传输模式（比如从原来的100M全双工修改为10M全双工）导致网络不通； 原因分析： 1、针对第一种异常情况，是由于上电时网线未插入，导致ETH初始化部分未能成功完成，之后即使再插入网线，程序中没有再次进行初始化的逻辑补充，从而导致网络异常； 2、针对第二种情况，情况是上电时完成了ETH的初始化并与PC协商成功，此时网络正常。但当PC端修改传输模式后，程序中未能执行再次协商与MAC的初始化工作，导致网络异常； 解决方法： 首先，要明确上述问题的关键点所在，所有的异常均是网线的拔插导致（PC端修改连接传输方式时也相当于网线的拔掉重插），因此主程序中必须要有对当前网络连接与断开的检测或者利用PHY芯片的中断引脚； 其次，无论利用轮询或是PHY中断配置引脚，根本的原理都是一样的，就是感知到网络的连接与断开，下面给出采用的查询方式： void Eth_Link_ITHandler(struct netif *netif) { /* Check whether the link interrupt has occurred or not */ if(((ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_MISR)) &amp; PHY_LINK_STATUS) != 0){/*检测插拔中断*/ uint16_t status = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR); if(status &amp; (PHY_AutoNego_Complete | PHY_Linked_Status)){/*检测到网线连接*/ if(EthInitStatus == 0){/*之前未成功初始化过*/ /*Reinit PHY*/ ETH_Reinit(); } else{/*之前已经成功初始化*/ /*set link up for re link callbalk function*/ netif_set_link_up(netif); } } else{/*网线断开*/\ /*set link down for re link callbalk function*/ netif_set_link_down(netif); } } } 备注说明：将该检测函数放入主循环，程序中标注的部分为解决网线热拔插问题的关键点。 1、标注红色的部分执行的条件是检测到网线插入且之前ETH部分未成功初始化过（即之前一直处在上电但网线未插入）的情况，此时需要对ETH重新初始化，从而解决异常现象的第一种情况，具体执行内容为： /** * @brief : first time power on but init failed, do again * @param : None * * @retval : None * @author : xuk */ void ETH_Reinit(void){ /* Configure Ethernet */ EthInitStatus = ETH_Init (&amp;ETH_InitStructure, DP83848_PHY_ADDRESS); } 其中ETH_InitStructure已设为全局结构体； 2、标注蓝色部分的执行条件是已经成功初始化过ETH，但之后出现了网线的拔插情况，此时需要在每次检测到网络连接时重新进行自协商并初始化MAC，具体的执行流程如下介绍： A、检测到该条件时，首先调用： netif_set_link_up(netif); netif_set_link_down(netif); B、追溯两个函数的定义处，如下： #if LWIP_NETIF_LINK_CALLBACK /** * Called by a driver when its link goes up */ void netif_set_link_up(struct netif *netif ) { netif-&gt;flags |= NETIF_FLAG_LINK_UP; #if LWIP_DHCP if (netif-&gt;dhcp) { dhcp_network_changed(netif); } #endif /* LWIP_DHCP */ #if LWIP_AUTOIP if (netif-&gt;autoip) { autoip_network_changed(netif); } #endif /* LWIP_AUTOIP */ if (netif-&gt;flags &amp; NETIF_FLAG_UP) { #if LWIP_ARP /* For Ethernet network interfaces, we would like to send a &quot;gratuitous ARP&quot; */ if (netif-&gt;flags &amp; NETIF_FLAG_ETHARP) { etharp_gratuitous(netif); } #endif /* LWIP_ARP */ #if LWIP_IGMP /* resend IGMP memberships */ if (netif-&gt;flags &amp; NETIF_FLAG_IGMP) { igmp_report_groups( netif); } #endif /* LWIP_IGMP */ } NETIF_LINK_CALLBACK(netif); } /** * Called by a driver when its link goes down */ void netif_set_link_down(struct netif *netif ) { netif-&gt;flags &amp;= ~NETIF_FLAG_LINK_UP; NETIF_LINK_CALLBACK(netif); } /** * Ask if a link is up */ u8_t netif_is_link_up(struct netif *netif) { return (netif-&gt;flags &amp; NETIF_FLAG_LINK_UP) ? 1 : 0; } /** * Set callback to be called when link is brought up/down */ void netif_set_link_callback (struct netif *netif, void (* link_callback)(struct netif *netif )) { if (netif) { netif-&gt;link_callback = link_callback; } } #endif /* LWIP_NETIF_LINK_CALLBACK */ 注意：I：从上述看出，若要这两个函数有效编译，则必须定义宏LWIP_NETIF_LINK_CALLBACK 为1，请自行设置； II：函数 netif_set_link_callback 的作用是指定网络连接发生改变时的回调函数； III：详细的讲一下主要思路， Eth_Link_ITHandler 执行中检测到网线拔插时分别调用 netif_set_link_up(netif)、netif_set_link_down(netif);这两个函数的调用会引发 netif_set_link_callback的执行，从而执行指定的网络连接或断开的回调函数； Ⅳ：通过netif_set_link_callback该函数在LWIP初始化的时候指定网络连接变化的回调函数，可放置如下位置： void LwIP_Init (void){ ...... ...... ...... ...... /*set the link up or link down callback function - xuk*/ netif_set_link_callback(&amp;netif,eth_re_link); } 其中，回调函数 eth_re_link 的具体内容如下，实现网络拔插后的重新自协商与MAC初始化： /** * @brief : process the relink of eth * @param : netif - - specify the ETH netif * * @retval : none * @author : xuk */ void eth_re_link (struct netif *netif){ __IO uint32_t tickstart = 0; uint32_t regvalue = 0, tmpreg = 0; if(netif_is_link_up(netif)){/*link up process*/ if(ETH_InitStructure.ETH_AutoNegotiation == ETH_AutoNegotiation_Enable){/*AutoNegotiation_Enable*/ /* Enable Auto-Negotiation */ ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, PHY_AutoNegotiation); /* Wait until the auto-negotiation will be completed */ do { tickstart++; } while (!(ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR) &amp; PHY_AutoNego_Complete) &amp;&amp; (tickstart &lt; (uint32_t)PHY_READ_TO)); /* Return ERROR in case of timeout */ if(tickstart == PHY_READ_TO) { // return ETH_ERROR; } /* Reset Timeout counter */ tickstart = 0; /* Read the result of the auto-negotiation */ regvalue = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_SR); /* Configure the MAC with the Duplex Mode fixed by the auto-negotiation process */ if((regvalue &amp; PHY_DUPLEX_STATUS) != (uint32_t)RESET) { /* Set Ethernet duplex mode to Full-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_FullDuplex; } else { /* Set Ethernet duplex mode to Half-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_HalfDuplex; } /* Configure the MAC with the speed fixed by the auto-negotiation process */ if(regvalue &amp; PHY_SPEED_STATUS) { /* Set Ethernet speed to 10M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_10M; } else { /* Set Ethernet speed to 100M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_100M; } } else{/*AutoNegotiation_Disable*/ if(!ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, ((uint16_t)(ETH_InitStructure.ETH_Mode &gt;&gt; 3) | (uint16_t)(ETH_InitStructure.ETH_Speed &gt;&gt; 1)))) { /* Return ERROR in case of write timeout */ // return ETH_ERROR; } /* Delay to assure PHY configuration */ // _eth_delay_(PHY_CONFIG_DELAY); } /*------------------------ ETHERNET MACCR Configuration --------------------*/ /* Get the ETHERNET MACCR value */ tmpreg = ETH-&gt;MACCR; /* Clear WD, PCE, PS, TE and RE bits */ tmpreg &amp;= MACCR_CLEAR_MASK; /* Set the WD bit according to ETH_Watchdog value */ /* Set the JD: bit according to ETH_Jabber value */ /* Set the IFG bit according to ETH_InterFrameGap value */ /* Set the DCRS bit according to ETH_CarrierSense value */ /* Set the FES bit according to ETH_Speed value */ /* Set the DO bit according to ETH_ReceiveOwn value */ /* Set the LM bit according to ETH_LoopbackMode value */ /* Set the DM bit according to ETH_Mode value */ /* Set the IPCO bit according to ETH_ChecksumOffload value */ /* Set the DR bit according to ETH_RetryTransmission value */ /* Set the ACS bit according to ETH_AutomaticPadCRCStrip value */ /* Set the BL bit according to ETH_BackOffLimit value */ /* Set the DC bit according to ETH_DeferralCheck value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_Watchdog | ETH_InitStructure.ETH_Jabber | ETH_InitStructure.ETH_InterFrameGap | ETH_InitStructure.ETH_CarrierSense | ETH_InitStructure.ETH_Speed | ETH_InitStructure.ETH_ReceiveOwn | ETH_InitStructure.ETH_LoopbackMode | ETH_InitStructure.ETH_Mode | ETH_InitStructure.ETH_ChecksumOffload | ETH_InitStructure.ETH_RetryTransmission | ETH_InitStructure.ETH_AutomaticPadCRCStrip | ETH_InitStructure.ETH_BackOffLimit | ETH_InitStructure.ETH_DeferralCheck); /* Write to ETHERNET MACCR */ ETH-&gt;MACCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACFFR Configuration --------------------*/ /* Set the RA bit according to ETH_ReceiveAll value */ /* Set the SAF and SAIF bits according to ETH_SourceAddrFilter value */ /* Set the PCF bit according to ETH_PassControlFrames value */ /* Set the DBF bit according to ETH_BroadcastFramesReception value */ /* Set the DAIF bit according to ETH_DestinationAddrFilter value */ /* Set the PR bit according to ETH_PromiscuousMode value */ /* Set the PM, HMC and HPF bits according to ETH_MulticastFramesFilter value */ /* Set the HUC and HPF bits according to ETH_UnicastFramesFilter value */ /* Write to ETHERNET MACFFR */ ETH-&gt;MACFFR = (uint32_t)(ETH_InitStructure.ETH_ReceiveAll | ETH_InitStructure.ETH_SourceAddrFilter | ETH_InitStructure.ETH_PassControlFrames | ETH_InitStructure.ETH_BroadcastFramesReception | ETH_InitStructure.ETH_DestinationAddrFilter | ETH_InitStructure.ETH_PromiscuousMode | ETH_InitStructure.ETH_MulticastFramesFilter | ETH_InitStructure.ETH_UnicastFramesFilter); /*--------------- ETHERNET MACHTHR and MACHTLR Configuration ---------------*/ /* Write to ETHERNET MACHTHR */ ETH-&gt;MACHTHR = (uint32_t)ETH_InitStructure.ETH_HashTableHigh; /* Write to ETHERNET MACHTLR */ ETH-&gt;MACHTLR = (uint32_t)ETH_InitStructure.ETH_HashTableLow; /*----------------------- ETHERNET MACFCR Configuration --------------------*/ /* Get the ETHERNET MACFCR value */ tmpreg = ETH-&gt;MACFCR; /* Clear xx bits */ tmpreg &amp;= MACFCR_CLEAR_MASK; /* Set the PT bit according to ETH_PauseTime value */ /* Set the DZPQ bit according to ETH_ZeroQuantaPause value */ /* Set the PLT bit according to ETH_PauseLowThreshold value */ /* Set the UP bit according to ETH_UnicastPauseFrameDetect value */ /* Set the RFE bit according to ETH_ReceiveFlowControl value */ /* Set the TFE bit according to ETH_TransmitFlowControl value */ tmpreg |= (uint32_t)((ETH_InitStructure.ETH_PauseTime &lt;&lt; 16) | ETH_InitStructure.ETH_ZeroQuantaPause | ETH_InitStructure.ETH_PauseLowThreshold | ETH_InitStructure.ETH_UnicastPauseFrameDetect | ETH_InitStructure.ETH_ReceiveFlowControl | ETH_InitStructure.ETH_TransmitFlowControl); /* Write to ETHERNET MACFCR */ ETH-&gt;MACFCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACVLANTR Configuration -----------------*/ /* Set the ETV bit according to ETH_VLANTagComparison value */ /* Set the VL bit according to ETH_VLANTagIdentifier value */ ETH-&gt;MACVLANTR = (uint32_t)(ETH_InitStructure.ETH_VLANTagComparison | ETH_InitStructure.ETH_VLANTagIdentifier); /*-------------------------------- DMA Config ------------------------------*/ /*----------------------- ETHERNET DMAOMR Configuration --------------------*/ /* Get the ETHERNET DMAOMR value */ tmpreg = ETH-&gt;DMAOMR; /* Clear xx bits */ tmpreg &amp;= DMAOMR_CLEAR_MASK; /* Set the DT bit according to ETH_DropTCPIPChecksumErrorFrame value */ /* Set the RSF bit according to ETH_ReceiveStoreForward value */ /* Set the DFF bit according to ETH_FlushReceivedFrame value */ /* Set the TSF bit according to ETH_TransmitStoreForward value */ /* Set the TTC bit according to ETH_TransmitThresholdControl value */ /* Set the FEF bit according to ETH_ForwardErrorFrames value */ /* Set the FUF bit according to ETH_ForwardUndersizedGoodFrames value */ /* Set the RTC bit according to ETH_ReceiveThresholdControl value */ /* Set the OSF bit according to ETH_SecondFrameOperate value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_DropTCPIPChecksumErrorFrame | ETH_InitStructure.ETH_ReceiveStoreForward | ETH_InitStructure.ETH_FlushReceivedFrame | ETH_InitStructure.ETH_TransmitStoreForward | ETH_InitStructure.ETH_TransmitThresholdControl | ETH_InitStructure.ETH_ForwardErrorFrames | ETH_InitStructure.ETH_ForwardUndersizedGoodFrames | ETH_InitStructure.ETH_ReceiveThresholdControl | ETH_InitStructure.ETH_SecondFrameOperate); /* Write to ETHERNET DMAOMR */ ETH-&gt;DMAOMR = (uint32_t)tmpreg; /*----------------------- ETHERNET DMABMR Configuration --------------------*/ /* Set the AAL bit according to ETH_AddressAlignedBeats value */ /* Set the FB bit according to ETH_FixedBurst value */ /* Set the RPBL and 4*PBL bits according to ETH_RxDMABurstLength value */ /* Set the PBL and 4*PBL bits according to ETH_TxDMABurstLength value */ /* Set the DSL bit according to ETH_DesciptorSkipLength value */ /* Set the PR and DA bits according to ETH_DMAArbitration value */ ETH-&gt;DMABMR = (uint32_t)(ETH_InitStructure.ETH_AddressAlignedBeats | ETH_InitStructure.ETH_FixedBurst | ETH_InitStructure.ETH_RxDMABurstLength | /* !! if 4xPBL is selected for Tx or Rx it is applied for the other */ ETH_InitStructure.ETH_TxDMABurstLength | (ETH_InitStructure.ETH_DescriptorSkipLength &lt;&lt; 2) | ETH_InitStructure.ETH_DMAArbitration | ETH_DMABMR_USP); /* Enable use of separate PBL for Rx and Tx */ #ifdef USE_ENHANCED_DMA_DESCRIPTORS /* Enable the Enhanced DMA descriptors */ ETH-&gt;DMABMR |= ETH_DMABMR_EDE; #endif /* USE_ENHANCED_DMA_DESCRIPTORS */ /* Return Ethernet configuration success */ // return ETH_SUCCESS; // ETH_Start(); } else{/*link down process*/ } } 至此，对于STM32F207（裸机）- LWIP网线热插入网络不通遇到的问题以及解决办法介绍完毕。 -xuk 阅读更多" />
+<meta property="og:description" content="开发背景： 1、主芯片—STM32F207VCT6； 2、TCP/IP协议栈—LWIP，依托ST例程移植； 3、操作系统—无（裸机）； 异常现象： 1、网线不插入的情况下先给设备上电，之后再插入网线无法ping通；（如果上电前网线插入，网络正常）； 2、网络已经正常的情况下，电脑PC端修改传输模式（比如从原来的100M全双工修改为10M全双工）导致网络不通； 原因分析： 1、针对第一种异常情况，是由于上电时网线未插入，导致ETH初始化部分未能成功完成，之后即使再插入网线，程序中没有再次进行初始化的逻辑补充，从而导致网络异常； 2、针对第二种情况，情况是上电时完成了ETH的初始化并与PC协商成功，此时网络正常。但当PC端修改传输模式后，程序中未能执行再次协商与MAC的初始化工作，导致网络异常； 解决方法： 首先，要明确上述问题的关键点所在，所有的异常均是网线的拔插导致（PC端修改连接传输方式时也相当于网线的拔掉重插），因此主程序中必须要有对当前网络连接与断开的检测或者利用PHY芯片的中断引脚； 其次，无论利用轮询或是PHY中断配置引脚，根本的原理都是一样的，就是感知到网络的连接与断开，下面给出采用的查询方式： void Eth_Link_ITHandler(struct netif *netif) { /* Check whether the link interrupt has occurred or not */ if(((ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_MISR)) &amp; PHY_LINK_STATUS) != 0){/*检测插拔中断*/ uint16_t status = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR); if(status &amp; (PHY_AutoNego_Complete | PHY_Linked_Status)){/*检测到网线连接*/ if(EthInitStatus == 0){/*之前未成功初始化过*/ /*Reinit PHY*/ ETH_Reinit(); } else{/*之前已经成功初始化*/ /*set link up for re link callbalk function*/ netif_set_link_up(netif); } } else{/*网线断开*/\ /*set link down for re link callbalk function*/ netif_set_link_down(netif); } } } 备注说明：将该检测函数放入主循环，程序中标注的部分为解决网线热拔插问题的关键点。 1、标注红色的部分执行的条件是检测到网线插入且之前ETH部分未成功初始化过（即之前一直处在上电但网线未插入）的情况，此时需要对ETH重新初始化，从而解决异常现象的第一种情况，具体执行内容为： /** * @brief : first time power on but init failed, do again * @param : None * * @retval : None * @author : xuk */ void ETH_Reinit(void){ /* Configure Ethernet */ EthInitStatus = ETH_Init (&amp;ETH_InitStructure, DP83848_PHY_ADDRESS); } 其中ETH_InitStructure已设为全局结构体； 2、标注蓝色部分的执行条件是已经成功初始化过ETH，但之后出现了网线的拔插情况，此时需要在每次检测到网络连接时重新进行自协商并初始化MAC，具体的执行流程如下介绍： A、检测到该条件时，首先调用： netif_set_link_up(netif); netif_set_link_down(netif); B、追溯两个函数的定义处，如下： #if LWIP_NETIF_LINK_CALLBACK /** * Called by a driver when its link goes up */ void netif_set_link_up(struct netif *netif ) { netif-&gt;flags |= NETIF_FLAG_LINK_UP; #if LWIP_DHCP if (netif-&gt;dhcp) { dhcp_network_changed(netif); } #endif /* LWIP_DHCP */ #if LWIP_AUTOIP if (netif-&gt;autoip) { autoip_network_changed(netif); } #endif /* LWIP_AUTOIP */ if (netif-&gt;flags &amp; NETIF_FLAG_UP) { #if LWIP_ARP /* For Ethernet network interfaces, we would like to send a &quot;gratuitous ARP&quot; */ if (netif-&gt;flags &amp; NETIF_FLAG_ETHARP) { etharp_gratuitous(netif); } #endif /* LWIP_ARP */ #if LWIP_IGMP /* resend IGMP memberships */ if (netif-&gt;flags &amp; NETIF_FLAG_IGMP) { igmp_report_groups( netif); } #endif /* LWIP_IGMP */ } NETIF_LINK_CALLBACK(netif); } /** * Called by a driver when its link goes down */ void netif_set_link_down(struct netif *netif ) { netif-&gt;flags &amp;= ~NETIF_FLAG_LINK_UP; NETIF_LINK_CALLBACK(netif); } /** * Ask if a link is up */ u8_t netif_is_link_up(struct netif *netif) { return (netif-&gt;flags &amp; NETIF_FLAG_LINK_UP) ? 1 : 0; } /** * Set callback to be called when link is brought up/down */ void netif_set_link_callback (struct netif *netif, void (* link_callback)(struct netif *netif )) { if (netif) { netif-&gt;link_callback = link_callback; } } #endif /* LWIP_NETIF_LINK_CALLBACK */ 注意：I：从上述看出，若要这两个函数有效编译，则必须定义宏LWIP_NETIF_LINK_CALLBACK 为1，请自行设置； II：函数 netif_set_link_callback 的作用是指定网络连接发生改变时的回调函数； III：详细的讲一下主要思路， Eth_Link_ITHandler 执行中检测到网线拔插时分别调用 netif_set_link_up(netif)、netif_set_link_down(netif);这两个函数的调用会引发 netif_set_link_callback的执行，从而执行指定的网络连接或断开的回调函数； Ⅳ：通过netif_set_link_callback该函数在LWIP初始化的时候指定网络连接变化的回调函数，可放置如下位置： void LwIP_Init (void){ ...... ...... ...... ...... /*set the link up or link down callback function - xuk*/ netif_set_link_callback(&amp;netif,eth_re_link); } 其中，回调函数 eth_re_link 的具体内容如下，实现网络拔插后的重新自协商与MAC初始化： /** * @brief : process the relink of eth * @param : netif - - specify the ETH netif * * @retval : none * @author : xuk */ void eth_re_link (struct netif *netif){ __IO uint32_t tickstart = 0; uint32_t regvalue = 0, tmpreg = 0; if(netif_is_link_up(netif)){/*link up process*/ if(ETH_InitStructure.ETH_AutoNegotiation == ETH_AutoNegotiation_Enable){/*AutoNegotiation_Enable*/ /* Enable Auto-Negotiation */ ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, PHY_AutoNegotiation); /* Wait until the auto-negotiation will be completed */ do { tickstart++; } while (!(ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR) &amp; PHY_AutoNego_Complete) &amp;&amp; (tickstart &lt; (uint32_t)PHY_READ_TO)); /* Return ERROR in case of timeout */ if(tickstart == PHY_READ_TO) { // return ETH_ERROR; } /* Reset Timeout counter */ tickstart = 0; /* Read the result of the auto-negotiation */ regvalue = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_SR); /* Configure the MAC with the Duplex Mode fixed by the auto-negotiation process */ if((regvalue &amp; PHY_DUPLEX_STATUS) != (uint32_t)RESET) { /* Set Ethernet duplex mode to Full-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_FullDuplex; } else { /* Set Ethernet duplex mode to Half-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_HalfDuplex; } /* Configure the MAC with the speed fixed by the auto-negotiation process */ if(regvalue &amp; PHY_SPEED_STATUS) { /* Set Ethernet speed to 10M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_10M; } else { /* Set Ethernet speed to 100M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_100M; } } else{/*AutoNegotiation_Disable*/ if(!ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, ((uint16_t)(ETH_InitStructure.ETH_Mode &gt;&gt; 3) | (uint16_t)(ETH_InitStructure.ETH_Speed &gt;&gt; 1)))) { /* Return ERROR in case of write timeout */ // return ETH_ERROR; } /* Delay to assure PHY configuration */ // _eth_delay_(PHY_CONFIG_DELAY); } /*------------------------ ETHERNET MACCR Configuration --------------------*/ /* Get the ETHERNET MACCR value */ tmpreg = ETH-&gt;MACCR; /* Clear WD, PCE, PS, TE and RE bits */ tmpreg &amp;= MACCR_CLEAR_MASK; /* Set the WD bit according to ETH_Watchdog value */ /* Set the JD: bit according to ETH_Jabber value */ /* Set the IFG bit according to ETH_InterFrameGap value */ /* Set the DCRS bit according to ETH_CarrierSense value */ /* Set the FES bit according to ETH_Speed value */ /* Set the DO bit according to ETH_ReceiveOwn value */ /* Set the LM bit according to ETH_LoopbackMode value */ /* Set the DM bit according to ETH_Mode value */ /* Set the IPCO bit according to ETH_ChecksumOffload value */ /* Set the DR bit according to ETH_RetryTransmission value */ /* Set the ACS bit according to ETH_AutomaticPadCRCStrip value */ /* Set the BL bit according to ETH_BackOffLimit value */ /* Set the DC bit according to ETH_DeferralCheck value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_Watchdog | ETH_InitStructure.ETH_Jabber | ETH_InitStructure.ETH_InterFrameGap | ETH_InitStructure.ETH_CarrierSense | ETH_InitStructure.ETH_Speed | ETH_InitStructure.ETH_ReceiveOwn | ETH_InitStructure.ETH_LoopbackMode | ETH_InitStructure.ETH_Mode | ETH_InitStructure.ETH_ChecksumOffload | ETH_InitStructure.ETH_RetryTransmission | ETH_InitStructure.ETH_AutomaticPadCRCStrip | ETH_InitStructure.ETH_BackOffLimit | ETH_InitStructure.ETH_DeferralCheck); /* Write to ETHERNET MACCR */ ETH-&gt;MACCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACFFR Configuration --------------------*/ /* Set the RA bit according to ETH_ReceiveAll value */ /* Set the SAF and SAIF bits according to ETH_SourceAddrFilter value */ /* Set the PCF bit according to ETH_PassControlFrames value */ /* Set the DBF bit according to ETH_BroadcastFramesReception value */ /* Set the DAIF bit according to ETH_DestinationAddrFilter value */ /* Set the PR bit according to ETH_PromiscuousMode value */ /* Set the PM, HMC and HPF bits according to ETH_MulticastFramesFilter value */ /* Set the HUC and HPF bits according to ETH_UnicastFramesFilter value */ /* Write to ETHERNET MACFFR */ ETH-&gt;MACFFR = (uint32_t)(ETH_InitStructure.ETH_ReceiveAll | ETH_InitStructure.ETH_SourceAddrFilter | ETH_InitStructure.ETH_PassControlFrames | ETH_InitStructure.ETH_BroadcastFramesReception | ETH_InitStructure.ETH_DestinationAddrFilter | ETH_InitStructure.ETH_PromiscuousMode | ETH_InitStructure.ETH_MulticastFramesFilter | ETH_InitStructure.ETH_UnicastFramesFilter); /*--------------- ETHERNET MACHTHR and MACHTLR Configuration ---------------*/ /* Write to ETHERNET MACHTHR */ ETH-&gt;MACHTHR = (uint32_t)ETH_InitStructure.ETH_HashTableHigh; /* Write to ETHERNET MACHTLR */ ETH-&gt;MACHTLR = (uint32_t)ETH_InitStructure.ETH_HashTableLow; /*----------------------- ETHERNET MACFCR Configuration --------------------*/ /* Get the ETHERNET MACFCR value */ tmpreg = ETH-&gt;MACFCR; /* Clear xx bits */ tmpreg &amp;= MACFCR_CLEAR_MASK; /* Set the PT bit according to ETH_PauseTime value */ /* Set the DZPQ bit according to ETH_ZeroQuantaPause value */ /* Set the PLT bit according to ETH_PauseLowThreshold value */ /* Set the UP bit according to ETH_UnicastPauseFrameDetect value */ /* Set the RFE bit according to ETH_ReceiveFlowControl value */ /* Set the TFE bit according to ETH_TransmitFlowControl value */ tmpreg |= (uint32_t)((ETH_InitStructure.ETH_PauseTime &lt;&lt; 16) | ETH_InitStructure.ETH_ZeroQuantaPause | ETH_InitStructure.ETH_PauseLowThreshold | ETH_InitStructure.ETH_UnicastPauseFrameDetect | ETH_InitStructure.ETH_ReceiveFlowControl | ETH_InitStructure.ETH_TransmitFlowControl); /* Write to ETHERNET MACFCR */ ETH-&gt;MACFCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACVLANTR Configuration -----------------*/ /* Set the ETV bit according to ETH_VLANTagComparison value */ /* Set the VL bit according to ETH_VLANTagIdentifier value */ ETH-&gt;MACVLANTR = (uint32_t)(ETH_InitStructure.ETH_VLANTagComparison | ETH_InitStructure.ETH_VLANTagIdentifier); /*-------------------------------- DMA Config ------------------------------*/ /*----------------------- ETHERNET DMAOMR Configuration --------------------*/ /* Get the ETHERNET DMAOMR value */ tmpreg = ETH-&gt;DMAOMR; /* Clear xx bits */ tmpreg &amp;= DMAOMR_CLEAR_MASK; /* Set the DT bit according to ETH_DropTCPIPChecksumErrorFrame value */ /* Set the RSF bit according to ETH_ReceiveStoreForward value */ /* Set the DFF bit according to ETH_FlushReceivedFrame value */ /* Set the TSF bit according to ETH_TransmitStoreForward value */ /* Set the TTC bit according to ETH_TransmitThresholdControl value */ /* Set the FEF bit according to ETH_ForwardErrorFrames value */ /* Set the FUF bit according to ETH_ForwardUndersizedGoodFrames value */ /* Set the RTC bit according to ETH_ReceiveThresholdControl value */ /* Set the OSF bit according to ETH_SecondFrameOperate value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_DropTCPIPChecksumErrorFrame | ETH_InitStructure.ETH_ReceiveStoreForward | ETH_InitStructure.ETH_FlushReceivedFrame | ETH_InitStructure.ETH_TransmitStoreForward | ETH_InitStructure.ETH_TransmitThresholdControl | ETH_InitStructure.ETH_ForwardErrorFrames | ETH_InitStructure.ETH_ForwardUndersizedGoodFrames | ETH_InitStructure.ETH_ReceiveThresholdControl | ETH_InitStructure.ETH_SecondFrameOperate); /* Write to ETHERNET DMAOMR */ ETH-&gt;DMAOMR = (uint32_t)tmpreg; /*----------------------- ETHERNET DMABMR Configuration --------------------*/ /* Set the AAL bit according to ETH_AddressAlignedBeats value */ /* Set the FB bit according to ETH_FixedBurst value */ /* Set the RPBL and 4*PBL bits according to ETH_RxDMABurstLength value */ /* Set the PBL and 4*PBL bits according to ETH_TxDMABurstLength value */ /* Set the DSL bit according to ETH_DesciptorSkipLength value */ /* Set the PR and DA bits according to ETH_DMAArbitration value */ ETH-&gt;DMABMR = (uint32_t)(ETH_InitStructure.ETH_AddressAlignedBeats | ETH_InitStructure.ETH_FixedBurst | ETH_InitStructure.ETH_RxDMABurstLength | /* !! if 4xPBL is selected for Tx or Rx it is applied for the other */ ETH_InitStructure.ETH_TxDMABurstLength | (ETH_InitStructure.ETH_DescriptorSkipLength &lt;&lt; 2) | ETH_InitStructure.ETH_DMAArbitration | ETH_DMABMR_USP); /* Enable use of separate PBL for Rx and Tx */ #ifdef USE_ENHANCED_DMA_DESCRIPTORS /* Enable the Enhanced DMA descriptors */ ETH-&gt;DMABMR |= ETH_DMABMR_EDE; #endif /* USE_ENHANCED_DMA_DESCRIPTORS */ /* Return Ethernet configuration success */ // return ETH_SUCCESS; // ETH_Start(); } else{/*link down process*/ } } 至此，对于STM32F207（裸机）- LWIP网线热插入网络不通遇到的问题以及解决办法介绍完毕。 -xuk 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2017/09/01/6e1ac3ced7cd2d3c9a92ec7e061131ce.html" />
+<meta property="og:url" content="https://uzzz.org/2017/09/01/6e1ac3ced7cd2d3c9a92ec7e061131ce.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2017-09-01T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"开发背景： 1、主芯片—STM32F207VCT6； 2、TCP/IP协议栈—LWIP，依托ST例程移植； 3、操作系统—无（裸机）； 异常现象： 1、网线不插入的情况下先给设备上电，之后再插入网线无法ping通；（如果上电前网线插入，网络正常）； 2、网络已经正常的情况下，电脑PC端修改传输模式（比如从原来的100M全双工修改为10M全双工）导致网络不通； 原因分析： 1、针对第一种异常情况，是由于上电时网线未插入，导致ETH初始化部分未能成功完成，之后即使再插入网线，程序中没有再次进行初始化的逻辑补充，从而导致网络异常； 2、针对第二种情况，情况是上电时完成了ETH的初始化并与PC协商成功，此时网络正常。但当PC端修改传输模式后，程序中未能执行再次协商与MAC的初始化工作，导致网络异常； 解决方法： 首先，要明确上述问题的关键点所在，所有的异常均是网线的拔插导致（PC端修改连接传输方式时也相当于网线的拔掉重插），因此主程序中必须要有对当前网络连接与断开的检测或者利用PHY芯片的中断引脚； 其次，无论利用轮询或是PHY中断配置引脚，根本的原理都是一样的，就是感知到网络的连接与断开，下面给出采用的查询方式： void Eth_Link_ITHandler(struct netif *netif) { /* Check whether the link interrupt has occurred or not */ if(((ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_MISR)) &amp; PHY_LINK_STATUS) != 0){/*检测插拔中断*/ uint16_t status = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR); if(status &amp; (PHY_AutoNego_Complete | PHY_Linked_Status)){/*检测到网线连接*/ if(EthInitStatus == 0){/*之前未成功初始化过*/ /*Reinit PHY*/ ETH_Reinit(); } else{/*之前已经成功初始化*/ /*set link up for re link callbalk function*/ netif_set_link_up(netif); } } else{/*网线断开*/\\ /*set link down for re link callbalk function*/ netif_set_link_down(netif); } } } 备注说明：将该检测函数放入主循环，程序中标注的部分为解决网线热拔插问题的关键点。 1、标注红色的部分执行的条件是检测到网线插入且之前ETH部分未成功初始化过（即之前一直处在上电但网线未插入）的情况，此时需要对ETH重新初始化，从而解决异常现象的第一种情况，具体执行内容为： /** * @brief : first time power on but init failed, do again * @param : None * * @retval : None * @author : xuk */ void ETH_Reinit(void){ /* Configure Ethernet */ EthInitStatus = ETH_Init (&amp;ETH_InitStructure, DP83848_PHY_ADDRESS); } 其中ETH_InitStructure已设为全局结构体； 2、标注蓝色部分的执行条件是已经成功初始化过ETH，但之后出现了网线的拔插情况，此时需要在每次检测到网络连接时重新进行自协商并初始化MAC，具体的执行流程如下介绍： A、检测到该条件时，首先调用： netif_set_link_up(netif); netif_set_link_down(netif); B、追溯两个函数的定义处，如下： #if LWIP_NETIF_LINK_CALLBACK /** * Called by a driver when its link goes up */ void netif_set_link_up(struct netif *netif ) { netif-&gt;flags |= NETIF_FLAG_LINK_UP; #if LWIP_DHCP if (netif-&gt;dhcp) { dhcp_network_changed(netif); } #endif /* LWIP_DHCP */ #if LWIP_AUTOIP if (netif-&gt;autoip) { autoip_network_changed(netif); } #endif /* LWIP_AUTOIP */ if (netif-&gt;flags &amp; NETIF_FLAG_UP) { #if LWIP_ARP /* For Ethernet network interfaces, we would like to send a &quot;gratuitous ARP&quot; */ if (netif-&gt;flags &amp; NETIF_FLAG_ETHARP) { etharp_gratuitous(netif); } #endif /* LWIP_ARP */ #if LWIP_IGMP /* resend IGMP memberships */ if (netif-&gt;flags &amp; NETIF_FLAG_IGMP) { igmp_report_groups( netif); } #endif /* LWIP_IGMP */ } NETIF_LINK_CALLBACK(netif); } /** * Called by a driver when its link goes down */ void netif_set_link_down(struct netif *netif ) { netif-&gt;flags &amp;= ~NETIF_FLAG_LINK_UP; NETIF_LINK_CALLBACK(netif); } /** * Ask if a link is up */ u8_t netif_is_link_up(struct netif *netif) { return (netif-&gt;flags &amp; NETIF_FLAG_LINK_UP) ? 1 : 0; } /** * Set callback to be called when link is brought up/down */ void netif_set_link_callback (struct netif *netif, void (* link_callback)(struct netif *netif )) { if (netif) { netif-&gt;link_callback = link_callback; } } #endif /* LWIP_NETIF_LINK_CALLBACK */ 注意：I：从上述看出，若要这两个函数有效编译，则必须定义宏LWIP_NETIF_LINK_CALLBACK 为1，请自行设置； II：函数 netif_set_link_callback 的作用是指定网络连接发生改变时的回调函数； III：详细的讲一下主要思路， Eth_Link_ITHandler 执行中检测到网线拔插时分别调用 netif_set_link_up(netif)、netif_set_link_down(netif);这两个函数的调用会引发 netif_set_link_callback的执行，从而执行指定的网络连接或断开的回调函数； Ⅳ：通过netif_set_link_callback该函数在LWIP初始化的时候指定网络连接变化的回调函数，可放置如下位置： void LwIP_Init (void){ ...... ...... ...... ...... /*set the link up or link down callback function - xuk*/ netif_set_link_callback(&amp;netif,eth_re_link); } 其中，回调函数 eth_re_link 的具体内容如下，实现网络拔插后的重新自协商与MAC初始化： /** * @brief : process the relink of eth * @param : netif - - specify the ETH netif * * @retval : none * @author : xuk */ void eth_re_link (struct netif *netif){ __IO uint32_t tickstart = 0; uint32_t regvalue = 0, tmpreg = 0; if(netif_is_link_up(netif)){/*link up process*/ if(ETH_InitStructure.ETH_AutoNegotiation == ETH_AutoNegotiation_Enable){/*AutoNegotiation_Enable*/ /* Enable Auto-Negotiation */ ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, PHY_AutoNegotiation); /* Wait until the auto-negotiation will be completed */ do { tickstart++; } while (!(ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR) &amp; PHY_AutoNego_Complete) &amp;&amp; (tickstart &lt; (uint32_t)PHY_READ_TO)); /* Return ERROR in case of timeout */ if(tickstart == PHY_READ_TO) { // return ETH_ERROR; } /* Reset Timeout counter */ tickstart = 0; /* Read the result of the auto-negotiation */ regvalue = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_SR); /* Configure the MAC with the Duplex Mode fixed by the auto-negotiation process */ if((regvalue &amp; PHY_DUPLEX_STATUS) != (uint32_t)RESET) { /* Set Ethernet duplex mode to Full-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_FullDuplex; } else { /* Set Ethernet duplex mode to Half-duplex following the auto-negotiation */ ETH_InitStructure.ETH_Mode = ETH_Mode_HalfDuplex; } /* Configure the MAC with the speed fixed by the auto-negotiation process */ if(regvalue &amp; PHY_SPEED_STATUS) { /* Set Ethernet speed to 10M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_10M; } else { /* Set Ethernet speed to 100M following the auto-negotiation */ ETH_InitStructure.ETH_Speed = ETH_Speed_100M; } } else{/*AutoNegotiation_Disable*/ if(!ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, ((uint16_t)(ETH_InitStructure.ETH_Mode &gt;&gt; 3) | (uint16_t)(ETH_InitStructure.ETH_Speed &gt;&gt; 1)))) { /* Return ERROR in case of write timeout */ // return ETH_ERROR; } /* Delay to assure PHY configuration */ // _eth_delay_(PHY_CONFIG_DELAY); } /*------------------------ ETHERNET MACCR Configuration --------------------*/ /* Get the ETHERNET MACCR value */ tmpreg = ETH-&gt;MACCR; /* Clear WD, PCE, PS, TE and RE bits */ tmpreg &amp;= MACCR_CLEAR_MASK; /* Set the WD bit according to ETH_Watchdog value */ /* Set the JD: bit according to ETH_Jabber value */ /* Set the IFG bit according to ETH_InterFrameGap value */ /* Set the DCRS bit according to ETH_CarrierSense value */ /* Set the FES bit according to ETH_Speed value */ /* Set the DO bit according to ETH_ReceiveOwn value */ /* Set the LM bit according to ETH_LoopbackMode value */ /* Set the DM bit according to ETH_Mode value */ /* Set the IPCO bit according to ETH_ChecksumOffload value */ /* Set the DR bit according to ETH_RetryTransmission value */ /* Set the ACS bit according to ETH_AutomaticPadCRCStrip value */ /* Set the BL bit according to ETH_BackOffLimit value */ /* Set the DC bit according to ETH_DeferralCheck value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_Watchdog | ETH_InitStructure.ETH_Jabber | ETH_InitStructure.ETH_InterFrameGap | ETH_InitStructure.ETH_CarrierSense | ETH_InitStructure.ETH_Speed | ETH_InitStructure.ETH_ReceiveOwn | ETH_InitStructure.ETH_LoopbackMode | ETH_InitStructure.ETH_Mode | ETH_InitStructure.ETH_ChecksumOffload | ETH_InitStructure.ETH_RetryTransmission | ETH_InitStructure.ETH_AutomaticPadCRCStrip | ETH_InitStructure.ETH_BackOffLimit | ETH_InitStructure.ETH_DeferralCheck); /* Write to ETHERNET MACCR */ ETH-&gt;MACCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACFFR Configuration --------------------*/ /* Set the RA bit according to ETH_ReceiveAll value */ /* Set the SAF and SAIF bits according to ETH_SourceAddrFilter value */ /* Set the PCF bit according to ETH_PassControlFrames value */ /* Set the DBF bit according to ETH_BroadcastFramesReception value */ /* Set the DAIF bit according to ETH_DestinationAddrFilter value */ /* Set the PR bit according to ETH_PromiscuousMode value */ /* Set the PM, HMC and HPF bits according to ETH_MulticastFramesFilter value */ /* Set the HUC and HPF bits according to ETH_UnicastFramesFilter value */ /* Write to ETHERNET MACFFR */ ETH-&gt;MACFFR = (uint32_t)(ETH_InitStructure.ETH_ReceiveAll | ETH_InitStructure.ETH_SourceAddrFilter | ETH_InitStructure.ETH_PassControlFrames | ETH_InitStructure.ETH_BroadcastFramesReception | ETH_InitStructure.ETH_DestinationAddrFilter | ETH_InitStructure.ETH_PromiscuousMode | ETH_InitStructure.ETH_MulticastFramesFilter | ETH_InitStructure.ETH_UnicastFramesFilter); /*--------------- ETHERNET MACHTHR and MACHTLR Configuration ---------------*/ /* Write to ETHERNET MACHTHR */ ETH-&gt;MACHTHR = (uint32_t)ETH_InitStructure.ETH_HashTableHigh; /* Write to ETHERNET MACHTLR */ ETH-&gt;MACHTLR = (uint32_t)ETH_InitStructure.ETH_HashTableLow; /*----------------------- ETHERNET MACFCR Configuration --------------------*/ /* Get the ETHERNET MACFCR value */ tmpreg = ETH-&gt;MACFCR; /* Clear xx bits */ tmpreg &amp;= MACFCR_CLEAR_MASK; /* Set the PT bit according to ETH_PauseTime value */ /* Set the DZPQ bit according to ETH_ZeroQuantaPause value */ /* Set the PLT bit according to ETH_PauseLowThreshold value */ /* Set the UP bit according to ETH_UnicastPauseFrameDetect value */ /* Set the RFE bit according to ETH_ReceiveFlowControl value */ /* Set the TFE bit according to ETH_TransmitFlowControl value */ tmpreg |= (uint32_t)((ETH_InitStructure.ETH_PauseTime &lt;&lt; 16) | ETH_InitStructure.ETH_ZeroQuantaPause | ETH_InitStructure.ETH_PauseLowThreshold | ETH_InitStructure.ETH_UnicastPauseFrameDetect | ETH_InitStructure.ETH_ReceiveFlowControl | ETH_InitStructure.ETH_TransmitFlowControl); /* Write to ETHERNET MACFCR */ ETH-&gt;MACFCR = (uint32_t)tmpreg; /*----------------------- ETHERNET MACVLANTR Configuration -----------------*/ /* Set the ETV bit according to ETH_VLANTagComparison value */ /* Set the VL bit according to ETH_VLANTagIdentifier value */ ETH-&gt;MACVLANTR = (uint32_t)(ETH_InitStructure.ETH_VLANTagComparison | ETH_InitStructure.ETH_VLANTagIdentifier); /*-------------------------------- DMA Config ------------------------------*/ /*----------------------- ETHERNET DMAOMR Configuration --------------------*/ /* Get the ETHERNET DMAOMR value */ tmpreg = ETH-&gt;DMAOMR; /* Clear xx bits */ tmpreg &amp;= DMAOMR_CLEAR_MASK; /* Set the DT bit according to ETH_DropTCPIPChecksumErrorFrame value */ /* Set the RSF bit according to ETH_ReceiveStoreForward value */ /* Set the DFF bit according to ETH_FlushReceivedFrame value */ /* Set the TSF bit according to ETH_TransmitStoreForward value */ /* Set the TTC bit according to ETH_TransmitThresholdControl value */ /* Set the FEF bit according to ETH_ForwardErrorFrames value */ /* Set the FUF bit according to ETH_ForwardUndersizedGoodFrames value */ /* Set the RTC bit according to ETH_ReceiveThresholdControl value */ /* Set the OSF bit according to ETH_SecondFrameOperate value */ tmpreg |= (uint32_t)(ETH_InitStructure.ETH_DropTCPIPChecksumErrorFrame | ETH_InitStructure.ETH_ReceiveStoreForward | ETH_InitStructure.ETH_FlushReceivedFrame | ETH_InitStructure.ETH_TransmitStoreForward | ETH_InitStructure.ETH_TransmitThresholdControl | ETH_InitStructure.ETH_ForwardErrorFrames | ETH_InitStructure.ETH_ForwardUndersizedGoodFrames | ETH_InitStructure.ETH_ReceiveThresholdControl | ETH_InitStructure.ETH_SecondFrameOperate); /* Write to ETHERNET DMAOMR */ ETH-&gt;DMAOMR = (uint32_t)tmpreg; /*----------------------- ETHERNET DMABMR Configuration --------------------*/ /* Set the AAL bit according to ETH_AddressAlignedBeats value */ /* Set the FB bit according to ETH_FixedBurst value */ /* Set the RPBL and 4*PBL bits according to ETH_RxDMABurstLength value */ /* Set the PBL and 4*PBL bits according to ETH_TxDMABurstLength value */ /* Set the DSL bit according to ETH_DesciptorSkipLength value */ /* Set the PR and DA bits according to ETH_DMAArbitration value */ ETH-&gt;DMABMR = (uint32_t)(ETH_InitStructure.ETH_AddressAlignedBeats | ETH_InitStructure.ETH_FixedBurst | ETH_InitStructure.ETH_RxDMABurstLength | /* !! if 4xPBL is selected for Tx or Rx it is applied for the other */ ETH_InitStructure.ETH_TxDMABurstLength | (ETH_InitStructure.ETH_DescriptorSkipLength &lt;&lt; 2) | ETH_InitStructure.ETH_DMAArbitration | ETH_DMABMR_USP); /* Enable use of separate PBL for Rx and Tx */ #ifdef USE_ENHANCED_DMA_DESCRIPTORS /* Enable the Enhanced DMA descriptors */ ETH-&gt;DMABMR |= ETH_DMABMR_EDE; #endif /* USE_ENHANCED_DMA_DESCRIPTORS */ /* Return Ethernet configuration success */ // return ETH_SUCCESS; // ETH_Start(); } else{/*link down process*/ } } 至此，对于STM32F207（裸机）- LWIP网线热插入网络不通遇到的问题以及解决办法介绍完毕。 -xuk 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2017/09/01/6e1ac3ced7cd2d3c9a92ec7e061131ce.html","headline":"STM32移植LWIP网线热插入网络不通的解决办法","dateModified":"2017-09-01T00:00:00+08:00","datePublished":"2017-09-01T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2017/09/01/6e1ac3ced7cd2d3c9a92ec7e061131ce.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>STM32移植LWIP网线热插入网络不通的解决办法</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-e2445db1a8.css"> 
+ <div class="htmledit_views"> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;"><strong>开发背景：</strong></span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">1、主芯片—STM32F207VCT6；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">2、TCP/IP协议栈—LWIP，依托ST例程移植；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">3、操作系统—无（裸机）；</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;"><strong>异常现象：</strong></span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">1、网线不插入的情况下先给设备上电，之后再插入网线无法ping通；（如果上电前网线插入，网络正常）；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">2、网络已经正常的情况下，电脑PC端修改传输模式（比如从原来的100M全双工修改为10M全双工）导致网络不通；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;"><strong>原因分析：</strong></span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">1、针对第一种异常情况，是由于上电时网线未插入，导致ETH初始化部分未能成功完成，之后即使再插入网线，程序中没有再次进行初始化的逻辑补充，从而导致网络异常；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">2、针对第二种情况，情况是上电时完成了ETH的初始化并与PC协商成功，此时网络正常。但当PC端修改传输模式后，程序中未能执行再次协商与MAC的初始化工作，导致网络异常；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;"><strong>解决方法：</strong></span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">首先，要明确上述问题的关键点所在，所有的异常均是网线的拔插导致（PC端修改连接传输方式时也相当于网线的拔掉重插），因此主程序中必须要有对当前网络连接与断开的检测或者利用PHY芯片的中断引脚；</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">其次，无论利用轮询或是PHY中断配置引脚，根本的原理都是一样的，就是感知到网络的连接与断开，下面给出采用的查询方式：</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">void Eth_Link_ITHandler(struct netif *netif)</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/* Check whether the link interrupt has occurred or not */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if(((ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_MISR)) &amp; PHY_LINK_STATUS) != 0){/*检测插拔中断*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">uint16_t status = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if(status &amp; (PHY_AutoNego_Complete | PHY_Linked_Status)){/*检测到网线连接*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if(EthInitStatus == 0){/*之前未成功初始化过*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);"><strong>/*Reinit PHY*/</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);"><strong>ETH_Reinit();</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">else{/*之前已经成功初始化*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/*set link up for re link callbalk function*/ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(9,115,248);"><strong>netif_set_link_up(netif); </strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">else{/*网线断开*/\</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/*set link down for re link callbalk function*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(9,115,248);"><strong>netif_set_link_down(netif);</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">备注说明：将该检测函数放入主循环，程序中标注的部分为解决网线热拔插问题的关键点。</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">1、标注红色的部分执行的条件是检测到网线插入且之前ETH部分未成功初始化过（即之前一直处在上电但网线未插入）的情况，此时需要对ETH重新初始化，从而解决异常现象的第一种情况，具体执行内容为：</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* @brief : first time power on but init failed, do again</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* @param : None </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* @retval : None</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* @author : xuk</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">void ETH_Reinit(void){</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/* Configure Ethernet */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">EthInitStatus = </span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">ETH_Init</span>
+   <span style="font-size:22px;font-family:'Times New Roman';">(&amp;ETH_InitStructure, DP83848_PHY_ADDRESS); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">其中ETH_InitStructure已设为全局结构体；</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">2、标注蓝色部分的执行条件是已经成功初始化过ETH，但之后出现了网线的拔插情况，此时需要在每次检测到网络连接时重新进行自协商并初始化MAC，具体的执行流程如下介绍：</span>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">A、检测到该条件时，首先调用：</span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;"></span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(9,115,248);"><strong>netif_set_link_up(netif); </strong></span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(9,115,248);"><strong>netif_set_link_down(netif);</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">B、追溯两个函数的定义处，如下：</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);"><strong>#if LWIP_NETIF_LINK_CALLBACK</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* Called by a driver when its link goes up</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">void netif_set_link_up(struct netif *netif )</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">netif-&gt;flags |= NETIF_FLAG_LINK_UP;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#if LWIP_DHCP</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif-&gt;dhcp) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">dhcp_network_changed(netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#endif /* LWIP_DHCP */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#if LWIP_AUTOIP</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif-&gt;autoip) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">autoip_network_changed(netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#endif /* LWIP_AUTOIP */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif-&gt;flags &amp; NETIF_FLAG_UP) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#if LWIP_ARP</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/* For Ethernet network interfaces, we would like to send a "gratuitous ARP" */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif-&gt;flags &amp; NETIF_FLAG_ETHARP) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">etharp_gratuitous(netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#endif /* LWIP_ARP */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#if LWIP_IGMP</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/* resend IGMP memberships */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif-&gt;flags &amp; NETIF_FLAG_IGMP) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">igmp_report_groups( netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">#endif /* LWIP_IGMP */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">NETIF_LINK_CALLBACK(netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* Called by a driver when its link goes down</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">void netif_set_link_down(struct netif *netif )</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">netif-&gt;flags &amp;= ~NETIF_FLAG_LINK_UP;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">NETIF_LINK_CALLBACK(netif);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">* Ask if a link is up</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">*/ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">u8_t netif_is_link_up(struct netif *netif)</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">return (netif-&gt;flags &amp; NETIF_FLAG_LINK_UP) ? 1 : 0;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">* Set callback to be called when link is brought up/down</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">void </span>
+   <span style="font-size:22px;font-family:'Times New Roman';"><strong>netif_set_link_callback</strong></span>
+   <span style="font-size:22px;font-family:'Times New Roman';">(struct netif *netif, void (* link_callback)(struct netif *netif ))</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">if (netif) {</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">netif-&gt;link_callback = link_callback;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">#endif /* LWIP_NETIF_LINK_CALLBACK */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">注意：I：从上述看出，若要这两个函数有效编译，则必须定义宏LWIP_NETIF_LINK_CALLBACK 为1，请自行设置；</span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">II：函数</span>
+   <span style="font-size:22px;font-family:'Times New Roman';"><strong>netif_set_link_callback</strong></span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">的作用是指定网络连接发生改变时的回调函数；</span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">III：详细的讲一下主要思路，</span>
+   <span style="font-size:22px;font-family:'Times New Roman';">Eth_Link_ITHandler</span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(223,64,42);">执行中检测到网线拔插时分别调用</span>
+   <span style="font-size:22px;font-family:'Times New Roman';color:rgb(9,115,248);"><strong>netif_set_link_up(netif)、netif_set_link_down(netif);这两个函数的调用会引发</strong></span>
+   <span style="font-size:22px;font-family:'Times New Roman';"><strong>netif_set_link_callback的执行，从而执行指定的网络连接或断开的回调函数；</strong></span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:22px;font-family:'Times New Roman';"><strong>Ⅳ：通过netif_set_link_callback该函数在LWIP初始化的时候指定网络连接变化的回调函数，可放置如下位置：</strong></span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">void </span>
+   <span style="font-size:18px;"><strong>LwIP_Init</strong></span>
+   <span style="font-size:18px;">(void){</span>
+  </div> 
+  <div style="text-indent:84px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">......</span>
+  </div> 
+  <div style="text-indent:84px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">......</span>
+  </div> 
+  <div style="text-indent:84px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">......</span>
+  </div> 
+  <div style="text-indent:84px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">......</span>
+  </div> 
+  <div style="text-indent:84px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;color:rgb(223,64,42);"><strong>/*set the link up or link down callback function - xuk*/</strong></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;color:rgb(223,64,42);"><strong>netif_set_link_callback(&amp;netif,eth_re_link);</strong></span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">其中，回调函数</span>
+   <span style="font-size:18px;color:rgb(223,64,42);"><strong>eth_re_link</strong></span>
+   <span style="font-size:18px;">的具体内容如下，实现网络拔插后的重新自协商与MAC初始化：</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/**</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">* @brief : process the relink of eth</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">* @param : netif - - specify the ETH netif</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">* </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">* @retval : none</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">* @author : xuk</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">void </span>
+   <span style="font-size:18px;color:rgb(223,64,42);"><strong>eth_re_link</strong></span>
+   <span style="font-size:18px;">(struct netif *netif){</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">__IO uint32_t tickstart = 0;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+   <span style="font-size:18px;">uint32_t regvalue = 0, tmpreg = 0;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if(netif_is_link_up(netif)){/*link up process*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if(ETH_InitStructure.ETH_AutoNegotiation == ETH_AutoNegotiation_Enable){/*AutoNegotiation_Enable*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Enable Auto-Negotiation */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, PHY_AutoNegotiation);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Wait until the auto-negotiation will be completed */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">do</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tickstart++;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">} while (!(ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_BSR) &amp; PHY_AutoNego_Complete) &amp;&amp; (tickstart &lt; (uint32_t)PHY_READ_TO));</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Return ERROR in case of timeout */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if(tickstart == PHY_READ_TO)</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">// return ETH_ERROR;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Reset Timeout counter */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tickstart = 0;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Read the result of the auto-negotiation */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">regvalue = ETH_ReadPHYRegister(DP83848_PHY_ADDRESS, PHY_SR);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Configure the MAC with the Duplex Mode fixed by the auto-negotiation process */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if((regvalue &amp; PHY_DUPLEX_STATUS) != (uint32_t)RESET)</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set Ethernet duplex mode to Full-duplex following the auto-negotiation */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Mode = ETH_Mode_FullDuplex; </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">else</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set Ethernet duplex mode to Half-duplex following the auto-negotiation */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Mode = ETH_Mode_HalfDuplex; </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Configure the MAC with the speed fixed by the auto-negotiation process */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if(regvalue &amp; PHY_SPEED_STATUS)</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set Ethernet speed to 10M following the auto-negotiation */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Speed = ETH_Speed_10M; </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">else</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set Ethernet speed to 100M following the auto-negotiation */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Speed = ETH_Speed_100M; </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">} </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">else{/*AutoNegotiation_Disable*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">if(!ETH_WritePHYRegister(DP83848_PHY_ADDRESS, PHY_BCR, ((uint16_t)(ETH_InitStructure.ETH_Mode &gt;&gt; 3) |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">(uint16_t)(ETH_InitStructure.ETH_Speed &gt;&gt; 1))))</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">{</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Return ERROR in case of write timeout */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">// return ETH_ERROR;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Delay to assure PHY configuration */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">// _eth_delay_(PHY_CONFIG_DELAY);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*------------------------ ETHERNET MACCR Configuration --------------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Get the ETHERNET MACCR value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg = ETH-&gt;MACCR;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Clear WD, PCE, PS, TE and RE bits */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg &amp;= MACCR_CLEAR_MASK;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the WD bit according to ETH_Watchdog value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the JD: bit according to ETH_Jabber value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the IFG bit according to ETH_InterFrameGap value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DCRS bit according to ETH_CarrierSense value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the FES bit according to ETH_Speed value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DO bit according to ETH_ReceiveOwn value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the LM bit according to ETH_LoopbackMode value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DM bit according to ETH_Mode value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the IPCO bit according to ETH_ChecksumOffload value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DR bit according to ETH_RetryTransmission value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the ACS bit according to ETH_AutomaticPadCRCStrip value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the BL bit according to ETH_BackOffLimit value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DC bit according to ETH_DeferralCheck value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg |= (uint32_t)(ETH_InitStructure.ETH_Watchdog | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Jabber | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_InterFrameGap |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_CarrierSense |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Speed | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ReceiveOwn |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_LoopbackMode |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_Mode | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ChecksumOffload | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_RetryTransmission | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_AutomaticPadCRCStrip | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_BackOffLimit | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_DeferralCheck);</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET MACCR */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACCR = (uint32_t)tmpreg;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*----------------------- ETHERNET MACFFR Configuration --------------------*/ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the RA bit according to ETH_ReceiveAll value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the SAF and SAIF bits according to ETH_SourceAddrFilter value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PCF bit according to ETH_PassControlFrames value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DBF bit according to ETH_BroadcastFramesReception value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DAIF bit according to ETH_DestinationAddrFilter value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PR bit according to ETH_PromiscuousMode value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PM, HMC and HPF bits according to ETH_MulticastFramesFilter value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the HUC and HPF bits according to ETH_UnicastFramesFilter value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET MACFFR */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACFFR = (uint32_t)(ETH_InitStructure.ETH_ReceiveAll | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_SourceAddrFilter |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_PassControlFrames |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_BroadcastFramesReception | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_DestinationAddrFilter |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_PromiscuousMode |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_MulticastFramesFilter |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_UnicastFramesFilter); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*--------------- ETHERNET MACHTHR and MACHTLR Configuration ---------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET MACHTHR */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACHTHR = (uint32_t)ETH_InitStructure.ETH_HashTableHigh;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET MACHTLR */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACHTLR = (uint32_t)ETH_InitStructure.ETH_HashTableLow;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*----------------------- ETHERNET MACFCR Configuration --------------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Get the ETHERNET MACFCR value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg = ETH-&gt;MACFCR;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Clear xx bits */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg &amp;= MACFCR_CLEAR_MASK;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PT bit according to ETH_PauseTime value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DZPQ bit according to ETH_ZeroQuantaPause value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PLT bit according to ETH_PauseLowThreshold value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the UP bit according to ETH_UnicastPauseFrameDetect value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the RFE bit according to ETH_ReceiveFlowControl value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the TFE bit according to ETH_TransmitFlowControl value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg |= (uint32_t)((ETH_InitStructure.ETH_PauseTime &lt;&lt; 16) | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ZeroQuantaPause |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_PauseLowThreshold |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_UnicastPauseFrameDetect | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ReceiveFlowControl |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_TransmitFlowControl); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET MACFCR */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACFCR = (uint32_t)tmpreg;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*----------------------- ETHERNET MACVLANTR Configuration -----------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the ETV bit according to ETH_VLANTagComparison value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the VL bit according to ETH_VLANTagIdentifier value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;MACVLANTR = (uint32_t)(ETH_InitStructure.ETH_VLANTagComparison | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_VLANTagIdentifier); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*-------------------------------- DMA Config ------------------------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*----------------------- ETHERNET DMAOMR Configuration --------------------*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Get the ETHERNET DMAOMR value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg = ETH-&gt;DMAOMR;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Clear xx bits */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg &amp;= DMAOMR_CLEAR_MASK;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DT bit according to ETH_DropTCPIPChecksumErrorFrame value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the RSF bit according to ETH_ReceiveStoreForward value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DFF bit according to ETH_FlushReceivedFrame value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the TSF bit according to ETH_TransmitStoreForward value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the TTC bit according to ETH_TransmitThresholdControl value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the FEF bit according to ETH_ForwardErrorFrames value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the FUF bit according to ETH_ForwardUndersizedGoodFrames value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the RTC bit according to ETH_ReceiveThresholdControl value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the OSF bit according to ETH_SecondFrameOperate value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">tmpreg |= (uint32_t)(ETH_InitStructure.ETH_DropTCPIPChecksumErrorFrame | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ReceiveStoreForward |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_FlushReceivedFrame |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_TransmitStoreForward | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_TransmitThresholdControl |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ForwardErrorFrames |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ForwardUndersizedGoodFrames |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_ReceiveThresholdControl | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_SecondFrameOperate); </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Write to ETHERNET DMAOMR */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;DMAOMR = (uint32_t)tmpreg;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/*----------------------- ETHERNET DMABMR Configuration --------------------*/ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the AAL bit according to ETH_AddressAlignedBeats value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the FB bit according to ETH_FixedBurst value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the RPBL and 4*PBL bits according to ETH_RxDMABurstLength value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PBL and 4*PBL bits according to ETH_TxDMABurstLength value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the DSL bit according to ETH_DesciptorSkipLength value */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Set the PR and DA bits according to ETH_DMAArbitration value */ </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;DMABMR = (uint32_t)(ETH_InitStructure.ETH_AddressAlignedBeats | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_FixedBurst |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_RxDMABurstLength | /* !! if 4xPBL is selected for Tx or Rx it is applied for the other */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_TxDMABurstLength | </span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">(ETH_InitStructure.ETH_DescriptorSkipLength &lt;&lt; 2) |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_InitStructure.ETH_DMAArbitration |</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH_DMABMR_USP); /* Enable use of separate PBL for Rx and Tx */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">#ifdef USE_ENHANCED_DMA_DESCRIPTORS</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Enable the Enhanced DMA descriptors */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">ETH-&gt;DMABMR |= ETH_DMABMR_EDE;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">#endif /* USE_ENHANCED_DMA_DESCRIPTORS */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">/* Return Ethernet configuration success */</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">// return ETH_SUCCESS;</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">// ETH_Start();</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">else{/*link down process*/</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;"></span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:18px;">}</span>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="text-indent:28px;line-height:1.75;font-size:14px;"> 
+   <span style="font-size:18px;">至此，对于STM32F207（裸机）- LWIP网线热插入网络不通遇到的问题以及解决办法介绍完毕。</span>
+  </div> 
+  <div style="text-indent:56px;line-height:1.75;font-size:14px;"> 
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <br>
+  </div> 
+  <div style="line-height:1.75;font-size:14px;">
+   <span style="font-size:30px;font-family:'KaiTi_GB2312', KaiTi, STKaiti;">-xuk</span>
+  </div> 
+ </div> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xukao5671927/article/details/77765464,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/xukao5671927/article/details/77765464,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

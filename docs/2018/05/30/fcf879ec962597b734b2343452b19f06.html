@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>北京项目链增加Quorum共识提升稳定性 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="北京项目链增加Quorum共识提升稳定性" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="﻿## 北京项目目前的POA共识及存在问题 POA共识介绍 北京项目是网贷资金存管项目，其业务模式是以XX银行为中心的，为此我们采用了POA共识机制（同时也是限于修改代码的时间因素），其特点是单点出块，中心化方式也是一种共识，叫POA（proof of authurity） 许可机制。所有节点的加入和退出都是由中心节点的管理员账户发出的。而且目前这个中心节点是写死的。ethereumj.conf，由于nodeid是有公钥和私钥的，其他节点无法伪造 miner = &#39;0x12345678&#39; //取nodeid开头几位 其他节点加入和退出，都是由中心节点控制的 定时出块。由于是中心化的方式，竞争出块的POW方式取消了，那么中心节点自然不需要在消耗大部分cpu时间在寻找hash上，直接读秒出块就可以了 Pending队列处理：目前是所有在Pending的交易都进入这个块，但是有总gas和总数量的限制 问题：Pending处理的时候，有新进来的交易怎么办？答案是看PendingStateImpl是有数据类型的，ConcurrentLinkedQueue，是锁住的 首先，nonce已经改成snowflake码了，按时间戳来，所以是有序的 其次，生成Pending的时候， pendingTransactions.add(new PendingTransaction(tx, getBestBlock().getNumber())); //这里拷贝生成了 protected List&lt;Transaction&gt; getAllPendingTransactions() { PendingStateImpl.TransactionSortedSet ret = new PendingStateImpl.TransactionSortedSet(); //这里看出是在区块最大交易条数限制中取交易，poll是从原交易集合中取数据 public List&lt;Transaction&gt; getPendingTransactionsWithRemove(){ List&lt;Transaction&gt; txs=new ArrayList&lt;&gt;(); int n=0; int cnt = config.minerBlockMaxTransactionCount(); while (pendingTransactions.peek()!=null&amp;&amp;n&lt;cnt){ txs.add(pendingTransactions.poll().getTransaction()); n++; } return txs; } 执行不成功的说明是报错了，只能由前端改了继续发；包含在区块中的必然是本机的，而且排除了gas的原因，如果出错就是必然是客户端交易的问题，所以不需要重新纳入Pending（纳入Pending的应该是miner的问题造成没有入链，所以必须给其下次入链） 存在的问题： 运行风险大，单点风险，中心节点服务器挂了，要重新启动才能出链 扩展性差，不易说服客户，有些客户可能想参与记账 Quorum投票共识算法 Quorum投票共识算法是JPMorgan的共识算法，利用了以太坊平台支持智能合约的优势，投票程序预编译到创世区块中，或者这步干脆省略，也作为java的一个包 因为智能合约的优势是可以修改、定制；但是这个投票逻辑是非常固定的，所以不需要有智能合约；但是交易记录时要有扩展的交易类型，因为以太坊只能记录转账交易、合约调用 2个miner（同时兼容voter），一个voter（更像是一个仲裁者） Eth62，新增一种特殊类型的投票交易 对应的是quorum包下特殊的程序逻辑（各个节点是一样的） 收到的投票交易，各节点都记录到日志中，miner节点也将上个区块投票情况打包到这个区块中（因为生成的区块是不能变了） miner和voter的添加删除也可以通过智能合约管理，由管理员账户发起 miner1发起的区块，并大家投票选中后，miner2会接受，但是接受时，要对自己的Pending队列做一个筛选处理，去掉已经被包含在区块中的交易 异常情景模拟： 正常情况下，miner1读秒出块（比如3秒，加减随机0.5秒），区块先给自己投上一票，然后广播给miner2和voter1，然后voter1给miner1投票（这个投票过程也是广播的），票数达到要求后各个节点都看到了这个区块票数够了入链，这个区块中也记载了投票的情况 1.miner1发出块的时候，可能miner2也发出了块（这个问题，首先要靠3秒，加减随机0.5秒来解决，但是还是有小概率是重合的），关键看voter投谁。miner1是不会投票给对方的，因为已经投给了自己，所以这里的关键是voter1投票给谁 先收到miner1的块，投票给miner1，这时候如果通讯不畅，miner1没收到反馈，但是miner2收到了，认为miner1有2票，commit了，voter1也commit了；只剩下miner1还在等并重新发起投票，但是相同区块高度已经commit并被其他2人拒绝了；然后miner2会发起下一个高度的区块，但是现在miner1怎么办？它发现对方的新区块跳号了，这时候exception，打印日志，然后根据配置的应对的Rule进行处理，可以人工介入，也可以以长链为准，检查签名后同步，同步到最新后再出块 先收到miner2的块，投票给miner2，则miner2入链 2.voter1挂了。miner1和miner2各自独立出块，互相发对方，票数平；这时候双方有出块的先后，最终某轮投票，会有胜者 3.miner1脑裂。miner2继续出块 4.整个网络瘫痪。miner1，miner2均无法出块; 网络恢复后，以最长链并核对后commit；如果两个miner的最新区块不一致，重新发起投票 5.miner1和miner2同时发出后，voter1选了miner1（经过验证签名和块高的，以及前序hash），并commit自己，但是广播的消息没有达到miner1和miner2；miner1和miner2没有规定票数，重新发起投票并选了miner2，这时候voter1活了，下一轮投票就来了，这时候voter发现问题了，前序hash不对，报exception，获取2个miner的区块情况，如果一致，就从其同步，如果不一致，2个miner分叉了，选择miner1并投固定miner1，逼死miner2（因为轮到miner2发现前序节点不对了，然后其发起同步流程，纠正过来再出块） 当然这个无法对付作恶，比如voter节点不顾只有一票的规定，给miner1和miner2都发送投票 阅读更多" />
+<meta property="og:description" content="﻿## 北京项目目前的POA共识及存在问题 POA共识介绍 北京项目是网贷资金存管项目，其业务模式是以XX银行为中心的，为此我们采用了POA共识机制（同时也是限于修改代码的时间因素），其特点是单点出块，中心化方式也是一种共识，叫POA（proof of authurity） 许可机制。所有节点的加入和退出都是由中心节点的管理员账户发出的。而且目前这个中心节点是写死的。ethereumj.conf，由于nodeid是有公钥和私钥的，其他节点无法伪造 miner = &#39;0x12345678&#39; //取nodeid开头几位 其他节点加入和退出，都是由中心节点控制的 定时出块。由于是中心化的方式，竞争出块的POW方式取消了，那么中心节点自然不需要在消耗大部分cpu时间在寻找hash上，直接读秒出块就可以了 Pending队列处理：目前是所有在Pending的交易都进入这个块，但是有总gas和总数量的限制 问题：Pending处理的时候，有新进来的交易怎么办？答案是看PendingStateImpl是有数据类型的，ConcurrentLinkedQueue，是锁住的 首先，nonce已经改成snowflake码了，按时间戳来，所以是有序的 其次，生成Pending的时候， pendingTransactions.add(new PendingTransaction(tx, getBestBlock().getNumber())); //这里拷贝生成了 protected List&lt;Transaction&gt; getAllPendingTransactions() { PendingStateImpl.TransactionSortedSet ret = new PendingStateImpl.TransactionSortedSet(); //这里看出是在区块最大交易条数限制中取交易，poll是从原交易集合中取数据 public List&lt;Transaction&gt; getPendingTransactionsWithRemove(){ List&lt;Transaction&gt; txs=new ArrayList&lt;&gt;(); int n=0; int cnt = config.minerBlockMaxTransactionCount(); while (pendingTransactions.peek()!=null&amp;&amp;n&lt;cnt){ txs.add(pendingTransactions.poll().getTransaction()); n++; } return txs; } 执行不成功的说明是报错了，只能由前端改了继续发；包含在区块中的必然是本机的，而且排除了gas的原因，如果出错就是必然是客户端交易的问题，所以不需要重新纳入Pending（纳入Pending的应该是miner的问题造成没有入链，所以必须给其下次入链） 存在的问题： 运行风险大，单点风险，中心节点服务器挂了，要重新启动才能出链 扩展性差，不易说服客户，有些客户可能想参与记账 Quorum投票共识算法 Quorum投票共识算法是JPMorgan的共识算法，利用了以太坊平台支持智能合约的优势，投票程序预编译到创世区块中，或者这步干脆省略，也作为java的一个包 因为智能合约的优势是可以修改、定制；但是这个投票逻辑是非常固定的，所以不需要有智能合约；但是交易记录时要有扩展的交易类型，因为以太坊只能记录转账交易、合约调用 2个miner（同时兼容voter），一个voter（更像是一个仲裁者） Eth62，新增一种特殊类型的投票交易 对应的是quorum包下特殊的程序逻辑（各个节点是一样的） 收到的投票交易，各节点都记录到日志中，miner节点也将上个区块投票情况打包到这个区块中（因为生成的区块是不能变了） miner和voter的添加删除也可以通过智能合约管理，由管理员账户发起 miner1发起的区块，并大家投票选中后，miner2会接受，但是接受时，要对自己的Pending队列做一个筛选处理，去掉已经被包含在区块中的交易 异常情景模拟： 正常情况下，miner1读秒出块（比如3秒，加减随机0.5秒），区块先给自己投上一票，然后广播给miner2和voter1，然后voter1给miner1投票（这个投票过程也是广播的），票数达到要求后各个节点都看到了这个区块票数够了入链，这个区块中也记载了投票的情况 1.miner1发出块的时候，可能miner2也发出了块（这个问题，首先要靠3秒，加减随机0.5秒来解决，但是还是有小概率是重合的），关键看voter投谁。miner1是不会投票给对方的，因为已经投给了自己，所以这里的关键是voter1投票给谁 先收到miner1的块，投票给miner1，这时候如果通讯不畅，miner1没收到反馈，但是miner2收到了，认为miner1有2票，commit了，voter1也commit了；只剩下miner1还在等并重新发起投票，但是相同区块高度已经commit并被其他2人拒绝了；然后miner2会发起下一个高度的区块，但是现在miner1怎么办？它发现对方的新区块跳号了，这时候exception，打印日志，然后根据配置的应对的Rule进行处理，可以人工介入，也可以以长链为准，检查签名后同步，同步到最新后再出块 先收到miner2的块，投票给miner2，则miner2入链 2.voter1挂了。miner1和miner2各自独立出块，互相发对方，票数平；这时候双方有出块的先后，最终某轮投票，会有胜者 3.miner1脑裂。miner2继续出块 4.整个网络瘫痪。miner1，miner2均无法出块; 网络恢复后，以最长链并核对后commit；如果两个miner的最新区块不一致，重新发起投票 5.miner1和miner2同时发出后，voter1选了miner1（经过验证签名和块高的，以及前序hash），并commit自己，但是广播的消息没有达到miner1和miner2；miner1和miner2没有规定票数，重新发起投票并选了miner2，这时候voter1活了，下一轮投票就来了，这时候voter发现问题了，前序hash不对，报exception，获取2个miner的区块情况，如果一致，就从其同步，如果不一致，2个miner分叉了，选择miner1并投固定miner1，逼死miner2（因为轮到miner2发现前序节点不对了，然后其发起同步流程，纠正过来再出块） 当然这个无法对付作恶，比如voter节点不顾只有一票的规定，给miner1和miner2都发送投票 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/05/30/fcf879ec962597b734b2343452b19f06.html" />
+<meta property="og:url" content="https://uzzz.org/2018/05/30/fcf879ec962597b734b2343452b19f06.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-05-30T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"﻿## 北京项目目前的POA共识及存在问题 POA共识介绍 北京项目是网贷资金存管项目，其业务模式是以XX银行为中心的，为此我们采用了POA共识机制（同时也是限于修改代码的时间因素），其特点是单点出块，中心化方式也是一种共识，叫POA（proof of authurity） 许可机制。所有节点的加入和退出都是由中心节点的管理员账户发出的。而且目前这个中心节点是写死的。ethereumj.conf，由于nodeid是有公钥和私钥的，其他节点无法伪造 miner = &#39;0x12345678&#39; //取nodeid开头几位 其他节点加入和退出，都是由中心节点控制的 定时出块。由于是中心化的方式，竞争出块的POW方式取消了，那么中心节点自然不需要在消耗大部分cpu时间在寻找hash上，直接读秒出块就可以了 Pending队列处理：目前是所有在Pending的交易都进入这个块，但是有总gas和总数量的限制 问题：Pending处理的时候，有新进来的交易怎么办？答案是看PendingStateImpl是有数据类型的，ConcurrentLinkedQueue，是锁住的 首先，nonce已经改成snowflake码了，按时间戳来，所以是有序的 其次，生成Pending的时候， pendingTransactions.add(new PendingTransaction(tx, getBestBlock().getNumber())); //这里拷贝生成了 protected List&lt;Transaction&gt; getAllPendingTransactions() { PendingStateImpl.TransactionSortedSet ret = new PendingStateImpl.TransactionSortedSet(); //这里看出是在区块最大交易条数限制中取交易，poll是从原交易集合中取数据 public List&lt;Transaction&gt; getPendingTransactionsWithRemove(){ List&lt;Transaction&gt; txs=new ArrayList&lt;&gt;(); int n=0; int cnt = config.minerBlockMaxTransactionCount(); while (pendingTransactions.peek()!=null&amp;&amp;n&lt;cnt){ txs.add(pendingTransactions.poll().getTransaction()); n++; } return txs; } 执行不成功的说明是报错了，只能由前端改了继续发；包含在区块中的必然是本机的，而且排除了gas的原因，如果出错就是必然是客户端交易的问题，所以不需要重新纳入Pending（纳入Pending的应该是miner的问题造成没有入链，所以必须给其下次入链） 存在的问题： 运行风险大，单点风险，中心节点服务器挂了，要重新启动才能出链 扩展性差，不易说服客户，有些客户可能想参与记账 Quorum投票共识算法 Quorum投票共识算法是JPMorgan的共识算法，利用了以太坊平台支持智能合约的优势，投票程序预编译到创世区块中，或者这步干脆省略，也作为java的一个包 因为智能合约的优势是可以修改、定制；但是这个投票逻辑是非常固定的，所以不需要有智能合约；但是交易记录时要有扩展的交易类型，因为以太坊只能记录转账交易、合约调用 2个miner（同时兼容voter），一个voter（更像是一个仲裁者） Eth62，新增一种特殊类型的投票交易 对应的是quorum包下特殊的程序逻辑（各个节点是一样的） 收到的投票交易，各节点都记录到日志中，miner节点也将上个区块投票情况打包到这个区块中（因为生成的区块是不能变了） miner和voter的添加删除也可以通过智能合约管理，由管理员账户发起 miner1发起的区块，并大家投票选中后，miner2会接受，但是接受时，要对自己的Pending队列做一个筛选处理，去掉已经被包含在区块中的交易 异常情景模拟： 正常情况下，miner1读秒出块（比如3秒，加减随机0.5秒），区块先给自己投上一票，然后广播给miner2和voter1，然后voter1给miner1投票（这个投票过程也是广播的），票数达到要求后各个节点都看到了这个区块票数够了入链，这个区块中也记载了投票的情况 1.miner1发出块的时候，可能miner2也发出了块（这个问题，首先要靠3秒，加减随机0.5秒来解决，但是还是有小概率是重合的），关键看voter投谁。miner1是不会投票给对方的，因为已经投给了自己，所以这里的关键是voter1投票给谁 先收到miner1的块，投票给miner1，这时候如果通讯不畅，miner1没收到反馈，但是miner2收到了，认为miner1有2票，commit了，voter1也commit了；只剩下miner1还在等并重新发起投票，但是相同区块高度已经commit并被其他2人拒绝了；然后miner2会发起下一个高度的区块，但是现在miner1怎么办？它发现对方的新区块跳号了，这时候exception，打印日志，然后根据配置的应对的Rule进行处理，可以人工介入，也可以以长链为准，检查签名后同步，同步到最新后再出块 先收到miner2的块，投票给miner2，则miner2入链 2.voter1挂了。miner1和miner2各自独立出块，互相发对方，票数平；这时候双方有出块的先后，最终某轮投票，会有胜者 3.miner1脑裂。miner2继续出块 4.整个网络瘫痪。miner1，miner2均无法出块; 网络恢复后，以最长链并核对后commit；如果两个miner的最新区块不一致，重新发起投票 5.miner1和miner2同时发出后，voter1选了miner1（经过验证签名和块高的，以及前序hash），并commit自己，但是广播的消息没有达到miner1和miner2；miner1和miner2没有规定票数，重新发起投票并选了miner2，这时候voter1活了，下一轮投票就来了，这时候voter发现问题了，前序hash不对，报exception，获取2个miner的区块情况，如果一致，就从其同步，如果不一致，2个miner分叉了，选择miner1并投固定miner1，逼死miner2（因为轮到miner2发现前序节点不对了，然后其发起同步流程，纠正过来再出块） 当然这个无法对付作恶，比如voter节点不顾只有一票的规定，给miner1和miner2都发送投票 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/05/30/fcf879ec962597b734b2343452b19f06.html","headline":"北京项目链增加Quorum共识提升稳定性","dateModified":"2018-05-30T00:00:00+08:00","datePublished":"2018-05-30T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/05/30/fcf879ec962597b734b2343452b19f06.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>北京项目链增加Quorum共识提升稳定性</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="markdown_views"> 
+  <p>﻿## 北京项目目前的POA共识及存在问题</p> 
+  <h6 id="poa共识介绍">POA共识介绍</h6> 
+  <p>北京项目是网贷资金存管项目，其业务模式是以XX银行为中心的，为此我们采用了POA共识机制（同时也是限于修改代码的时间因素），其特点是单点出块，中心化方式也是一种共识，叫POA（proof of authurity）</p> 
+  <ul> 
+   <li>许可机制。所有节点的加入和退出都是由中心节点的管理员账户发出的。而且目前这个中心节点是写死的。ethereumj.conf，由于nodeid是有公钥和私钥的，其他节点无法伪造</li> 
+  </ul> 
+  <pre class="prettyprint"><code class=" hljs cs">
+miner = <span class="hljs-string">'0x12345678'</span>  <span class="hljs-comment">//取nodeid开头几位</span>
+</code></pre> 
+  <p><font color="blue">其他节点加入和退出，都是由中心节点控制的</font></p> 
+  <ul> 
+   <li><p>定时出块。由于是中心化的方式，竞争出块的POW方式取消了，那么中心节点自然不需要在消耗大部分cpu时间在寻找hash上，直接读秒出块就可以了</p></li> 
+   <li><p>Pending队列处理：目前是所有在Pending的交易都进入这个块，但是有总gas和总数量的限制</p> 
+    <ul>
+     <li>问题：Pending处理的时候，有新进来的交易怎么办？答案是看PendingStateImpl是有数据类型的，ConcurrentLinkedQueue，是锁住的</li>
+    </ul></li> 
+  </ul> 
+  <p>首先，nonce已经改成snowflake码了，按时间戳来，所以是有序的</p> 
+  <p>其次，生成Pending的时候，</p> 
+  <pre class="prettyprint"><code class=" hljs cs">
+pendingTransactions.add(<span class="hljs-keyword">new</span> PendingTransaction(tx, getBestBlock().getNumber()));
+<span class="hljs-comment">//这里拷贝生成了</span>
+
+<span class="hljs-keyword">protected</span> List&lt;Transaction&gt; <span class="hljs-title">getAllPendingTransactions</span>() {
+    PendingStateImpl.TransactionSortedSet ret = <span class="hljs-keyword">new</span> PendingStateImpl.TransactionSortedSet();
+<span class="hljs-comment">//这里看出是在区块最大交易条数限制中取交易，poll是从原交易集合中取数据</span>
+
+<span class="hljs-keyword">public</span> List&lt;Transaction&gt; <span class="hljs-title">getPendingTransactionsWithRemove</span>(){
+    List&lt;Transaction&gt; txs=<span class="hljs-keyword">new</span> ArrayList&lt;&gt;();
+    <span class="hljs-keyword">int</span> n=<span class="hljs-number">0</span>;
+    <span class="hljs-keyword">int</span> cnt = config.minerBlockMaxTransactionCount();
+    <span class="hljs-keyword">while</span> (pendingTransactions.peek()!=<span class="hljs-keyword">null</span>&amp;&amp;n&lt;cnt){
+        txs.add(pendingTransactions.poll().getTransaction());
+        n++;
+    }
+    <span class="hljs-keyword">return</span> txs;
+}</code></pre> 
+  <p>执行不成功的说明是报错了，只能由前端改了继续发；包含在区块中的必然是本机的，而且排除了gas的原因，如果出错就是必然是客户端交易的问题，所以不需要重新纳入Pending（纳入Pending的应该是miner的问题造成没有入链，所以必须给其下次入链）</p> 
+  <p><font color="red"></font></p> 
+  <p>存在的问题：</p> 
+  <ol> 
+   <li><p>运行风险大，单点风险，中心节点服务器挂了，要重新启动才能出链</p></li> 
+   <li><p>扩展性差，不易说服客户，有些客户可能想参与记账</p></li> 
+  </ol> 
+  <p></p> 
+  <hr> 
+  <h6 id="quorum投票共识算法">Quorum投票共识算法</h6> 
+  <p>Quorum投票共识算法是JPMorgan的共识算法，利用了以太坊平台支持智能合约的优势，投票程序预编译到创世区块中，或者这步干脆省略，也作为java的一个包</p> 
+  <p><strong>因为智能合约的优势是可以修改、定制；但是这个投票逻辑是非常固定的，所以不需要有智能合约；但是交易记录时要有扩展的交易类型，因为以太坊只能记录转账交易、合约调用</strong></p> 
+  <p>2个miner（同时兼容voter），一个voter（更像是一个仲裁者）</p> 
+  <ul> 
+   <li><p>Eth62，新增一种特殊类型的投票交易</p></li> 
+   <li><p>对应的是quorum包下特殊的程序逻辑（各个节点是一样的）</p></li> 
+   <li><p>收到的投票交易，各节点都记录到日志中，miner节点也将上个区块投票情况打包到这个区块中（因为生成的区块是不能变了）</p></li> 
+   <li><p>miner和voter的添加删除也可以通过智能合约管理，由管理员账户发起</p></li> 
+   <li><p>miner1发起的区块，并大家投票选中后，miner2会接受，但是接受时，要对自己的Pending队列做一个<strong>筛选处理</strong>，去掉已经被包含在区块中的交易</p></li> 
+  </ul> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/2018053016160768?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3d4aWQyNzk4MjI2/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="这里写图片描述" title=""></p> 
+  <hr> 
+  <h6 id="异常情景模拟">异常情景模拟：</h6> 
+  <p>正常情况下，miner1读秒出块（比如3秒，加减随机0.5秒），区块先给自己投上一票，然后广播给miner2和voter1，然后voter1给miner1投票（这个投票过程也是广播的），票数达到要求后<strong>各个节点都看到了这个区块票数够了</strong>入链，这个区块中也记载了投票的情况</p> 
+  <ul> 
+   <li><p>1.miner1发出块的时候，可能miner2也发出了块（这个问题，首先要靠3秒，加减随机0.5秒来解决，但是还是有小概率是重合的），关键看voter投谁。miner1是不会投票给对方的，因为已经投给了自己，所以这里的关键是voter1投票给谁</p> 
+    <ul>
+     <li><p>先收到miner1的块，投票给miner1，这时候如果通讯不畅，miner1没收到反馈，但是miner2收到了，认为miner1有2票，commit了，voter1也commit了；只剩下miner1还在等并重新发起投票，但是相同区块高度已经commit并被其他2人拒绝了；然后miner2会发起下一个高度的区块，<font color="red">但是现在miner1怎么办？它发现对方的新区块跳号了，这时候exception，打印日志，然后根据配置的应对的Rule进行处理，可以人工介入，也可以以长链为准，检查签名后同步，同步到最新后再出块</font></p></li> 
+     <li><p>先收到miner2的块，投票给miner2，则miner2入链</p></li>
+    </ul></li> 
+   <li><p>2.voter1挂了。miner1和miner2各自独立出块，互相发对方，票数平；这时候双方有出块的先后，最终某轮投票，会有胜者</p></li> 
+   <li><p>3.miner1脑裂。miner2继续出块</p></li> 
+   <li><p>4.整个网络瘫痪。miner1，miner2均无法出块; 网络恢复后，以最长链并核对后commit；如果两个miner的最新区块不一致，重新发起投票</p></li> 
+   <li><p>5.miner1和miner2同时发出后，voter1选了miner1（经过验证签名和块高的，以及前序hash），并commit自己，但是广播的消息没有达到miner1和miner2；miner1和miner2没有规定票数，重新发起投票并选了miner2，这时候<strong>voter1活了，下一轮投票就来了</strong>，这时候voter发现问题了，前序hash不对，报exception，获取2个miner的区块情况，如果一致，就从其同步，如果不一致，2个miner分叉了，选择miner1并投固定miner1，逼死miner2（<font color="red">因为轮到miner2发现前序节点不对了，然后其发起同步流程，纠正过来再出块</font>）</p></li> 
+  </ul> 
+  <p>当然这个无法对付作恶，比如voter节点不顾只有一票的规定，给miner1和miner2都发送投票</p> 
+ </div> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/markdown_views-ea0013b516.css"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn btn-red-hollow" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/wxid2798226/article/details/80511797,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/wxid2798226/article/details/80511797,&quot;}">阅读更多</a> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

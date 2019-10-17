@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Hyperledger fabric应用的多机部署 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Hyperledger fabric应用的多机部署" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zhayujie5200/article/details/82529167 前面关于fabric部署的介绍都是基于单机环境下的，实际生产环境中一般会根据应用场景将节点分开部署在多台物理机上，面临的难题主要是不同主机间的节点如何通过网络进行通信。 前言 这里仍然以balance-transfer v1.0为例，尝试将两个组织分布到内网中的两台机器上，部署示意图如下： 这里使用的是solo模式的排序服务，orderer节点和Org1位于一台机器上，Org2位于另一台机器上，每个组织有一个CA节点和两个Peer节点，整个应用程序代码也部署在第一台机器上（图中未标出）。这里为了简便只用了两台机器，实际中也可以根据需要将每一个节点分开部署在一台物理机上。 如果使用kafka模型的排序服务，部署就更为复杂一些，需要增加机器来部署更多的排序相关节点以保证排序服务的崩溃故障容错。 步骤 一、编写docker-compose文件 当前由于是单机部署，所以共七个容器的配置都是写在一个docker-compose.yaml中的，现在需要拆分成两份，用于在两台机器上分别启动节点。 拆分的过程很简单，只需要在一份docker配置文件中保留Orderer节点，Org1的1个CA节点、2个Peer节点的配置，在另一份配置文件中保留Org2的1个CA、2个Peer的配置。 这一步的重点，也是整个多级部署的关键，就是需要在每个Peer容器中添加extra_hosts参数，这个参数提供需要连接的节点的主机名hostname和ip的映射。在单机环境中是无须设置这个参数的，因为所有容器处于同一机器同一网络，可以直接通过主机名来连接其他容器，但是如果处于不同机器，就必须提供IP地址才能跨主机通信。 对于extra_hosts的设置，网上的一些资料看法不一，有的人认为peer节点的该参数要设置其余所有节点的ip地址。经过一些测试后我发现：只需要设置位于不同机器上的Orderer节点以及同组织其他节点的ip。 这里Org1与Orderer节点处于同一机器，组织内的两个节点也没有分开，所以无需添加extra_hosts；而Org2的两个Peer节点则只需要添加Orderer节点的IP，就可以正常接收到区块了。 extra_hosts: - &quot;orderer.example.com:192.168.1.66&quot; 如果把Org2的两个Peer分开到两个机器上，则这两个Peer还需要添加上彼此的IP映射，因为Orderer节点只会分发区块给组织的Leader节点，所以其他节点需要访问Leader节点来获取区块。 之所以我们没有添加其他组织的节点ip，是因为不同组织间只能通过锚节点（anchor peers）进行通信，这里在没有设置锚节点的情况下就算我们添加了其他组织的ip也无济于事，在后面会研究如何设置锚节点来进行跨组织的通信。 二、分发配置文件 现在机器二运行节点所需要的配置文件。我们先在机器一上操作，这里新建了一个artifacts目录，首先从crypto-config目录复制过来Org2的msp目录，然后是两个容器配置的文件，最后如果我们的组织名称不是Org1或Org2，则需要手动创建一个CA配置文件（由于要修改affiliation字段）。 artifacts ├── org2.example.com // Org2的msp目录 ├── base.yaml ├── docker-compose.yaml └── fabric-ca-server-config.yaml // 如果组织名是自定义的则需要这个文件 这里的目录名称需要命名为artifacts，因为将来要在此目录下执行docker-compose up命令，而该命令创建的网络id默认就是当前所在目录的名称，为了让两台机器节点处于同一网络，就必须使该目录名称保持一致。 此时docker-compose.yaml还要做相应修改，因为新机器的msp目录的相对路径发生了改变（位于同一目录下），注意CA容器和Peer容器的volumes映射部分和environment部分的某些参数要根据实际路径稍作调整。 准备完成后，就可以将整个artifacts目录发送到新的机器上去，有多种方法，可以在命令行使用scp命令，也可以用FileZilla等远程连接客户端以sftp方式进行文件传输。 三、修改network-config.json文件 接下来修改网络配置文件，需要修改每个组织CA和Peer的IP地址，由于APP和组织一是同一机器，所以这里Org1节点的ip保持为localhost即可，无需修改。下面是Org2的第一个节点的设置，由于这里两台机器处于同一内网，所以写内网ip就可以。 &quot;peer1&quot;: { &quot;requests&quot;: &quot;grpcs://192.168.1.13:7051&quot;, &quot;events&quot;: &quot;grpcs://192.168.1.13:7053&quot;, &quot;server-hostname&quot;: &quot;peer0.org2.example.com&quot;, &quot;tls_cacerts&quot;: &quot;../artifacts/channel/crypto-config/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt&quot; }, 四、在两台机器上分别启动节点 新加入机器所需的环境有：fabric镜像（ca，peer，ccenv），docker，docker-compose。所有准备工作都已完成后，可以开始启动节点了，在两台主机的artifacts目录下分别执行一下命令启动所有容器： docker-compose up -d 接下来需要初始化网络，要完成的操作有：注册用户、创建通道、将所有节点加入通道、在所有节点上安装链码、在通道上实例化链码。这些步骤可以通过执行balance-transfer提供的脚本runApp.sh来完成，也可以手动一步步提交请求完成。 到这一步，多机部署的fabric网络就建立成功了，可以测试下两台机器上的节点是否维护相同账本，可以指定Org1的节点发起交易，在Org2的节点上进行查询，查看是否账本数据能够同步。 实际应用：多机增加组织 上面提到的多机部署过程，需要在fabric网络建立之前就确定哪些节点应该部署在哪些机器上。而实际开发中更多的情况是：在网络建立之初可能无法预估有哪些网络成员，有些存在不同主机上的组织或节点需要在后续依次加入，并且不能破坏当前网络的正常运行。 这就需要结合多机部署和动态增加组织两种场景，将新的机器上的新组织节点加入到当前网络中。动态增加组织在前面的文章中已经详细介绍过了，多机增加组织则需要加上本文上述的一些步骤，可概括为以下几步： 为新组织生产msp目录，包含证书、私钥； 发送增加新组织的请求，更新通道配置（已经调用SDK写成了接口）； 将新组织的配置文件置于目标机器，包括msp目录、容器配置文件； 修改network-config.json文件，添加新组织节点信息； 在新加机器上启动所有容器； 发送请求将新组织节点加入通道，安装链码，有需要还可以升级链码。 为了更简便地在任意主机上创建新组织并加入到网络，我写了一些脚本来实现一键部署。需要的机器操作系统为CenhtOS 7.4+或Ubuntu 16.04+，无需下载任何先决条件。现提供了两个目录deploy和new-org，new-org目录需要提前置于应用程序所在服务器上（位于App项目根目录），而deploy目录将会分发到每一个新加机器中，只需要简单两步就可以完成多机动态增加的部署： 一、将deploy目录拷贝至新加入的机器，在目录下执行： sudo ./deploy.sh --domain &lt;domain&gt; --order &lt;ordererIP&gt; (domain参数：新加组织的域名， order参数：orderer节点所在的ip地址) e.g. sudo ./deploy.sh --domain org2.example.com --order 192.168.1.66 二、将deploy/artifacts目录下生成的msp目录(org2.example.com)拷贝到app所在服务器的new-org目录中 并在new-org目录下执行： sudo ./add_org.sh - -org &lt;orgName&gt; --ip &lt;IP&gt; (org参数：新加组织的名称，ip参数：新组织所在机器的ip地址) e.g. sudo ./add_org.sh --org archain --ip 192.168.1.13 执行完后新机器上的新组织即可成功加入当前网络。 注: deploy/pkg中存放了所需的镜像及软件包，如果有缺失，deploy.sh脚本执行时会自行从网络下载，所以无需手动配置环境。运行部署脚本后，新增机器会默认部署一个新组织，并启动所有节点（1CA, 2peer, 2couchdb）。如果需要自定义主机中需要部署的节点，对脚本稍作调整即可。 多机部署组织的所有脚本及配置文件位于：https://github.com/zhayujie/fabric-tools 阅读更多" />
+<meta property="og:description" content="版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zhayujie5200/article/details/82529167 前面关于fabric部署的介绍都是基于单机环境下的，实际生产环境中一般会根据应用场景将节点分开部署在多台物理机上，面临的难题主要是不同主机间的节点如何通过网络进行通信。 前言 这里仍然以balance-transfer v1.0为例，尝试将两个组织分布到内网中的两台机器上，部署示意图如下： 这里使用的是solo模式的排序服务，orderer节点和Org1位于一台机器上，Org2位于另一台机器上，每个组织有一个CA节点和两个Peer节点，整个应用程序代码也部署在第一台机器上（图中未标出）。这里为了简便只用了两台机器，实际中也可以根据需要将每一个节点分开部署在一台物理机上。 如果使用kafka模型的排序服务，部署就更为复杂一些，需要增加机器来部署更多的排序相关节点以保证排序服务的崩溃故障容错。 步骤 一、编写docker-compose文件 当前由于是单机部署，所以共七个容器的配置都是写在一个docker-compose.yaml中的，现在需要拆分成两份，用于在两台机器上分别启动节点。 拆分的过程很简单，只需要在一份docker配置文件中保留Orderer节点，Org1的1个CA节点、2个Peer节点的配置，在另一份配置文件中保留Org2的1个CA、2个Peer的配置。 这一步的重点，也是整个多级部署的关键，就是需要在每个Peer容器中添加extra_hosts参数，这个参数提供需要连接的节点的主机名hostname和ip的映射。在单机环境中是无须设置这个参数的，因为所有容器处于同一机器同一网络，可以直接通过主机名来连接其他容器，但是如果处于不同机器，就必须提供IP地址才能跨主机通信。 对于extra_hosts的设置，网上的一些资料看法不一，有的人认为peer节点的该参数要设置其余所有节点的ip地址。经过一些测试后我发现：只需要设置位于不同机器上的Orderer节点以及同组织其他节点的ip。 这里Org1与Orderer节点处于同一机器，组织内的两个节点也没有分开，所以无需添加extra_hosts；而Org2的两个Peer节点则只需要添加Orderer节点的IP，就可以正常接收到区块了。 extra_hosts: - &quot;orderer.example.com:192.168.1.66&quot; 如果把Org2的两个Peer分开到两个机器上，则这两个Peer还需要添加上彼此的IP映射，因为Orderer节点只会分发区块给组织的Leader节点，所以其他节点需要访问Leader节点来获取区块。 之所以我们没有添加其他组织的节点ip，是因为不同组织间只能通过锚节点（anchor peers）进行通信，这里在没有设置锚节点的情况下就算我们添加了其他组织的ip也无济于事，在后面会研究如何设置锚节点来进行跨组织的通信。 二、分发配置文件 现在机器二运行节点所需要的配置文件。我们先在机器一上操作，这里新建了一个artifacts目录，首先从crypto-config目录复制过来Org2的msp目录，然后是两个容器配置的文件，最后如果我们的组织名称不是Org1或Org2，则需要手动创建一个CA配置文件（由于要修改affiliation字段）。 artifacts ├── org2.example.com // Org2的msp目录 ├── base.yaml ├── docker-compose.yaml └── fabric-ca-server-config.yaml // 如果组织名是自定义的则需要这个文件 这里的目录名称需要命名为artifacts，因为将来要在此目录下执行docker-compose up命令，而该命令创建的网络id默认就是当前所在目录的名称，为了让两台机器节点处于同一网络，就必须使该目录名称保持一致。 此时docker-compose.yaml还要做相应修改，因为新机器的msp目录的相对路径发生了改变（位于同一目录下），注意CA容器和Peer容器的volumes映射部分和environment部分的某些参数要根据实际路径稍作调整。 准备完成后，就可以将整个artifacts目录发送到新的机器上去，有多种方法，可以在命令行使用scp命令，也可以用FileZilla等远程连接客户端以sftp方式进行文件传输。 三、修改network-config.json文件 接下来修改网络配置文件，需要修改每个组织CA和Peer的IP地址，由于APP和组织一是同一机器，所以这里Org1节点的ip保持为localhost即可，无需修改。下面是Org2的第一个节点的设置，由于这里两台机器处于同一内网，所以写内网ip就可以。 &quot;peer1&quot;: { &quot;requests&quot;: &quot;grpcs://192.168.1.13:7051&quot;, &quot;events&quot;: &quot;grpcs://192.168.1.13:7053&quot;, &quot;server-hostname&quot;: &quot;peer0.org2.example.com&quot;, &quot;tls_cacerts&quot;: &quot;../artifacts/channel/crypto-config/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt&quot; }, 四、在两台机器上分别启动节点 新加入机器所需的环境有：fabric镜像（ca，peer，ccenv），docker，docker-compose。所有准备工作都已完成后，可以开始启动节点了，在两台主机的artifacts目录下分别执行一下命令启动所有容器： docker-compose up -d 接下来需要初始化网络，要完成的操作有：注册用户、创建通道、将所有节点加入通道、在所有节点上安装链码、在通道上实例化链码。这些步骤可以通过执行balance-transfer提供的脚本runApp.sh来完成，也可以手动一步步提交请求完成。 到这一步，多机部署的fabric网络就建立成功了，可以测试下两台机器上的节点是否维护相同账本，可以指定Org1的节点发起交易，在Org2的节点上进行查询，查看是否账本数据能够同步。 实际应用：多机增加组织 上面提到的多机部署过程，需要在fabric网络建立之前就确定哪些节点应该部署在哪些机器上。而实际开发中更多的情况是：在网络建立之初可能无法预估有哪些网络成员，有些存在不同主机上的组织或节点需要在后续依次加入，并且不能破坏当前网络的正常运行。 这就需要结合多机部署和动态增加组织两种场景，将新的机器上的新组织节点加入到当前网络中。动态增加组织在前面的文章中已经详细介绍过了，多机增加组织则需要加上本文上述的一些步骤，可概括为以下几步： 为新组织生产msp目录，包含证书、私钥； 发送增加新组织的请求，更新通道配置（已经调用SDK写成了接口）； 将新组织的配置文件置于目标机器，包括msp目录、容器配置文件； 修改network-config.json文件，添加新组织节点信息； 在新加机器上启动所有容器； 发送请求将新组织节点加入通道，安装链码，有需要还可以升级链码。 为了更简便地在任意主机上创建新组织并加入到网络，我写了一些脚本来实现一键部署。需要的机器操作系统为CenhtOS 7.4+或Ubuntu 16.04+，无需下载任何先决条件。现提供了两个目录deploy和new-org，new-org目录需要提前置于应用程序所在服务器上（位于App项目根目录），而deploy目录将会分发到每一个新加机器中，只需要简单两步就可以完成多机动态增加的部署： 一、将deploy目录拷贝至新加入的机器，在目录下执行： sudo ./deploy.sh --domain &lt;domain&gt; --order &lt;ordererIP&gt; (domain参数：新加组织的域名， order参数：orderer节点所在的ip地址) e.g. sudo ./deploy.sh --domain org2.example.com --order 192.168.1.66 二、将deploy/artifacts目录下生成的msp目录(org2.example.com)拷贝到app所在服务器的new-org目录中 并在new-org目录下执行： sudo ./add_org.sh - -org &lt;orgName&gt; --ip &lt;IP&gt; (org参数：新加组织的名称，ip参数：新组织所在机器的ip地址) e.g. sudo ./add_org.sh --org archain --ip 192.168.1.13 执行完后新机器上的新组织即可成功加入当前网络。 注: deploy/pkg中存放了所需的镜像及软件包，如果有缺失，deploy.sh脚本执行时会自行从网络下载，所以无需手动配置环境。运行部署脚本后，新增机器会默认部署一个新组织，并启动所有节点（1CA, 2peer, 2couchdb）。如果需要自定义主机中需要部署的节点，对脚本稍作调整即可。 多机部署组织的所有脚本及配置文件位于：https://github.com/zhayujie/fabric-tools 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/09/08/277776f1cea78fd7195c65109712120b.html" />
+<meta property="og:url" content="https://uzzz.org/2018/09/08/277776f1cea78fd7195c65109712120b.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-09-08T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zhayujie5200/article/details/82529167 前面关于fabric部署的介绍都是基于单机环境下的，实际生产环境中一般会根据应用场景将节点分开部署在多台物理机上，面临的难题主要是不同主机间的节点如何通过网络进行通信。 前言 这里仍然以balance-transfer v1.0为例，尝试将两个组织分布到内网中的两台机器上，部署示意图如下： 这里使用的是solo模式的排序服务，orderer节点和Org1位于一台机器上，Org2位于另一台机器上，每个组织有一个CA节点和两个Peer节点，整个应用程序代码也部署在第一台机器上（图中未标出）。这里为了简便只用了两台机器，实际中也可以根据需要将每一个节点分开部署在一台物理机上。 如果使用kafka模型的排序服务，部署就更为复杂一些，需要增加机器来部署更多的排序相关节点以保证排序服务的崩溃故障容错。 步骤 一、编写docker-compose文件 当前由于是单机部署，所以共七个容器的配置都是写在一个docker-compose.yaml中的，现在需要拆分成两份，用于在两台机器上分别启动节点。 拆分的过程很简单，只需要在一份docker配置文件中保留Orderer节点，Org1的1个CA节点、2个Peer节点的配置，在另一份配置文件中保留Org2的1个CA、2个Peer的配置。 这一步的重点，也是整个多级部署的关键，就是需要在每个Peer容器中添加extra_hosts参数，这个参数提供需要连接的节点的主机名hostname和ip的映射。在单机环境中是无须设置这个参数的，因为所有容器处于同一机器同一网络，可以直接通过主机名来连接其他容器，但是如果处于不同机器，就必须提供IP地址才能跨主机通信。 对于extra_hosts的设置，网上的一些资料看法不一，有的人认为peer节点的该参数要设置其余所有节点的ip地址。经过一些测试后我发现：只需要设置位于不同机器上的Orderer节点以及同组织其他节点的ip。 这里Org1与Orderer节点处于同一机器，组织内的两个节点也没有分开，所以无需添加extra_hosts；而Org2的两个Peer节点则只需要添加Orderer节点的IP，就可以正常接收到区块了。 extra_hosts: - &quot;orderer.example.com:192.168.1.66&quot; 如果把Org2的两个Peer分开到两个机器上，则这两个Peer还需要添加上彼此的IP映射，因为Orderer节点只会分发区块给组织的Leader节点，所以其他节点需要访问Leader节点来获取区块。 之所以我们没有添加其他组织的节点ip，是因为不同组织间只能通过锚节点（anchor peers）进行通信，这里在没有设置锚节点的情况下就算我们添加了其他组织的ip也无济于事，在后面会研究如何设置锚节点来进行跨组织的通信。 二、分发配置文件 现在机器二运行节点所需要的配置文件。我们先在机器一上操作，这里新建了一个artifacts目录，首先从crypto-config目录复制过来Org2的msp目录，然后是两个容器配置的文件，最后如果我们的组织名称不是Org1或Org2，则需要手动创建一个CA配置文件（由于要修改affiliation字段）。 artifacts ├── org2.example.com // Org2的msp目录 ├── base.yaml ├── docker-compose.yaml └── fabric-ca-server-config.yaml // 如果组织名是自定义的则需要这个文件 这里的目录名称需要命名为artifacts，因为将来要在此目录下执行docker-compose up命令，而该命令创建的网络id默认就是当前所在目录的名称，为了让两台机器节点处于同一网络，就必须使该目录名称保持一致。 此时docker-compose.yaml还要做相应修改，因为新机器的msp目录的相对路径发生了改变（位于同一目录下），注意CA容器和Peer容器的volumes映射部分和environment部分的某些参数要根据实际路径稍作调整。 准备完成后，就可以将整个artifacts目录发送到新的机器上去，有多种方法，可以在命令行使用scp命令，也可以用FileZilla等远程连接客户端以sftp方式进行文件传输。 三、修改network-config.json文件 接下来修改网络配置文件，需要修改每个组织CA和Peer的IP地址，由于APP和组织一是同一机器，所以这里Org1节点的ip保持为localhost即可，无需修改。下面是Org2的第一个节点的设置，由于这里两台机器处于同一内网，所以写内网ip就可以。 &quot;peer1&quot;: { &quot;requests&quot;: &quot;grpcs://192.168.1.13:7051&quot;, &quot;events&quot;: &quot;grpcs://192.168.1.13:7053&quot;, &quot;server-hostname&quot;: &quot;peer0.org2.example.com&quot;, &quot;tls_cacerts&quot;: &quot;../artifacts/channel/crypto-config/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt&quot; }, 四、在两台机器上分别启动节点 新加入机器所需的环境有：fabric镜像（ca，peer，ccenv），docker，docker-compose。所有准备工作都已完成后，可以开始启动节点了，在两台主机的artifacts目录下分别执行一下命令启动所有容器： docker-compose up -d 接下来需要初始化网络，要完成的操作有：注册用户、创建通道、将所有节点加入通道、在所有节点上安装链码、在通道上实例化链码。这些步骤可以通过执行balance-transfer提供的脚本runApp.sh来完成，也可以手动一步步提交请求完成。 到这一步，多机部署的fabric网络就建立成功了，可以测试下两台机器上的节点是否维护相同账本，可以指定Org1的节点发起交易，在Org2的节点上进行查询，查看是否账本数据能够同步。 实际应用：多机增加组织 上面提到的多机部署过程，需要在fabric网络建立之前就确定哪些节点应该部署在哪些机器上。而实际开发中更多的情况是：在网络建立之初可能无法预估有哪些网络成员，有些存在不同主机上的组织或节点需要在后续依次加入，并且不能破坏当前网络的正常运行。 这就需要结合多机部署和动态增加组织两种场景，将新的机器上的新组织节点加入到当前网络中。动态增加组织在前面的文章中已经详细介绍过了，多机增加组织则需要加上本文上述的一些步骤，可概括为以下几步： 为新组织生产msp目录，包含证书、私钥； 发送增加新组织的请求，更新通道配置（已经调用SDK写成了接口）； 将新组织的配置文件置于目标机器，包括msp目录、容器配置文件； 修改network-config.json文件，添加新组织节点信息； 在新加机器上启动所有容器； 发送请求将新组织节点加入通道，安装链码，有需要还可以升级链码。 为了更简便地在任意主机上创建新组织并加入到网络，我写了一些脚本来实现一键部署。需要的机器操作系统为CenhtOS 7.4+或Ubuntu 16.04+，无需下载任何先决条件。现提供了两个目录deploy和new-org，new-org目录需要提前置于应用程序所在服务器上（位于App项目根目录），而deploy目录将会分发到每一个新加机器中，只需要简单两步就可以完成多机动态增加的部署： 一、将deploy目录拷贝至新加入的机器，在目录下执行： sudo ./deploy.sh --domain &lt;domain&gt; --order &lt;ordererIP&gt; (domain参数：新加组织的域名， order参数：orderer节点所在的ip地址) e.g. sudo ./deploy.sh --domain org2.example.com --order 192.168.1.66 二、将deploy/artifacts目录下生成的msp目录(org2.example.com)拷贝到app所在服务器的new-org目录中 并在new-org目录下执行： sudo ./add_org.sh - -org &lt;orgName&gt; --ip &lt;IP&gt; (org参数：新加组织的名称，ip参数：新组织所在机器的ip地址) e.g. sudo ./add_org.sh --org archain --ip 192.168.1.13 执行完后新机器上的新组织即可成功加入当前网络。 注: deploy/pkg中存放了所需的镜像及软件包，如果有缺失，deploy.sh脚本执行时会自行从网络下载，所以无需手动配置环境。运行部署脚本后，新增机器会默认部署一个新组织，并启动所有节点（1CA, 2peer, 2couchdb）。如果需要自定义主机中需要部署的节点，对脚本稍作调整即可。 多机部署组织的所有脚本及配置文件位于：https://github.com/zhayujie/fabric-tools 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/09/08/277776f1cea78fd7195c65109712120b.html","headline":"Hyperledger fabric应用的多机部署","dateModified":"2018-09-08T00:00:00+08:00","datePublished":"2018-09-08T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/09/08/277776f1cea78fd7195c65109712120b.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Hyperledger fabric应用的多机部署</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div class="article-copyright">
+   版权声明：本文为博主原创文章，未经博主允许不得转载。 https://blog.csdn.net/zhayujie5200/article/details/82529167 
+ </div> 
+ <div class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <p>前面关于fabric部署的介绍都是基于单机环境下的，实际生产环境中一般会根据应用场景将节点分开部署在多台物理机上，面临的难题主要是不同主机间的节点如何通过网络进行通信。</p> 
+  <!--more--> 
+  <h2><a id="_6"></a>前言</h2> 
+  <p>这里仍然以balance-transfer v1.0为例，尝试将两个组织分布到内网中的两台机器上，部署示意图如下：</p> 
+  <p><img src="https://blog.uzzz.org/_p?https://img-blog.csdn.net/20181012164404976?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L3poYXl1amllNTIwMA==/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70" alt="在这里插入图片描述"></p> 
+  <p>这里使用的是solo模式的排序服务，orderer节点和Org1位于一台机器上，Org2位于另一台机器上，每个组织有一个CA节点和两个Peer节点，整个应用程序代码也部署在第一台机器上（图中未标出）。这里为了简便只用了两台机器，实际中也可以根据需要将每一个节点分开部署在一台物理机上。</p> 
+  <p>如果使用kafka模型的排序服务，部署就更为复杂一些，需要增加机器来部署更多的排序相关节点以保证排序服务的崩溃故障容错。</p> 
+  <h2><a id="_16"></a>步骤</h2> 
+  <h3><a id="dockercompose_17"></a>一、编写docker-compose文件</h3> 
+  <p>当前由于是单机部署，所以共七个容器的配置都是写在一个<code>docker-compose.yaml</code>中的，现在需要拆分成两份，用于在两台机器上分别启动节点。</p> 
+  <p>拆分的过程很简单，只需要在一份docker配置文件中保留Orderer节点，Org1的1个CA节点、2个Peer节点的配置，在另一份配置文件中保留Org2的1个CA、2个Peer的配置。</p> 
+  <p>这一步的重点，也是整个多级部署的关键，就是需要在每个Peer容器中添加<code>extra_hosts</code>参数，这个参数提供需要连接的节点的主机名hostname和ip的映射。在单机环境中是无须设置这个参数的，因为所有容器处于同一机器同一网络，可以直接通过主机名来连接其他容器，但是如果处于不同机器，就必须提供IP地址才能跨主机通信。</p> 
+  <p>对于<code>extra_hosts</code>的设置，网上的一些资料看法不一，有的人认为peer节点的该参数要设置其余所有节点的ip地址。经过一些测试后我发现：<strong>只需要设置位于不同机器上的Orderer节点以及同组织其他节点的ip</strong>。</p> 
+  <p>这里Org1与Orderer节点处于同一机器，组织内的两个节点也没有分开，所以无需添加extra_hosts；而Org2的两个Peer节点则只需要添加Orderer节点的IP，就可以正常接收到区块了。</p> 
+  <pre><code>extra_hosts:
+    - "orderer.example.com:192.168.1.66"
+</code></pre> 
+  <p>如果把Org2的两个Peer分开到两个机器上，则这两个Peer还需要添加上彼此的IP映射，因为Orderer节点只会分发区块给组织的Leader节点，所以其他节点需要访问Leader节点来获取区块。</p> 
+  <p>之所以我们没有添加其他组织的节点ip，是因为不同组织间只能通过锚节点（anchor peers）进行通信，这里在没有设置锚节点的情况下就算我们添加了其他组织的ip也无济于事，在后面会研究如何设置锚节点来进行跨组织的通信。</p> 
+  <h3><a id="_39"></a>二、分发配置文件</h3> 
+  <p>现在机器二运行节点所需要的配置文件。我们先在机器一上操作，这里新建了一个artifacts目录，首先从<code>crypto-config</code>目录复制过来Org2的msp目录，然后是两个容器配置的文件，最后如果我们的组织名称不是Org1或Org2，则需要手动创建一个CA配置文件（由于要修改affiliation字段）。</p> 
+  <pre><code>artifacts
+    ├── org2.example.com	            // Org2的msp目录
+    ├── base.yaml				      
+    ├── docker-compose.yaml		     
+    └── fabric-ca-server-config.yaml    // 如果组织名是自定义的则需要这个文件
+</code></pre> 
+  <p>这里的目录名称需要命名为<code>artifacts</code>，因为将来要在此目录下执行<code>docker-compose up</code>命令，而该命令创建的网络id默认就是当前所在目录的名称，为了让两台机器节点处于同一网络，就必须使该目录名称保持一致。</p> 
+  <p>此时<code>docker-compose.yaml</code>还要做相应修改，因为新机器的msp目录的相对路径发生了改变（位于同一目录下），注意CA容器和Peer容器的<code>volumes</code>映射部分和<code>environment</code>部分的某些参数要根据实际路径稍作调整。</p> 
+  <p>准备完成后，就可以将整个artifacts目录发送到新的机器上去，有多种方法，可以在命令行使用<code>scp</code>命令，也可以用<code>FileZilla</code>等远程连接客户端以<code>sftp</code>方式进行文件传输。</p> 
+  <h3><a id="networkconfigjson_56"></a>三、修改network-config.json文件</h3> 
+  <p>接下来修改网络配置文件，需要修改每个组织CA和Peer的IP地址，由于APP和组织一是同一机器，所以这里Org1节点的ip保持为localhost即可，无需修改。下面是Org2的第一个节点的设置，由于这里两台机器处于同一内网，所以写内网ip就可以。</p> 
+  <pre><code>"peer1": {
+    "requests": "grpcs://192.168.1.13:7051",
+    "events": "grpcs://192.168.1.13:7053",
+    "server-hostname": "peer0.org2.example.com",
+    "tls_cacerts": "../artifacts/channel/crypto-config/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt"
+},
+</code></pre> 
+  <h3><a id="_67"></a>四、在两台机器上分别启动节点</h3> 
+  <p>新加入机器所需的环境有：fabric镜像（ca，peer，ccenv），docker，docker-compose。所有准备工作都已完成后，可以开始启动节点了，在两台主机的<code>artifacts目录下</code>分别执行一下命令启动所有容器：</p> 
+  <pre><code>docker-compose up -d
+</code></pre> 
+  <p>接下来需要初始化网络，要完成的操作有：<strong>注册用户、创建通道、将所有节点加入通道、在所有节点上安装链码、在通道上实例化链码</strong>。这些步骤可以通过执行balance-transfer提供的脚本<code>runApp.sh</code>来完成，也可以手动一步步提交请求完成。</p> 
+  <p>到这一步，多机部署的fabric网络就建立成功了，可以测试下两台机器上的节点是否维护相同账本，可以指定Org1的节点发起交易，在Org2的节点上进行查询，查看是否账本数据能够同步。</p> 
+  <h2><a id="_78"></a>实际应用：多机增加组织</h2> 
+  <p>上面提到的多机部署过程，需要在fabric网络建立之前就确定哪些节点应该部署在哪些机器上。而实际开发中更多的情况是：在网络建立之初可能无法预估有哪些网络成员，有些存在不同主机上的组织或节点需要在后续依次加入，并且不能破坏当前网络的正常运行。</p> 
+  <p>这就需要结合多机部署和动态增加组织两种场景，将新的机器上的新组织节点加入到当前网络中。<a href="http://zhayujie.com/fabric/add-org.html" rel="nofollow">动态增加组织</a>在前面的文章中已经详细介绍过了，多机增加组织则需要加上本文上述的一些步骤，可概括为以下几步：</p> 
+  <ul> 
+   <li>为新组织生产msp目录，包含证书、私钥；</li> 
+   <li>发送增加新组织的请求，更新通道配置（已经调用SDK写成了接口）；</li> 
+   <li>将新组织的配置文件置于目标机器，包括msp目录、容器配置文件；</li> 
+   <li>修改network-config.json文件，添加新组织节点信息；</li> 
+   <li>在新加机器上启动所有容器；</li> 
+   <li>发送请求将新组织节点加入通道，安装链码，有需要还可以升级链码。</li> 
+  </ul> 
+  <p>为了更简便地在任意主机上创建新组织并加入到网络，我写了一些脚本来实现一键部署。需要的机器操作系统为<strong>CenhtOS 7.4+<strong>或</strong>Ubuntu 16.04+</strong>，无需下载任何先决条件。现提供了两个目录deploy和new-org，<strong>new-org</strong>目录需要提前置于应用程序所在服务器上（位于App项目根目录），而<strong>deploy</strong>目录将会分发到每一个新加机器中，只需要简单两步就可以完成多机动态增加的部署：</p> 
+  <p><strong>一、将deploy目录拷贝至新加入的机器，在目录下执行：</strong></p> 
+  <pre><code>sudo ./deploy.sh --domain &lt;domain&gt;  --order &lt;ordererIP&gt;
+</code></pre> 
+  <p>(domain参数：新加组织的域名， order参数：orderer节点所在的ip地址)</p> 
+  <pre><code>e.g.   sudo ./deploy.sh --domain org2.example.com --order 192.168.1.66
+</code></pre> 
+  <p><strong>二、将deploy/artifacts目录下生成的msp目录(<a href="http://org2.example.com" rel="nofollow">org2.example.com</a>)拷贝到app所在服务器的new-org目录中</strong></p> 
+  <p>并在new-org目录下执行：</p> 
+  <pre><code>sudo ./add_org.sh - -org &lt;orgName&gt; --ip &lt;IP&gt;
+</code></pre> 
+  <p>(org参数：新加组织的名称，ip参数：新组织所在机器的ip地址)</p> 
+  <pre><code>e.g.     sudo ./add_org.sh --org archain --ip 192.168.1.13
+</code></pre> 
+  <p>执行完后新机器上的新组织即可成功加入当前网络。</p> 
+  <p>注: <code>deploy/pkg</code>中存放了所需的镜像及软件包，如果有缺失，<code>deploy.sh</code>脚本执行时会自行从网络下载，所以无需手动配置环境。运行部署脚本后，新增机器会默认部署一个新组织，并启动所有节点（1CA, 2peer, 2couchdb）。如果需要自定义主机中需要部署的节点，对脚本稍作调整即可。</p> 
+  <p>多机部署组织的所有脚本及配置文件位于：<a href="https://github.com/zhayujie/fabric-tools" rel="nofollow">https://github.com/zhayujie/fabric-tools</a></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-778f64ae39.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhayujie5200/article/details/82529167,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/zhayujie5200/article/details/82529167,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

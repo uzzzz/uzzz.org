@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>Fabric源码分析 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="Fabric源码分析" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="orderer模块的设计与实现 这一块参考《fabric源码分析与深入解读》做了部分总结，加深理解。当时想了解一下kafka共识，之后发现只有和orderer联系起来才能真正的理解可插拔的共识机制。这里提前先说一些要点： orderer模块主要用到kingpin第三方包来执行配置命令，而peer模块主要用viper/cobra第三方包来执行配置命令。 order只做broadcast和deliver。broadcast主要是peer节点向order节点发送消息；deliver主要是order节点发送消息。 grpc分为客户端和服务端。对于grpc连接orderer来说，peer是客户端，orderer为服务端。 peer节点中的ledger的gossip服务起来之后就建立了与orderer的Deliver服务的连接，之后当orderer帐本中存在block数据之后，就开始主动向leader的Deliver客户端发送block数据，这个推送一直持续，Leader的Deliver客户端收到block流之后会使用gossip服务向自身和其他peer节点散播这些block数据。 数据流向 思维脑图 详情可以用xmind打开百度网盘连接 链接：https://pan.baidu.com/s/1HymBWX5sib_2rR_DRmqL1Q 提取码：hb92 fabric中使用kafka的基本目的是在多个peer结点同时向orderer服务发送消息时，能通过kafka形成一个串行的消息队列（队列中消息序号唯一，至此kafka的作用就算完成了），然后供cutter进行封装成一批批消息（即block），再将block写入orderer的ledger，也就形成了块链，最后供区域内各个peer结点中的leader获取orderer的ledger中的数据，然后由leader将数据在的区域中的各个peer结点间共享，形成了区块链。 流言算法gossip Gossip算法又被称为反熵（Anti-Entropy），熵是物理学上的一个概念，代表杂乱无章，而反熵就是在杂乱无章中寻求一致，这充分说明了Gossip的特点：在一个有界网络中，每个节点都随机地与其他节点通信，经过一番杂乱无章的通信，最终所有节点的状态都会达成一致。每个节点可能知道所有其他节点，也可能仅知道几个邻居节点，只要这些节可以通过网络连通，最终他们的状态都是一致的，当然这也是疫情传播的特点。 gossip数据传输协议 peer结点“撬动”gossip以可测量的方式去广播（broadcast）账本和频道数据。gossip消息传送是是持续的，而且在频道中的每个peer不间断的从其它的peer那里接收当前的和一贯的（也就是格式等前后一致）账本数据（ledger data）。每个传播的消息都被签名过，因此“拜占庭的参与者”发送虚假的消息会很容易被识别，把消息发到消息不想到达的目标的分发行为会被阻止。peer会被延迟，网络参与者或者其他造成block丢失的原因所影响，但这些丢失block的peer最终将通过联系持有这些丢失block的peer异步更新到当前账本状态。（只有leader节点才会启动deliverservice模块） 以gossip为基础的数据传播协议在Fabric网络上执行三个基础的功能： 通过持续性的识别有效成员peer和检测那些已经下线的peer，管理peer的发现（discovery）和频道成员关系。 在频道上所有的peer之间传播账本数据。任何持有与频道其他peer结点不同步的数据的peer识别丢失的block并通过拷贝正确的数据来同步自身。 通过允许账本数据以peer点对peer点（peer-to-peer）状态传输更新的方式，提高新加入网络的peer结点的同步速度。 以gossip为基础的广播操作是通过peer从频道中其他peer中接收消息，然后把这些消息传送到频道上一定数量随机选择的peer结点，这个数量是可配置常量。peer结点也能运用一个pull机制，而不是等待一个消息的投递。这个循环重复着，伴随着频道成员关系的结果，账本和状态信息持续保持最新且同步。对于新block的传播，在频道中的领导peer（the leader peer）从ordering服务pull数据并初始化gossip到各个peer的传播。 gossip消息类型Tag EMPTY 空消息 CHAN_AND_ORG 同时在同一频道和同一组织内传播 CHAN_OR_ORG 既可以在同一频道内也可以在同一组织内传播 CHAN_ONLY 只在同一频道内传播 ORG_ONLY 只在同一组织内传播 gossip算法总结 详情可以利用xmind参考。利用上面的百度链接下载即可。 之后在书中看到一个”消息去往何方“的知识点，大概意思是gossip消息如何散播，有点绕脑，但还是值得深究的： 如图，A，B，C，D四个结点，属于同一频道同一组织。这里更粗线条的模拟一下传播的过程，初始条件： A-B，B-C，B-D，C-D均为一个单位距离，A-C，A-D均为两个单位距离。 四个结点处理消息效率一致，每100s，才能向一个单位距离范围的结点传播一条消息。 每隔400s，每个结点的stateInfoMsgStore清理一次名单。对于存在时间&gt;=400s的名单，将废止。 只传播一条消息M，是高度为2的block。时间用Tn表示，如T100表示时间在100s时，T110表示时间在110s时。每个结点发送自身的状态信息用S（i，h，t）表示，i代表身份，h代表当前账本的高度，t代表时间戳。每个结点的账本高度当前均为1。每个结点需花费10s，才能将M存储到自身的账本中。 此刻从0s开始计时，A为leader，开始接收deliverservice来的消息并开始传播。此前已花费了100s时间供四个结点同时初始化，每个结点此刻中只存在一个单位距离范围的结点名单， 即：A中有S（B，1，0）；B中有S（A，1，0），S（C，1，0），S（D，1，0）；C中有S（B，1，0），S（D，1，0）；D中有S（B，1，0），S（C，1，0）。 T10时，A将M提交到自己的账本中，发送了S（A，2，10）给B，随即将M传播给B。 T110时，B收到S（A，2，10）并更新自己的名单，同时收到M，立即传播给A，C，D。 T120时，B将M提交到自己的账本中，向A，C，D发送S（B，2，120）。 T200时，在T0前100s就开始传播S的A-C，A-D两条2个单位距离线路的双方也都收到了各自的S，即A收到S（C，1，-100），S（D，1，-100）；C收到S（A，1，-100）；D收到S（A，1，-100），此刻每个结点的名单中都包含另外三个结点。 T210时，A，C，D收到B发送的M，A已有M，未作进一步处理，C和D立即向其余三个结点传播M。 T220时，C和D将M提交到自己的账本中，向其余三个结点分别发送了S（C，2，220），S（D，2，220），同时，A，C，D也收到B发送来的S（B，2，120）。 T220时，名单情况为：A中有S（B，2，120），S（C，1，-100），S（D，1，-100）；B中有S（A，2，10），S（C，1，0），S（D，1，0）；C中有S（A，1，-100），S（B，2，120），S（D，1，0）；D中有S（A，1，-100），S（B，2，120），S（C，1，0）。 T310时，A，B，D收到C发来的M，因为都有了，未作进一步处理；A，B，C都收到D发来的M，因为都有了，未作进一步处理。 T320时，A，B，D收到C发来的S（C，2，220）；A，B，C收到D发来的S（D，2，220），各自更新自己的名单。 T320时，名单情况为：A中有S（B，2，120），S（C，2，220），S（D，2，220）；B中有S（A，2，10），S（C，2，220），S（D，2，220）；C中有S（A，1，-100），S（B，2，120），S（D，2，220）；D中有S（A，1，-100），S（B，2，120），S（C，2，220）。 T400时，每个结点的stateInfoMsgStore清理一次名单，C，D中的S（A，1，-100）将被清除。至此M在四个结点间散播过程终止。 chaincode的设计与实现 综述 chaincode是Fabric实现智能合约的方式，利用容器技术将智能合约放置在容器中运行，进行调用。链码在fabric节点上的隔离沙盒（docker容器）中执行，并通过gRPC协议来与节点进行交互。必要的交互包括调用链码、读写账本、返回响应结果等。而且提供了四个管理chaincode生命周期的命令：package，install，instantiate，upgrade。在这里需要注意一下：chaincode应该只被安装在chaincode所有者的背书节点上，便于chaincode逻辑对整个网络的其他成员保密。其他没有chaincode成员将无权成为chaincode影响下的交易的认证节点（endorser)。也就是说，他们不能执行chaincode。不过，他们仍然可以验证交易并提交到帐本上（在相同的网络中）。 通过参考《fabric源码分析与深入解读》，在链码部分，主要讨论chaincode所涉及的各种承载chaincode数据的结构体和元工具，ACC（用户应用链码）以及SCC（系统链码）的部署和实例化。 详细思维脑图 同样可以结合之前的链接里的chaincode文件查看。利用xmind软件。 FSM（有限状态机）的介绍 在chaincode的设计中，ChaincodeSupport服务会使用到FSM。FSM将一个事物从状态A向状态B的转换看作一个是事件，并可以设置在进入/离开某个状态时自动调用的时机函数。每个状态事件、状态，时机函数都用字符串关键字表示。我在源码中找了其用法的基本格式，如下： func NewPeerConnectionFSM(to string) *PeerConnectionFSM { d := &amp;PeerConnectionFSM{ To: to, } //创建一个FSM，三个参数：1.默认状态 2.定义状态事件 3.定义状态转变时调用的函数 d.FSM = fsm.NewFSM( &quot;created&quot;, fsm.Events{ //状态事件的名称 该事件的起始状态src 该事件的结束状态Dst {Name: &quot;HELLO&quot;, Src: []string{&quot;created&quot;}, Dst: &quot;established&quot;}, //状态事件HELLO表示事物的状态从状态created到状态established {Name: &quot;GET_PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PING&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;DISCONNECT&quot;, Src: []string{&quot;created&quot;, &quot;established&quot;}, Dst: &quot;closed&quot;}, }, //状态事件调用函数（时机函数） 格式：调用时机_事件或者状态 fsm.Callbacks{ &quot;enter_state&quot;: func(e *fsm.Event) { d.enterState(e) }, &quot;before_HELLO&quot;: func(e *fsm.Event) { d.beforeHello(e) }, //表示在HELLO状态发生之前调用该函数 &quot;after_HELLO&quot;: func(e *fsm.Event) { d.afterHello(e) }, &quot;before_PING&quot;: func(e *fsm.Event) { d.beforePing(e) }, &quot;after_PING&quot;: func(e *fsm.Event) { d.afterPing(e) }, }, ) return d } 在学习源码的时候遇到这个然后去官方文档查了一下，大致理解了其作用，而且不止在chaincode涉及到了RWset,在ledger中也有提及。下面是官方文档中的相关介绍： 事务模拟和读写集 在模拟a处的事务期间，为事务endorser准备读写集。它read set包含事务在模拟期间读取的唯一键及其提交版本的列表。它write set包含一个唯一键列表（尽管可能与读取集中存在的键重叠）以及事务写入的新值。如果事务执行的更新是删除密钥，则为密钥设置删除标记（代替新值）。 此外，如果事务为键多次写入值，则仅保留最后写入的值。此外，如果事务读取键的值，则即使事务在发出读取之前更新了键的值，也会返回已提交状态的值。换句话说，不支持Read-your-writes语义。 如前所述，密钥的版本仅记录在读取集中; 写集只包含事务设置的唯一键列表及其最新值。 可以有各种方案来实现版本。版本控制方案的最低要求是为给定密钥生成非重复标识符。例如，对于版本使用单调递增的数字可以是一种这样的方案。在当前实现中，我们使用基于区块链高度的版本控制方案，其中提交事务的高度被用作事务修改的所有密钥的最新版本。在此方案中，事务的高度由元组表示（txNumber是块内事务的高度）。与增量数字方案相比，该方案具有许多优点 - 主要是，它可以实现其他组件，如陈述，事务模拟和验证，以进行有效的设计选择。 RWset读写集的理解 以下是通过模拟假设事务准备的示例读写集的图示。为简单起见，在插图中，我们使用增量数来表示版本。 &lt;读集&gt; 使用读写集进行事务验证和更新世界状态 A committer使用读写集的读集部分来检查事务的有效性和读写集的写集部分，以更新受影响的密钥的版本和值。 在验证阶段，valid如果事务的读取集中存在的每个密钥的版本与世界状态中相同密钥的版本匹配，则考虑事务 - 假设所有先前的valid事务（包括同一块中的先前事务）已提交（已提交状态）。如果读写集还包含一个或多个查询信息，则执行附加验证。 此附加验证应确保在查询信息中捕获的结果的超范围（即范围的并集）中未插入/删除/更新密钥。换句话说，如果我们在提交状态的验证期间重新执行任何范围查询（在模拟期间执行的事务），它应该产生与模拟时事务所观察到的结果相同的结果。此检查确保如果事务在提交期间观察幻像项，则应将事务标记为无效。请注意，此幻像保护仅限于范围查询（即GetStateByRange链代码中的功能），尚未针对其他查询实现（即，GetQueryResult链码中的功能）。其他查询存在幻像风险，因此应仅用于未提交排序的只读事务，除非应用程序可以保证模拟和验证/提交时间之间结果集的稳定性。如果事务通过了有效性检查，则提交者使用写集来更新世界状态。在更新阶段，对于写集中存在的每个密钥，相同密钥的世界状态中的值被设置为写集中指定的值。此外，世界状态中的密钥版本被更改以反映最新版本。 示例模拟和验证 本节通过示例场景帮助理解语义。出于该示例的目的k，在世界状态中键的存在由元组表示，(k,ver,val)其中 ver键是k具有val其值的最新版本的键。现在，考虑一组五个事务T1, T2, T3, T4, and T5，全部模拟在世界状态的同一快照上。以下代码段显示了模拟事务的世界状态的快照，以及每个事务执行的读写活动的顺序。 世界状态：（k1,1，v1），（k2,1，v2），（k3,1，v3），（k4,1，v4），（k5,1，v5） T1 - &gt;写（k1，v1’），写（k2，v2’） T2 - &gt;读（k1），写（k3，v3’） T3 - &gt;写（k2，v2’’） T4 - &gt;写（k2，v2’’’），读（k2） T5 - &gt;写（k6，v6’），读（k5） 现在，假设这些事务按T1，…，T5的顺序排序（可以包含在单个块或不同的块中） T1通过验证，因为它不执行任何读取。此外，密钥的元组k1和k2世界状态更新为(k1,2,v1’), (k2,2,v2’) T2验证失败，因为它读取了一个密钥k1，该密钥由前面的事务修改 -T1 T3传递验证，因为它不执行读取。此外，密钥的元组k2，在世界状态中更新为(k2,3,v2’’) T4验证失败，因为它读取了一个密钥k2，该密钥由前面的事务修改T1 T5传递验证，因为它读取一个密钥，k5,该密钥未被任何前面的事务修改 注意：尚不支持具有多个读写集的事务。 阅读更多" />
+<meta property="og:description" content="orderer模块的设计与实现 这一块参考《fabric源码分析与深入解读》做了部分总结，加深理解。当时想了解一下kafka共识，之后发现只有和orderer联系起来才能真正的理解可插拔的共识机制。这里提前先说一些要点： orderer模块主要用到kingpin第三方包来执行配置命令，而peer模块主要用viper/cobra第三方包来执行配置命令。 order只做broadcast和deliver。broadcast主要是peer节点向order节点发送消息；deliver主要是order节点发送消息。 grpc分为客户端和服务端。对于grpc连接orderer来说，peer是客户端，orderer为服务端。 peer节点中的ledger的gossip服务起来之后就建立了与orderer的Deliver服务的连接，之后当orderer帐本中存在block数据之后，就开始主动向leader的Deliver客户端发送block数据，这个推送一直持续，Leader的Deliver客户端收到block流之后会使用gossip服务向自身和其他peer节点散播这些block数据。 数据流向 思维脑图 详情可以用xmind打开百度网盘连接 链接：https://pan.baidu.com/s/1HymBWX5sib_2rR_DRmqL1Q 提取码：hb92 fabric中使用kafka的基本目的是在多个peer结点同时向orderer服务发送消息时，能通过kafka形成一个串行的消息队列（队列中消息序号唯一，至此kafka的作用就算完成了），然后供cutter进行封装成一批批消息（即block），再将block写入orderer的ledger，也就形成了块链，最后供区域内各个peer结点中的leader获取orderer的ledger中的数据，然后由leader将数据在的区域中的各个peer结点间共享，形成了区块链。 流言算法gossip Gossip算法又被称为反熵（Anti-Entropy），熵是物理学上的一个概念，代表杂乱无章，而反熵就是在杂乱无章中寻求一致，这充分说明了Gossip的特点：在一个有界网络中，每个节点都随机地与其他节点通信，经过一番杂乱无章的通信，最终所有节点的状态都会达成一致。每个节点可能知道所有其他节点，也可能仅知道几个邻居节点，只要这些节可以通过网络连通，最终他们的状态都是一致的，当然这也是疫情传播的特点。 gossip数据传输协议 peer结点“撬动”gossip以可测量的方式去广播（broadcast）账本和频道数据。gossip消息传送是是持续的，而且在频道中的每个peer不间断的从其它的peer那里接收当前的和一贯的（也就是格式等前后一致）账本数据（ledger data）。每个传播的消息都被签名过，因此“拜占庭的参与者”发送虚假的消息会很容易被识别，把消息发到消息不想到达的目标的分发行为会被阻止。peer会被延迟，网络参与者或者其他造成block丢失的原因所影响，但这些丢失block的peer最终将通过联系持有这些丢失block的peer异步更新到当前账本状态。（只有leader节点才会启动deliverservice模块） 以gossip为基础的数据传播协议在Fabric网络上执行三个基础的功能： 通过持续性的识别有效成员peer和检测那些已经下线的peer，管理peer的发现（discovery）和频道成员关系。 在频道上所有的peer之间传播账本数据。任何持有与频道其他peer结点不同步的数据的peer识别丢失的block并通过拷贝正确的数据来同步自身。 通过允许账本数据以peer点对peer点（peer-to-peer）状态传输更新的方式，提高新加入网络的peer结点的同步速度。 以gossip为基础的广播操作是通过peer从频道中其他peer中接收消息，然后把这些消息传送到频道上一定数量随机选择的peer结点，这个数量是可配置常量。peer结点也能运用一个pull机制，而不是等待一个消息的投递。这个循环重复着，伴随着频道成员关系的结果，账本和状态信息持续保持最新且同步。对于新block的传播，在频道中的领导peer（the leader peer）从ordering服务pull数据并初始化gossip到各个peer的传播。 gossip消息类型Tag EMPTY 空消息 CHAN_AND_ORG 同时在同一频道和同一组织内传播 CHAN_OR_ORG 既可以在同一频道内也可以在同一组织内传播 CHAN_ONLY 只在同一频道内传播 ORG_ONLY 只在同一组织内传播 gossip算法总结 详情可以利用xmind参考。利用上面的百度链接下载即可。 之后在书中看到一个”消息去往何方“的知识点，大概意思是gossip消息如何散播，有点绕脑，但还是值得深究的： 如图，A，B，C，D四个结点，属于同一频道同一组织。这里更粗线条的模拟一下传播的过程，初始条件： A-B，B-C，B-D，C-D均为一个单位距离，A-C，A-D均为两个单位距离。 四个结点处理消息效率一致，每100s，才能向一个单位距离范围的结点传播一条消息。 每隔400s，每个结点的stateInfoMsgStore清理一次名单。对于存在时间&gt;=400s的名单，将废止。 只传播一条消息M，是高度为2的block。时间用Tn表示，如T100表示时间在100s时，T110表示时间在110s时。每个结点发送自身的状态信息用S（i，h，t）表示，i代表身份，h代表当前账本的高度，t代表时间戳。每个结点的账本高度当前均为1。每个结点需花费10s，才能将M存储到自身的账本中。 此刻从0s开始计时，A为leader，开始接收deliverservice来的消息并开始传播。此前已花费了100s时间供四个结点同时初始化，每个结点此刻中只存在一个单位距离范围的结点名单， 即：A中有S（B，1，0）；B中有S（A，1，0），S（C，1，0），S（D，1，0）；C中有S（B，1，0），S（D，1，0）；D中有S（B，1，0），S（C，1，0）。 T10时，A将M提交到自己的账本中，发送了S（A，2，10）给B，随即将M传播给B。 T110时，B收到S（A，2，10）并更新自己的名单，同时收到M，立即传播给A，C，D。 T120时，B将M提交到自己的账本中，向A，C，D发送S（B，2，120）。 T200时，在T0前100s就开始传播S的A-C，A-D两条2个单位距离线路的双方也都收到了各自的S，即A收到S（C，1，-100），S（D，1，-100）；C收到S（A，1，-100）；D收到S（A，1，-100），此刻每个结点的名单中都包含另外三个结点。 T210时，A，C，D收到B发送的M，A已有M，未作进一步处理，C和D立即向其余三个结点传播M。 T220时，C和D将M提交到自己的账本中，向其余三个结点分别发送了S（C，2，220），S（D，2，220），同时，A，C，D也收到B发送来的S（B，2，120）。 T220时，名单情况为：A中有S（B，2，120），S（C，1，-100），S（D，1，-100）；B中有S（A，2，10），S（C，1，0），S（D，1，0）；C中有S（A，1，-100），S（B，2，120），S（D，1，0）；D中有S（A，1，-100），S（B，2，120），S（C，1，0）。 T310时，A，B，D收到C发来的M，因为都有了，未作进一步处理；A，B，C都收到D发来的M，因为都有了，未作进一步处理。 T320时，A，B，D收到C发来的S（C，2，220）；A，B，C收到D发来的S（D，2，220），各自更新自己的名单。 T320时，名单情况为：A中有S（B，2，120），S（C，2，220），S（D，2，220）；B中有S（A，2，10），S（C，2，220），S（D，2，220）；C中有S（A，1，-100），S（B，2，120），S（D，2，220）；D中有S（A，1，-100），S（B，2，120），S（C，2，220）。 T400时，每个结点的stateInfoMsgStore清理一次名单，C，D中的S（A，1，-100）将被清除。至此M在四个结点间散播过程终止。 chaincode的设计与实现 综述 chaincode是Fabric实现智能合约的方式，利用容器技术将智能合约放置在容器中运行，进行调用。链码在fabric节点上的隔离沙盒（docker容器）中执行，并通过gRPC协议来与节点进行交互。必要的交互包括调用链码、读写账本、返回响应结果等。而且提供了四个管理chaincode生命周期的命令：package，install，instantiate，upgrade。在这里需要注意一下：chaincode应该只被安装在chaincode所有者的背书节点上，便于chaincode逻辑对整个网络的其他成员保密。其他没有chaincode成员将无权成为chaincode影响下的交易的认证节点（endorser)。也就是说，他们不能执行chaincode。不过，他们仍然可以验证交易并提交到帐本上（在相同的网络中）。 通过参考《fabric源码分析与深入解读》，在链码部分，主要讨论chaincode所涉及的各种承载chaincode数据的结构体和元工具，ACC（用户应用链码）以及SCC（系统链码）的部署和实例化。 详细思维脑图 同样可以结合之前的链接里的chaincode文件查看。利用xmind软件。 FSM（有限状态机）的介绍 在chaincode的设计中，ChaincodeSupport服务会使用到FSM。FSM将一个事物从状态A向状态B的转换看作一个是事件，并可以设置在进入/离开某个状态时自动调用的时机函数。每个状态事件、状态，时机函数都用字符串关键字表示。我在源码中找了其用法的基本格式，如下： func NewPeerConnectionFSM(to string) *PeerConnectionFSM { d := &amp;PeerConnectionFSM{ To: to, } //创建一个FSM，三个参数：1.默认状态 2.定义状态事件 3.定义状态转变时调用的函数 d.FSM = fsm.NewFSM( &quot;created&quot;, fsm.Events{ //状态事件的名称 该事件的起始状态src 该事件的结束状态Dst {Name: &quot;HELLO&quot;, Src: []string{&quot;created&quot;}, Dst: &quot;established&quot;}, //状态事件HELLO表示事物的状态从状态created到状态established {Name: &quot;GET_PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PING&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;DISCONNECT&quot;, Src: []string{&quot;created&quot;, &quot;established&quot;}, Dst: &quot;closed&quot;}, }, //状态事件调用函数（时机函数） 格式：调用时机_事件或者状态 fsm.Callbacks{ &quot;enter_state&quot;: func(e *fsm.Event) { d.enterState(e) }, &quot;before_HELLO&quot;: func(e *fsm.Event) { d.beforeHello(e) }, //表示在HELLO状态发生之前调用该函数 &quot;after_HELLO&quot;: func(e *fsm.Event) { d.afterHello(e) }, &quot;before_PING&quot;: func(e *fsm.Event) { d.beforePing(e) }, &quot;after_PING&quot;: func(e *fsm.Event) { d.afterPing(e) }, }, ) return d } 在学习源码的时候遇到这个然后去官方文档查了一下，大致理解了其作用，而且不止在chaincode涉及到了RWset,在ledger中也有提及。下面是官方文档中的相关介绍： 事务模拟和读写集 在模拟a处的事务期间，为事务endorser准备读写集。它read set包含事务在模拟期间读取的唯一键及其提交版本的列表。它write set包含一个唯一键列表（尽管可能与读取集中存在的键重叠）以及事务写入的新值。如果事务执行的更新是删除密钥，则为密钥设置删除标记（代替新值）。 此外，如果事务为键多次写入值，则仅保留最后写入的值。此外，如果事务读取键的值，则即使事务在发出读取之前更新了键的值，也会返回已提交状态的值。换句话说，不支持Read-your-writes语义。 如前所述，密钥的版本仅记录在读取集中; 写集只包含事务设置的唯一键列表及其最新值。 可以有各种方案来实现版本。版本控制方案的最低要求是为给定密钥生成非重复标识符。例如，对于版本使用单调递增的数字可以是一种这样的方案。在当前实现中，我们使用基于区块链高度的版本控制方案，其中提交事务的高度被用作事务修改的所有密钥的最新版本。在此方案中，事务的高度由元组表示（txNumber是块内事务的高度）。与增量数字方案相比，该方案具有许多优点 - 主要是，它可以实现其他组件，如陈述，事务模拟和验证，以进行有效的设计选择。 RWset读写集的理解 以下是通过模拟假设事务准备的示例读写集的图示。为简单起见，在插图中，我们使用增量数来表示版本。 &lt;读集&gt; 使用读写集进行事务验证和更新世界状态 A committer使用读写集的读集部分来检查事务的有效性和读写集的写集部分，以更新受影响的密钥的版本和值。 在验证阶段，valid如果事务的读取集中存在的每个密钥的版本与世界状态中相同密钥的版本匹配，则考虑事务 - 假设所有先前的valid事务（包括同一块中的先前事务）已提交（已提交状态）。如果读写集还包含一个或多个查询信息，则执行附加验证。 此附加验证应确保在查询信息中捕获的结果的超范围（即范围的并集）中未插入/删除/更新密钥。换句话说，如果我们在提交状态的验证期间重新执行任何范围查询（在模拟期间执行的事务），它应该产生与模拟时事务所观察到的结果相同的结果。此检查确保如果事务在提交期间观察幻像项，则应将事务标记为无效。请注意，此幻像保护仅限于范围查询（即GetStateByRange链代码中的功能），尚未针对其他查询实现（即，GetQueryResult链码中的功能）。其他查询存在幻像风险，因此应仅用于未提交排序的只读事务，除非应用程序可以保证模拟和验证/提交时间之间结果集的稳定性。如果事务通过了有效性检查，则提交者使用写集来更新世界状态。在更新阶段，对于写集中存在的每个密钥，相同密钥的世界状态中的值被设置为写集中指定的值。此外，世界状态中的密钥版本被更改以反映最新版本。 示例模拟和验证 本节通过示例场景帮助理解语义。出于该示例的目的k，在世界状态中键的存在由元组表示，(k,ver,val)其中 ver键是k具有val其值的最新版本的键。现在，考虑一组五个事务T1, T2, T3, T4, and T5，全部模拟在世界状态的同一快照上。以下代码段显示了模拟事务的世界状态的快照，以及每个事务执行的读写活动的顺序。 世界状态：（k1,1，v1），（k2,1，v2），（k3,1，v3），（k4,1，v4），（k5,1，v5） T1 - &gt;写（k1，v1’），写（k2，v2’） T2 - &gt;读（k1），写（k3，v3’） T3 - &gt;写（k2，v2’’） T4 - &gt;写（k2，v2’’’），读（k2） T5 - &gt;写（k6，v6’），读（k5） 现在，假设这些事务按T1，…，T5的顺序排序（可以包含在单个块或不同的块中） T1通过验证，因为它不执行任何读取。此外，密钥的元组k1和k2世界状态更新为(k1,2,v1’), (k2,2,v2’) T2验证失败，因为它读取了一个密钥k1，该密钥由前面的事务修改 -T1 T3传递验证，因为它不执行读取。此外，密钥的元组k2，在世界状态中更新为(k2,3,v2’’) T4验证失败，因为它读取了一个密钥k2，该密钥由前面的事务修改T1 T5传递验证，因为它读取一个密钥，k5,该密钥未被任何前面的事务修改 注意：尚不支持具有多个读写集的事务。 阅读更多" />
+<link rel="canonical" href="https://uzzz.org/2018/11/24/66e19701a2c1b6f2b44823dfc710508f.html" />
+<meta property="og:url" content="https://uzzz.org/2018/11/24/66e19701a2c1b6f2b44823dfc710508f.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2018-11-24T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"orderer模块的设计与实现 这一块参考《fabric源码分析与深入解读》做了部分总结，加深理解。当时想了解一下kafka共识，之后发现只有和orderer联系起来才能真正的理解可插拔的共识机制。这里提前先说一些要点： orderer模块主要用到kingpin第三方包来执行配置命令，而peer模块主要用viper/cobra第三方包来执行配置命令。 order只做broadcast和deliver。broadcast主要是peer节点向order节点发送消息；deliver主要是order节点发送消息。 grpc分为客户端和服务端。对于grpc连接orderer来说，peer是客户端，orderer为服务端。 peer节点中的ledger的gossip服务起来之后就建立了与orderer的Deliver服务的连接，之后当orderer帐本中存在block数据之后，就开始主动向leader的Deliver客户端发送block数据，这个推送一直持续，Leader的Deliver客户端收到block流之后会使用gossip服务向自身和其他peer节点散播这些block数据。 数据流向 思维脑图 详情可以用xmind打开百度网盘连接 链接：https://pan.baidu.com/s/1HymBWX5sib_2rR_DRmqL1Q 提取码：hb92 fabric中使用kafka的基本目的是在多个peer结点同时向orderer服务发送消息时，能通过kafka形成一个串行的消息队列（队列中消息序号唯一，至此kafka的作用就算完成了），然后供cutter进行封装成一批批消息（即block），再将block写入orderer的ledger，也就形成了块链，最后供区域内各个peer结点中的leader获取orderer的ledger中的数据，然后由leader将数据在的区域中的各个peer结点间共享，形成了区块链。 流言算法gossip Gossip算法又被称为反熵（Anti-Entropy），熵是物理学上的一个概念，代表杂乱无章，而反熵就是在杂乱无章中寻求一致，这充分说明了Gossip的特点：在一个有界网络中，每个节点都随机地与其他节点通信，经过一番杂乱无章的通信，最终所有节点的状态都会达成一致。每个节点可能知道所有其他节点，也可能仅知道几个邻居节点，只要这些节可以通过网络连通，最终他们的状态都是一致的，当然这也是疫情传播的特点。 gossip数据传输协议 peer结点“撬动”gossip以可测量的方式去广播（broadcast）账本和频道数据。gossip消息传送是是持续的，而且在频道中的每个peer不间断的从其它的peer那里接收当前的和一贯的（也就是格式等前后一致）账本数据（ledger data）。每个传播的消息都被签名过，因此“拜占庭的参与者”发送虚假的消息会很容易被识别，把消息发到消息不想到达的目标的分发行为会被阻止。peer会被延迟，网络参与者或者其他造成block丢失的原因所影响，但这些丢失block的peer最终将通过联系持有这些丢失block的peer异步更新到当前账本状态。（只有leader节点才会启动deliverservice模块） 以gossip为基础的数据传播协议在Fabric网络上执行三个基础的功能： 通过持续性的识别有效成员peer和检测那些已经下线的peer，管理peer的发现（discovery）和频道成员关系。 在频道上所有的peer之间传播账本数据。任何持有与频道其他peer结点不同步的数据的peer识别丢失的block并通过拷贝正确的数据来同步自身。 通过允许账本数据以peer点对peer点（peer-to-peer）状态传输更新的方式，提高新加入网络的peer结点的同步速度。 以gossip为基础的广播操作是通过peer从频道中其他peer中接收消息，然后把这些消息传送到频道上一定数量随机选择的peer结点，这个数量是可配置常量。peer结点也能运用一个pull机制，而不是等待一个消息的投递。这个循环重复着，伴随着频道成员关系的结果，账本和状态信息持续保持最新且同步。对于新block的传播，在频道中的领导peer（the leader peer）从ordering服务pull数据并初始化gossip到各个peer的传播。 gossip消息类型Tag EMPTY 空消息 CHAN_AND_ORG 同时在同一频道和同一组织内传播 CHAN_OR_ORG 既可以在同一频道内也可以在同一组织内传播 CHAN_ONLY 只在同一频道内传播 ORG_ONLY 只在同一组织内传播 gossip算法总结 详情可以利用xmind参考。利用上面的百度链接下载即可。 之后在书中看到一个”消息去往何方“的知识点，大概意思是gossip消息如何散播，有点绕脑，但还是值得深究的： 如图，A，B，C，D四个结点，属于同一频道同一组织。这里更粗线条的模拟一下传播的过程，初始条件： A-B，B-C，B-D，C-D均为一个单位距离，A-C，A-D均为两个单位距离。 四个结点处理消息效率一致，每100s，才能向一个单位距离范围的结点传播一条消息。 每隔400s，每个结点的stateInfoMsgStore清理一次名单。对于存在时间&gt;=400s的名单，将废止。 只传播一条消息M，是高度为2的block。时间用Tn表示，如T100表示时间在100s时，T110表示时间在110s时。每个结点发送自身的状态信息用S（i，h，t）表示，i代表身份，h代表当前账本的高度，t代表时间戳。每个结点的账本高度当前均为1。每个结点需花费10s，才能将M存储到自身的账本中。 此刻从0s开始计时，A为leader，开始接收deliverservice来的消息并开始传播。此前已花费了100s时间供四个结点同时初始化，每个结点此刻中只存在一个单位距离范围的结点名单， 即：A中有S（B，1，0）；B中有S（A，1，0），S（C，1，0），S（D，1，0）；C中有S（B，1，0），S（D，1，0）；D中有S（B，1，0），S（C，1，0）。 T10时，A将M提交到自己的账本中，发送了S（A，2，10）给B，随即将M传播给B。 T110时，B收到S（A，2，10）并更新自己的名单，同时收到M，立即传播给A，C，D。 T120时，B将M提交到自己的账本中，向A，C，D发送S（B，2，120）。 T200时，在T0前100s就开始传播S的A-C，A-D两条2个单位距离线路的双方也都收到了各自的S，即A收到S（C，1，-100），S（D，1，-100）；C收到S（A，1，-100）；D收到S（A，1，-100），此刻每个结点的名单中都包含另外三个结点。 T210时，A，C，D收到B发送的M，A已有M，未作进一步处理，C和D立即向其余三个结点传播M。 T220时，C和D将M提交到自己的账本中，向其余三个结点分别发送了S（C，2，220），S（D，2，220），同时，A，C，D也收到B发送来的S（B，2，120）。 T220时，名单情况为：A中有S（B，2，120），S（C，1，-100），S（D，1，-100）；B中有S（A，2，10），S（C，1，0），S（D，1，0）；C中有S（A，1，-100），S（B，2，120），S（D，1，0）；D中有S（A，1，-100），S（B，2，120），S（C，1，0）。 T310时，A，B，D收到C发来的M，因为都有了，未作进一步处理；A，B，C都收到D发来的M，因为都有了，未作进一步处理。 T320时，A，B，D收到C发来的S（C，2，220）；A，B，C收到D发来的S（D，2，220），各自更新自己的名单。 T320时，名单情况为：A中有S（B，2，120），S（C，2，220），S（D，2，220）；B中有S（A，2，10），S（C，2，220），S（D，2，220）；C中有S（A，1，-100），S（B，2，120），S（D，2，220）；D中有S（A，1，-100），S（B，2，120），S（C，2，220）。 T400时，每个结点的stateInfoMsgStore清理一次名单，C，D中的S（A，1，-100）将被清除。至此M在四个结点间散播过程终止。 chaincode的设计与实现 综述 chaincode是Fabric实现智能合约的方式，利用容器技术将智能合约放置在容器中运行，进行调用。链码在fabric节点上的隔离沙盒（docker容器）中执行，并通过gRPC协议来与节点进行交互。必要的交互包括调用链码、读写账本、返回响应结果等。而且提供了四个管理chaincode生命周期的命令：package，install，instantiate，upgrade。在这里需要注意一下：chaincode应该只被安装在chaincode所有者的背书节点上，便于chaincode逻辑对整个网络的其他成员保密。其他没有chaincode成员将无权成为chaincode影响下的交易的认证节点（endorser)。也就是说，他们不能执行chaincode。不过，他们仍然可以验证交易并提交到帐本上（在相同的网络中）。 通过参考《fabric源码分析与深入解读》，在链码部分，主要讨论chaincode所涉及的各种承载chaincode数据的结构体和元工具，ACC（用户应用链码）以及SCC（系统链码）的部署和实例化。 详细思维脑图 同样可以结合之前的链接里的chaincode文件查看。利用xmind软件。 FSM（有限状态机）的介绍 在chaincode的设计中，ChaincodeSupport服务会使用到FSM。FSM将一个事物从状态A向状态B的转换看作一个是事件，并可以设置在进入/离开某个状态时自动调用的时机函数。每个状态事件、状态，时机函数都用字符串关键字表示。我在源码中找了其用法的基本格式，如下： func NewPeerConnectionFSM(to string) *PeerConnectionFSM { d := &amp;PeerConnectionFSM{ To: to, } //创建一个FSM，三个参数：1.默认状态 2.定义状态事件 3.定义状态转变时调用的函数 d.FSM = fsm.NewFSM( &quot;created&quot;, fsm.Events{ //状态事件的名称 该事件的起始状态src 该事件的结束状态Dst {Name: &quot;HELLO&quot;, Src: []string{&quot;created&quot;}, Dst: &quot;established&quot;}, //状态事件HELLO表示事物的状态从状态created到状态established {Name: &quot;GET_PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PEERS&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;PING&quot;, Src: []string{&quot;established&quot;}, Dst: &quot;established&quot;}, {Name: &quot;DISCONNECT&quot;, Src: []string{&quot;created&quot;, &quot;established&quot;}, Dst: &quot;closed&quot;}, }, //状态事件调用函数（时机函数） 格式：调用时机_事件或者状态 fsm.Callbacks{ &quot;enter_state&quot;: func(e *fsm.Event) { d.enterState(e) }, &quot;before_HELLO&quot;: func(e *fsm.Event) { d.beforeHello(e) }, //表示在HELLO状态发生之前调用该函数 &quot;after_HELLO&quot;: func(e *fsm.Event) { d.afterHello(e) }, &quot;before_PING&quot;: func(e *fsm.Event) { d.beforePing(e) }, &quot;after_PING&quot;: func(e *fsm.Event) { d.afterPing(e) }, }, ) return d } 在学习源码的时候遇到这个然后去官方文档查了一下，大致理解了其作用，而且不止在chaincode涉及到了RWset,在ledger中也有提及。下面是官方文档中的相关介绍： 事务模拟和读写集 在模拟a处的事务期间，为事务endorser准备读写集。它read set包含事务在模拟期间读取的唯一键及其提交版本的列表。它write set包含一个唯一键列表（尽管可能与读取集中存在的键重叠）以及事务写入的新值。如果事务执行的更新是删除密钥，则为密钥设置删除标记（代替新值）。 此外，如果事务为键多次写入值，则仅保留最后写入的值。此外，如果事务读取键的值，则即使事务在发出读取之前更新了键的值，也会返回已提交状态的值。换句话说，不支持Read-your-writes语义。 如前所述，密钥的版本仅记录在读取集中; 写集只包含事务设置的唯一键列表及其最新值。 可以有各种方案来实现版本。版本控制方案的最低要求是为给定密钥生成非重复标识符。例如，对于版本使用单调递增的数字可以是一种这样的方案。在当前实现中，我们使用基于区块链高度的版本控制方案，其中提交事务的高度被用作事务修改的所有密钥的最新版本。在此方案中，事务的高度由元组表示（txNumber是块内事务的高度）。与增量数字方案相比，该方案具有许多优点 - 主要是，它可以实现其他组件，如陈述，事务模拟和验证，以进行有效的设计选择。 RWset读写集的理解 以下是通过模拟假设事务准备的示例读写集的图示。为简单起见，在插图中，我们使用增量数来表示版本。 &lt;读集&gt; 使用读写集进行事务验证和更新世界状态 A committer使用读写集的读集部分来检查事务的有效性和读写集的写集部分，以更新受影响的密钥的版本和值。 在验证阶段，valid如果事务的读取集中存在的每个密钥的版本与世界状态中相同密钥的版本匹配，则考虑事务 - 假设所有先前的valid事务（包括同一块中的先前事务）已提交（已提交状态）。如果读写集还包含一个或多个查询信息，则执行附加验证。 此附加验证应确保在查询信息中捕获的结果的超范围（即范围的并集）中未插入/删除/更新密钥。换句话说，如果我们在提交状态的验证期间重新执行任何范围查询（在模拟期间执行的事务），它应该产生与模拟时事务所观察到的结果相同的结果。此检查确保如果事务在提交期间观察幻像项，则应将事务标记为无效。请注意，此幻像保护仅限于范围查询（即GetStateByRange链代码中的功能），尚未针对其他查询实现（即，GetQueryResult链码中的功能）。其他查询存在幻像风险，因此应仅用于未提交排序的只读事务，除非应用程序可以保证模拟和验证/提交时间之间结果集的稳定性。如果事务通过了有效性检查，则提交者使用写集来更新世界状态。在更新阶段，对于写集中存在的每个密钥，相同密钥的世界状态中的值被设置为写集中指定的值。此外，世界状态中的密钥版本被更改以反映最新版本。 示例模拟和验证 本节通过示例场景帮助理解语义。出于该示例的目的k，在世界状态中键的存在由元组表示，(k,ver,val)其中 ver键是k具有val其值的最新版本的键。现在，考虑一组五个事务T1, T2, T3, T4, and T5，全部模拟在世界状态的同一快照上。以下代码段显示了模拟事务的世界状态的快照，以及每个事务执行的读写活动的顺序。 世界状态：（k1,1，v1），（k2,1，v2），（k3,1，v3），（k4,1，v4），（k5,1，v5） T1 - &gt;写（k1，v1’），写（k2，v2’） T2 - &gt;读（k1），写（k3，v3’） T3 - &gt;写（k2，v2’’） T4 - &gt;写（k2，v2’’’），读（k2） T5 - &gt;写（k6，v6’），读（k5） 现在，假设这些事务按T1，…，T5的顺序排序（可以包含在单个块或不同的块中） T1通过验证，因为它不执行任何读取。此外，密钥的元组k1和k2世界状态更新为(k1,2,v1’), (k2,2,v2’) T2验证失败，因为它读取了一个密钥k1，该密钥由前面的事务修改 -T1 T3传递验证，因为它不执行读取。此外，密钥的元组k2，在世界状态中更新为(k2,3,v2’’) T4验证失败，因为它读取了一个密钥k2，该密钥由前面的事务修改T1 T5传递验证，因为它读取一个密钥，k5,该密钥未被任何前面的事务修改 注意：尚不支持具有多个读写集的事务。 阅读更多","@type":"BlogPosting","url":"https://uzzz.org/2018/11/24/66e19701a2c1b6f2b44823dfc710508f.html","headline":"Fabric源码分析","dateModified":"2018-11-24T00:00:00+08:00","datePublished":"2018-11-24T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2018/11/24/66e19701a2c1b6f2b44823dfc710508f.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>Fabric源码分析</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <div id="content_views" class="markdown_views prism-dracula"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h1><a id="orderer_0"></a>orderer模块的设计与实现</h1> 
+  <p>这一块参考《fabric源码分析与深入解读》做了部分总结，加深理解。当时想了解一下kafka共识，之后发现只有和orderer联系起来才能真正的理解可插拔的共识机制。这里提前先说一些要点：</p> 
+  <ol> 
+   <li>orderer模块主要用到kingpin第三方包来执行配置命令，而peer模块主要用viper/cobra第三方包来执行配置命令。</li> 
+   <li>order只做broadcast和deliver。broadcast主要是peer节点向order节点发送消息；deliver主要是order节点发送消息。</li> 
+   <li>grpc分为客户端和服务端。对于grpc连接orderer来说，peer是客户端，orderer为服务端。</li> 
+   <li>peer节点中的ledger的gossip服务起来之后就建立了与orderer的Deliver服务的连接，之后当orderer帐本中存在block数据之后，就开始主动向leader的Deliver客户端发送block数据，这个推送一直持续，Leader的Deliver客户端收到block流之后会使用gossip服务向自身和其他peer节点散播这些block数据。</li> 
+  </ol> 
+  <h2><a id="_8"></a>数据流向</h2> 
+  <p><img src="https://img-blog.csdnimg.cn/20181124150907291.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0hfWElOR0hBSQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <h2><a id="_10"></a>思维脑图</h2> 
+  <p>详情可以用xmind打开百度网盘连接 链接：<a href="https://pan.baidu.com/s/1HymBWX5sib_2rR_DRmqL1Q" rel="nofollow">https://pan.baidu.com/s/1HymBWX5sib_2rR_DRmqL1Q</a> 提取码：hb92</p> 
+  <p><img src="https://img-blog.csdnimg.cn/20181124151112829.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0hfWElOR0hBSQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p>fabric中使用kafka的基本目的是在多个peer结点同时向orderer服务发送消息时，能通过kafka形成一个串行的消息队列（队列中消息序号唯一，至此kafka的作用就算完成了），然后供cutter进行封装成一批批消息（即block），再将block写入orderer的ledger，也就形成了块链，最后供区域内各个peer结点中的leader获取orderer的ledger中的数据，然后由leader将数据在的区域中的各个peer结点间共享，形成了区块链。</p> 
+  <hr> 
+  <h1><a id="gossip_20"></a>流言算法gossip</h1> 
+  <p>Gossip算法又被称为反熵（Anti-Entropy），熵是物理学上的一个概念，代表杂乱无章，而反熵就是在杂乱无章中寻求一致，这充分说明了Gossip的特点：在一个有界网络中，每个节点都随机地与其他节点通信，经过一番杂乱无章的通信，最终所有节点的状态都会达成一致。每个节点可能知道所有其他节点，也可能仅知道几个邻居节点，只要这些节可以通过网络连通，最终他们的状态都是一致的，当然这也是疫情传播的特点。<br> <strong>gossip数据传输协议</strong><br> peer结点“撬动”gossip以可测量的方式去广播（broadcast）账本和频道数据。gossip消息传送是是持续的，而且在频道中的每个peer不间断的从其它的peer那里接收当前的和一贯的（也就是格式等前后一致）账本数据（ledger data）。每个传播的消息都被签名过，因此“拜占庭的参与者”发送虚假的消息会很容易被识别，把消息发到消息不想到达的目标的分发行为会被阻止。peer会被延迟，网络参与者或者其他造成block丢失的原因所影响，但这些丢失block的peer最终将通过联系持有这些丢失block的peer异步更新到当前账本状态。（只有leader节点才会启动deliverservice模块）</p> 
+  <p>以gossip为基础的数据传播协议在Fabric网络上执行三个基础的功能：</p> 
+  <ol> 
+   <li>通过持续性的识别有效成员peer和检测那些已经下线的peer，管理peer的发现（discovery）和频道成员关系。</li> 
+   <li>在频道上所有的peer之间传播账本数据。任何持有与频道其他peer结点不同步的数据的peer识别丢失的block并通过拷贝正确的数据来同步自身。</li> 
+   <li>通过允许账本数据以peer点对peer点（peer-to-peer）状态传输更新的方式，提高新加入网络的peer结点的同步速度。</li> 
+  </ol> 
+  <p>以gossip为基础的广播操作是通过peer从频道中其他peer中接收消息，然后把这些消息传送到频道上一定数量随机选择的peer结点，这个数量是可配置常量。peer结点也能运用一个pull机制，而不是等待一个消息的投递。这个循环重复着，伴随着频道成员关系的结果，账本和状态信息持续保持最新且同步。对于新block的传播，在频道中的领导peer（the leader peer）从ordering服务pull数据并初始化gossip到各个peer的传播。</p> 
+  <p><strong>gossip消息类型Tag</strong></p> 
+  <ol> 
+   <li>EMPTY 空消息</li> 
+   <li>CHAN_AND_ORG 同时在同一频道和同一组织内传播</li> 
+   <li>CHAN_OR_ORG 既可以在同一频道内也可以在同一组织内传播</li> 
+   <li>CHAN_ONLY 只在同一频道内传播</li> 
+   <li>ORG_ONLY 只在同一组织内传播</li> 
+  </ol> 
+  <h2><a id="gossip_42"></a>gossip算法总结</h2> 
+  <p>详情可以利用xmind参考。利用上面的百度链接下载即可。<br> <img src="https://img-blog.csdnimg.cn/2018112415503036.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0hfWElOR0hBSQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p>之后在书中看到一个”消息去往何方“的知识点，大概意思是gossip消息如何散播，有点绕脑，但还是值得深究的：<br> <img src="https://img-blog.csdnimg.cn/20181124155545854.png" alt="在这里插入图片描述"><br> 如图，A，B，C，D四个结点，属于同一频道同一组织。这里更粗线条的模拟一下传播的过程，初始条件：</p> 
+  <p>A-B，B-C，B-D，C-D均为一个单位距离，A-C，A-D均为两个单位距离。<br> 四个结点处理消息效率一致，每100s，才能向一个单位距离范围的结点传播一条消息。<br> 每隔400s，每个结点的stateInfoMsgStore清理一次名单。对于存在时间&gt;=400s的名单，将废止。<br> 只传播一条消息M，是高度为2的block。时间用Tn表示，如T100表示时间在100s时，T110表示时间在110s时。每个结点发送自身的状态信息用S（i，h，t）表示，i代表身份，h代表当前账本的高度，t代表时间戳。每个结点的账本高度当前均为1。每个结点需花费10s，才能将M存储到自身的账本中。<br> 此刻从0s开始计时，A为leader，开始接收deliverservice来的消息并开始传播。此前已花费了100s时间供四个结点同时初始化，每个结点此刻中只存在一个单位距离范围的结点名单，</p> 
+  <p>即：A中有S（B，1，0）；B中有S（A，1，0），S（C，1，0），S（D，1，0）；C中有S（B，1，0），S（D，1，0）；D中有S（B，1，0），S（C，1，0）。</p> 
+  <p>T10时，A将M提交到自己的账本中，发送了S（A，2，10）给B，随即将M传播给B。<br> T110时，B收到S（A，2，10）并更新自己的名单，同时收到M，立即传播给A，C，D。</p> 
+  <p>T120时，B将M提交到自己的账本中，向A，C，D发送S（B，2，120）。<br> T200时，在T0前100s就开始传播S的A-C，A-D两条2个单位距离线路的双方也都收到了各自的S，即A收到S（C，1，-100），S（D，1，-100）；C收到S（A，1，-100）；D收到S（A，1，-100），此刻每个结点的名单中都包含另外三个结点。</p> 
+  <p>T210时，A，C，D收到B发送的M，A已有M，未作进一步处理，C和D立即向其余三个结点传播M。</p> 
+  <p>T220时，C和D将M提交到自己的账本中，向其余三个结点分别发送了S（C，2，220），S（D，2，220），同时，A，C，D也收到B发送来的S（B，2，120）。</p> 
+  <p>T220时，名单情况为：A中有S（B，2，120），S（C，1，-100），S（D，1，-100）；B中有S（A，2，10），S（C，1，0），S（D，1，0）；C中有S（A，1，-100），S（B，2，120），S（D，1，0）；D中有S（A，1，-100），S（B，2，120），S（C，1，0）。<br> T310时，A，B，D收到C发来的M，因为都有了，未作进一步处理；A，B，C都收到D发来的M，因为都有了，未作进一步处理。</p> 
+  <p>T320时，A，B，D收到C发来的S（C，2，220）；A，B，C收到D发来的S（D，2，220），各自更新自己的名单。</p> 
+  <p>T320时，名单情况为：A中有S（B，2，120），S（C，2，220），S（D，2，220）；B中有S（A，2，10），S（C，2，220），S（D，2，220）；C中有S（A，1，-100），S（B，2，120），S（D，2，220）；D中有S（A，1，-100），S（B，2，120），S（C，2，220）。<br> T400时，每个结点的stateInfoMsgStore清理一次名单，C，D中的S（A，1，-100）将被清除。至此M在四个结点间散播过程终止。</p> 
+  <hr> 
+  <h2><a id="chaincode_77"></a>chaincode的设计与实现</h2> 
+  <p><strong>综述</strong><br> chaincode是Fabric实现智能合约的方式，利用容器技术将智能合约放置在容器中运行，进行调用。链码在fabric节点上的隔离沙盒（docker容器）中执行，并通过gRPC协议来与节点进行交互。必要的交互包括调用链码、读写账本、返回响应结果等。而且提供了四个管理chaincode生命周期的命令：package，install，instantiate，upgrade。在这里需要注意一下：chaincode应该只被安装在chaincode所有者的背书节点上，便于chaincode逻辑对整个网络的其他成员保密。其他没有chaincode成员将无权成为chaincode影响下的交易的认证节点（endorser)。也就是说，他们不能执行chaincode。不过，他们仍然可以验证交易并提交到帐本上（在相同的网络中）。</p> 
+  <p>通过参考《fabric源码分析与深入解读》，在链码部分，主要讨论chaincode所涉及的各种承载chaincode数据的结构体和元工具，ACC（用户应用链码）以及SCC（系统链码）的部署和实例化。</p> 
+  <p><strong>详细思维脑图</strong><br> 同样可以结合之前的链接里的chaincode文件查看。利用xmind软件。<br> <img src="https://img-blog.csdnimg.cn/20181124155953794.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L0hfWElOR0hBSQ==,size_16,color_FFFFFF,t_70" alt="在这里插入图片描述"></p> 
+  <p><strong>FSM（有限状态机）的介绍</strong><br> 在chaincode的设计中，ChaincodeSupport服务会使用到FSM。FSM将一个事物从状态A向状态B的转换看作一个是事件，并可以设置在进入/离开某个状态时自动调用的时机函数。每个状态事件、状态，时机函数都用字符串关键字表示。我在源码中找了其用法的基本格式，如下：</p> 
+  <pre><code>func NewPeerConnectionFSM(to string) *PeerConnectionFSM {
+   d := &amp;PeerConnectionFSM{
+      To: to,
+   }
+//创建一个FSM，三个参数：1.默认状态 2.定义状态事件 3.定义状态转变时调用的函数
+   d.FSM = fsm.NewFSM(
+      "created",
+      fsm.Events{
+      //状态事件的名称   该事件的起始状态src  该事件的结束状态Dst
+         {Name: "HELLO", Src: []string{"created"}, Dst: "established"},    //状态事件HELLO表示事物的状态从状态created到状态established
+         {Name: "GET_PEERS", Src: []string{"established"}, Dst: "established"},
+         {Name: "PEERS", Src: []string{"established"}, Dst: "established"},
+         {Name: "PING", Src: []string{"established"}, Dst: "established"},
+         {Name: "DISCONNECT", Src: []string{"created", "established"}, Dst: "closed"},
+      },
+//状态事件调用函数（时机函数）   格式：调用时机_事件或者状态
+      fsm.Callbacks{
+         "enter_state":  func(e *fsm.Event) { d.enterState(e) },
+         "before_HELLO": func(e *fsm.Event) { d.beforeHello(e) }, //表示在HELLO状态发生之前调用该函数
+         "after_HELLO":  func(e *fsm.Event) { d.afterHello(e) },
+         "before_PING":  func(e *fsm.Event) { d.beforePing(e) },
+         "after_PING":   func(e *fsm.Event) { d.afterPing(e) },
+      },
+   )
+ 
+   return d
+}
+</code></pre> 
+  <p>在学习源码的时候遇到这个然后去官方文档查了一下，大致理解了其作用，而且不止在chaincode涉及到了RWset,在ledger中也有提及。下面是官方文档中的相关介绍：</p> 
+  <p>事务模拟和读写集<br> 在模拟a处的事务期间，为事务endorser准备读写集。它read set包含事务在模拟期间读取的唯一键及其提交版本的列表。它write set包含一个唯一键列表（尽管可能与读取集中存在的键重叠）以及事务写入的新值。如果事务执行的更新是删除密钥，则为密钥设置删除标记（代替新值）。</p> 
+  <p>此外，如果事务为键多次写入值，则仅保留最后写入的值。此外，如果事务读取键的值，则即使事务在发出读取之前更新了键的值，也会返回已提交状态的值。换句话说，不支持Read-your-writes语义。</p> 
+  <p>如前所述，密钥的版本仅记录在读取集中; 写集只包含事务设置的唯一键列表及其最新值。</p> 
+  <pre><code>    可以有各种方案来实现版本。版本控制方案的最低要求是为给定密钥生成非重复标识符。例如，对于版本使用单调递增的数字可以是一种这样的方案。在当前实现中，我们使用基于区块链高度的版本控制方案，其中提交事务的高度被用作事务修改的所有密钥的最新版本。在此方案中，事务的高度由元组表示（txNumber是块内事务的高度）。与增量数字方案相比，该方案具有许多优点 - 主要是，它可以实现其他组件，如陈述，事务模拟和验证，以进行有效的设计选择。
+</code></pre> 
+  <p><strong>RWset读写集的理解</strong><br> 以下是通过模拟假设事务准备的示例读写集的图示。为简单起见，在插图中，我们使用增量数来表示版本。</p> &lt;读集&gt; 
+  <p>使用读写集进行事务验证和更新世界状态<br> A committer使用读写集的读集部分来检查事务的有效性和读写集的写集部分，以更新受影响的密钥的版本和值。</p> 
+  <p>在验证阶段，valid如果事务的读取集中存在的每个密钥的版本与世界状态中相同密钥的版本匹配，则考虑事务 - 假设所有先前的valid事务（包括同一块中的先前事务）已提交（已提交状态）。如果读写集还包含一个或多个查询信息，则执行附加验证。</p> 
+  <p>此附加验证应确保在查询信息中捕获的结果的超范围（即范围的并集）中未插入/删除/更新密钥。换句话说，如果我们在提交状态的验证期间重新执行任何范围查询（在模拟期间执行的事务），它应该产生与模拟时事务所观察到的结果相同的结果。此检查确保如果事务在提交期间观察幻像项，则应将事务标记为无效。请注意，此幻像保护仅限于范围查询（即GetStateByRange链代码中的功能），尚未针对其他查询实现（即，GetQueryResult链码中的功能）。其他查询存在幻像风险，因此应仅用于未提交排序的只读事务，除非应用程序可以保证模拟和验证/提交时间之间结果集的稳定性。如果事务通过了有效性检查，则提交者使用写集来更新世界状态。在更新阶段，对于写集中存在的每个密钥，相同密钥的世界状态中的值被设置为写集中指定的值。此外，世界状态中的密钥版本被更改以反映最新版本。</p> 
+  <p>示例模拟和验证<br> 本节通过示例场景帮助理解语义。出于该示例的目的k，在世界状态中键的存在由元组表示，(k,ver,val)其中 ver键是k具有val其值的最新版本的键。现在，考虑一组五个事务T1, T2, T3, T4, and T5，全部模拟在世界状态的同一快照上。以下代码段显示了模拟事务的世界状态的快照，以及每个事务执行的读写活动的顺序。</p> 
+  <p>世界状态：（k1,1，v1），（k2,1，v2），（k3,1，v3），（k4,1，v4），（k5,1，v5）<br> T1 - &gt;写（k1，v1’），写（k2，v2’）<br> T2 - &gt;读（k1），写（k3，v3’）<br> T3 - &gt;写（k2，v2’’）<br> T4 - &gt;写（k2，v2’’’），读（k2）<br> T5 - &gt;写（k6，v6’），读（k5）<br> 现在，假设这些事务按T1，…，T5的顺序排序（可以包含在单个块或不同的块中）</p> 
+  <p>T1通过验证，因为它不执行任何读取。此外，密钥的元组k1和k2世界状态更新为(k1,2,v1’), (k2,2,v2’)<br> T2验证失败，因为它读取了一个密钥k1，该密钥由前面的事务修改 -T1<br> T3传递验证，因为它不执行读取。此外，密钥的元组k2，在世界状态中更新为(k2,3,v2’’)<br> T4验证失败，因为它读取了一个密钥k2，该密钥由前面的事务修改T1<br> T5传递验证，因为它读取一个密钥，k5,该密钥未被任何前面的事务修改<br> 注意：尚不支持具有多个读写集的事务。</p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-2b43bc2447.css" rel="stylesheet"> 
+</div> 
+<div class="hide-article-box text-center"> 
+ <a class="btn" id="btn-readmore" data-track-view="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/H_XINGHAI/article/details/84451015,&quot;}" data-track-click="{&quot;mod&quot;:&quot;popu_376&quot;,&quot;con&quot;:&quot;,https://blog.csdn.net/H_XINGHAI/article/details/84451015,&quot;}">阅读更多</a> 
+</div> 
+<script>
+						(function(){
+							function setArticleH(btnReadmore,posi){
+								var winH = $(window).height();
+								var articleBox = $("div.article_content");
+								var artH = articleBox.height();
+								if(artH > winH*posi){
+									articleBox.css({
+										'height':winH*posi+'px',
+										'overflow':'hidden'
+									})
+									btnReadmore.click(function(){
+										if(typeof window.localStorage === "object" && typeof window.csdn.anonymousUserLimit === "object"){
+											if(!window.csdn.anonymousUserLimit.judgment()){
+												window.csdn.anonymousUserLimit.Jumplogin();
+												return false;
+											}else if(!currentUserName){
+												window.csdn.anonymousUserLimit.updata();
+											}
+										}
+										
+										articleBox.removeAttr("style");
+										$(this).parent().remove();
+									})
+								}else{
+									btnReadmore.parent().remove();
+								}
+							}
+							var btnReadmore = $("#btn-readmore");
+							if(btnReadmore.length>0){
+								if(currentUserName){
+									setArticleH(btnReadmore,3);
+								}else{
+									setArticleH(btnReadmore,1.2);
+								}
+							}
+						})()
+					</script>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>

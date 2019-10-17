@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+<!-- Begin Jekyll SEO tag v2.5.0 -->
+<title>MaskRCNN源码阅读 | 有组织在！</title>
+<meta name="generator" content="Jekyll v3.8.5" />
+<meta property="og:title" content="MaskRCNN源码阅读" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="MaskRCNN源码阅读 前言 这两天读了下MaskRCNN的源码，在github上找的Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow。 之前看过FasterRCNN的源码，不过当时没有做记录。 总的来说，MaskRCNN算是集大成者。其在FasterRCNN的框架上修改而成，backbone由经典的VGG变成了ResNet+FPN(Feature Pyramid Network)，RPN基本上没变，Roi pooling相应的升级成RoiAlign（可以更好的解决mask预测问题），预测头网络在原先的分类预测和回归预测的基础上又添加了一个新分支，用来预测mask。第一个将深度学习应用在语义分割上的应该是FCN(Fully Convolutional Networks)吧。 关于模型的代码实现主要在model.py文件中。 定义模型网络结果的代码主要在MaskRCNN类中的build方法中。推荐先看这个方法，有个概况之后，再细看各个子网络的实现。 输入定义 分别定义了在training和inference模式下的输入 Bottom-up 应该就是ResNet网络 # Build the shared convolutional layers. # Bottom-up Layers # Returns a list of the last layers of each stage, 5 in total. # Don&#39;t create the thead (stage 5), so we pick the 4th item in the list. if callable(config.BACKBONE): _, C2, C3, C4, C5 = config.BACKBONE(input_image, stage5=True, train_bn=config.TRAIN_BN) else: _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE, stage5=True, train_bn=config.TRAIN_BN) Top-down 以P4为例。先将P5上采样，得到与P4长宽一样的特征图，然后将C4进行卷积（横向连接），最后将两者相加（插个题外话，其实，有些论文中的网络是相乘或者其他的操作）。最后在将P4进行次卷积，据说是为了目的是消除上采样的混叠效应（aliasing effect）。 P4 = KL.Add(name=&quot;fpn_p4add&quot;)([ KL.UpSampling2D(size=(2, 2), name=&quot;fpn_p5upsampled&quot;)(P5), KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name=&#39;fpn_c4p4&#39;)(C4)]) P4 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding=&quot;SAME&quot;, name=&quot;fpn_p4&quot;)(P4) 注意的是，用于RPN的特征图和用于头部网络的特征图并不完全一致。 RPN FasterRCNN的RPN只需要在接受一个特征图，而如今要接受多尺度的特征图。在得到RPN在不同尺度上输出结果（即在不同特征图的每个点上的每个anchor上的处理结果）后还需要再整理一下，如将不同的尺度上的输出结果中的bbox信息聚合在一块。 # RPN Model rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE, len(config.RPN_ANCHOR_RATIOS), config.TOP_DOWN_PYRAMID_SIZE) # Loop through pyramid layers layer_outputs = [] # list of lists for p in rpn_feature_maps: layer_outputs.append(rpn([p])) # Concatenate layer outputs # Convert from list of lists of level outputs to list of lists # of outputs across levels. # e.g. [[a1, b1, c1], [a2, b2, c2]] =&gt; [[a1, a2], [b1, b2], [c1, c2]] output_names = [&quot;rpn_class_logits&quot;, &quot;rpn_class&quot;, &quot;rpn_bbox&quot;] outputs = list(zip(*layer_outputs)) outputs = [KL.Concatenate(axis=1, name=n)(list(o)) for o, n in zip(outputs, output_names)] rpn_class_logits, rpn_class, rpn_bbox = outputs 其中，不同bbox的坐标是使用的归一化的坐标，所以在不同特征图上的预测结果是可以混合在一块的。 ProposalLayer RPN网络输出那么多信息，需要进一步处理，得到有效的proposal。ProposalLayer根据anchor score和NMS进行选择。顺便调整下bbox位置及大小。 # Generate proposals # Proposals are [batch, N, (y1, x1, y2, x2)] in normalized coordinates # and zero padded. proposal_count = config.POST_NMS_ROIS_TRAINING if mode == &quot;training&quot;\ else config.POST_NMS_ROIS_INFERENCE rpn_rois = ProposalLayer( proposal_count=proposal_count, nms_threshold=config.RPN_NMS_THRESHOLD, name=&quot;ROI&quot;, config=config)([rpn_class, rpn_bbox, anchors]) 在最初的时候，一直想不通ProposalLayer层是怎么工作的，因为之前只知道卷积层和pool层，直到看了FasterRCNN的源代码后才知道Layer还可以这么搞。MaskRCNN的ProposalLayer和FasterRCNN的差不多。 DetectionTargetLayer 产生用于训练的样本。大致过程是先去掉数据集中过于拥挤的目标框，计算proposal和gt_boxes(真实的目标框)的重叠情况（矩阵形式），正负样本取样，文中的正负样本比例为2:1。给每个GT boxes和GT masks分配正样本（正ROI），和其他的后续处理。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) PyramidROIAlign ROI Pooling的升级版。原理可以在资料中找到。我原以为实现起来会很复杂，实际上并不是这样的。代码中先选择要在哪个层次的特征图上处理后，使用的是采样点为1的ROIalign（可以使用tf.image.crop_and_resize，该函数支持双线性插值。将最初最初的大自然图像想象成一个2D连续信号，图像经过离散采样后得到了数字图像，记录了每个整数坐标上的信息，整数坐标之间的信息通过插值算法拟合。将这个思路应用在特征图上） # Crop and Resize # From Mask R-CNN paper: &quot;We sample four regular locations, so # that we can evaluate either max or average pooling. In fact, # interpolating only a single value at each bin center (without # pooling) is nearly as effective.&quot; # # Here we use the simplified approach of a single value per bin, # which is how it&#39;s done in tf.crop_and_resize() # Result: [batch * num_boxes, pool_height, pool_width, channels] pooled.append(tf.image.crop_and_resize( feature_maps[i], level_boxes, box_indices, self.pool_shape, method=&quot;bilinear&quot;)) fpn_classifier_graph 和FasterRCNN大同小异，除了采用了ROIAlign之外。 build_fpn_mask_graph 除了采用ROIAlign外，基本上也都是常规操作吧。可以参考FCN网络理解。 DetectionLayer 在inference模式时，模型先进行fpn_classifier_graph处理，然后将其输出输入到DetectionLayer处理后，将其输出作为代替training模式下的rois输入到build_fpn_mask_graph中。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) 主要处理流程是 确定ROI的类别 修正bbox 过滤背景和低置信度的boxes 应用NMS 保留top_k目标 training和inference 在ProposalLayer层之前，两者只有输入不同，之后两者的区别主要在于 training模式：DetectionTargetLayer -&gt; NetworkHeads(fpn_classifier_graph + build_fpn_mask_graph) -&gt; Losses inference模式：NetworkHeads(fpn_classifier_graph ±&gt; DetectionLayer -&gt; build_fpn_mask_graph) 参考资料 在阅读源码的时候，参考这下面的资料，推荐先阅读资料在看源码。 令人拍案称奇的Mask RCNN MASK RCNN 源码阅读(UPDATE) Hellcatzm/Mask_RCNN: Mask R-CNN on Keras and TensorFlow，个人注释版" />
+<meta property="og:description" content="MaskRCNN源码阅读 前言 这两天读了下MaskRCNN的源码，在github上找的Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow。 之前看过FasterRCNN的源码，不过当时没有做记录。 总的来说，MaskRCNN算是集大成者。其在FasterRCNN的框架上修改而成，backbone由经典的VGG变成了ResNet+FPN(Feature Pyramid Network)，RPN基本上没变，Roi pooling相应的升级成RoiAlign（可以更好的解决mask预测问题），预测头网络在原先的分类预测和回归预测的基础上又添加了一个新分支，用来预测mask。第一个将深度学习应用在语义分割上的应该是FCN(Fully Convolutional Networks)吧。 关于模型的代码实现主要在model.py文件中。 定义模型网络结果的代码主要在MaskRCNN类中的build方法中。推荐先看这个方法，有个概况之后，再细看各个子网络的实现。 输入定义 分别定义了在training和inference模式下的输入 Bottom-up 应该就是ResNet网络 # Build the shared convolutional layers. # Bottom-up Layers # Returns a list of the last layers of each stage, 5 in total. # Don&#39;t create the thead (stage 5), so we pick the 4th item in the list. if callable(config.BACKBONE): _, C2, C3, C4, C5 = config.BACKBONE(input_image, stage5=True, train_bn=config.TRAIN_BN) else: _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE, stage5=True, train_bn=config.TRAIN_BN) Top-down 以P4为例。先将P5上采样，得到与P4长宽一样的特征图，然后将C4进行卷积（横向连接），最后将两者相加（插个题外话，其实，有些论文中的网络是相乘或者其他的操作）。最后在将P4进行次卷积，据说是为了目的是消除上采样的混叠效应（aliasing effect）。 P4 = KL.Add(name=&quot;fpn_p4add&quot;)([ KL.UpSampling2D(size=(2, 2), name=&quot;fpn_p5upsampled&quot;)(P5), KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name=&#39;fpn_c4p4&#39;)(C4)]) P4 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding=&quot;SAME&quot;, name=&quot;fpn_p4&quot;)(P4) 注意的是，用于RPN的特征图和用于头部网络的特征图并不完全一致。 RPN FasterRCNN的RPN只需要在接受一个特征图，而如今要接受多尺度的特征图。在得到RPN在不同尺度上输出结果（即在不同特征图的每个点上的每个anchor上的处理结果）后还需要再整理一下，如将不同的尺度上的输出结果中的bbox信息聚合在一块。 # RPN Model rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE, len(config.RPN_ANCHOR_RATIOS), config.TOP_DOWN_PYRAMID_SIZE) # Loop through pyramid layers layer_outputs = [] # list of lists for p in rpn_feature_maps: layer_outputs.append(rpn([p])) # Concatenate layer outputs # Convert from list of lists of level outputs to list of lists # of outputs across levels. # e.g. [[a1, b1, c1], [a2, b2, c2]] =&gt; [[a1, a2], [b1, b2], [c1, c2]] output_names = [&quot;rpn_class_logits&quot;, &quot;rpn_class&quot;, &quot;rpn_bbox&quot;] outputs = list(zip(*layer_outputs)) outputs = [KL.Concatenate(axis=1, name=n)(list(o)) for o, n in zip(outputs, output_names)] rpn_class_logits, rpn_class, rpn_bbox = outputs 其中，不同bbox的坐标是使用的归一化的坐标，所以在不同特征图上的预测结果是可以混合在一块的。 ProposalLayer RPN网络输出那么多信息，需要进一步处理，得到有效的proposal。ProposalLayer根据anchor score和NMS进行选择。顺便调整下bbox位置及大小。 # Generate proposals # Proposals are [batch, N, (y1, x1, y2, x2)] in normalized coordinates # and zero padded. proposal_count = config.POST_NMS_ROIS_TRAINING if mode == &quot;training&quot;\ else config.POST_NMS_ROIS_INFERENCE rpn_rois = ProposalLayer( proposal_count=proposal_count, nms_threshold=config.RPN_NMS_THRESHOLD, name=&quot;ROI&quot;, config=config)([rpn_class, rpn_bbox, anchors]) 在最初的时候，一直想不通ProposalLayer层是怎么工作的，因为之前只知道卷积层和pool层，直到看了FasterRCNN的源代码后才知道Layer还可以这么搞。MaskRCNN的ProposalLayer和FasterRCNN的差不多。 DetectionTargetLayer 产生用于训练的样本。大致过程是先去掉数据集中过于拥挤的目标框，计算proposal和gt_boxes(真实的目标框)的重叠情况（矩阵形式），正负样本取样，文中的正负样本比例为2:1。给每个GT boxes和GT masks分配正样本（正ROI），和其他的后续处理。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) PyramidROIAlign ROI Pooling的升级版。原理可以在资料中找到。我原以为实现起来会很复杂，实际上并不是这样的。代码中先选择要在哪个层次的特征图上处理后，使用的是采样点为1的ROIalign（可以使用tf.image.crop_and_resize，该函数支持双线性插值。将最初最初的大自然图像想象成一个2D连续信号，图像经过离散采样后得到了数字图像，记录了每个整数坐标上的信息，整数坐标之间的信息通过插值算法拟合。将这个思路应用在特征图上） # Crop and Resize # From Mask R-CNN paper: &quot;We sample four regular locations, so # that we can evaluate either max or average pooling. In fact, # interpolating only a single value at each bin center (without # pooling) is nearly as effective.&quot; # # Here we use the simplified approach of a single value per bin, # which is how it&#39;s done in tf.crop_and_resize() # Result: [batch * num_boxes, pool_height, pool_width, channels] pooled.append(tf.image.crop_and_resize( feature_maps[i], level_boxes, box_indices, self.pool_shape, method=&quot;bilinear&quot;)) fpn_classifier_graph 和FasterRCNN大同小异，除了采用了ROIAlign之外。 build_fpn_mask_graph 除了采用ROIAlign外，基本上也都是常规操作吧。可以参考FCN网络理解。 DetectionLayer 在inference模式时，模型先进行fpn_classifier_graph处理，然后将其输出输入到DetectionLayer处理后，将其输出作为代替training模式下的rois输入到build_fpn_mask_graph中。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) 主要处理流程是 确定ROI的类别 修正bbox 过滤背景和低置信度的boxes 应用NMS 保留top_k目标 training和inference 在ProposalLayer层之前，两者只有输入不同，之后两者的区别主要在于 training模式：DetectionTargetLayer -&gt; NetworkHeads(fpn_classifier_graph + build_fpn_mask_graph) -&gt; Losses inference模式：NetworkHeads(fpn_classifier_graph ±&gt; DetectionLayer -&gt; build_fpn_mask_graph) 参考资料 在阅读源码的时候，参考这下面的资料，推荐先阅读资料在看源码。 令人拍案称奇的Mask RCNN MASK RCNN 源码阅读(UPDATE) Hellcatzm/Mask_RCNN: Mask R-CNN on Keras and TensorFlow，个人注释版" />
+<link rel="canonical" href="https://uzzz.org/2019/04/16/728225.html" />
+<meta property="og:url" content="https://uzzz.org/2019/04/16/728225.html" />
+<meta property="og:site_name" content="有组织在！" />
+<meta property="og:type" content="article" />
+<meta property="article:published_time" content="2019-04-16T00:00:00+08:00" />
+<script type="application/ld+json">
+{"description":"MaskRCNN源码阅读 前言 这两天读了下MaskRCNN的源码，在github上找的Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow。 之前看过FasterRCNN的源码，不过当时没有做记录。 总的来说，MaskRCNN算是集大成者。其在FasterRCNN的框架上修改而成，backbone由经典的VGG变成了ResNet+FPN(Feature Pyramid Network)，RPN基本上没变，Roi pooling相应的升级成RoiAlign（可以更好的解决mask预测问题），预测头网络在原先的分类预测和回归预测的基础上又添加了一个新分支，用来预测mask。第一个将深度学习应用在语义分割上的应该是FCN(Fully Convolutional Networks)吧。 关于模型的代码实现主要在model.py文件中。 定义模型网络结果的代码主要在MaskRCNN类中的build方法中。推荐先看这个方法，有个概况之后，再细看各个子网络的实现。 输入定义 分别定义了在training和inference模式下的输入 Bottom-up 应该就是ResNet网络 # Build the shared convolutional layers. # Bottom-up Layers # Returns a list of the last layers of each stage, 5 in total. # Don&#39;t create the thead (stage 5), so we pick the 4th item in the list. if callable(config.BACKBONE): _, C2, C3, C4, C5 = config.BACKBONE(input_image, stage5=True, train_bn=config.TRAIN_BN) else: _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE, stage5=True, train_bn=config.TRAIN_BN) Top-down 以P4为例。先将P5上采样，得到与P4长宽一样的特征图，然后将C4进行卷积（横向连接），最后将两者相加（插个题外话，其实，有些论文中的网络是相乘或者其他的操作）。最后在将P4进行次卷积，据说是为了目的是消除上采样的混叠效应（aliasing effect）。 P4 = KL.Add(name=&quot;fpn_p4add&quot;)([ KL.UpSampling2D(size=(2, 2), name=&quot;fpn_p5upsampled&quot;)(P5), KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name=&#39;fpn_c4p4&#39;)(C4)]) P4 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding=&quot;SAME&quot;, name=&quot;fpn_p4&quot;)(P4) 注意的是，用于RPN的特征图和用于头部网络的特征图并不完全一致。 RPN FasterRCNN的RPN只需要在接受一个特征图，而如今要接受多尺度的特征图。在得到RPN在不同尺度上输出结果（即在不同特征图的每个点上的每个anchor上的处理结果）后还需要再整理一下，如将不同的尺度上的输出结果中的bbox信息聚合在一块。 # RPN Model rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE, len(config.RPN_ANCHOR_RATIOS), config.TOP_DOWN_PYRAMID_SIZE) # Loop through pyramid layers layer_outputs = [] # list of lists for p in rpn_feature_maps: layer_outputs.append(rpn([p])) # Concatenate layer outputs # Convert from list of lists of level outputs to list of lists # of outputs across levels. # e.g. [[a1, b1, c1], [a2, b2, c2]] =&gt; [[a1, a2], [b1, b2], [c1, c2]] output_names = [&quot;rpn_class_logits&quot;, &quot;rpn_class&quot;, &quot;rpn_bbox&quot;] outputs = list(zip(*layer_outputs)) outputs = [KL.Concatenate(axis=1, name=n)(list(o)) for o, n in zip(outputs, output_names)] rpn_class_logits, rpn_class, rpn_bbox = outputs 其中，不同bbox的坐标是使用的归一化的坐标，所以在不同特征图上的预测结果是可以混合在一块的。 ProposalLayer RPN网络输出那么多信息，需要进一步处理，得到有效的proposal。ProposalLayer根据anchor score和NMS进行选择。顺便调整下bbox位置及大小。 # Generate proposals # Proposals are [batch, N, (y1, x1, y2, x2)] in normalized coordinates # and zero padded. proposal_count = config.POST_NMS_ROIS_TRAINING if mode == &quot;training&quot;\\ else config.POST_NMS_ROIS_INFERENCE rpn_rois = ProposalLayer( proposal_count=proposal_count, nms_threshold=config.RPN_NMS_THRESHOLD, name=&quot;ROI&quot;, config=config)([rpn_class, rpn_bbox, anchors]) 在最初的时候，一直想不通ProposalLayer层是怎么工作的，因为之前只知道卷积层和pool层，直到看了FasterRCNN的源代码后才知道Layer还可以这么搞。MaskRCNN的ProposalLayer和FasterRCNN的差不多。 DetectionTargetLayer 产生用于训练的样本。大致过程是先去掉数据集中过于拥挤的目标框，计算proposal和gt_boxes(真实的目标框)的重叠情况（矩阵形式），正负样本取样，文中的正负样本比例为2:1。给每个GT boxes和GT masks分配正样本（正ROI），和其他的后续处理。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) PyramidROIAlign ROI Pooling的升级版。原理可以在资料中找到。我原以为实现起来会很复杂，实际上并不是这样的。代码中先选择要在哪个层次的特征图上处理后，使用的是采样点为1的ROIalign（可以使用tf.image.crop_and_resize，该函数支持双线性插值。将最初最初的大自然图像想象成一个2D连续信号，图像经过离散采样后得到了数字图像，记录了每个整数坐标上的信息，整数坐标之间的信息通过插值算法拟合。将这个思路应用在特征图上） # Crop and Resize # From Mask R-CNN paper: &quot;We sample four regular locations, so # that we can evaluate either max or average pooling. In fact, # interpolating only a single value at each bin center (without # pooling) is nearly as effective.&quot; # # Here we use the simplified approach of a single value per bin, # which is how it&#39;s done in tf.crop_and_resize() # Result: [batch * num_boxes, pool_height, pool_width, channels] pooled.append(tf.image.crop_and_resize( feature_maps[i], level_boxes, box_indices, self.pool_shape, method=&quot;bilinear&quot;)) fpn_classifier_graph 和FasterRCNN大同小异，除了采用了ROIAlign之外。 build_fpn_mask_graph 除了采用ROIAlign外，基本上也都是常规操作吧。可以参考FCN网络理解。 DetectionLayer 在inference模式时，模型先进行fpn_classifier_graph处理，然后将其输出输入到DetectionLayer处理后，将其输出作为代替training模式下的rois输入到build_fpn_mask_graph中。 # Generate detection targets # Subsamples proposals and generates target outputs for training # Note that proposal class IDs, gt_boxes, and gt_masks are zero # padded. Equally, returned rois and targets are zero padded. rois, target_class_ids, target_bbox, target_mask =\\ DetectionTargetLayer(config, name=&quot;proposal_targets&quot;)([ target_rois, input_gt_class_ids, gt_boxes, input_gt_masks]) 主要处理流程是 确定ROI的类别 修正bbox 过滤背景和低置信度的boxes 应用NMS 保留top_k目标 training和inference 在ProposalLayer层之前，两者只有输入不同，之后两者的区别主要在于 training模式：DetectionTargetLayer -&gt; NetworkHeads(fpn_classifier_graph + build_fpn_mask_graph) -&gt; Losses inference模式：NetworkHeads(fpn_classifier_graph ±&gt; DetectionLayer -&gt; build_fpn_mask_graph) 参考资料 在阅读源码的时候，参考这下面的资料，推荐先阅读资料在看源码。 令人拍案称奇的Mask RCNN MASK RCNN 源码阅读(UPDATE) Hellcatzm/Mask_RCNN: Mask R-CNN on Keras and TensorFlow，个人注释版","@type":"BlogPosting","url":"https://uzzz.org/2019/04/16/728225.html","headline":"MaskRCNN源码阅读","dateModified":"2019-04-16T00:00:00+08:00","datePublished":"2019-04-16T00:00:00+08:00","mainEntityOfPage":{"@type":"WebPage","@id":"https://uzzz.org/2019/04/16/728225.html"},"@context":"http://schema.org"}</script>
+<!-- End Jekyll SEO tag -->
+
+
+    <link rel="stylesheet" href="/assets/css/style.css?v=">
+    <script src="/assets/js/scale.fix.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    
+    <!-- Global site tag (gtag.js) - Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=UA-123344652-1"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+
+      gtag('config', 'UA-123344652-1');
+    </script>
+    
+    <script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+    <script>
+      (adsbygoogle = window.adsbygoogle || []).push({
+        google_ad_client: "ca-pub-8889449066804352",
+        enable_page_level_ads: true
+      });
+    </script>
+    
+    <script async custom-element="amp-auto-ads"
+        src="https://cdn.ampproject.org/v0/amp-auto-ads-0.1.js">
+    </script>
+    
+    <style>
+      @media screen and (max-width:760px){
+        .sm-hidden{display:none; }
+      }
+    </style>
+
+  </head>
+  <body>
+    
+        <amp-auto-ads type="adsense"
+              data-ad-client="ca-pub-8889449066804352">
+        </amp-auto-ads>
+    
+    <div class="wrapper">
+      <header  class="without-description" >
+        <h1>MaskRCNN源码阅读</h1>
+        
+        
+        <ul style="display: block;">
+            <li><a href="https://uzshare.com/" style="line-height: unset;" target="_blank"><strong>柚子社区</strong></a></li>
+ 	    <li><a href="/donate/" style="line-height: unset;" target="_blank"><strong>Donate</strong></a></li>
+        </ul>
+        
+      </header>
+      <section>
+
+<div style="margin:0 0 8px 0;">
+<style>
+table.gsc-input {
+    margin: 0;
+}
+.cse .gsc-control-cse, .gsc-control-cse {
+    padding: 0;
+    width: auto;
+}
+.gsc-search-box td {
+    border-bottom: none;
+}
+</style>
+<script>
+  (function() {
+    var cx = '004431708863642777669:qan2_6ugotw';
+    var gcse = document.createElement('script');
+    gcse.type = 'text/javascript';
+    gcse.async = true;
+    gcse.src = 'https://cse.google.com/cse.js?cx=' + cx;
+    var s = document.getElementsByTagName('script')[0];
+    s.parentNode.insertBefore(gcse, s);
+  })();
+</script>
+<gcse:search></gcse:search>
+</div>
+<!-- match content ads -->
+	        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+			<ins class="adsbygoogle"
+			     style="display:block"
+			     data-ad-format="autorelaxed"
+			     data-ad-client="ca-pub-8889449066804352"
+			     data-ad-slot="1928667997"></ins>
+			<script>
+			     (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>	
+
+
+
+        <div id="article_content" class="article_content clearfix csdn-tracking-statistics" data-pid="blog" data-mod="popu_307" data-dsm="post"> 
+ <link rel="stylesheet" href="https://csdnimg.cn/release/phoenix/template/css/ck_htmledit_views-f57960eb32.css"> 
+ <div id="content_views" class="markdown_views prism-atom-one-dark"> 
+  <!-- flowchart 箭头图标 勿删 --> 
+  <svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+   <path stroke-linecap="round" d="M5,0 0,2.5 5,5z" id="raphael-marker-block" style="-webkit-tap-highlight-color: rgba(0, 0, 0, 0);"></path>
+  </svg> 
+  <h1><a id="MaskRCNN_0"></a>MaskRCNN源码阅读</h1> 
+  <h1><a id="_2"></a>前言</h1> 
+  <p>这两天读了下MaskRCNN的源码，在github上找的<a href="https://github.com/matterport/Mask_RCNN" rel="nofollow">Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow</a>。</p> 
+  <p>之前看过FasterRCNN的源码，不过当时没有做记录。</p> 
+  <p>总的来说，MaskRCNN算是集大成者。其在FasterRCNN的框架上修改而成，backbone由经典的VGG变成了ResNet+FPN(Feature Pyramid Network)，RPN基本上没变，Roi pooling相应的升级成RoiAlign（可以更好的解决mask预测问题），预测头网络在原先的分类预测和回归预测的基础上又添加了一个新分支，用来预测mask。第一个将深度学习应用在语义分割上的应该是FCN(Fully Convolutional Networks)吧。</p> 
+  <p>关于模型的代码实现主要在model.py文件中。</p> 
+  <p>定义模型网络结果的代码主要在MaskRCNN类中的build方法中。推荐先看这个方法，有个概况之后，再细看各个子网络的实现。</p> 
+  <h1><a id="_14"></a>输入定义</h1> 
+  <p>分别定义了在training和inference模式下的输入</p> 
+  <h1><a id="Bottomup_17"></a>Bottom-up</h1> 
+  <p>应该就是ResNet网络</p> 
+  <pre><code class="prism language-py">        <span class="token comment"># Build the shared convolutional layers.</span>
+        <span class="token comment"># Bottom-up Layers</span>
+        <span class="token comment"># Returns a list of the last layers of each stage, 5 in total.</span>
+        <span class="token comment"># Don't create the thead (stage 5), so we pick the 4th item in the list.</span>
+        <span class="token keyword">if</span> <span class="token builtin">callable</span><span class="token punctuation">(</span>config<span class="token punctuation">.</span>BACKBONE<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            _<span class="token punctuation">,</span> C2<span class="token punctuation">,</span> C3<span class="token punctuation">,</span> C4<span class="token punctuation">,</span> C5 <span class="token operator">=</span> config<span class="token punctuation">.</span>BACKBONE<span class="token punctuation">(</span>input_image<span class="token punctuation">,</span> stage5<span class="token operator">=</span><span class="token boolean">True</span><span class="token punctuation">,</span>
+                                                train_bn<span class="token operator">=</span>config<span class="token punctuation">.</span>TRAIN_BN<span class="token punctuation">)</span>
+        <span class="token keyword">else</span><span class="token punctuation">:</span>
+            _<span class="token punctuation">,</span> C2<span class="token punctuation">,</span> C3<span class="token punctuation">,</span> C4<span class="token punctuation">,</span> C5 <span class="token operator">=</span> resnet_graph<span class="token punctuation">(</span>input_image<span class="token punctuation">,</span> config<span class="token punctuation">.</span>BACKBONE<span class="token punctuation">,</span>
+                                             stage5<span class="token operator">=</span><span class="token boolean">True</span><span class="token punctuation">,</span> train_bn<span class="token operator">=</span>config<span class="token punctuation">.</span>TRAIN_BN<span class="token punctuation">)</span>
+</code></pre> 
+  <h1><a id="Topdown_31"></a>Top-down</h1> 
+  <p>以P4为例。先将P5上采样，得到与P4长宽一样的特征图，然后将C4进行卷积（横向连接），最后将两者相加（插个题外话，其实，有些论文中的网络是相乘或者其他的操作）。最后在将P4进行次卷积，据说是为了目的是消除上采样的混叠效应（aliasing effect）。</p> 
+  <pre><code class="prism language-py">        P4 <span class="token operator">=</span> KL<span class="token punctuation">.</span>Add<span class="token punctuation">(</span>name<span class="token operator">=</span><span class="token string">"fpn_p4add"</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token punctuation">[</span>
+            KL<span class="token punctuation">.</span>UpSampling2D<span class="token punctuation">(</span>size<span class="token operator">=</span><span class="token punctuation">(</span><span class="token number">2</span><span class="token punctuation">,</span> <span class="token number">2</span><span class="token punctuation">)</span><span class="token punctuation">,</span> name<span class="token operator">=</span><span class="token string">"fpn_p5upsampled"</span><span class="token punctuation">)</span><span class="token punctuation">(</span>P5<span class="token punctuation">)</span><span class="token punctuation">,</span>
+            KL<span class="token punctuation">.</span>Conv2D<span class="token punctuation">(</span>config<span class="token punctuation">.</span>TOP_DOWN_PYRAMID_SIZE<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token number">1</span><span class="token punctuation">,</span> <span class="token number">1</span><span class="token punctuation">)</span><span class="token punctuation">,</span> name<span class="token operator">=</span><span class="token string">'fpn_c4p4'</span><span class="token punctuation">)</span><span class="token punctuation">(</span>C4<span class="token punctuation">)</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+</code></pre> 
+  <pre><code class="prism language-py">        P4 <span class="token operator">=</span> KL<span class="token punctuation">.</span>Conv2D<span class="token punctuation">(</span>config<span class="token punctuation">.</span>TOP_DOWN_PYRAMID_SIZE<span class="token punctuation">,</span> <span class="token punctuation">(</span><span class="token number">3</span><span class="token punctuation">,</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">,</span> padding<span class="token operator">=</span><span class="token string">"SAME"</span><span class="token punctuation">,</span> name<span class="token operator">=</span><span class="token string">"fpn_p4"</span><span class="token punctuation">)</span><span class="token punctuation">(</span>P4<span class="token punctuation">)</span>
+</code></pre> 
+  <p>注意的是，用于RPN的特征图和用于头部网络的特征图并不完全一致。</p> 
+  <h1><a id="RPN_43"></a>RPN</h1> 
+  <p>FasterRCNN的RPN只需要在接受一个特征图，而如今要接受多尺度的特征图。在得到RPN在不同尺度上输出结果（即在不同特征图的每个点上的每个anchor上的处理结果）后还需要再整理一下，如将不同的尺度上的输出结果中的bbox信息聚合在一块。</p> 
+  <pre><code class="prism language-py">        <span class="token comment"># RPN Model</span>
+        rpn <span class="token operator">=</span> build_rpn_model<span class="token punctuation">(</span>config<span class="token punctuation">.</span>RPN_ANCHOR_STRIDE<span class="token punctuation">,</span>
+                              <span class="token builtin">len</span><span class="token punctuation">(</span>config<span class="token punctuation">.</span>RPN_ANCHOR_RATIOS<span class="token punctuation">)</span><span class="token punctuation">,</span> config<span class="token punctuation">.</span>TOP_DOWN_PYRAMID_SIZE<span class="token punctuation">)</span>
+        <span class="token comment"># Loop through pyramid layers</span>
+        layer_outputs <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token punctuation">]</span>  <span class="token comment"># list of lists</span>
+        <span class="token keyword">for</span> p <span class="token keyword">in</span> rpn_feature_maps<span class="token punctuation">:</span>
+            layer_outputs<span class="token punctuation">.</span>append<span class="token punctuation">(</span>rpn<span class="token punctuation">(</span><span class="token punctuation">[</span>p<span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+        <span class="token comment"># Concatenate layer outputs</span>
+        <span class="token comment"># Convert from list of lists of level outputs to list of lists</span>
+        <span class="token comment"># of outputs across levels.</span>
+        <span class="token comment"># e.g. [[a1, b1, c1], [a2, b2, c2]] =&gt; [[a1, a2], [b1, b2], [c1, c2]]</span>
+        output_names <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token string">"rpn_class_logits"</span><span class="token punctuation">,</span> <span class="token string">"rpn_class"</span><span class="token punctuation">,</span> <span class="token string">"rpn_bbox"</span><span class="token punctuation">]</span>
+        outputs <span class="token operator">=</span> <span class="token builtin">list</span><span class="token punctuation">(</span><span class="token builtin">zip</span><span class="token punctuation">(</span><span class="token operator">*</span>layer_outputs<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        outputs <span class="token operator">=</span> <span class="token punctuation">[</span>KL<span class="token punctuation">.</span>Concatenate<span class="token punctuation">(</span>axis<span class="token operator">=</span><span class="token number">1</span><span class="token punctuation">,</span> name<span class="token operator">=</span>n<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token builtin">list</span><span class="token punctuation">(</span>o<span class="token punctuation">)</span><span class="token punctuation">)</span>
+                   <span class="token keyword">for</span> o<span class="token punctuation">,</span> n <span class="token keyword">in</span> <span class="token builtin">zip</span><span class="token punctuation">(</span>outputs<span class="token punctuation">,</span> output_names<span class="token punctuation">)</span><span class="token punctuation">]</span>
+
+        rpn_class_logits<span class="token punctuation">,</span> rpn_class<span class="token punctuation">,</span> rpn_bbox <span class="token operator">=</span> outputs
+</code></pre> 
+  <p>其中，不同bbox的坐标是使用的归一化的坐标，所以在不同特征图上的预测结果是可以混合在一块的。</p> 
+  <h1><a id="ProposalLayer_66"></a>ProposalLayer</h1> 
+  <p>RPN网络输出那么多信息，需要进一步处理，得到有效的proposal。ProposalLayer根据anchor score和NMS进行选择。顺便调整下bbox位置及大小。</p> 
+  <pre><code class="prism language-py">        <span class="token comment"># Generate proposals</span>
+        <span class="token comment"># Proposals are [batch, N, (y1, x1, y2, x2)] in normalized coordinates</span>
+        <span class="token comment"># and zero padded.</span>
+        proposal_count <span class="token operator">=</span> config<span class="token punctuation">.</span>POST_NMS_ROIS_TRAINING <span class="token keyword">if</span> mode <span class="token operator">==</span> <span class="token string">"training"</span>\
+            <span class="token keyword">else</span> config<span class="token punctuation">.</span>POST_NMS_ROIS_INFERENCE
+        rpn_rois <span class="token operator">=</span> ProposalLayer<span class="token punctuation">(</span>
+            proposal_count<span class="token operator">=</span>proposal_count<span class="token punctuation">,</span>
+            nms_threshold<span class="token operator">=</span>config<span class="token punctuation">.</span>RPN_NMS_THRESHOLD<span class="token punctuation">,</span>
+            name<span class="token operator">=</span><span class="token string">"ROI"</span><span class="token punctuation">,</span>
+            config<span class="token operator">=</span>config<span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token punctuation">[</span>rpn_class<span class="token punctuation">,</span> rpn_bbox<span class="token punctuation">,</span> anchors<span class="token punctuation">]</span><span class="token punctuation">)</span>
+</code></pre> 
+  <p>在最初的时候，一直想不通ProposalLayer层是怎么工作的，因为之前只知道卷积层和pool层，直到看了FasterRCNN的源代码后才知道Layer还可以这么搞。MaskRCNN的ProposalLayer和FasterRCNN的差不多。</p> 
+  <h1><a id="DetectionTargetLayer_82"></a>DetectionTargetLayer</h1> 
+  <p>产生用于训练的样本。大致过程是先去掉数据集中过于拥挤的目标框，计算proposal和gt_boxes(真实的目标框)的重叠情况（矩阵形式），正负样本取样，文中的正负样本比例为2:1。给每个GT boxes和GT masks分配正样本（正ROI），和其他的后续处理。</p> 
+  <pre><code class="prism language-py">            <span class="token comment"># Generate detection targets</span>
+            <span class="token comment"># Subsamples proposals and generates target outputs for training</span>
+            <span class="token comment"># Note that proposal class IDs, gt_boxes, and gt_masks are zero</span>
+            <span class="token comment"># padded. Equally, returned rois and targets are zero padded.</span>
+            rois<span class="token punctuation">,</span> target_class_ids<span class="token punctuation">,</span> target_bbox<span class="token punctuation">,</span> target_mask <span class="token operator">=</span>\
+                DetectionTargetLayer<span class="token punctuation">(</span>config<span class="token punctuation">,</span> name<span class="token operator">=</span><span class="token string">"proposal_targets"</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token punctuation">[</span>
+                    target_rois<span class="token punctuation">,</span> input_gt_class_ids<span class="token punctuation">,</span> gt_boxes<span class="token punctuation">,</span> input_gt_masks<span class="token punctuation">]</span><span class="token punctuation">)</span>
+</code></pre> 
+  <h1><a id="PyramidROIAlign_95"></a>PyramidROIAlign</h1> 
+  <p>ROI Pooling的升级版。原理可以在资料中找到。我原以为实现起来会很复杂，实际上并不是这样的。代码中先选择要在哪个层次的特征图上处理后，使用的是采样点为1的ROIalign（可以使用tf.image.crop_and_resize，该函数支持双线性插值。将最初最初的大自然图像想象成一个2D连续信号，图像经过离散采样后得到了数字图像，记录了每个整数坐标上的信息，整数坐标之间的信息通过插值算法拟合。将这个思路应用在特征图上）</p> 
+  <pre><code class="prism language-py">            <span class="token comment"># Crop and Resize</span>
+            <span class="token comment"># From Mask R-CNN paper: "We sample four regular locations, so</span>
+            <span class="token comment"># that we can evaluate either max or average pooling. In fact,</span>
+            <span class="token comment"># interpolating only a single value at each bin center (without</span>
+            <span class="token comment"># pooling) is nearly as effective."</span>
+            <span class="token comment">#</span>
+            <span class="token comment"># Here we use the simplified approach of a single value per bin,</span>
+            <span class="token comment"># which is how it's done in tf.crop_and_resize()</span>
+            <span class="token comment"># Result: [batch * num_boxes, pool_height, pool_width, channels]</span>
+            pooled<span class="token punctuation">.</span>append<span class="token punctuation">(</span>tf<span class="token punctuation">.</span>image<span class="token punctuation">.</span>crop_and_resize<span class="token punctuation">(</span>
+                feature_maps<span class="token punctuation">[</span>i<span class="token punctuation">]</span><span class="token punctuation">,</span> level_boxes<span class="token punctuation">,</span> box_indices<span class="token punctuation">,</span> self<span class="token punctuation">.</span>pool_shape<span class="token punctuation">,</span>
+                method<span class="token operator">=</span><span class="token string">"bilinear"</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre> 
+  <h1><a id="fpn_classifier_graph_111"></a>fpn_classifier_graph</h1> 
+  <p>和FasterRCNN大同小异，除了采用了ROIAlign之外。</p> 
+  <h1><a id="build_fpn_mask_graph_114"></a>build_fpn_mask_graph</h1> 
+  <p>除了采用ROIAlign外，基本上也都是常规操作吧。可以参考FCN网络理解。</p> 
+  <h1><a id="DetectionLayer_118"></a>DetectionLayer</h1> 
+  <p>在inference模式时，模型先进行fpn_classifier_graph处理，然后将其输出输入到DetectionLayer处理后，将其输出作为代替training模式下的rois输入到build_fpn_mask_graph中。</p> 
+  <pre><code class="prism language-py">            <span class="token comment"># Generate detection targets</span>
+            <span class="token comment"># Subsamples proposals and generates target outputs for training</span>
+            <span class="token comment"># Note that proposal class IDs, gt_boxes, and gt_masks are zero</span>
+            <span class="token comment"># padded. Equally, returned rois and targets are zero padded.</span>
+            rois<span class="token punctuation">,</span> target_class_ids<span class="token punctuation">,</span> target_bbox<span class="token punctuation">,</span> target_mask <span class="token operator">=</span>\
+                DetectionTargetLayer<span class="token punctuation">(</span>config<span class="token punctuation">,</span> name<span class="token operator">=</span><span class="token string">"proposal_targets"</span><span class="token punctuation">)</span><span class="token punctuation">(</span><span class="token punctuation">[</span>
+                    target_rois<span class="token punctuation">,</span> input_gt_class_ids<span class="token punctuation">,</span> gt_boxes<span class="token punctuation">,</span> input_gt_masks<span class="token punctuation">]</span><span class="token punctuation">)</span>
+</code></pre> 
+  <p>主要处理流程是</p> 
+  <ol> 
+   <li>确定ROI的类别</li> 
+   <li>修正bbox</li> 
+   <li>过滤背景和低置信度的boxes</li> 
+   <li>应用NMS</li> 
+   <li>保留top_k目标</li> 
+  </ol> 
+  <h1><a id="traininginference_136"></a>training和inference</h1> 
+  <p>在ProposalLayer层之前，两者只有输入不同，之后两者的区别主要在于</p> 
+  <ul> 
+   <li>training模式：DetectionTargetLayer -&gt; NetworkHeads(fpn_classifier_graph + build_fpn_mask_graph) -&gt; Losses</li> 
+   <li>inference模式：NetworkHeads(fpn_classifier_graph ±&gt; DetectionLayer -&gt; build_fpn_mask_graph)</li> 
+  </ul> 
+  <h1><a id="_141"></a>参考资料</h1> 
+  <p>在阅读源码的时候，参考这下面的资料，推荐先阅读资料在看源码。<br> <a href="https://zhuanlan.zhihu.com/p/37998710" rel="nofollow">令人拍案称奇的Mask RCNN</a><br> <a href="https://www.cnblogs.com/YouXiangLiThon/p/9178861.html" rel="nofollow">MASK RCNN 源码阅读(UPDATE)</a></p> 
+  <p><a href="https://github.com/Hellcatzm/Mask_RCNN" rel="nofollow">Hellcatzm/Mask_RCNN: Mask R-CNN on Keras and TensorFlow，个人注释版</a></p> 
+ </div> 
+ <link href="https://csdnimg.cn/release/phoenix/mdeditor/markdown_views-258a4616f7.css" rel="stylesheet"> 
+</div>
+
+	<script async src="//pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
+	<!-- 自定义广告 -->
+	<ins class="adsbygoogle"
+	     style="display:block"
+	     data-ad-client="ca-pub-8889449066804352"
+	     data-ad-slot="1494696990"
+	     data-ad-format="auto"
+	     data-full-width-responsive="true"></ins>
+	<script>
+		(adsbygoogle = window.adsbygoogle || []).push({});
+	</script>
+
+
+        <br />
+        <a href="https://uzshare.com/">更多精彩内容</a>
+      </section>
+      
+      <header style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+        <ul style="display: block;">
+          <li><a href="/" style="line-height: 40px;padding-top:0px;">回首页</a></li>
+        </ul>
+      </header>
+      <header class="sm-hidden" style="right: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/imgqcode.png" style="width:160px;" />
+      </header>
+      
+      <header class="sm-hidden" style="left: 0;position: fixed;bottom: 60px;z-index: 100;background: none;border-bottom:none;">
+          <img src="https://uzzz.org.cn/hou_imgqcode.png" style="width:160px;">
+      </header>
+    </div>
+    
+    <!--[if !IE]><script>fixScale(document);</script><![endif]-->
+
+    <script>
+    var _hmt = _hmt || [];
+    (function() {
+      var hm = document.createElement("script");
+      hm.src = "https://hm.baidu.com/hm.js?d293c49e1e4bfe8f276695a5aa953300";
+      var s = document.getElementsByTagName("script")[0]; 
+      s.parentNode.insertBefore(hm, s);
+    })();
+    </script>
+
+  </body>
+</html>
