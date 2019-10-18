@@ -19,9 +19,9 @@ get_header(); ?>
 				</header><!-- .entry-header -->
 				
 				<div class="entry-content clearfix">
-					<p><?php esc_html_e( 'It looks like nothing was found at this location. Maybe try a search or one of the links below?', 'tortuga' ); ?></p>
+					<p><?php esc_html_e( 'It looks like nothing was found at this location. Maybe try  one of the links below?', 'tortuga' ); ?></p>
 					
-					<?php get_search_form(); ?>
+					<?php //get_search_form(); ?>
 
 					<?php the_widget( 'WP_Widget_Recent_Posts' ); ?>
 

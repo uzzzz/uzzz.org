@@ -242,6 +242,12 @@ function tortuga_add_image_size_names( $sizes ) {
 }
 add_filter( 'image_size_names_choose', 'tortuga_add_image_size_names' );
 
+function chinese_excerpt($text, $lenth=100) {
+	$text = mb_substr($text,0, $lenth);
+	return $text;
+}
+add_filter('the_excerpt', 'chinese_excerpt');
+
 
 /**
  * Include Files

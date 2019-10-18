@@ -43,6 +43,16 @@ endif;
 					endwhile; ?>
 
 				</div>
+			
+			<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js">	</script>
+			<ins class="adsbygoogle"
+				 style="display:block"
+				 data-ad-format="autorelaxed"
+				 data-ad-client="ca-pub-8889449066804352"
+				 data-ad-slot="1928667997"></ins>
+			<script>
+				 (adsbygoogle = window.adsbygoogle || []).push({});
+			</script>
 
 				<?php tortuga_pagination();
 
