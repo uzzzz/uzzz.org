@@ -8,17 +8,12 @@
 ?>
 <div id="magazine-homepage-widgets" class="widget-area clearfix">
 
-			<div id="custom_html-3" class="widget_text widget widget_custom_html"><div class="textwidget custom-html-widget"><script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script>
-<!-- 展示-横幅-自适应-广告 -->
-<ins class="adsbygoogle"
-     style="display:block"
-     data-ad-client="ca-pub-8889449066804352"
-     data-ad-slot="6054387901"
-     data-ad-format="auto"
-     data-full-width-responsive="true"></ins>
-<script>
-     (adsbygoogle = window.adsbygoogle || []).push({});
-</script></div></div>
+			<div id="custom_html-3" class="widget_text widget widget_custom_html"><div class="textwidget custom-html-widget">
+
+
+<iframe src="https://rcm-cn.amazon-adsystem.com/e/cm?o=28&p=48&l=ur1&category=udio_video&banner=1N8F0FSTZ71W0Z5VNYR2&f=ifr&linkID=7a8baaa56abbc727b6a3dc3d17f3f4c0&t=uzzz08-23&tracking_id=uzzz08-23" width="728" height="90" scrolling="no" border="0" marginwidth="0" style="border:none;" frameborder="0"></iframe>
+				
+				</div></div>
 		</div>
 
 <article id="post-<?php the_ID(); ?>" <?php post_class(); ?>>
